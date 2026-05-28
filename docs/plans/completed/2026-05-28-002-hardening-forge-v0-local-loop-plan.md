@@ -4,7 +4,7 @@ type: hardening
 status: completed
 date: 2026-05-28
 origin: docs/brainstorms/forge-v0-wedge-requirements.md
-previous_plan: docs/plans/2026-05-28-001-feat-forge-v0-local-loop-plan.md
+previous_plan: docs/plans/completed/2026-05-28-001-feat-forge-v0-local-loop-plan.md
 review_artifact: ce-code-review run forge-v0-autofix-001
 ---
 
@@ -349,7 +349,7 @@ The milestones are intentionally sequenced by risk. Secret handling and JSON con
 - `rtk cargo fmt --all --check`
 - `rtk cargo test --workspace`
 - `rtk cargo clippy --workspace --all-targets -- -D warnings`
-- `ce-code-review mode:autofix base:origin/main plan:docs/plans/2026-05-28-002-hardening-forge-v0-local-loop-plan.md`
+- `ce-code-review mode:autofix base:origin/main plan:docs/plans/completed/2026-05-28-002-hardening-forge-v0-local-loop-plan.md`
 - Dogfood: `forge init -> start -> save -> run -> propose -> check -> accept -> export branch -> export pr-body -> doctor`
 - Confirm exported branch does not include `.forge`, `.env`, or secret-risk files.
 - Confirm PR body does not include raw secret-like output.
@@ -359,6 +359,6 @@ The milestones are intentionally sequenced by risk. Secret handling and JSON con
 ## Sources
 
 - Origin requirements: `docs/brainstorms/forge-v0-wedge-requirements.md`.
-- Previous implementation plan: `docs/plans/2026-05-28-001-feat-forge-v0-local-loop-plan.md`.
+- Previous implementation plan: `docs/plans/completed/2026-05-28-001-feat-forge-v0-local-loop-plan.md`.
 - Review artifact: `ce-code-review` run `forge-v0-autofix-001`.
 - Current implementation files under `crates/forge-*`.

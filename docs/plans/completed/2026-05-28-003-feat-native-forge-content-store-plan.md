@@ -4,7 +4,7 @@ type: feat
 status: completed
 date: 2026-05-28
 origin: PRD.md
-previous_plan: docs/plans/2026-05-28-002-hardening-forge-v0-local-loop-plan.md
+previous_plan: docs/plans/completed/2026-05-28-002-hardening-forge-v0-local-loop-plan.md
 ---
 
 # feat: Native Forge Content Store
@@ -376,7 +376,7 @@ This also introduces persistent object-format commitments. Even if the object pa
 - Product/storage source of truth: `PRD.md`, especially Storage Architecture, Object Identity, Crash-Safe Writes, MVP Scope, Dependency Policy, and Testing Strategy.
 - v0 requirement boundary: `docs/brainstorms/forge-v0-wedge-requirements.md`, which explicitly defers native Forge content backend after Git-backed v0.
 - Current implementation baseline: `crates/forge-content/src/lib.rs`, `crates/forge-content-git/src/lib.rs`, `crates/forge-store/src/lib.rs`, `crates/forge-cli/src/main.rs`, and `crates/forge-cli/tests`.
-- Previous shipped slice: `docs/plans/2026-05-28-002-hardening-forge-v0-local-loop-plan.md`.
+- Previous shipped slice: `docs/plans/completed/2026-05-28-002-hardening-forge-v0-local-loop-plan.md`.
 - Rust filesystem durability primitives: `std::fs::File` docs for `sync_all`, `sync_data`, and file creation behavior: https://doc.rust-lang.org/std/fs/struct.File.html.
 - SHA-256 dependency reference: RustCrypto `sha2` crate docs: https://docs.rs/sha2.
 - Scale boundary for deferred pack work: Git pack format documentation: https://git-scm.com/docs/gitformat-pack.

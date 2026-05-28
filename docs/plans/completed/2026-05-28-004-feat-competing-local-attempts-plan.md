@@ -319,4 +319,4 @@ This also adds a second durable repository setting: the attached attempt. Unlike
 - Product source: `PRD.md`, especially Attempt Isolation, Proposal Semantics, Conflict and Merge Model, and v0 success criteria.
 - Current implementation baseline: `crates/forge-cli/src/main.rs`, `crates/forge-store/src/lib.rs`, and `crates/forge-store/migrations/001_init.sql`.
 - Current integration patterns: `crates/forge-cli/tests/forge_start_save.rs`, `crates/forge-cli/tests/forge_propose_check.rs`, `crates/forge-cli/tests/forge_accept_export.rs`, and `crates/forge-cli/tests/forge_doctor_gc.rs`.
-- Prior shipped plans: `docs/plans/2026-05-28-001-feat-forge-v0-local-loop-plan.md`, `docs/plans/2026-05-28-002-hardening-forge-v0-local-loop-plan.md`, and `docs/plans/2026-05-28-003-feat-native-forge-content-store-plan.md`.
+- Prior shipped plans: `docs/plans/completed/2026-05-28-001-feat-forge-v0-local-loop-plan.md`, `docs/plans/completed/2026-05-28-002-hardening-forge-v0-local-loop-plan.md`, and `docs/plans/completed/2026-05-28-003-feat-native-forge-content-store-plan.md`.
