@@ -1,0 +1,10 @@
+[package]
+name = "forge-content-git"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+forge-content = { path = "../forge-content" }
+tempfile.workspace = true

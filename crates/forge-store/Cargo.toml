@@ -1,0 +1,12 @@
+[package]
+name = "forge-store"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+forge-core = { path = "../forge-core" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
