@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS repositories (
     id TEXT PRIMARY KEY,
     root_path TEXT NOT NULL UNIQUE,
     git_head TEXT,
+    content_backend TEXT NOT NULL DEFAULT 'git',
     created_at_ms INTEGER NOT NULL
 );
 

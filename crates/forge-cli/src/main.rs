@@ -1,5 +1,5 @@
 use clap::{error::ErrorKind, Args, Parser, Subcommand};
-use forge_content::ContentBackend;
+use forge_content::{classify_content_ref, ContentBackend, ContentRefKind};
 use forge_protocol::{ErrorObject, ResponseEnvelope, ResponseStatus};
 use serde_json::{json, Value};
 use std::env;
@@ -18,7 +18,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Init,
+    Init(InitArgs),
     Start(IntentArgs),
     Save,
     Restore(RestoreArgs),
@@ -31,6 +31,12 @@ enum Command {
     Doctor,
     Gc(GcArgs),
     Export(ExportArgs),
+}
+
+#[derive(Debug, Args)]
+struct InitArgs {
+    #[arg(long, value_parser = ["git", "native"])]
+    content_backend: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -88,7 +94,7 @@ fn main() -> ExitCode {
     };
     let request_id = cli.request_id.clone();
     let response = match cli.command {
-        Command::Init => init_response(request_id),
+        Command::Init(args) => init_response(request_id, args),
         Command::Start(args) => start_response(request_id, args),
         Command::Save => save_response(request_id),
         Command::Restore(args) if !args.yes => structured_error(
@@ -195,8 +201,7 @@ fn start_response(request_id: Option<String>, args: IntentArgs) -> ResponseEnvel
 
 fn save_response(request_id: Option<String>) -> ResponseEnvelope {
     command_result("save", request_id, |cwd, request_id| {
-        let backend = forge_content_git::GitContentBackend;
-        let content = backend.snapshot_worktree(&cwd)?;
+        let content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
         let saved = forge_store::save_snapshot(
             &cwd,
             request_id,
@@ -213,13 +218,12 @@ fn save_response(request_id: Option<String>) -> ResponseEnvelope {
 fn restore_response(request_id: Option<String>, args: RestoreArgs) -> ResponseEnvelope {
     command_result("restore", request_id, |cwd, request_id| {
         let content_ref = forge_store::snapshot_content_ref(&cwd, &args.snapshot_id)?;
-        let backend = forge_content_git::GitContentBackend;
-        let current_content = backend.snapshot_worktree(&cwd)?;
+        let current_content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
         let latest_content_ref = forge_store::latest_snapshot_content_ref(&cwd)?;
         if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
             anyhow::bail!("dirty worktree has unsaved changes");
         }
-        backend.restore_snapshot(&cwd, &content_ref)?;
+        backend_for_content_ref(&content_ref)?.restore_snapshot(&cwd, &content_ref)?;
         let restored = forge_store::record_restore(&cwd, request_id, &args.snapshot_id)?;
         Ok((
             Some(restored.operation_id.clone()),
@@ -466,10 +470,14 @@ where
     }
 }
 
-fn init_response(request_id: Option<String>) -> ResponseEnvelope {
+fn init_response(request_id: Option<String>, args: InitArgs) -> ResponseEnvelope {
+    let content_backend = args
+        .content_backend
+        .or_else(|| env::var("FORGE_CONTENT_BACKEND").ok())
+        .unwrap_or_else(|| "git".to_string());
     match env::current_dir()
         .map_err(anyhow::Error::from)
-        .and_then(|cwd| forge_store::init_repository(&cwd, request_id.clone()))
+        .and_then(|cwd| forge_store::init_repository(&cwd, request_id.clone(), content_backend))
     {
         Ok(repository) => ResponseEnvelope::success(
             "init",
@@ -484,6 +492,22 @@ fn init_response(request_id: Option<String>) -> ResponseEnvelope {
             error.to_string(),
             Value::Object(Default::default()),
         ),
+    }
+}
+
+fn selected_backend(cwd: &std::path::Path) -> anyhow::Result<Box<dyn ContentBackend>> {
+    match forge_store::repository_content_backend(cwd)?.as_str() {
+        "git" => Ok(Box::new(forge_content_git::GitContentBackend)),
+        "native" => Ok(Box::new(forge_content_native::NativeContentBackend)),
+        other => anyhow::bail!("unsupported content backend {other}"),
+    }
+}
+
+fn backend_for_content_ref(content_ref: &str) -> anyhow::Result<Box<dyn ContentBackend>> {
+    match classify_content_ref(content_ref) {
+        ContentRefKind::GitTree(_) => Ok(Box::new(forge_content_git::GitContentBackend)),
+        ContentRefKind::ForgeTree(_) => Ok(Box::new(forge_content_native::NativeContentBackend)),
+        ContentRefKind::Unsupported => anyhow::bail!("unsupported content ref"),
     }
 }
 

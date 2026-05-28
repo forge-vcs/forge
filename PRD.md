@@ -2,15 +2,15 @@
 
 ## 1. Executive Summary
 
-Forge is a Rust-native change-control system designed for the era where AI agents and humans both produce code. It is not a Git clone with friendlier commands. Its first product is an agent-native review ledger over existing Git repositories; its long-term architecture keeps the door open for a native Forge content backend.
+Forge is a Rust-native change-control system designed for the era where AI agents and humans both produce code. It is not a Git clone with friendlier commands. Its first product is an agent-native review ledger over existing Git repositories; its long-term architecture now includes an explicit native Forge content backend.
 
 Forge's reviewable lifecycle is:
 
 Intent -> Attempt -> Snapshot -> Proposal -> Evidence -> Check Result -> Decision -> Publication
 
-The product starts as a local CLI, metadata store, evidence ledger, and Git-backed content adapter. It must later be strong enough to support a hosted collaboration platform: the next GitHub built around intents, agent attempts, evidence, policy, review, and safe publication.
+The product starts as a local CLI, metadata store, evidence ledger, and Git-compatible content boundary. Git-backed snapshots remain the default adapter, and native Forge loose-object snapshots are available behind an explicit repository setting. It must later be strong enough to support a hosted collaboration platform: the next GitHub built around intents, agent attempts, evidence, policy, review, and safe publication.
 
-Forge v0 is not an independent VCS. It validates the agent-native workflow before replacing Git storage.
+Forge v0 is not an independent VCS. It validates the agent-native workflow and begins proving native snapshot storage without replacing Git as the collaboration/export protocol.
 
 The current IDEA.md has the right strategic direction, but it under-specifies the dangerous parts:
 
@@ -148,7 +148,7 @@ Hard rule: do not implement custom cryptography or custom compression for produc
 - Requiring agents to understand Git internals.
 - Trusting self-reported agent provenance without later attestation.
 - Letting Git branch semantics dictate the Forge domain model.
-- Treating v0 as proof that Forge has solved native VCS storage.
+- Treating v0 native loose objects as proof that Forge has solved complete native VCS storage.
 
 ## 7. Target Users
 
@@ -428,11 +428,11 @@ Forge must define invariants before implementation. Suggested v0 invariants:
 Forge v0 should use a hybrid local storage design:
 
 - SQLite metadata store for repository state, operation/view records, intents, attempts, snapshots, proposals, evidence metadata, check results, decisions, publications, conflict sets, indexes, and schema migrations.
-- Content backend abstraction for file-content snapshots. v0 uses Git-backed tree snapshots; a native Forge content store can be added later.
+- Content backend abstraction for file-content snapshots. Git-backed tree snapshots remain the default. Native Forge snapshots can be enabled explicitly and are stored as loose content-addressed objects under `.forge/objects`.
 - Content-addressed file store for large evidence payloads and optional auxiliary blobs.
 - Indexes/caches for fast status, path lookup, changed-file queries, and evidence lookup.
 
-The operation/view state in SQLite is the lifecycle source of truth. Git object IDs are content backend references, not Forge domain objects. Indexes are rebuildable.
+The operation/view state in SQLite is the lifecycle source of truth. Git object IDs and Forge object IDs are content backend references, not Forge domain objects. Indexes are rebuildable.
 
 ### 10.2 Object Identity
 
@@ -480,7 +480,7 @@ Recommended v0 approach:
 - Large evidence payloads and optional auxiliary content blobs are stored separately as content-addressed files.
 - Diagnostic commands render objects as JSON for humans and agents.
 - A small line-based text format may be used for local config and policy if it remains simple and versioned.
-- A canonical binary object format is deferred until remote sync or native Forge storage requires it.
+- Native snapshot content uses deterministic versioned loose blob/tree payloads with SHA-256 identity. A canonical binary object format, packfiles, compression, and remote sync are deferred until the loose-object boundary is proven.
 
 Human-readable `.forge` is less important than inspectable `.forge`. `forge inspect` can provide human-readable views without making the storage format fragile.
 
@@ -845,6 +845,7 @@ Recommended v0 approach:
 - Export accepted proposals to Git branches or commits.
 - Generate PR-ready Markdown evidence.
 - Record Git object IDs as adapter metadata.
+- When native content mode is enabled, synthesize Git trees from Forge-native tree objects only at export time.
 
 The v0 content boundary should be expressed through a `ContentBackend` abstraction:
 
@@ -853,7 +854,7 @@ The v0 content boundary should be expressed through a `ContentBackend` abstracti
 - Materialize a `TreeRef` into a workspace.
 - Export a proposal to a Git branch.
 
-This is pragmatic. Reimplementing Git object storage and protocol before validating Forge's agent-native workflow is likely a trap.
+This is pragmatic. Reimplementing Git protocol before validating Forge's agent-native workflow is likely a trap. Native mode keeps the boundary intact: Forge can capture and restore snapshots without Git tree objects internally, but accepted work still leaves through the Git adapter in v0.
 
 ### 19.3 Future Native Git Adapter
 
@@ -1186,6 +1187,7 @@ The hosted platform should not be "GitHub but Rust." It should be "review and sa
 - `forge-store`: SQLite metadata, migrations, operations, views, indexes.
 - `forge-content`: content backend traits, tree refs, blob refs, diff abstractions.
 - `forge-content-git`: Git CLI-backed content backend.
+- `forge-content-native`: Forge-native loose object backend for regular-file snapshots.
 - `forge-worktree`: path scanning, ignore handling, snapshots, restore.
 - `forge-evidence`: command capture and evidence records.
 - `forge-policy`: check policy and results.

@@ -88,6 +88,16 @@ pub fn create_branch_from_tree(
     let tree = content_ref
         .strip_prefix("git-tree:")
         .ok_or_else(|| anyhow!("unsupported content ref"))?;
+    create_branch_from_git_tree(repo_root, branch, base_commit, tree, message)
+}
+
+pub fn create_branch_from_git_tree(
+    repo_root: &Path,
+    branch: &str,
+    base_commit: &str,
+    tree: &str,
+    message: &str,
+) -> Result<String> {
     let commit = git(
         repo_root,
         &["commit-tree", tree, "-p", base_commit, "-m", message],

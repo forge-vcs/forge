@@ -222,6 +222,111 @@ fn save_excludes_tracked_secret_risk_paths_from_snapshot() {
     assert!(!tree_paths.lines().any(|path| path == ".env"));
 }
 
+#[test]
+fn native_save_and_restore_materializes_exact_tree() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "native restore"])
+        .assert()
+        .success();
+
+    std::fs::write(repo.path().join("README.md"), "native once\n").expect("write readme");
+    std::fs::write(repo.path().join("safe.txt"), "safe\n").expect("write safe");
+    std::fs::write(repo.path().join(".env"), "TOKEN=secret\n").expect("write env");
+    std::fs::write(repo.path().join(".gitignore"), "ignored.log\n").expect("write gitignore");
+    std::fs::write(repo.path().join("ignored.log"), "ignored build\n").expect("write ignored");
+    let first = json_output(repo.forge().args(["--json", "save"]).assert().success());
+    let first_ref = first["data"]["content_ref"].as_str().unwrap();
+    assert!(first_ref.starts_with("forge-tree:f1:tree:sha256:"));
+    let changed_paths = first["data"]["changed_paths"].as_array().unwrap();
+    assert!(changed_paths.iter().any(|path| path == "README.md"));
+    assert!(changed_paths.iter().any(|path| path == "safe.txt"));
+    assert!(!changed_paths.iter().any(|path| path == ".env"));
+    assert!(!changed_paths.iter().any(|path| path == "ignored.log"));
+    assert_native_objects_do_not_contain(repo.path(), "TOKEN=secret");
+    assert_native_objects_do_not_contain(repo.path(), ".env");
+    assert_native_objects_do_not_contain(repo.path(), "ignored build");
+
+    std::fs::write(repo.path().join("README.md"), "native twice\n").expect("write readme");
+    std::fs::write(repo.path().join("later.txt"), "later\n").expect("write later");
+    repo.forge().args(["--json", "save"]).assert().success();
+
+    let first_snapshot = first["data"]["snapshot_id"].as_str().unwrap();
+    repo.forge()
+        .args(["--json", "restore", first_snapshot, "--yes"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        "native once\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("safe.txt")).unwrap(),
+        "safe\n"
+    );
+    assert!(!repo.path().join("later.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join(".env")).unwrap(),
+        "TOKEN=secret\n"
+    );
+}
+
+#[test]
+fn native_restore_refuses_unsaved_dirty_worktree() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "native dirty restore"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("README.md"), "saved\n").expect("write readme");
+    let saved = json_output(repo.forge().args(["--json", "save"]).assert().success());
+    let snapshot_id = saved["data"]["snapshot_id"].as_str().unwrap();
+
+    std::fs::write(repo.path().join("README.md"), "unsaved\n").expect("write readme");
+    std::fs::write(repo.path().join("unsaved.txt"), "unsaved new\n").expect("write unsaved");
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "restore", snapshot_id, "--yes"])
+            .assert()
+            .failure(),
+    );
+
+    assert_eq!(output["errors"][0]["code"], "DIRTY_WORKTREE");
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        "unsaved\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("unsaved.txt")).unwrap(),
+        "unsaved new\n"
+    );
+}
+
+fn assert_native_objects_do_not_contain(repo_path: &std::path::Path, needle: &str) {
+    let objects = repo_path.join(".forge/objects/sha256");
+    for prefix in std::fs::read_dir(objects).expect("object prefixes") {
+        let prefix = prefix.expect("object prefix");
+        for object in std::fs::read_dir(prefix.path()).expect("objects") {
+            let object = object.expect("object");
+            let bytes = std::fs::read(object.path()).expect("read object");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains(needle),
+                "native object {} contains {needle:?}",
+                object.path().display()
+            );
+        }
+    }
+}
+
 fn git(cwd: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args(args)

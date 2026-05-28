@@ -1,13 +1,14 @@
 [package]
-name = "forge-store"
+name = "forge-content-native"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-forge-content-native = { path = "../forge-content-native" }
-forge-core = { path = "../forge-core" }
-rusqlite.workspace = true
+forge-content = { path = "../forge-content" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
