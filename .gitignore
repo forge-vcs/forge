@@ -1,3 +1,4 @@
 /.DS_Store
 /.forge/
 /target/
+.compound-engineering/*.local.yaml

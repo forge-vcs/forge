@@ -160,4 +160,4 @@ The next wedge is not full workspace orchestration. It is the ability to keep mu
 
 - Product source: `PRD.md`, especially Attempt Isolation, Proposal Semantics, Conflict and Merge Model, and v0 success criteria.
 - Current v0 requirements: `docs/brainstorms/forge-v0-wedge-requirements.md`, which deliberately limited the first workflow to one active local attempt.
-- Prior implementation plans: `docs/plans/2026-05-28-001-feat-forge-v0-local-loop-plan.md`, `docs/plans/2026-05-28-002-hardening-forge-v0-local-loop-plan.md`, and `docs/plans/2026-05-28-003-feat-native-forge-content-store-plan.md`.
+- Prior implementation plans: `docs/plans/completed/2026-05-28-001-feat-forge-v0-local-loop-plan.md`, `docs/plans/completed/2026-05-28-002-hardening-forge-v0-local-loop-plan.md`, and `docs/plans/completed/2026-05-28-003-feat-native-forge-content-store-plan.md`.
