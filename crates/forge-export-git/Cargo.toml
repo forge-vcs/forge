@@ -1,0 +1,9 @@
+[package]
+name = "forge-export-git"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+forge-content-git = { path = "../forge-content-git" }

@@ -1,0 +1,180 @@
+mod common;
+
+use common::TestRepo;
+use serde_json::Value;
+
+fn json_output(assert: assert_cmd::assert::Assert) -> Value {
+    serde_json::from_slice(&assert.get_output().stdout).expect("valid json")
+}
+
+fn git(cwd: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn prepare_proposal(repo: &TestRepo) {
+    repo.forge().args(["--json", "init"]).assert().success();
+    repo.forge()
+        .args(["--json", "start", "export proposal"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("README.md"), "exported\n").expect("write readme");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    repo.forge().args(["--json", "propose"]).assert().success();
+    repo.forge().args(["--json", "check"]).assert().success();
+}
+
+#[test]
+fn accept_records_decision_and_export_branch_leaves_current_branch() {
+    let repo = TestRepo::new_git();
+    prepare_proposal(&repo);
+    let current_branch = git(repo.path(), &["branch", "--show-current"]);
+
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    assert_eq!(accepted["data"]["decision"], "accepted");
+    assert_eq!(
+        git(repo.path(), &["branch", "--show-current"]),
+        current_branch
+    );
+
+    let exported = json_output(
+        repo.forge()
+            .args(["--json", "export", "branch", "forge/exported"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(exported["data"]["branch_name"], "forge/exported");
+    assert_eq!(
+        git(repo.path(), &["branch", "--show-current"]),
+        current_branch
+    );
+    git(repo.path(), &["rev-parse", "--verify", "forge/exported"]);
+
+    let overwrite = json_output(
+        repo.forge()
+            .args(["--json", "export", "branch", "forge/exported"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(overwrite["errors"][0]["code"], "BRANCH_EXISTS");
+}
+
+#[test]
+fn reject_prevents_export() {
+    let repo = TestRepo::new_git();
+    prepare_proposal(&repo);
+    repo.forge().args(["--json", "reject"]).assert().success();
+
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "export", "branch", "forge/rejected"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(output["errors"][0]["code"], "REJECTED");
+}
+
+#[test]
+fn export_fails_when_base_is_stale() {
+    let repo = TestRepo::new_git();
+    prepare_proposal(&repo);
+    repo.forge().args(["--json", "accept"]).assert().success();
+
+    std::fs::write(repo.path().join("stale.txt"), "move head\n").expect("write stale file");
+    git(repo.path(), &["add", "stale.txt"]);
+    git(repo.path(), &["commit", "-m", "move target"]);
+
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "export", "branch", "forge/stale"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(output["errors"][0]["code"], "STALE_BASE");
+    assert!(output["operation_id"].as_str().unwrap().starts_with("op_"));
+}
+
+#[test]
+fn export_reconciles_existing_branch_when_it_matches_expected_commit() {
+    let repo = TestRepo::new_git();
+    prepare_proposal(&repo);
+    repo.forge().args(["--json", "accept"]).assert().success();
+    let show = json_output(repo.forge().args(["--json", "show"]).assert().success());
+    let proposal = &show["data"]["latest_proposal"];
+    let base_head = proposal["base_head"].as_str().unwrap();
+    let tree = proposal["content_ref"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("git-tree:")
+        .unwrap();
+    let commit = git(
+        repo.path(),
+        &[
+            "commit-tree",
+            tree,
+            "-p",
+            base_head,
+            "-m",
+            "Forge accepted proposal",
+        ],
+    );
+    let commit = commit.trim();
+    git(
+        repo.path(),
+        &["update-ref", "refs/heads/forge/recovered", commit],
+    );
+
+    let exported = json_output(
+        repo.forge()
+            .args(["--json", "export", "branch", "forge/recovered"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(exported["data"]["branch_name"], "forge/recovered");
+    assert_eq!(exported["data"]["commit_id"], commit);
+}
+
+#[test]
+fn accept_fails_when_base_is_stale() {
+    let repo = TestRepo::new_git();
+    prepare_proposal(&repo);
+    std::fs::write(repo.path().join("stale-before-accept.txt"), "move head\n")
+        .expect("write stale file");
+    git(repo.path(), &["add", "stale-before-accept.txt"]);
+    git(repo.path(), &["commit", "-m", "move target before accept"]);
+
+    let output = json_output(repo.forge().args(["--json", "accept"]).assert().failure());
+    assert_eq!(output["errors"][0]["code"], "STALE_BASE");
+}
+
+#[test]
+fn export_requires_acceptance_for_exact_latest_revision() {
+    let repo = TestRepo::new_git();
+    prepare_proposal(&repo);
+    repo.forge().args(["--json", "accept"]).assert().success();
+
+    std::fs::write(repo.path().join("README.md"), "new proposal\n").expect("write readme");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge().args(["--json", "propose"]).assert().success();
+
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "export", "branch", "forge/not-accepted-latest"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(output["errors"][0]["code"], "NOT_ACCEPTED");
+}
