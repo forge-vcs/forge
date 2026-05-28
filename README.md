@@ -27,29 +27,46 @@ still exporting accepted proposals to Git branches for existing PR workflows.
 - `forge restore <snapshot-id> --yes` refuses unsaved dirty work. Restoring
   between saved snapshots materializes the target snapshot and removes files
   absent from that snapshot, except protected Forge/secret-risk paths.
+- `forge attempt attach <attempt-id>` uses the same dirty-worktree refusal and
+  materializes the attempt's latest snapshot, or its base revision if it has no
+  snapshots yet.
 - Mutating `--request-id` values are scoped to the command and replay the
   original success or failure. Reusing one for a different mutating command
   returns `REQUEST_ID_CONFLICT`.
 - Checks, decisions, branch exports, and PR body context are bound to the exact
   proposal revision being reviewed or published.
+- When multiple active attempts or proposals are possible, pass explicit
+  `--attempt <id>` and `--proposal <id>`. Ambiguous commands return typed JSON
+  errors instead of choosing global latest state.
 
 ## Current Commands
 
 - `forge init`
 - `forge init --content-backend native`
 - `forge start <intent>`
-- `forge save`
+- `forge attempt start --intent <intent-id>`
+- `forge attempt list`
+- `forge attempt show <attempt-id>`
+- `forge attempt attach <attempt-id>`
+- `forge save [--attempt <id>]`
 - `forge restore <snapshot-id> --yes`
-- `forge run [--timeout-ms <n>] -- <command>`
-- `forge propose`
-- `forge show`
-- `forge check`
-- `forge accept`
-- `forge reject`
+- `forge run [--attempt <id>] [--timeout-ms <n>] -- <command>`
+- `forge propose [--attempt <id>]`
+- `forge show [--attempt <id>]`
+- `forge proposal list [--attempt <id>]`
+- `forge check [--attempt <id>] [--proposal <id>]`
+- `forge accept [--attempt <id>] [--proposal <id>]`
+- `forge reject [--attempt <id>] [--proposal <id>]`
 - `forge doctor`
 - `forge gc --dry-run`
-- `forge export branch <name>`
-- `forge export pr-body`
+- `forge export branch [--attempt <id>] [--proposal <id>] <name>`
+- `forge export pr-body [--attempt <id>] [--proposal <id>]`
+
+`forge start <intent>` remains the simple path: it creates a new intent, creates
+one attempt, and attaches it to the current checkout. `forge attempt start
+--intent <intent-id>` creates another attempt under an existing intent without
+materializing it; use `forge attempt attach <attempt-id>` to move the checkout
+between competing attempts.
 
 ## Native Content Backend
 

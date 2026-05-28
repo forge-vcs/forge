@@ -45,7 +45,9 @@ impl ContentBackend for GitContentBackend {
             .ok_or_else(|| anyhow!("unsupported content ref"))?;
         let target_paths = tree_paths(repo_root, tree)?;
         let current_paths = materialized_paths(repo_root)?;
-        git(repo_root, &["checkout", tree, "--", "."])?;
+        for path in &target_paths {
+            git(repo_root, &["checkout", tree, "--", path])?;
+        }
         for path in current_paths {
             if target_paths.binary_search(&path).is_err() && !is_ignored_by_policy(&path) {
                 let full_path = repo_root.join(&path);
@@ -63,6 +65,11 @@ pub fn current_head(repo_root: &Path) -> Result<String> {
     Ok(git(repo_root, &["rev-parse", "--verify", "HEAD"])?
         .trim()
         .to_string())
+}
+
+pub fn content_ref_for_commit_tree(repo_root: &Path, commit: &str) -> Result<String> {
+    let tree = git(repo_root, &["rev-parse", &format!("{commit}^{{tree}}")])?;
+    Ok(format!("git-tree:{}", tree.trim()))
 }
 
 pub fn branch_exists(repo_root: &Path, name: &str) -> bool {

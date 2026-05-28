@@ -553,9 +553,13 @@ v0 can use normal filesystem workspaces and, in Git-backed repositories, Git wor
 Required commands:
 
 - `forge start "intent text"`
+- `forge attempt start --intent <intent-id>`
 - `forge attempt list`
-- `forge attempt status <id>`
+- `forge attempt show <id>`
 - `forge attempt attach <id>`
+
+Deferred commands:
+
 - `forge attempt finish <id>`
 - `forge attempt abandon <id>`
 - `forge attempt compare <a> <b>`
@@ -962,18 +966,25 @@ Default human/agent workflow:
 
 - `forge init`
 - `forge start "intent text"`
-- `forge save`
-- `forge run -- <command>`
-- `forge propose`
-- `forge check`
-- `forge accept`
-- `forge reject`
-- `forge show`
+- `forge save [--attempt <id>]`
+- `forge run [--attempt <id>] -- <command>`
+- `forge propose [--attempt <id>]`
+- `forge check [--attempt <id>] [--proposal <id>]`
+- `forge accept [--attempt <id>] [--proposal <id>]`
+- `forge reject [--attempt <id>] [--proposal <id>]`
+- `forge show [--attempt <id>]`
 - `forge doctor`
-- `forge export pr-body`
-- `forge export branch`
+- `forge export pr-body [--attempt <id>] [--proposal <id>]`
+- `forge export branch [--attempt <id>] [--proposal <id>] <name>`
 
-Advanced noun commands may exist later for inspection and automation, but the default workflow should not force humans to learn every internal object.
+Attempt and proposal inspection commands support competing local work without
+requiring branch management:
+
+- `forge attempt start --intent <intent-id>`
+- `forge attempt list`
+- `forge attempt show <attempt-id>`
+- `forge attempt attach <attempt-id>`
+- `forge proposal list [--attempt <id>]`
 
 ### 21.3 JSON Output Contract
 

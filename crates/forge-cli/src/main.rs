@@ -20,14 +20,16 @@ struct Cli {
 enum Command {
     Init(InitArgs),
     Start(IntentArgs),
-    Save,
+    Attempt(AttemptArgs),
+    Save(AttemptScopedArgs),
     Restore(RestoreArgs),
     Run(RunArgs),
-    Propose,
-    Check,
-    Accept,
-    Reject,
-    Show,
+    Propose(AttemptScopedArgs),
+    Check(ProposalScopedArgs),
+    Accept(ProposalScopedArgs),
+    Reject(ProposalScopedArgs),
+    Show(AttemptScopedArgs),
+    Proposal(ProposalArgs),
     Doctor,
     Gc(GcArgs),
     Export(ExportArgs),
@@ -45,6 +47,51 @@ struct IntentArgs {
 }
 
 #[derive(Debug, Args)]
+struct AttemptScopedArgs {
+    #[arg(long)]
+    attempt: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ProposalScopedArgs {
+    #[arg(long)]
+    attempt: Option<String>,
+    #[arg(long)]
+    proposal: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AttemptArgs {
+    #[command(subcommand)]
+    command: AttemptCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum AttemptCommand {
+    Start(AttemptStartArgs),
+    List,
+    Show { attempt_id: String },
+    Attach { attempt_id: String },
+}
+
+#[derive(Debug, Args)]
+struct AttemptStartArgs {
+    #[arg(long)]
+    intent: String,
+}
+
+#[derive(Debug, Args)]
+struct ProposalArgs {
+    #[command(subcommand)]
+    command: ProposalCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProposalCommand {
+    List(AttemptScopedArgs),
+}
+
+#[derive(Debug, Args)]
 struct RestoreArgs {
     snapshot_id: String,
     #[arg(long)]
@@ -53,6 +100,8 @@ struct RestoreArgs {
 
 #[derive(Debug, Args)]
 struct RunArgs {
+    #[arg(long)]
+    attempt: Option<String>,
     #[arg(long, default_value_t = forge_evidence::DEFAULT_TIMEOUT_MS)]
     timeout_ms: u64,
     #[arg(last = true)]
@@ -73,8 +122,17 @@ struct ExportArgs {
 
 #[derive(Debug, Subcommand)]
 enum ExportCommand {
-    Branch { name: String },
-    PrBody,
+    Branch(ExportBranchArgs),
+    PrBody(ProposalScopedArgs),
+}
+
+#[derive(Debug, Args)]
+struct ExportBranchArgs {
+    #[arg(long)]
+    attempt: Option<String>,
+    #[arg(long)]
+    proposal: Option<String>,
+    name: String,
 }
 
 fn main() -> ExitCode {
@@ -96,7 +154,8 @@ fn main() -> ExitCode {
     let response = match cli.command {
         Command::Init(args) => init_response(request_id, args),
         Command::Start(args) => start_response(request_id, args),
-        Command::Save => save_response(request_id),
+        Command::Attempt(args) => attempt_response(request_id, args),
+        Command::Save(args) => save_response(request_id, args),
         Command::Restore(args) if !args.yes => structured_error(
             "restore",
             request_id,
@@ -106,11 +165,12 @@ fn main() -> ExitCode {
         ),
         Command::Restore(args) => restore_response(request_id, args),
         Command::Run(args) => run_response(request_id, args),
-        Command::Propose => propose_response(request_id),
-        Command::Check => check_response(request_id),
-        Command::Accept => decision_response(request_id, "accepted"),
-        Command::Reject => decision_response(request_id, "rejected"),
-        Command::Show => show_response(request_id),
+        Command::Propose(args) => propose_response(request_id, args),
+        Command::Check(args) => check_response(request_id, args),
+        Command::Accept(args) => decision_response(request_id, args, "accepted"),
+        Command::Reject(args) => decision_response(request_id, args, "rejected"),
+        Command::Show(args) => show_response(request_id, args),
+        Command::Proposal(args) => proposal_response(request_id, args),
         Command::Doctor => doctor_response(request_id),
         Command::Gc(args) => gc_response(request_id, args),
         Command::Export(args) => export_response(request_id, args),
@@ -164,7 +224,11 @@ fn command_from_args(args: &[String]) -> String {
     match positional.as_slice() {
         [] => "forge".to_string(),
         [command] => command.clone(),
-        [command, subcommand, ..] if command == "export" => format!("{command} {subcommand}"),
+        [command, subcommand, ..]
+            if matches!(command.as_str(), "export" | "attempt" | "proposal") =>
+        {
+            format!("{command} {subcommand}")
+        }
         [command, ..] => command.clone(),
     }
 }
@@ -199,12 +263,91 @@ fn start_response(request_id: Option<String>, args: IntentArgs) -> ResponseEnvel
     })
 }
 
-fn save_response(request_id: Option<String>) -> ResponseEnvelope {
+fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEnvelope {
+    match args.command {
+        AttemptCommand::Start(args) => {
+            command_result("attempt start", request_id, |cwd, request_id| {
+                let base_head = forge_content_git::current_head(&cwd)?;
+                let started = forge_store::start_attempt_for_intent(
+                    &cwd,
+                    request_id,
+                    args.intent,
+                    base_head,
+                )?;
+                Ok((
+                    Some(started.operation_id.clone()),
+                    serde_json::to_value(started)?,
+                ))
+            })
+        }
+        AttemptCommand::List => command_result("attempt list", request_id, |cwd, _| {
+            Ok((
+                None,
+                json!({ "attempts": forge_store::list_attempts(&cwd)? }),
+            ))
+        }),
+        AttemptCommand::Show { attempt_id } => {
+            command_result("attempt show", request_id, |cwd, _| {
+                Ok((
+                    None,
+                    serde_json::to_value(forge_store::show_attempt(&cwd, &attempt_id)?)?,
+                ))
+            })
+        }
+        AttemptCommand::Attach { attempt_id } => {
+            command_result("attempt attach", request_id, |cwd, request_id| {
+                let target_base_head = forge_store::attempt_base_head(&cwd, &attempt_id)?;
+                let current_content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
+                let resolved_current = forge_store::resolve_attempt(&cwd, None).ok();
+                let latest_content_ref = match resolved_current {
+                    Some(resolved) => forge_store::latest_snapshot_content_ref(
+                        &cwd,
+                        Some(&resolved.attempt.attempt_id),
+                    )?
+                    .or_else(|| {
+                        forge_content_git::content_ref_for_commit_tree(
+                            &cwd,
+                            &resolved.attempt.base_head,
+                        )
+                        .ok()
+                    }),
+                    None => {
+                        let head = forge_content_git::current_head(&cwd)?;
+                        Some(forge_content_git::content_ref_for_commit_tree(&cwd, &head)?)
+                    }
+                };
+                if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
+                    anyhow::bail!("dirty worktree has unsaved changes");
+                }
+                let content_ref = match forge_store::attempt_materialization_ref(&cwd, &attempt_id)?
+                {
+                    Some(content_ref) => content_ref,
+                    None => {
+                        forge_content_git::content_ref_for_commit_tree(&cwd, &target_base_head)?
+                    }
+                };
+                backend_for_content_ref(&content_ref)?.restore_snapshot(&cwd, &content_ref)?;
+                let attached = forge_store::attach_attempt(&cwd, request_id, &attempt_id)?;
+                Ok((
+                    Some(attached.operation_id.clone()),
+                    json!({
+                        "attempt_id": attempt_id,
+                        "content_ref": content_ref,
+                        "current_view_id": attached.view_id
+                    }),
+                ))
+            })
+        }
+    }
+}
+
+fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> ResponseEnvelope {
     command_result("save", request_id, |cwd, request_id| {
         let content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
         let saved = forge_store::save_snapshot(
             &cwd,
             request_id,
+            args.attempt.as_deref(),
             content.content_ref,
             content.changed_paths,
         )?;
@@ -219,7 +362,7 @@ fn restore_response(request_id: Option<String>, args: RestoreArgs) -> ResponseEn
     command_result("restore", request_id, |cwd, request_id| {
         let content_ref = forge_store::snapshot_content_ref(&cwd, &args.snapshot_id)?;
         let current_content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
-        let latest_content_ref = forge_store::latest_snapshot_content_ref(&cwd)?;
+        let latest_content_ref = forge_store::latest_snapshot_content_ref(&cwd, None)?;
         if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
             anyhow::bail!("dirty worktree has unsaved changes");
         }
@@ -245,6 +388,7 @@ fn run_response(request_id: Option<String>, args: RunArgs) -> ResponseEnvelope {
         let recorded = forge_store::record_evidence(
             &cwd,
             request_id,
+            args.attempt.as_deref(),
             forge_store::EvidenceInput {
                 command: captured.command,
                 args: captured.args,
@@ -269,9 +413,9 @@ fn run_response(request_id: Option<String>, args: RunArgs) -> ResponseEnvelope {
     })
 }
 
-fn propose_response(request_id: Option<String>) -> ResponseEnvelope {
+fn propose_response(request_id: Option<String>, args: AttemptScopedArgs) -> ResponseEnvelope {
     command_result("propose", request_id, |cwd, request_id| {
-        let proposal = forge_store::propose(&cwd, request_id)?;
+        let proposal = forge_store::propose(&cwd, request_id, args.attempt.as_deref())?;
         Ok((
             Some(proposal.operation_id.clone()),
             serde_json::to_value(proposal)?,
@@ -279,13 +423,19 @@ fn propose_response(request_id: Option<String>) -> ResponseEnvelope {
     })
 }
 
-fn check_response(request_id: Option<String>) -> ResponseEnvelope {
+fn check_response(request_id: Option<String>, args: ProposalScopedArgs) -> ResponseEnvelope {
     command_result("check", request_id, |cwd, request_id| {
-        let show = forge_store::show(&cwd)?;
+        let show = forge_store::show(&cwd, args.attempt.as_deref())?;
         let latest_exit_code = show.latest_evidence.map(|e| e.exit_code);
         let evaluation = forge_policy::evaluate(latest_exit_code);
-        let check =
-            forge_store::record_check(&cwd, request_id, evaluation.status, evaluation.reason)?;
+        let check = forge_store::record_check(
+            &cwd,
+            request_id,
+            args.attempt.as_deref(),
+            args.proposal.as_deref(),
+            evaluation.status,
+            evaluation.reason,
+        )?;
         Ok((
             Some(check.operation_id.clone()),
             serde_json::to_value(check)?,
@@ -293,16 +443,30 @@ fn check_response(request_id: Option<String>) -> ResponseEnvelope {
     })
 }
 
-fn decision_response(request_id: Option<String>, decision: &'static str) -> ResponseEnvelope {
+fn decision_response(
+    request_id: Option<String>,
+    args: ProposalScopedArgs,
+    decision: &'static str,
+) -> ResponseEnvelope {
     command_result(decision_command(decision), request_id, |cwd, request_id| {
         if decision == "accepted" {
-            let proposal = forge_store::latest_exportable_proposal(&cwd)?;
+            let proposal = forge_store::exportable_proposal(
+                &cwd,
+                args.attempt.as_deref(),
+                args.proposal.as_deref(),
+            )?;
             let current_head = forge_content_git::current_head(&cwd)?;
             if current_head != proposal.base_head {
                 anyhow::bail!("stale base");
             }
         }
-        let record = forge_store::decide(&cwd, request_id, decision)?;
+        let record = forge_store::decide(
+            &cwd,
+            request_id,
+            args.attempt.as_deref(),
+            args.proposal.as_deref(),
+            decision,
+        )?;
         Ok((
             Some(record.operation_id.clone()),
             serde_json::to_value(record)?,
@@ -310,11 +474,22 @@ fn decision_response(request_id: Option<String>, decision: &'static str) -> Resp
     })
 }
 
-fn show_response(request_id: Option<String>) -> ResponseEnvelope {
+fn show_response(request_id: Option<String>, args: AttemptScopedArgs) -> ResponseEnvelope {
     command_result("show", request_id, |cwd, _request_id| {
-        let show = forge_store::show(&cwd)?;
+        let show = forge_store::show(&cwd, args.attempt.as_deref())?;
         Ok((None, serde_json::to_value(show)?))
     })
+}
+
+fn proposal_response(request_id: Option<String>, args: ProposalArgs) -> ResponseEnvelope {
+    match args.command {
+        ProposalCommand::List(args) => command_result("proposal list", request_id, |cwd, _| {
+            Ok((
+                None,
+                json!({ "proposals": forge_store::list_proposals(&cwd, args.attempt.as_deref())? }),
+            ))
+        }),
+    }
 }
 
 fn doctor_response(request_id: Option<String>) -> ResponseEnvelope {
@@ -336,13 +511,18 @@ fn gc_response(request_id: Option<String>, args: GcArgs) -> ResponseEnvelope {
 
 fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnvelope {
     match args.command {
-        ExportCommand::PrBody => command_result("export pr-body", request_id, |cwd, _| {
-            let body = forge_store::pr_body(&cwd)?;
+        ExportCommand::PrBody(args) => command_result("export pr-body", request_id, |cwd, _| {
+            let body =
+                forge_store::pr_body_for(&cwd, args.attempt.as_deref(), args.proposal.as_deref())?;
             Ok((None, json!({ "body": body })))
         }),
-        ExportCommand::Branch { name } => {
+        ExportCommand::Branch(args) => {
             command_result("export branch", request_id, |cwd, request_id| {
-                let proposal = forge_store::latest_exportable_proposal(&cwd)?;
+                let proposal = forge_store::exportable_proposal(
+                    &cwd,
+                    args.attempt.as_deref(),
+                    args.proposal.as_deref(),
+                )?;
                 match forge_store::decision_for_proposal_revision(
                     &cwd,
                     &proposal.proposal_revision_id,
@@ -354,21 +534,26 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                     _ => anyhow::bail!("proposal is not accepted"),
                 }
                 let current_head = forge_content_git::current_head(&cwd)?;
-                if forge_store::publication_exists_for_branch(&cwd, &name)?
-                    && forge_content_git::branch_exists(&cwd, &name)
+                if forge_store::publication_exists_for_branch(&cwd, &args.name)?
+                    && forge_content_git::branch_exists(&cwd, &args.name)
                 {
                     anyhow::bail!("branch already exists");
                 }
                 let commit_id = forge_export_git::export_branch(
                     &cwd,
-                    &name,
+                    &args.name,
                     &proposal.base_head,
                     &current_head,
                     &proposal.content_ref,
                     "Forge accepted proposal",
                 )?;
-                let publication =
-                    forge_store::record_publication(&cwd, request_id, name, commit_id)?;
+                let publication = forge_store::record_publication(
+                    &cwd,
+                    request_id,
+                    &proposal.proposal_id,
+                    args.name,
+                    commit_id,
+                )?;
                 Ok((
                     Some(publication.operation_id.clone()),
                     serde_json::to_value(publication)?,
@@ -558,6 +743,16 @@ fn error_code(command: &str, message: &str) -> &'static str {
         "NOT_INITIALIZED"
     } else if message.contains("no active attempt") {
         "NO_ACTIVE_ATTEMPT"
+    } else if message.contains("AMBIGUOUS_ATTEMPT") {
+        "AMBIGUOUS_ATTEMPT"
+    } else if message.contains("UNKNOWN_ATTEMPT") {
+        "UNKNOWN_ATTEMPT"
+    } else if message.contains("AMBIGUOUS_PROPOSAL") {
+        "AMBIGUOUS_PROPOSAL"
+    } else if message.contains("UNKNOWN_PROPOSAL") {
+        "UNKNOWN_PROPOSAL"
+    } else if message.contains("UNKNOWN_INTENT") {
+        "UNKNOWN_INTENT"
     } else if message.contains("no snapshot") {
         "NO_SNAPSHOT"
     } else if message.contains("no proposal") {
@@ -592,6 +787,8 @@ fn is_mutating_command(command: &str) -> bool {
         command,
         "init"
             | "start"
+            | "attempt start"
+            | "attempt attach"
             | "save"
             | "restore"
             | "run"
