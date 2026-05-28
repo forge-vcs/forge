@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
 
@@ -423,7 +423,7 @@ pub fn operation_for_request(cwd: &Path, request_id: &str) -> Result<Option<Requ
             "SELECT id, command, status, error_json
              FROM operations
              WHERE repo_id = ?1 AND request_id = ?2
-             ORDER BY created_at_ms DESC LIMIT 1",
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
             params![context.repo_id, request_id],
             |row| {
                 let error_json: Option<String> = row.get(3)?;
@@ -567,7 +567,7 @@ pub fn save_snapshot(
     let tx = connection.transaction()?;
     let parent_snapshot_id: Option<String> = tx
         .query_row(
-            "SELECT id FROM snapshots WHERE attempt_id = ?1 ORDER BY created_at_ms DESC LIMIT 1",
+            "SELECT id FROM snapshots WHERE attempt_id = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
             params![attempt.attempt_id],
             |row| row.get(0),
         )
@@ -936,7 +936,7 @@ pub fn decision_for_proposal_revision(
         .query_row(
             "SELECT decision FROM decisions
              WHERE repo_id = ?1 AND proposal_revision_id = ?2
-             ORDER BY created_at_ms DESC LIMIT 1",
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
             params![context.repo_id, proposal_revision_id],
             |row| row.get(0),
         )
@@ -1453,7 +1453,7 @@ fn latest_snapshot_for_attempt(
     connection
         .query_row(
             "SELECT id, content_ref, changed_paths_json FROM snapshots
-             WHERE attempt_id = ?1 ORDER BY created_at_ms DESC LIMIT 1",
+             WHERE attempt_id = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
             params![attempt_id],
             |row| {
                 let changed_paths_json: String = row.get(2)?;
@@ -1476,7 +1476,7 @@ fn latest_evidence_for_attempt(
     connection
         .query_row(
             "SELECT id, snapshot_id, command, args_json, exit_code, sensitivity, trust FROM evidence
-             WHERE attempt_id = ?1 ORDER BY created_at_ms DESC LIMIT 1",
+             WHERE attempt_id = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
             params![attempt_id],
             |row| {
                 let args_json: String = row.get(3)?;
@@ -1540,7 +1540,7 @@ fn proposal_by_id(
              FROM proposals p
              JOIN proposal_revisions pr ON pr.proposal_id = p.id
              WHERE p.repo_id = ?1 AND p.id = ?2
-             ORDER BY pr.created_at_ms DESC LIMIT 1",
+             ORDER BY pr.created_at_ms DESC, pr.rowid DESC LIMIT 1",
             params![context.repo_id, proposal_id],
             |row| {
                 let changed_paths_json: String = row.get(6)?;
@@ -1651,7 +1651,7 @@ fn latest_check_for_proposal_revision(
         .query_row(
             "SELECT id, status, reason FROM check_results
              WHERE repo_id = ?1 AND proposal_revision_id = ?2
-             ORDER BY created_at_ms DESC LIMIT 1",
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
             params![context.repo_id, proposal_revision_id],
             |row| {
                 Ok(CheckSummary {
@@ -1693,7 +1693,7 @@ fn latest_decision_for_proposal_revision(
         .query_row(
             "SELECT decision FROM decisions
              WHERE repo_id = ?1 AND proposal_revision_id = ?2
-             ORDER BY created_at_ms DESC LIMIT 1",
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
             params![context.repo_id, proposal_revision_id],
             |row| row.get(0),
         )
@@ -1711,7 +1711,7 @@ fn latest_publication_for_proposal_revision(
             "SELECT id, proposal_id, proposal_revision_id, branch_name, commit_id
              FROM publications
              WHERE repo_id = ?1 AND proposal_revision_id = ?2
-             ORDER BY created_at_ms DESC LIMIT 1",
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
             params![context.repo_id, proposal_revision_id],
             |row| {
                 Ok(PublicationRecord {
@@ -1785,15 +1785,11 @@ fn insert_operation_view(
     })
 }
 
+// Collision-resistant, time-sortable id. UUIDv7 replaces the previous `{millis}_{nanos}`
+// scheme, which collided on same-nanosecond mints under concurrency. The `<prefix>_`
+// convention and opaque-TEXT-key contract are preserved.
 fn new_id(prefix: &str) -> String {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!(
-        "{prefix}_{}_{}",
-        duration.as_millis(),
-        duration.subsec_nanos()
-    )
+    format!("{prefix}_{}", Uuid::now_v7().simple())
 }
 
 fn apply_migrations(connection: &mut Connection) -> Result<()> {
