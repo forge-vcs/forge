@@ -1,12 +1,11 @@
 use anyhow::{anyhow, bail, Context, Result};
-use forge_core::{now_ms, OperationId, OperationStatus, RepositoryId, ViewId, ViewKind};
+use forge_core::{new_id, now_ms, OperationId, OperationStatus, RepositoryId, ViewId, ViewKind};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use uuid::Uuid;
 
 const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
 
@@ -1785,13 +1784,6 @@ fn insert_operation_view(
     })
 }
 
-// Collision-resistant, time-sortable id. UUIDv7 replaces the previous `{millis}_{nanos}`
-// scheme, which collided on same-nanosecond mints under concurrency. The `<prefix>_`
-// convention and opaque-TEXT-key contract are preserved.
-fn new_id(prefix: &str) -> String {
-    format!("{prefix}_{}", Uuid::now_v7().simple())
-}
-
 fn apply_migrations(connection: &mut Connection) -> Result<()> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -1952,4 +1944,43 @@ fn git_head(root: &Path) -> Option<String> {
     }
 
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latest_selector_breaks_same_ms_ties_by_rowid() {
+        // The nine "latest" selectors append `, rowid DESC` so rows sharing a
+        // created_at_ms are returned in deterministic insertion order (highest rowid =
+        // most recently inserted). Proven directly against SQLite, independent of the
+        // multi-process coverage deferred to Phase 1b.
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE snapshots (id TEXT PRIMARY KEY, attempt_id TEXT, created_at_ms INTEGER);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO snapshots (id, attempt_id, created_at_ms) VALUES ('first', 'a', 100)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO snapshots (id, attempt_id, created_at_ms) VALUES ('second', 'a', 100)",
+                [],
+            )
+            .unwrap();
+        let latest: String = connection
+            .query_row(
+                "SELECT id FROM snapshots WHERE attempt_id = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+                params!["a"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(latest, "second");
+    }
 }

@@ -94,6 +94,12 @@ fn unique_suffix() -> String {
     Uuid::now_v7().simple().to_string()
 }
 
+/// Mint a prefixed, collision-resistant id (e.g. `snapshot_0193...`). The single
+/// definition of the id scheme, shared across crates so a future change is one edit.
+pub fn new_id(prefix: &str) -> String {
+    format!("{prefix}_{}", unique_suffix())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +132,14 @@ mod tests {
     fn distinct_id_types_carry_distinct_prefixes() {
         assert!(RepositoryId::new().to_string().starts_with("repo_"));
         assert!(ViewId::new().to_string().starts_with("view_"));
+    }
+
+    #[test]
+    fn new_id_is_prefixed_uuidv7_hex() {
+        let id = new_id("snapshot");
+        let suffix = id.strip_prefix("snapshot_").unwrap();
+        assert_eq!(suffix.len(), 32);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(new_id("snapshot"), new_id("snapshot"));
     }
 }

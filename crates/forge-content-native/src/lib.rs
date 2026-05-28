@@ -517,7 +517,13 @@ fn ensure_child_kind(entry: &TreeEntry, child: &ObjectId) -> Result<()> {
 
 /// Fsync a directory so a newly created or renamed entry within it is durable.
 /// Errors propagate — a swallowed directory sync silently breaks crash-durability,
-/// which is the hole this replaces.
+/// which is the hole this replaces. This is a deliberate fail-hard: a write whose
+/// directory entry may not survive a crash must not report success.
+/// Known limitation: a few filesystems (some network/overlay mounts) reject fsync on a
+/// directory fd (EINVAL/ENOTSUP), where directory durability is meaningless anyway; on
+/// those `.forge` locations write_object will now error. `.forge` is expected to be on a
+/// local filesystem (Phase 1b's WAL work makes that constraint explicit), so tolerating
+/// those errnos as a degraded no-op is deferred rather than guessed at here.
 fn sync_dir(path: &Path) -> Result<()> {
     let dir = File::open(path)
         .with_context(|| format!("open directory for fsync: {}", path.display()))?;
