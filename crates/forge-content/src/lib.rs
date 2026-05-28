@@ -3,6 +3,8 @@ use serde::Serialize;
 use std::path::Path;
 
 pub const SECRET_RISK_SENSITIVITY: &str = "secret_risk";
+pub const GIT_TREE_PREFIX: &str = "git-tree:";
+pub const FORGE_TREE_PREFIX: &str = "forge-tree:";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotContent {
@@ -13,6 +15,23 @@ pub struct SnapshotContent {
 pub trait ContentBackend {
     fn snapshot_worktree(&self, repo_root: &Path) -> Result<SnapshotContent>;
     fn restore_snapshot(&self, repo_root: &Path, content_ref: &str) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentRefKind<'a> {
+    GitTree(&'a str),
+    ForgeTree(&'a str),
+    Unsupported,
+}
+
+pub fn classify_content_ref(content_ref: &str) -> ContentRefKind<'_> {
+    if let Some(value) = content_ref.strip_prefix(GIT_TREE_PREFIX) {
+        ContentRefKind::GitTree(value)
+    } else if let Some(value) = content_ref.strip_prefix(FORGE_TREE_PREFIX) {
+        ContentRefKind::ForgeTree(value)
+    } else {
+        ContentRefKind::Unsupported
+    }
 }
 
 pub fn is_secret_risk_path(path: &str) -> bool {

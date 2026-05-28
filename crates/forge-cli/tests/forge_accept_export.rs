@@ -22,7 +22,15 @@ fn git(cwd: &std::path::Path, args: &[&str]) -> String {
 }
 
 fn prepare_proposal(repo: &TestRepo) {
-    repo.forge().args(["--json", "init"]).assert().success();
+    prepare_proposal_with_init(repo, &["--json", "init"]);
+}
+
+fn prepare_native_proposal(repo: &TestRepo) {
+    prepare_proposal_with_init(repo, &["--json", "init", "--content-backend", "native"]);
+}
+
+fn prepare_proposal_with_init(repo: &TestRepo, init_args: &[&str]) {
+    repo.forge().args(init_args).assert().success();
     repo.forge()
         .args(["--json", "start", "export proposal"])
         .assert()
@@ -177,4 +185,33 @@ fn export_requires_acceptance_for_exact_latest_revision() {
             .failure(),
     );
     assert_eq!(output["errors"][0]["code"], "NOT_ACCEPTED");
+}
+
+#[test]
+fn native_accepted_proposal_exports_to_git_branch() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let show = json_output(repo.forge().args(["--json", "show"]).assert().success());
+    assert!(show["data"]["latest_proposal"]["content_ref"]
+        .as_str()
+        .unwrap()
+        .starts_with("forge-tree:"));
+    let current_branch = git(repo.path(), &["branch", "--show-current"]);
+
+    repo.forge().args(["--json", "accept"]).assert().success();
+    let exported = json_output(
+        repo.forge()
+            .args(["--json", "export", "branch", "forge/native-exported"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(exported["data"]["branch_name"], "forge/native-exported");
+    assert_eq!(
+        git(repo.path(), &["branch", "--show-current"]),
+        current_branch
+    );
+    assert_eq!(
+        git(repo.path(), &["show", "forge/native-exported:README.md"]),
+        "exported\n"
+    );
 }

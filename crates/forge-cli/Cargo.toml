@@ -13,6 +13,7 @@ anyhow.workspace = true
 clap.workspace = true
 forge-content = { path = "../forge-content" }
 forge-content-git = { path = "../forge-content-git" }
+forge-content-native = { path = "../forge-content-native" }
 forge-evidence = { path = "../forge-evidence" }
 forge-export-git = { path = "../forge-export-git" }
 forge-policy = { path = "../forge-policy" }
@@ -22,6 +23,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
+forge-content-native = { path = "../forge-content-native" }
 predicates.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true

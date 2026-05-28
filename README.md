@@ -8,9 +8,11 @@ Forge v0 is a Rust CLI that records a local agent-work lifecycle:
 init -> start -> save -> run -> propose -> check -> accept -> export branch
 ```
 
-The current implementation stores lifecycle metadata in `.forge/forge.db`, uses
-Git tree objects as the v0 content backend, and emits stable JSON envelopes for
-agent use with `--json`.
+The current implementation stores lifecycle metadata in `.forge/forge.db` and
+emits stable JSON envelopes for agent use with `--json`. Repositories default to
+Git tree objects as the content backend, but `forge init --content-backend native`
+stores snapshots as Forge-native loose objects under `.forge/objects` while
+still exporting accepted proposals to Git branches for existing PR workflows.
 
 ## Safety Defaults
 
@@ -34,6 +36,7 @@ agent use with `--json`.
 ## Current Commands
 
 - `forge init`
+- `forge init --content-backend native`
 - `forge start <intent>`
 - `forge save`
 - `forge restore <snapshot-id> --yes`
@@ -47,6 +50,15 @@ agent use with `--json`.
 - `forge gc --dry-run`
 - `forge export branch <name>`
 - `forge export pr-body`
+
+## Native Content Backend
+
+Native mode writes immutable `f1:<type>:sha256:<digest>` blob and tree objects
+under `.forge/objects/sha256`. It supports regular files, directory structure,
+executable bits where available, exact restore, doctor integrity checks, and
+`forge gc --dry-run` reachability reporting. It intentionally does not implement
+packfiles, compression, remote sync, semantic merge, symlink/submodule handling,
+or automatic snapshots yet.
 
 ## Development
 

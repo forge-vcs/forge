@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use forge_core::{now_ms, OperationId, OperationStatus, RepositoryId, ViewId, ViewKind};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ pub struct InitRepository {
     pub forge_dir: String,
     pub database_path: String,
     pub git_head: Option<String>,
+    pub content_backend: String,
     pub current_operation_id: String,
     pub current_view_id: String,
     pub already_initialized: bool,
@@ -50,6 +51,7 @@ pub struct RepositoryContext {
     pub repo_id: String,
     pub root_path: PathBuf,
     pub database_path: PathBuf,
+    pub content_backend: String,
     pub current_operation_id: String,
     pub current_view_id: String,
 }
@@ -218,10 +220,18 @@ pub struct GcDryRunReport {
     pub dry_run: bool,
     pub unreachable_snapshots: Vec<String>,
     pub unreachable_evidence: Vec<String>,
+    pub unreachable_native_objects: Vec<String>,
     pub deleted: Vec<String>,
 }
 
-pub fn init_repository(cwd: &Path, request_id: Option<String>) -> Result<InitRepository> {
+pub fn init_repository(
+    cwd: &Path,
+    request_id: Option<String>,
+    content_backend: String,
+) -> Result<InitRepository> {
+    if !matches!(content_backend.as_str(), "git" | "native") {
+        bail!("unsupported content backend");
+    }
     let root = git_root(cwd)?;
     let forge_dir = root.join(".forge");
     fs::create_dir_all(&forge_dir)
@@ -248,8 +258,8 @@ pub fn init_repository(cwd: &Path, request_id: Option<String>) -> Result<InitRep
     let tx = connection.transaction()?;
 
     tx.execute(
-        "INSERT INTO repositories (id, root_path, git_head, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
-        params![repo_id, root.to_string_lossy(), git_head, now],
+        "INSERT INTO repositories (id, root_path, git_head, content_backend, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![repo_id, root.to_string_lossy(), git_head, content_backend, now],
     )?;
     tx.execute(
         "INSERT INTO operations (
@@ -269,6 +279,7 @@ pub fn init_repository(cwd: &Path, request_id: Option<String>) -> Result<InitRep
         "repository_id": repo_id,
         "root_path": root,
         "git_head": git_head,
+        "content_backend": content_backend,
         "lifecycle": "initialized"
     })
     .to_string();
@@ -291,6 +302,7 @@ pub fn init_repository(cwd: &Path, request_id: Option<String>) -> Result<InitRep
         forge_dir: forge_dir.to_string_lossy().into_owned(),
         database_path: database_path.to_string_lossy().into_owned(),
         git_head,
+        content_backend,
         current_operation_id: operation_id,
         current_view_id: view_id,
         already_initialized: already_had_db,
@@ -326,20 +338,33 @@ pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     if !database_path.exists() {
         return Err(anyhow!("forge repository is not initialized"));
     }
-    let connection = open_connection(&database_path)?;
-    let (repo_id, current_operation_id, current_view_id): (String, String, String) =
-        connection.query_row(
-            "SELECT repo_id, current_operation_id, current_view_id FROM current_state WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
+    let mut connection = open_connection(&database_path)?;
+    apply_migrations(&mut connection)?;
+    let (repo_id, content_backend, current_operation_id, current_view_id): (
+        String,
+        String,
+        String,
+        String,
+    ) = connection.query_row(
+        "SELECT cs.repo_id, r.content_backend, cs.current_operation_id, cs.current_view_id
+             FROM current_state cs
+             JOIN repositories r ON r.id = cs.repo_id
+             WHERE cs.singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
     Ok(RepositoryContext {
         repo_id,
         root_path: root,
         database_path,
+        content_backend,
         current_operation_id,
         current_view_id,
     })
+}
+
+pub fn repository_content_backend(cwd: &Path) -> Result<String> {
+    Ok(open_repository(cwd)?.content_backend)
 }
 
 pub fn operation_for_request(cwd: &Path, request_id: &str) -> Result<Option<RequestIdOperation>> {
@@ -897,19 +922,32 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
     if !dangling_temp_files.is_empty() {
         issues.push("dangling temporary files".to_string());
     }
-    let mut statement = connection.prepare("SELECT id, content_ref FROM snapshots")?;
+    let native_store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let mut reachable_native_objects = std::collections::BTreeSet::new();
+    let mut statement = connection.prepare(
+        "SELECT 'snapshot ' || id, content_ref FROM snapshots
+         UNION ALL
+         SELECT 'proposal revision ' || id, content_ref FROM proposal_revisions",
+    )?;
     let refs = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
     for content_ref in refs {
-        let (snapshot_id, content_ref) = content_ref?;
+        let (label, content_ref) = content_ref?;
         if let Some(tree) = content_ref.strip_prefix("git-tree:") {
             let output = Command::new("git")
                 .args(["cat-file", "-e", &format!("{tree}^{{tree}}")])
                 .current_dir(&context.root_path)
                 .output()?;
             if !output.status.success() {
-                issues.push(format!("missing content ref for snapshot {snapshot_id}"));
+                issues.push(format!("missing content ref for {label}"));
+            }
+        } else if content_ref.starts_with("forge-tree:") {
+            match native_store.verify_content_ref(&content_ref) {
+                Ok(ids) => reachable_native_objects.extend(ids),
+                Err(error) => {
+                    issues.push(format!("invalid native content ref for {label}: {error}"))
+                }
             }
         }
     }
@@ -961,11 +999,34 @@ pub fn pr_body(cwd: &Path) -> Result<String> {
 }
 
 pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
-    let _context = open_repository(cwd)?;
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let native_store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let mut reachable = std::collections::BTreeSet::new();
+    let mut statement = connection.prepare(
+        "SELECT content_ref FROM snapshots
+         UNION
+         SELECT content_ref FROM proposal_revisions",
+    )?;
+    let refs = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for content_ref in refs {
+        let content_ref = content_ref?;
+        if content_ref.starts_with("forge-tree:") {
+            if let Ok(ids) = native_store.verify_content_ref(&content_ref) {
+                reachable.extend(ids);
+            }
+        }
+    }
+    let all = native_store.all_object_ids()?;
+    let unreachable_native_objects = all
+        .difference(&reachable)
+        .map(ToString::to_string)
+        .collect();
     Ok(GcDryRunReport {
         dry_run: true,
         unreachable_snapshots: Vec::new(),
         unreachable_evidence: Vec::new(),
+        unreachable_native_objects,
         deleted: Vec::new(),
     })
 }
@@ -1277,7 +1338,23 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
         )?;
         tx.commit()?;
     }
+    ensure_repository_content_backend_column(connection)?;
 
+    Ok(())
+}
+
+fn ensure_repository_content_backend_column(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(repositories)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == "content_backend" {
+            return Ok(());
+        }
+    }
+    connection.execute(
+        "ALTER TABLE repositories ADD COLUMN content_backend TEXT NOT NULL DEFAULT 'git'",
+        [],
+    )?;
     Ok(())
 }
 
@@ -1295,7 +1372,7 @@ fn read_init_repository(
 ) -> Result<Option<InitRepository>> {
     let row = connection
         .query_row(
-            "SELECT r.id, r.git_head, cs.current_operation_id, cs.current_view_id
+            "SELECT r.id, r.git_head, r.content_backend, cs.current_operation_id, cs.current_view_id
              FROM repositories r
              JOIN current_state cs ON cs.repo_id = r.id
              WHERE r.root_path = ?1",
@@ -1306,21 +1383,25 @@ fn read_init_repository(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             },
         )
         .optional()?;
 
     Ok(row.map(
-        |(repository_id, git_head, current_operation_id, current_view_id)| InitRepository {
-            repository_id,
-            root_path: root.to_string_lossy().into_owned(),
-            forge_dir: forge_dir.to_string_lossy().into_owned(),
-            database_path: database_path.to_string_lossy().into_owned(),
-            git_head,
-            current_operation_id,
-            current_view_id,
-            already_initialized: true,
+        |(repository_id, git_head, content_backend, current_operation_id, current_view_id)| {
+            InitRepository {
+                repository_id,
+                root_path: root.to_string_lossy().into_owned(),
+                forge_dir: forge_dir.to_string_lossy().into_owned(),
+                database_path: database_path.to_string_lossy().into_owned(),
+                git_head,
+                content_backend,
+                current_operation_id,
+                current_view_id,
+                already_initialized: true,
+            }
         },
     ))
 }

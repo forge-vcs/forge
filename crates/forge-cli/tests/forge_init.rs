@@ -144,6 +144,38 @@ fn init_is_idempotent() {
 }
 
 #[test]
+fn existing_repository_without_content_backend_column_migrates_on_normal_command() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    {
+        let connection =
+            Connection::open(repo.path().join(".forge/forge.db")).expect("open forge db");
+        connection
+            .execute("ALTER TABLE repositories DROP COLUMN content_backend", [])
+            .expect("simulate older schema");
+    }
+
+    let output = repo
+        .forge()
+        .args(["--json", "doctor"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(json["data"]["ok"], true);
+
+    let connection = Connection::open(repo.path().join(".forge/forge.db")).expect("open forge db");
+    let backend: String = connection
+        .query_row("SELECT content_backend FROM repositories", [], |row| {
+            row.get(0)
+        })
+        .expect("content backend default");
+    assert_eq!(backend, "git");
+}
+
+#[test]
 fn init_outside_git_repo_returns_structured_error() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
 
