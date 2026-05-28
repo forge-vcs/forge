@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS current_state (
     repo_id TEXT NOT NULL REFERENCES repositories(id),
     current_operation_id TEXT NOT NULL REFERENCES operations(id),
     current_view_id TEXT NOT NULL REFERENCES views(id),
+    attached_attempt_id TEXT REFERENCES attempts(id),
     updated_at_ms INTEGER NOT NULL
 );
 

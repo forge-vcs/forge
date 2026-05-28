@@ -176,11 +176,18 @@ fn export_requires_acceptance_for_exact_latest_revision() {
 
     std::fs::write(repo.path().join("README.md"), "new proposal\n").expect("write readme");
     repo.forge().args(["--json", "save"]).assert().success();
-    repo.forge().args(["--json", "propose"]).assert().success();
+    let latest = json_output(repo.forge().args(["--json", "propose"]).assert().success());
 
     let output = json_output(
         repo.forge()
-            .args(["--json", "export", "branch", "forge/not-accepted-latest"])
+            .args([
+                "--json",
+                "export",
+                "branch",
+                "--proposal",
+                latest["data"]["proposal_id"].as_str().unwrap(),
+                "forge/not-accepted-latest",
+            ])
             .assert()
             .failure(),
     );

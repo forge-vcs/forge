@@ -54,6 +54,7 @@ pub struct RepositoryContext {
     pub content_backend: String,
     pub current_operation_id: String,
     pub current_view_id: String,
+    pub attached_attempt_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,6 +62,7 @@ pub struct StartAttempt {
     pub intent_id: String,
     pub attempt_id: String,
     pub base_head: String,
+    pub attached: bool,
     pub operation_id: String,
     pub current_view_id: String,
 }
@@ -71,6 +73,25 @@ pub struct AttemptRecord {
     pub intent_id: String,
     pub intent: String,
     pub base_head: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AttemptSummary {
+    pub attempt_id: String,
+    pub intent_id: String,
+    pub intent: String,
+    pub base_head: String,
+    pub status: String,
+    pub attached: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AttemptShowRecord {
+    pub attempt: AttemptSummary,
+    pub latest_snapshot: Option<SnapshotSummary>,
+    pub latest_evidence: Option<EvidenceSummary>,
+    pub proposals: Vec<ProposalMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -194,6 +215,7 @@ pub struct EvidenceSummary {
 pub struct ProposalSummary {
     pub proposal_id: String,
     pub proposal_revision_id: String,
+    pub attempt_id: String,
     pub snapshot_id: String,
     pub base_head: String,
     pub content_ref: String,
@@ -201,10 +223,34 @@ pub struct ProposalSummary {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ProposalMetadata {
+    pub proposal_id: String,
+    pub proposal_revision_id: String,
+    pub attempt_id: String,
+    pub snapshot_id: String,
+    pub base_head: String,
+    pub content_ref: String,
+    pub changed_paths: Vec<String>,
+    pub check_status: Option<String>,
+    pub decision_status: Option<String>,
+    pub publication_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CheckSummary {
     pub check_result_id: String,
     pub status: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedAttempt {
+    pub attempt: AttemptRecord,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedProposal {
+    pub proposal: ProposalSummary,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -290,8 +336,8 @@ pub fn init_repository(
     )?;
     tx.execute(
         "INSERT INTO current_state (
-            singleton, repo_id, current_operation_id, current_view_id, updated_at_ms
-        ) VALUES (1, ?1, ?2, ?3, ?4)",
+            singleton, repo_id, current_operation_id, current_view_id, attached_attempt_id, updated_at_ms
+        ) VALUES (1, ?1, ?2, ?3, NULL, ?4)",
         params![repo_id, operation_id, view_id, now],
     )?;
     tx.commit()?;
@@ -340,18 +386,19 @@ pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     }
     let mut connection = open_connection(&database_path)?;
     apply_migrations(&mut connection)?;
-    let (repo_id, content_backend, current_operation_id, current_view_id): (
+    let (repo_id, content_backend, current_operation_id, current_view_id, attached_attempt_id): (
         String,
         String,
         String,
         String,
+        Option<String>,
     ) = connection.query_row(
-        "SELECT cs.repo_id, r.content_backend, cs.current_operation_id, cs.current_view_id
+        "SELECT cs.repo_id, r.content_backend, cs.current_operation_id, cs.current_view_id, cs.attached_attempt_id
              FROM current_state cs
              JOIN repositories r ON r.id = cs.repo_id
              WHERE cs.singleton = 1",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     )?;
     Ok(RepositoryContext {
         repo_id,
@@ -360,6 +407,7 @@ pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
         content_backend,
         current_operation_id,
         current_view_id,
+        attached_attempt_id,
     })
 }
 
@@ -398,16 +446,74 @@ pub fn start_attempt(
     base_head: String,
 ) -> Result<StartAttempt> {
     let context = open_repository(cwd)?;
+    create_attempt(
+        &context,
+        request_id,
+        None,
+        Some(intent),
+        base_head,
+        true,
+        "start",
+    )
+}
+
+pub fn start_attempt_for_intent(
+    cwd: &Path,
+    request_id: Option<String>,
+    intent_id: String,
+    base_head: String,
+) -> Result<StartAttempt> {
+    let context = open_repository(cwd)?;
+    create_attempt(
+        &context,
+        request_id,
+        Some(intent_id),
+        None,
+        base_head,
+        false,
+        "attempt start",
+    )
+}
+
+fn create_attempt(
+    context: &RepositoryContext,
+    request_id: Option<String>,
+    intent_id: Option<String>,
+    intent: Option<String>,
+    base_head: String,
+    attach: bool,
+    command: &str,
+) -> Result<StartAttempt> {
     let mut connection = open_connection(&context.database_path)?;
     let tx = connection.transaction()?;
     let now = now_ms();
-    let intent_id = new_id("intent");
+    let intent_id = match intent_id {
+        Some(id) => {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM intents WHERE repo_id = ?1 AND id = ?2)",
+                params![context.repo_id, id],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                bail!("UNKNOWN_INTENT: unknown intent {id}");
+            }
+            id
+        }
+        None => {
+            let id = new_id("intent");
+            tx.execute(
+                "INSERT INTO intents (id, repo_id, text, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    id,
+                    context.repo_id,
+                    intent.unwrap_or_else(|| "local agent attempt".to_string()),
+                    now
+                ],
+            )?;
+            id
+        }
+    };
     let attempt_id = new_id("attempt");
-
-    tx.execute(
-        "INSERT INTO intents (id, repo_id, text, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
-        params![intent_id, context.repo_id, intent, now],
-    )?;
     tx.execute(
         "INSERT INTO attempts (id, repo_id, intent_id, base_head, status, created_at_ms)
          VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
@@ -420,7 +526,7 @@ pub fn start_attempt(
         Some(&context.current_operation_id),
         OperationViewInput {
             request_id,
-            command: "start".to_string(),
+            command: command.to_string(),
             kind: "attempt_started".to_string(),
             view_kind: ViewKind::Initialized,
             state: json!({
@@ -430,12 +536,19 @@ pub fn start_attempt(
             }),
         },
     )?;
+    if attach {
+        tx.execute(
+            "UPDATE current_state SET attached_attempt_id = ?1 WHERE singleton = 1",
+            params![attempt_id],
+        )?;
+    }
     tx.commit()?;
 
     Ok(StartAttempt {
         intent_id,
         attempt_id,
         base_head,
+        attached: attach,
         operation_id: op.operation_id,
         current_view_id: op.view_id,
     })
@@ -444,11 +557,12 @@ pub fn start_attempt(
 pub fn save_snapshot(
     cwd: &Path,
     request_id: Option<String>,
+    attempt_id: Option<&str>,
     content_ref: String,
     changed_paths: Vec<String>,
 ) -> Result<SnapshotRecord> {
     let context = open_repository(cwd)?;
-    let attempt = active_attempt(&context)?;
+    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
     let mut connection = open_connection(&context.database_path)?;
     let tx = connection.transaction()?;
     let parent_snapshot_id: Option<String> = tx
@@ -513,9 +627,11 @@ pub fn snapshot_content_ref(cwd: &Path, snapshot_id: &str) -> Result<String> {
         .with_context(|| format!("unknown snapshot {snapshot_id}"))
 }
 
-pub fn latest_snapshot_content_ref(cwd: &Path) -> Result<Option<String>> {
+pub fn latest_snapshot_content_ref(cwd: &Path, attempt_id: Option<&str>) -> Result<Option<String>> {
     let context = open_repository(cwd)?;
-    Ok(latest_snapshot(&context)?.map(|snapshot| snapshot.content_ref))
+    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    Ok(latest_snapshot_for_attempt(&context, &attempt.attempt_id)?
+        .map(|snapshot| snapshot.content_ref))
 }
 
 pub fn record_restore(
@@ -545,11 +661,12 @@ pub fn record_restore(
 pub fn record_evidence(
     cwd: &Path,
     request_id: Option<String>,
+    attempt_id: Option<&str>,
     input: EvidenceInput,
 ) -> Result<EvidenceRecord> {
     let context = open_repository(cwd)?;
-    let attempt = active_attempt(&context)?;
-    let snapshot = latest_snapshot(&context)?;
+    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    let snapshot = latest_snapshot_for_attempt(&context, &attempt.attempt_id)?;
     let mut connection = open_connection(&context.database_path)?;
     let tx = connection.transaction()?;
     let evidence_id = new_id("evidence");
@@ -594,7 +711,8 @@ pub fn record_evidence(
         },
     )?;
     tx.commit()?;
-    let latest = latest_evidence(&context)?.context("recorded evidence missing")?;
+    let latest = latest_evidence_for_attempt(&context, &attempt.attempt_id)?
+        .context("recorded evidence missing")?;
     Ok(EvidenceRecord {
         evidence_id,
         attempt_id: attempt.attempt_id,
@@ -613,10 +731,15 @@ pub fn record_evidence(
     })
 }
 
-pub fn propose(cwd: &Path, request_id: Option<String>) -> Result<ProposalRecord> {
+pub fn propose(
+    cwd: &Path,
+    request_id: Option<String>,
+    attempt_id: Option<&str>,
+) -> Result<ProposalRecord> {
     let context = open_repository(cwd)?;
-    let attempt = active_attempt(&context)?;
-    let snapshot = latest_snapshot(&context)?.context("no snapshot saved for active attempt")?;
+    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    let snapshot = latest_snapshot_for_attempt(&context, &attempt.attempt_id)?
+        .context("no snapshot saved for active attempt")?;
     let mut connection = open_connection(&context.database_path)?;
     let tx = connection.transaction()?;
     let proposal_id = new_id("proposal");
@@ -674,12 +797,15 @@ pub fn propose(cwd: &Path, request_id: Option<String>) -> Result<ProposalRecord>
 pub fn record_check(
     cwd: &Path,
     request_id: Option<String>,
+    attempt_id: Option<&str>,
+    proposal_id: Option<&str>,
     status: String,
     reason: String,
 ) -> Result<CheckRecord> {
     let context = open_repository(cwd)?;
-    let proposal = latest_proposal(&context)?.context("no proposal exists")?;
-    let evidence = latest_evidence(&context)?;
+    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
+    let evidence = latest_evidence_for_attempt(&context, &attempt.attempt_id)?;
     let evidence_id = evidence.as_ref().map(|e| e.evidence_id.clone());
     let (status, reason) = match evidence.as_ref().and_then(|e| e.snapshot_id.as_deref()) {
         Some(snapshot_id) if snapshot_id == proposal.snapshot_id => (status, reason),
@@ -734,9 +860,16 @@ pub fn record_check(
     })
 }
 
-pub fn decide(cwd: &Path, request_id: Option<String>, decision: &str) -> Result<DecisionRecord> {
+pub fn decide(
+    cwd: &Path,
+    request_id: Option<String>,
+    attempt_id: Option<&str>,
+    proposal_id: Option<&str>,
+    decision: &str,
+) -> Result<DecisionRecord> {
     let context = open_repository(cwd)?;
-    let proposal = latest_proposal(&context)?.context("no proposal exists")?;
+    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
     let mut connection = open_connection(&context.database_path)?;
     let tx = connection.transaction()?;
     let decision_id = new_id("decision");
@@ -778,8 +911,14 @@ pub fn decide(cwd: &Path, request_id: Option<String>, decision: &str) -> Result<
     })
 }
 
-pub fn latest_exportable_proposal(cwd: &Path) -> Result<ProposalSummary> {
-    latest_proposal(&open_repository(cwd)?)?.context("no proposal exists")
+pub fn exportable_proposal(
+    cwd: &Path,
+    attempt_id: Option<&str>,
+    proposal_id: Option<&str>,
+) -> Result<ProposalSummary> {
+    let context = open_repository(cwd)?;
+    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    Ok(resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal)
 }
 
 pub fn latest_decision(cwd: &Path) -> Result<Option<String>> {
@@ -819,11 +958,12 @@ pub fn publication_exists_for_branch(cwd: &Path, branch_name: &str) -> Result<bo
 pub fn record_publication(
     cwd: &Path,
     request_id: Option<String>,
+    proposal_id: &str,
     branch_name: String,
     commit_id: String,
 ) -> Result<PublicationRecord> {
     let context = open_repository(cwd)?;
-    let proposal = latest_proposal(&context)?.context("no proposal exists")?;
+    let proposal = proposal_by_id(&context, proposal_id)?.context("no proposal exists")?;
     let mut connection = open_connection(&context.database_path)?;
     let tx = connection.transaction()?;
     let publication_id = new_id("publication");
@@ -864,15 +1004,40 @@ pub fn record_publication(
     })
 }
 
-pub fn show(cwd: &Path) -> Result<ShowRecord> {
+pub fn show(cwd: &Path, attempt_id: Option<&str>) -> Result<ShowRecord> {
     let context = open_repository(cwd)?;
+    let attempt = match resolve_attempt_in_context(&context, attempt_id) {
+        Ok(resolved) => Some(resolved.attempt),
+        Err(error) if error.to_string().contains("no active attempt") => None,
+        Err(error) => return Err(error),
+    };
     Ok(ShowRecord {
-        attempt: active_attempt(&context).ok(),
-        latest_snapshot: latest_snapshot(&context)?,
-        latest_evidence: latest_evidence(&context)?,
-        latest_proposal: latest_proposal(&context)?,
-        latest_check: latest_check(&context)?,
-        latest_decision: latest_decision_for_context(&context)?,
+        latest_snapshot: attempt
+            .as_ref()
+            .map(|attempt| latest_snapshot_for_attempt(&context, &attempt.attempt_id))
+            .transpose()?
+            .flatten(),
+        latest_evidence: attempt
+            .as_ref()
+            .map(|attempt| latest_evidence_for_attempt(&context, &attempt.attempt_id))
+            .transpose()?
+            .flatten(),
+        latest_proposal: attempt
+            .as_ref()
+            .map(|attempt| latest_proposal_for_attempt(&context, &attempt.attempt_id))
+            .transpose()?
+            .flatten(),
+        latest_check: attempt
+            .as_ref()
+            .map(|attempt| latest_check_for_attempt(&context, &attempt.attempt_id))
+            .transpose()?
+            .flatten(),
+        latest_decision: attempt
+            .as_ref()
+            .map(|attempt| latest_decision_for_attempt(&context, &attempt.attempt_id))
+            .transpose()?
+            .flatten(),
+        attempt,
     })
 }
 
@@ -893,7 +1058,7 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         })
         .optional()?
         .flatten();
-    if schema_version != Some(1) {
+    if schema_version != Some(2) {
         issues.push("schema mismatch".to_string());
     }
     let state_count: i64 = connection.query_row(
@@ -960,35 +1125,46 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
 }
 
 pub fn pr_body(cwd: &Path) -> Result<String> {
-    let show = show(cwd)?;
+    pr_body_for(cwd, None, None)
+}
+
+pub fn pr_body_for(
+    cwd: &Path,
+    attempt_id: Option<&str>,
+    proposal_id: Option<&str>,
+) -> Result<String> {
+    let context = open_repository(cwd)?;
+    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
+    let evidence = latest_evidence_for_attempt(&context, &attempt.attempt_id)?;
+    let check = latest_check_for_proposal_revision(&context, &proposal.proposal_revision_id)?;
+    let decision = latest_decision_for_proposal_revision(&context, &proposal.proposal_revision_id)?;
     let mut body = String::new();
     body.push_str("# Forge Proposal\n\n");
-    if let Some(attempt) = show.attempt {
-        body.push_str(&format!("Intent: {}\n\n", attempt.intent));
+    body.push_str(&format!("Intent: {}\n\n", attempt.intent));
+    body.push_str("## Changed Paths\n");
+    for path in proposal.changed_paths {
+        body.push_str(&format!("- {path}\n"));
     }
-    if let Some(proposal) = show.latest_proposal {
-        body.push_str("## Changed Paths\n");
-        for path in proposal.changed_paths {
-            body.push_str(&format!("- {path}\n"));
-        }
-        body.push('\n');
-    }
-    if let Some(evidence) = show.latest_evidence {
+    body.push('\n');
+    if let Some(evidence) = evidence {
         body.push_str("## Evidence\n");
         body.push_str(&format!(
             "- `{}` exited with `{}` ({})\n\n",
             evidence.command, evidence.exit_code, evidence.trust
         ));
     }
-    if let Some(check) = show.latest_check {
+    if let Some(check) = check {
         body.push_str("## Check\n");
         body.push_str(&format!("- {}: {}\n\n", check.status, check.reason));
     }
-    if let Some(decision) = show.latest_decision {
+    if let Some(decision) = decision {
         body.push_str("## Decision\n");
         body.push_str(&format!("- {decision}\n"));
     }
-    if let Some(publication) = latest_publication(&open_repository(cwd)?)? {
+    if let Some(publication) =
+        latest_publication_for_proposal_revision(&context, &proposal.proposal_revision_id)?
+    {
         body.push_str("\n## Publication\n");
         body.push_str(&format!(
             "- `{}` at `{}`\n",
@@ -1091,39 +1267,194 @@ pub fn record_failed_operation(
     })
 }
 
-fn active_attempt(context: &RepositoryContext) -> Result<AttemptRecord> {
+pub fn resolve_attempt(cwd: &Path, attempt_id: Option<&str>) -> Result<ResolvedAttempt> {
+    let context = open_repository(cwd)?;
+    resolve_attempt_in_context(&context, attempt_id)
+}
+
+fn resolve_attempt_in_context(
+    context: &RepositoryContext,
+    attempt_id: Option<&str>,
+) -> Result<ResolvedAttempt> {
+    if let Some(attempt_id) = attempt_id {
+        let attempt = attempt_by_id(context, attempt_id)?
+            .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
+        return Ok(ResolvedAttempt { attempt });
+    }
+
+    if let Some(attached_attempt_id) = context.attached_attempt_id.as_deref() {
+        if let Some(attempt) = attempt_by_id(context, attached_attempt_id)? {
+            if attempt.status == "active" {
+                return Ok(ResolvedAttempt { attempt });
+            }
+        }
+    }
+
+    let attempts = active_attempts(context)?;
+    match attempts.as_slice() {
+        [] => bail!("no active attempt"),
+        [attempt] => Ok(ResolvedAttempt {
+            attempt: attempt.clone(),
+        }),
+        _ => bail!(
+            "AMBIGUOUS_ATTEMPT: {}",
+            attempts
+                .iter()
+                .map(|attempt| attempt.attempt_id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
+fn attempt_by_id(context: &RepositoryContext, attempt_id: &str) -> Result<Option<AttemptRecord>> {
     let connection = open_connection(&context.database_path)?;
     connection
         .query_row(
-            "SELECT a.id, a.intent_id, i.text, a.base_head
+            "SELECT a.id, a.intent_id, i.text, a.base_head, a.status
              FROM attempts a
              JOIN intents i ON i.id = a.intent_id
-             WHERE a.repo_id = ?1 AND a.status = 'active'
-             ORDER BY a.created_at_ms DESC LIMIT 1",
-            params![context.repo_id],
+             WHERE a.repo_id = ?1 AND a.id = ?2",
+            params![context.repo_id, attempt_id],
             |row| {
                 Ok(AttemptRecord {
                     attempt_id: row.get(0)?,
                     intent_id: row.get(1)?,
                     intent: row.get(2)?,
                     base_head: row.get(3)?,
+                    status: row.get(4)?,
                 })
             },
         )
-        .context("no active attempt")
+        .optional()
+        .map_err(Into::into)
 }
 
-fn latest_snapshot(context: &RepositoryContext) -> Result<Option<SnapshotSummary>> {
+fn active_attempts(context: &RepositoryContext) -> Result<Vec<AttemptRecord>> {
     let connection = open_connection(&context.database_path)?;
-    let attempt = match active_attempt(context) {
-        Ok(attempt) => attempt,
-        Err(_) => return Ok(None),
-    };
+    let mut statement = connection.prepare(
+        "SELECT a.id, a.intent_id, i.text, a.base_head, a.status
+         FROM attempts a
+         JOIN intents i ON i.id = a.intent_id
+         WHERE a.repo_id = ?1 AND a.status = 'active'
+         ORDER BY a.created_at_ms ASC",
+    )?;
+    let rows = statement.query_map(params![context.repo_id], |row| {
+        Ok(AttemptRecord {
+            attempt_id: row.get(0)?,
+            intent_id: row.get(1)?,
+            intent: row.get(2)?,
+            base_head: row.get(3)?,
+            status: row.get(4)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub fn list_attempts(cwd: &Path) -> Result<Vec<AttemptSummary>> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let mut statement = connection.prepare(
+        "SELECT a.id, a.intent_id, i.text, a.base_head, a.status
+         FROM attempts a
+         JOIN intents i ON i.id = a.intent_id
+         WHERE a.repo_id = ?1
+         ORDER BY a.created_at_ms ASC",
+    )?;
+    let attached = context.attached_attempt_id.clone();
+    let rows = statement.query_map(params![context.repo_id], |row| {
+        let attempt_id: String = row.get(0)?;
+        Ok(AttemptSummary {
+            attached: attached.as_deref() == Some(attempt_id.as_str()),
+            attempt_id,
+            intent_id: row.get(1)?,
+            intent: row.get(2)?,
+            base_head: row.get(3)?,
+            status: row.get(4)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub fn show_attempt(cwd: &Path, attempt_id: &str) -> Result<AttemptShowRecord> {
+    let context = open_repository(cwd)?;
+    let attempt = attempt_by_id(&context, attempt_id)?
+        .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
+    Ok(AttemptShowRecord {
+        attempt: AttemptSummary {
+            attached: context.attached_attempt_id.as_deref() == Some(attempt.attempt_id.as_str()),
+            attempt_id: attempt.attempt_id.clone(),
+            intent_id: attempt.intent_id.clone(),
+            intent: attempt.intent.clone(),
+            base_head: attempt.base_head.clone(),
+            status: attempt.status.clone(),
+        },
+        latest_snapshot: latest_snapshot_for_attempt(&context, &attempt.attempt_id)?,
+        latest_evidence: latest_evidence_for_attempt(&context, &attempt.attempt_id)?,
+        proposals: proposal_metadata_for_attempt(&context, &attempt.attempt_id)?,
+    })
+}
+
+pub fn attach_attempt(
+    cwd: &Path,
+    request_id: Option<String>,
+    attempt_id: &str,
+) -> Result<OperationViewResult> {
+    let context = open_repository(cwd)?;
+    let attempt = attempt_by_id(&context, attempt_id)?
+        .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
+    let mut connection = open_connection(&context.database_path)?;
+    let tx = connection.transaction()?;
+    let op = insert_operation_view(
+        &tx,
+        &context.repo_id,
+        Some(&context.current_operation_id),
+        OperationViewInput {
+            request_id,
+            command: "attempt attach".to_string(),
+            kind: "attempt_attached".to_string(),
+            view_kind: ViewKind::Initialized,
+            state: json!({
+                "lifecycle": "attempt_attached",
+                "attempt_id": attempt.attempt_id
+            }),
+        },
+    )?;
+    tx.execute(
+        "UPDATE current_state SET attached_attempt_id = ?1 WHERE singleton = 1",
+        params![attempt.attempt_id],
+    )?;
+    tx.commit()?;
+    Ok(op)
+}
+
+pub fn attempt_materialization_ref(cwd: &Path, attempt_id: &str) -> Result<Option<String>> {
+    let context = open_repository(cwd)?;
+    let attempt = attempt_by_id(&context, attempt_id)?
+        .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
+    Ok(latest_snapshot_for_attempt(&context, &attempt.attempt_id)?
+        .map(|snapshot| snapshot.content_ref))
+}
+
+pub fn attempt_base_head(cwd: &Path, attempt_id: &str) -> Result<String> {
+    let context = open_repository(cwd)?;
+    Ok(attempt_by_id(&context, attempt_id)?
+        .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?
+        .base_head)
+}
+
+fn latest_snapshot_for_attempt(
+    context: &RepositoryContext,
+    attempt_id: &str,
+) -> Result<Option<SnapshotSummary>> {
+    let connection = open_connection(&context.database_path)?;
     connection
         .query_row(
             "SELECT id, content_ref, changed_paths_json FROM snapshots
              WHERE attempt_id = ?1 ORDER BY created_at_ms DESC LIMIT 1",
-            params![attempt.attempt_id],
+            params![attempt_id],
             |row| {
                 let changed_paths_json: String = row.get(2)?;
                 Ok(SnapshotSummary {
@@ -1137,17 +1468,16 @@ fn latest_snapshot(context: &RepositoryContext) -> Result<Option<SnapshotSummary
         .map_err(Into::into)
 }
 
-fn latest_evidence(context: &RepositoryContext) -> Result<Option<EvidenceSummary>> {
+fn latest_evidence_for_attempt(
+    context: &RepositoryContext,
+    attempt_id: &str,
+) -> Result<Option<EvidenceSummary>> {
     let connection = open_connection(&context.database_path)?;
-    let attempt = match active_attempt(context) {
-        Ok(attempt) => attempt,
-        Err(_) => return Ok(None),
-    };
     connection
         .query_row(
             "SELECT id, snapshot_id, command, args_json, exit_code, sensitivity, trust FROM evidence
              WHERE attempt_id = ?1 ORDER BY created_at_ms DESC LIMIT 1",
-            params![attempt.attempt_id],
+            params![attempt_id],
             |row| {
                 let args_json: String = row.get(3)?;
                 Ok(EvidenceSummary {
@@ -1165,24 +1495,62 @@ fn latest_evidence(context: &RepositoryContext) -> Result<Option<EvidenceSummary
         .map_err(Into::into)
 }
 
-fn latest_proposal(context: &RepositoryContext) -> Result<Option<ProposalSummary>> {
+fn resolve_proposal(
+    context: &RepositoryContext,
+    attempt_id: &str,
+    proposal_id: Option<&str>,
+    allow_single_default: bool,
+) -> Result<ResolvedProposal> {
+    if let Some(proposal_id) = proposal_id {
+        let proposal = proposal_by_id(context, proposal_id)?
+            .ok_or_else(|| anyhow!("UNKNOWN_PROPOSAL: unknown proposal {proposal_id}"))?;
+        if proposal.attempt_id != attempt_id {
+            bail!(
+                "UNKNOWN_PROPOSAL: proposal {proposal_id} does not belong to attempt {attempt_id}"
+            );
+        }
+        return Ok(ResolvedProposal { proposal });
+    }
+
+    let proposals = proposals_for_attempt(context, attempt_id)?;
+    match proposals.as_slice() {
+        [] => bail!("no proposal exists"),
+        [proposal] if allow_single_default => Ok(ResolvedProposal {
+            proposal: proposal.clone(),
+        }),
+        _ => bail!(
+            "AMBIGUOUS_PROPOSAL: {}",
+            proposals
+                .iter()
+                .map(|proposal| proposal.proposal_id.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
+fn proposal_by_id(
+    context: &RepositoryContext,
+    proposal_id: &str,
+) -> Result<Option<ProposalSummary>> {
     let connection = open_connection(&context.database_path)?;
     connection
         .query_row(
-            "SELECT p.id, pr.id, p.snapshot_id, p.base_head, pr.content_ref, pr.changed_paths_json
+            "SELECT p.id, pr.id, p.attempt_id, p.snapshot_id, p.base_head, pr.content_ref, pr.changed_paths_json
              FROM proposals p
              JOIN proposal_revisions pr ON pr.proposal_id = p.id
-             WHERE p.repo_id = ?1
+             WHERE p.repo_id = ?1 AND p.id = ?2
              ORDER BY pr.created_at_ms DESC LIMIT 1",
-            params![context.repo_id],
+            params![context.repo_id, proposal_id],
             |row| {
-                let changed_paths_json: String = row.get(5)?;
+                let changed_paths_json: String = row.get(6)?;
                 Ok(ProposalSummary {
                     proposal_id: row.get(0)?,
                     proposal_revision_id: row.get(1)?,
-                    snapshot_id: row.get(2)?,
-                    base_head: row.get(3)?,
-                    content_ref: row.get(4)?,
+                    attempt_id: row.get(2)?,
+                    snapshot_id: row.get(3)?,
+                    base_head: row.get(4)?,
+                    content_ref: row.get(5)?,
                     changed_paths: serde_json::from_str(&changed_paths_json).unwrap_or_default(),
                 })
             },
@@ -1191,13 +1559,100 @@ fn latest_proposal(context: &RepositoryContext) -> Result<Option<ProposalSummary
         .map_err(Into::into)
 }
 
-fn latest_check(context: &RepositoryContext) -> Result<Option<CheckSummary>> {
+fn proposals_for_attempt(
+    context: &RepositoryContext,
+    attempt_id: &str,
+) -> Result<Vec<ProposalSummary>> {
+    let connection = open_connection(&context.database_path)?;
+    let mut statement = connection.prepare(
+        "SELECT p.id, pr.id, p.attempt_id, p.snapshot_id, p.base_head, pr.content_ref, pr.changed_paths_json
+         FROM proposals p
+         JOIN proposal_revisions pr ON pr.proposal_id = p.id
+         WHERE p.repo_id = ?1 AND p.attempt_id = ?2
+         ORDER BY pr.created_at_ms ASC",
+    )?;
+    let rows = statement.query_map(params![context.repo_id, attempt_id], |row| {
+        let changed_paths_json: String = row.get(6)?;
+        Ok(ProposalSummary {
+            proposal_id: row.get(0)?,
+            proposal_revision_id: row.get(1)?,
+            attempt_id: row.get(2)?,
+            snapshot_id: row.get(3)?,
+            base_head: row.get(4)?,
+            content_ref: row.get(5)?,
+            changed_paths: serde_json::from_str(&changed_paths_json).unwrap_or_default(),
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn latest_proposal_for_attempt(
+    context: &RepositoryContext,
+    attempt_id: &str,
+) -> Result<Option<ProposalSummary>> {
+    Ok(proposals_for_attempt(context, attempt_id)?.pop())
+}
+
+pub fn list_proposals(cwd: &Path, attempt_id: Option<&str>) -> Result<Vec<ProposalMetadata>> {
+    let context = open_repository(cwd)?;
+    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    proposal_metadata_for_attempt(&context, &attempt.attempt_id)
+}
+
+fn proposal_metadata_for_attempt(
+    context: &RepositoryContext,
+    attempt_id: &str,
+) -> Result<Vec<ProposalMetadata>> {
+    proposals_for_attempt(context, attempt_id)?
+        .into_iter()
+        .map(|proposal| {
+            let check_status =
+                latest_check_for_proposal_revision(context, &proposal.proposal_revision_id)?
+                    .map(|check| check.status);
+            let decision_status =
+                latest_decision_for_proposal_revision(context, &proposal.proposal_revision_id)?;
+            let publication_status =
+                latest_publication_for_proposal_revision(context, &proposal.proposal_revision_id)?
+                    .map(|_| "published".to_string());
+            Ok(ProposalMetadata {
+                proposal_id: proposal.proposal_id,
+                proposal_revision_id: proposal.proposal_revision_id,
+                attempt_id: proposal.attempt_id,
+                snapshot_id: proposal.snapshot_id,
+                base_head: proposal.base_head,
+                content_ref: proposal.content_ref,
+                changed_paths: proposal.changed_paths,
+                check_status,
+                decision_status,
+                publication_status,
+            })
+        })
+        .collect()
+}
+
+fn latest_check_for_attempt(
+    context: &RepositoryContext,
+    attempt_id: &str,
+) -> Result<Option<CheckSummary>> {
+    let proposal = match latest_proposal_for_attempt(context, attempt_id)? {
+        Some(proposal) => proposal,
+        None => return Ok(None),
+    };
+    latest_check_for_proposal_revision(context, &proposal.proposal_revision_id)
+}
+
+fn latest_check_for_proposal_revision(
+    context: &RepositoryContext,
+    proposal_revision_id: &str,
+) -> Result<Option<CheckSummary>> {
     let connection = open_connection(&context.database_path)?;
     connection
         .query_row(
             "SELECT id, status, reason FROM check_results
-             WHERE repo_id = ?1 ORDER BY created_at_ms DESC LIMIT 1",
-            params![context.repo_id],
+             WHERE repo_id = ?1 AND proposal_revision_id = ?2
+             ORDER BY created_at_ms DESC LIMIT 1",
+            params![context.repo_id, proposal_revision_id],
             |row| {
                 Ok(CheckSummary {
                     check_result_id: row.get(0)?,
@@ -1211,24 +1666,53 @@ fn latest_check(context: &RepositoryContext) -> Result<Option<CheckSummary>> {
 }
 
 fn latest_decision_for_context(context: &RepositoryContext) -> Result<Option<String>> {
+    let attempt = match resolve_attempt_in_context(context, None) {
+        Ok(attempt) => attempt.attempt,
+        Err(_) => return Ok(None),
+    };
+    latest_decision_for_attempt(context, &attempt.attempt_id)
+}
+
+fn latest_decision_for_attempt(
+    context: &RepositoryContext,
+    attempt_id: &str,
+) -> Result<Option<String>> {
+    let proposal = match latest_proposal_for_attempt(context, attempt_id)? {
+        Some(proposal) => proposal,
+        None => return Ok(None),
+    };
+    latest_decision_for_proposal_revision(context, &proposal.proposal_revision_id)
+}
+
+fn latest_decision_for_proposal_revision(
+    context: &RepositoryContext,
+    proposal_revision_id: &str,
+) -> Result<Option<String>> {
     let connection = open_connection(&context.database_path)?;
     connection
         .query_row(
-            "SELECT decision FROM decisions WHERE repo_id = ?1 ORDER BY created_at_ms DESC LIMIT 1",
-            params![context.repo_id],
+            "SELECT decision FROM decisions
+             WHERE repo_id = ?1 AND proposal_revision_id = ?2
+             ORDER BY created_at_ms DESC LIMIT 1",
+            params![context.repo_id, proposal_revision_id],
             |row| row.get(0),
         )
         .optional()
         .map_err(Into::into)
 }
 
-fn latest_publication(context: &RepositoryContext) -> Result<Option<PublicationRecord>> {
+fn latest_publication_for_proposal_revision(
+    context: &RepositoryContext,
+    proposal_revision_id: &str,
+) -> Result<Option<PublicationRecord>> {
     let connection = open_connection(&context.database_path)?;
     connection
         .query_row(
             "SELECT id, proposal_id, proposal_revision_id, branch_name, commit_id
-             FROM publications WHERE repo_id = ?1 ORDER BY created_at_ms DESC LIMIT 1",
-            params![context.repo_id],
+             FROM publications
+             WHERE repo_id = ?1 AND proposal_revision_id = ?2
+             ORDER BY created_at_ms DESC LIMIT 1",
+            params![context.repo_id, proposal_revision_id],
             |row| {
                 Ok(PublicationRecord {
                     publication_id: row.get(0)?,
@@ -1339,6 +1823,21 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
         tx.commit()?;
     }
     ensure_repository_content_backend_column(connection)?;
+    ensure_attached_attempt_column(connection)?;
+
+    let applied_002 = connection
+        .query_row(
+            "SELECT version FROM schema_migrations WHERE version = 2",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if applied_002.is_none() {
+        connection.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (2, '002_attached_attempt', ?1)",
+            params![now_ms()],
+        )?;
+    }
 
     Ok(())
 }
@@ -1353,6 +1852,21 @@ fn ensure_repository_content_backend_column(connection: &Connection) -> Result<(
     }
     connection.execute(
         "ALTER TABLE repositories ADD COLUMN content_backend TEXT NOT NULL DEFAULT 'git'",
+        [],
+    )?;
+    Ok(())
+}
+
+fn ensure_attached_attempt_column(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(current_state)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == "attached_attempt_id" {
+            return Ok(());
+        }
+    }
+    connection.execute(
+        "ALTER TABLE current_state ADD COLUMN attached_attempt_id TEXT REFERENCES attempts(id)",
         [],
     )?;
     Ok(())
