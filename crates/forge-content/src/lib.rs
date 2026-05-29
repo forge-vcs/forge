@@ -6,6 +6,22 @@ pub const SECRET_RISK_SENSITIVITY: &str = "secret_risk";
 pub const GIT_TREE_PREFIX: &str = "git-tree:";
 pub const FORGE_TREE_PREFIX: &str = "forge-tree:";
 
+/// Test-only crash injection (NER-132 U6). In **debug builds only**, if the
+/// `FORGE_CRASH_POINT` environment variable names `point`, hard-abort the process
+/// (`std::process::abort`) to simulate a kill at a durability boundary — skipping
+/// all `Drop`/flush, exactly like a SIGKILL or sandbox teardown. In release builds
+/// `cfg!(debug_assertions)` is `false`, so the entire check is dead code with zero
+/// overhead. Only the crash-injection harness sets the env var; no production path
+/// does. Lives in forge-content because both forge-cli (the save boundary) and
+/// forge-content-native (the restore boundary) inject through it.
+pub fn maybe_crash(point: &str) {
+    if cfg!(debug_assertions)
+        && matches!(std::env::var("FORGE_CRASH_POINT"), Ok(active) if active == point)
+    {
+        std::process::abort();
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotContent {
     pub content_ref: String,

@@ -447,6 +447,10 @@ fn materialize_tree(
                     sync_dir(parent)?;
                 }
                 target_paths.insert(rel);
+                // Crash boundary (NER-132 U6, debug-only): this file is fully
+                // renamed (whole, never torn) and its temp consumed; a crash here
+                // leaves a partially-restored worktree with no orphaned temp.
+                forge_content::maybe_crash("mid_restore");
             }
             TreeEntryKind::Dir => {
                 let full = repo_root.join(&rel);

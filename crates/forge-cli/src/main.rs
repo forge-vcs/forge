@@ -344,6 +344,11 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
 fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> ResponseEnvelope {
     command_result("save", request_id, |cwd, request_id| {
         let content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
+        // Crash boundary (NER-132 U6, debug-only): objects are now durably fsynced
+        // but no content_ref row is committed. A crash here must never leave a
+        // committed ref pointing at a missing object — the objects are present, the
+        // ref is absent.
+        forge_content::maybe_crash("after_object_fsync_before_db_commit");
         let saved = forge_store::save_snapshot(
             &cwd,
             request_id,
@@ -351,6 +356,11 @@ fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> Respons
             content.content_ref,
             content.changed_paths,
         )?;
+        // Crash boundary (NER-132 U6, debug-only): the content_ref is committed and
+        // durable (synchronous=NORMAL fsyncs the WAL on commit) even if the WAL is
+        // not yet checkpointed. On reopen, WAL recovery must show the committed ref
+        // AND its durably-retained object.
+        forge_content::maybe_crash("after_db_commit_before_checkpoint");
         Ok((
             Some(saved.operation_id.clone()),
             serde_json::to_value(saved)?,
