@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 2 — numbered migration runner, typed ForgeError contract, launch-blocker gates (NER-133)"
 type: feat
-status: active
+status: completed
 date: 2026-05-29
 deepened: 2026-05-29
 origin: docs/handoffs/2026-05-29-ner-133-phase-2-kickoff.md
