@@ -1,3 +1,5 @@
+mod schema;
+
 use clap::{error::ErrorKind, Args, Parser, Subcommand};
 use forge_content::{classify_content_ref, ContentBackend, ContentRefKind};
 use forge_protocol::{ErrorObject, ResponseEnvelope, ResponseStatus, RetryMetadata};
@@ -34,6 +36,8 @@ enum Command {
     Doctor,
     Gc(GcArgs),
     Export(ExportArgs),
+    /// Emit the versioned machine contract (schema_version, command + error registry).
+    Schema,
 }
 
 #[derive(Debug, Args)]
@@ -175,6 +179,7 @@ fn main() -> ExitCode {
         Command::Doctor => doctor_response(request_id),
         Command::Gc(args) => gc_response(request_id, args),
         Command::Export(args) => export_response(request_id, args),
+        Command::Schema => schema_response(request_id),
     };
 
     if cli.json {
@@ -778,6 +783,13 @@ fn init_response(request_id: Option<String>, args: InitArgs) -> ResponseEnvelope
     }
 }
 
+/// Emit the static `forge.cli.v0` machine contract. Deliberately does NOT route
+/// through `command_result`: the contract is static and must work without a
+/// repository (no `migrate`, no lock, no cwd dependency).
+fn schema_response(request_id: Option<String>) -> ResponseEnvelope {
+    ResponseEnvelope::success("schema", request_id, None, schema::contract())
+}
+
 fn selected_backend(cwd: &std::path::Path) -> anyhow::Result<Box<dyn ContentBackend>> {
     match forge_store::repository_content_backend(cwd)?.as_str() {
         "git" => Ok(Box::new(forge_content_git::GitContentBackend)),
@@ -826,6 +838,9 @@ fn print_human(response: &ResponseEnvelope) {
                 if let Some(body) = response.data.get("body").and_then(Value::as_str) {
                     print!("{body}");
                 }
+            }
+            "schema" => {
+                println!("{}", serde_json::to_string_pretty(&response.data).unwrap());
             }
             command => println!("{command} succeeded"),
         }

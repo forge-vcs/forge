@@ -233,6 +233,139 @@ impl std::fmt::Display for ForgeError {
 
 impl std::error::Error for ForgeError {}
 
+/// A single entry in the published error-code registry: the agent-visible `code`,
+/// its retry classification, and the JSON keys its [`ForgeError::details`] emits.
+///
+/// Hand-mirrors one [`ForgeError`] variant each. The drift-guard test below pins
+/// `error_registry().len()` to the number of variants, so a newly-added variant
+/// is a compile-then-test failure until its registry entry exists — the registry
+/// cannot silently drift from the enum it documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorCodeSpec {
+    pub code: &'static str,
+    pub retryable: bool,
+    pub after_ms: Option<u64>,
+    pub details_keys: &'static [&'static str],
+}
+
+/// Every code [`ForgeError`] can emit, for the published `forge schema` registry.
+///
+/// One entry per `ForgeError` variant. Keep this in lockstep with the enum — the
+/// drift-guard test asserts both directions (every variant's `.code()` appears
+/// here, and the length matches the variant count).
+pub fn error_registry() -> &'static [ErrorCodeSpec] {
+    &[
+        ErrorCodeSpec {
+            code: "STALE_BASE",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["expected_head", "actual_head"],
+        },
+        ErrorCodeSpec {
+            code: "DIRTY_WORKTREE",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["paths", "redacted_count"],
+        },
+        ErrorCodeSpec {
+            code: "AMBIGUOUS_ATTEMPT",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["candidate_ids"],
+        },
+        ErrorCodeSpec {
+            code: "UNKNOWN_ATTEMPT",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["selector"],
+        },
+        ErrorCodeSpec {
+            code: "AMBIGUOUS_PROPOSAL",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["candidate_ids"],
+        },
+        ErrorCodeSpec {
+            code: "UNKNOWN_PROPOSAL",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["selector"],
+        },
+        ErrorCodeSpec {
+            code: "UNKNOWN_INTENT",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["selector"],
+        },
+        ErrorCodeSpec {
+            code: "NO_ACTIVE_ATTEMPT",
+            retryable: false,
+            after_ms: None,
+            details_keys: &[],
+        },
+        ErrorCodeSpec {
+            code: "NO_SNAPSHOT",
+            retryable: false,
+            after_ms: None,
+            details_keys: &[],
+        },
+        ErrorCodeSpec {
+            code: "NO_PROPOSAL",
+            retryable: false,
+            after_ms: None,
+            details_keys: &[],
+        },
+        ErrorCodeSpec {
+            code: "NOT_ACCEPTED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &[],
+        },
+        ErrorCodeSpec {
+            code: "REJECTED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &[],
+        },
+        ErrorCodeSpec {
+            code: "BRANCH_EXISTS",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["name"],
+        },
+        ErrorCodeSpec {
+            code: "NOT_INITIALIZED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &[],
+        },
+        ErrorCodeSpec {
+            code: "REQUEST_ID_CONFLICT",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["existing_command"],
+        },
+        ErrorCodeSpec {
+            code: "CONFLICT",
+            retryable: true,
+            after_ms: Some(RETRY_BACKOFF_MS),
+            details_keys: &[],
+        },
+        ErrorCodeSpec {
+            code: "SCHEMA_VERSION_UNSUPPORTED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["db_version", "supported_head"],
+        },
+        ErrorCodeSpec {
+            code: "MIGRATION_FAILED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["version", "message"],
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +527,106 @@ mod tests {
             .downcast_ref::<ForgeError>()
             .expect("downcast recovers the typed error");
         assert_eq!(recovered.code(), "NO_SNAPSHOT");
+    }
+
+    /// Drift guard for the published `forge schema` registry: a representative
+    /// instance of EVERY variant must have its `.code()` present in
+    /// `error_registry()`, AND the registry length must equal the variant count,
+    /// so a newly-added variant cannot ship without a registry entry. Same
+    /// discipline as `codes_match_the_pre_change_registry`.
+    #[test]
+    fn registry_covers_every_variant() {
+        // One representative instance per variant. Adding a variant without
+        // extending this list is a compile error (the match below is exhaustive).
+        let all = [
+            ForgeError::StaleBase {
+                expected_head: "a".into(),
+                actual_head: "b".into(),
+            },
+            ForgeError::DirtyWorktree { paths: vec![] },
+            ForgeError::AmbiguousAttempt {
+                candidate_ids: vec![],
+            },
+            ForgeError::UnknownAttempt {
+                selector: "x".into(),
+            },
+            ForgeError::AmbiguousProposal {
+                candidate_ids: vec![],
+            },
+            ForgeError::UnknownProposal {
+                selector: "x".into(),
+            },
+            ForgeError::UnknownIntent {
+                selector: "x".into(),
+            },
+            ForgeError::NoActiveAttempt,
+            ForgeError::NoSnapshot,
+            ForgeError::NoProposal,
+            ForgeError::NotAccepted,
+            ForgeError::Rejected,
+            ForgeError::BranchExists { name: "x".into() },
+            ForgeError::NotInitialized,
+            ForgeError::RequestIdConflict {
+                existing_command: "start".into(),
+            },
+            ForgeError::CurrentStateChanged,
+            ForgeError::UnknownSchemaVersion {
+                db_version: 3,
+                supported_head: 2,
+            },
+            ForgeError::MigrationFailed {
+                version: 2,
+                message: "boom".into(),
+            },
+        ];
+
+        // Exhaustiveness check: if a variant is added, this match fails to compile
+        // until `all` (and the registry) are extended.
+        for variant in &all {
+            match variant {
+                ForgeError::StaleBase { .. }
+                | ForgeError::DirtyWorktree { .. }
+                | ForgeError::AmbiguousAttempt { .. }
+                | ForgeError::UnknownAttempt { .. }
+                | ForgeError::AmbiguousProposal { .. }
+                | ForgeError::UnknownProposal { .. }
+                | ForgeError::UnknownIntent { .. }
+                | ForgeError::NoActiveAttempt
+                | ForgeError::NoSnapshot
+                | ForgeError::NoProposal
+                | ForgeError::NotAccepted
+                | ForgeError::Rejected
+                | ForgeError::BranchExists { .. }
+                | ForgeError::NotInitialized
+                | ForgeError::RequestIdConflict { .. }
+                | ForgeError::CurrentStateChanged
+                | ForgeError::UnknownSchemaVersion { .. }
+                | ForgeError::MigrationFailed { .. } => {}
+            }
+        }
+
+        let registry = error_registry();
+        for variant in &all {
+            assert!(
+                registry.iter().any(|spec| spec.code == variant.code()),
+                "registry is missing an entry for {}",
+                variant.code()
+            );
+        }
+        assert_eq!(
+            registry.len(),
+            all.len(),
+            "error_registry() must have exactly one entry per ForgeError variant"
+        );
+
+        // Retryability/after_ms in the registry must match the runtime classifiers.
+        for variant in &all {
+            let spec = registry
+                .iter()
+                .find(|spec| spec.code == variant.code())
+                .expect("registry entry");
+            assert_eq!(spec.retryable, variant.retryable(), "{}", variant.code());
+            assert_eq!(spec.after_ms, variant.after_ms(), "{}", variant.code());
+        }
     }
 }

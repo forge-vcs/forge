@@ -13,7 +13,7 @@ use std::time::Duration;
 mod error;
 mod migrations;
 mod repo_lock;
-pub use error::ForgeError;
+pub use error::{error_registry, ErrorCodeSpec, ForgeError};
 pub use repo_lock::{LockTimeout, RepoLock};
 
 #[derive(Debug, Clone, Serialize)]
