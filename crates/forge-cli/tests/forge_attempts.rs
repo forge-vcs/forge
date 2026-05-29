@@ -573,6 +573,9 @@ fn restore_rejects_cross_attempt_snapshot() {
         mismatch["errors"][0]["details"]["attached_attempt"],
         second_attempt
     );
+    // The mismatch is deterministic on both the save and restore surfaces — pin the
+    // contract so a refactor can't silently flip restore's classification (review T1).
+    assert_eq!(mismatch["retry"]["retryable"], false);
     assert_eq!(
         std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
         "attempt two\n",
