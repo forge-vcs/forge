@@ -31,3 +31,9 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Install sqlite3 (e2e DB assertions)
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+
+      - name: End-to-end eval (real binary)
+        run: bash scripts/e2e-eval.sh
