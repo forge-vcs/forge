@@ -18,7 +18,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Clippy runs with `-D warnings` — warnings are hard failures. Format with `cargo fmt --all`. GitHub Actions CI (`.github/workflows/ci.yml`) runs these same three checks on every push to `main` and every pull request; there is no Makefile or justfile — Cargo is the only build system.
+Clippy runs with `-D warnings` — warnings are hard failures. Format with `cargo fmt --all`. To mirror CI exactly in one shot — the trio **plus** the end-to-end eval that drives the real `forge` binary — run `bash scripts/ci.sh` before pushing; `scripts/e2e-eval.sh` runs that eval on its own. GitHub Actions CI (`.github/workflows/ci.yml`) runs these same checks (fmt, test, clippy, then the e2e eval) on every push to `main` and every pull request; there is no Makefile or justfile — Cargo is the only build system.
 
 ## Engineering workflow
 
