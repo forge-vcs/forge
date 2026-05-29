@@ -8,6 +8,8 @@
 //! guard — each call opens its own connection, exactly the multi-process shape the
 //! guard must defend (Phase 1a R6 / the solution doc's §4 and §7).
 
+use forge_core::ViewKind;
+use forge_store::{ForgeError, OperationViewInput};
 use std::path::Path;
 use std::process::Command;
 
@@ -92,8 +94,14 @@ fn recorded_failure_replays_as_failure_via_in_txn_guard() {
     // As the CLI does on a domain error, record a failed operation under a request
     // id (it commits no domain row). Retrying the same id through a writer must
     // surface that recorded failure so the CLI's status-aware replay reproduces it.
-    forge_store::record_failed_operation(repo.path(), Some("rq-2".to_string()), "start", "boom")
-        .expect("record failed operation");
+    forge_store::record_failed_operation(
+        repo.path(),
+        Some("rq-2".to_string()),
+        "start",
+        "COMMAND_FAILED",
+        "boom",
+    )
+    .expect("record failed operation");
 
     let error = forge_store::start_attempt(
         repo.path(),
@@ -158,4 +166,67 @@ fn concurrent_same_request_id_start_commits_exactly_one_attempt() {
     assert_eq!(committed, 1, "exactly one start commits");
     assert_eq!(replayed, 1, "the loser observes the in-txn replay guard");
     assert_eq!(attempt_count(&path), 1);
+}
+
+/// The genuine singleton CAS in `create_operation_view` — passing a stale
+/// `expected_current_operation_id` — raises the typed, retryable
+/// `ForgeError::CurrentStateChanged` (code `CONFLICT`), not a string. This is the
+/// classification the CLI relies on to skip persisting the failure under a
+/// `--request-id` so a retry re-executes (NER-133 R7).
+#[test]
+fn stale_cas_raises_retryable_current_state_changed() {
+    let repo = init_repo();
+    let db_path = repo.path().join(".forge/forge.db");
+
+    let error = forge_store::create_operation_view(
+        &db_path,
+        "op_stale_does_not_match_current",
+        OperationViewInput {
+            request_id: None,
+            command: "save".to_string(),
+            kind: "snapshot_saved".to_string(),
+            view_kind: ViewKind::Initialized,
+            state: serde_json::json!({ "lifecycle": "test" }),
+        },
+    )
+    .expect_err("a stale expected-current-operation-id must lose the CAS");
+
+    let forge_error = error
+        .downcast_ref::<ForgeError>()
+        .expect("the CAS failure is a typed ForgeError");
+    assert_eq!(*forge_error, ForgeError::CurrentStateChanged);
+    assert_eq!(forge_error.code(), "CONFLICT");
+    assert!(
+        forge_error.retryable(),
+        "the singleton CAS is the one transient/retryable domain error"
+    );
+    assert_eq!(forge_error.after_ms(), Some(50));
+}
+
+/// `record_failed_operation` stores the typed code alongside the message in
+/// `error_json`, so the CLI's `replay_response` reads the stored code directly
+/// rather than re-deriving it from the message (the substring ladder is gone).
+#[test]
+fn record_failed_operation_persists_the_typed_code() {
+    let repo = init_repo();
+    forge_store::record_failed_operation(
+        repo.path(),
+        Some("rq-code".to_string()),
+        "accept",
+        "STALE_BASE",
+        "stale base: HEAD moved",
+    )
+    .expect("record failed operation");
+
+    let stored: String = rusqlite::Connection::open(repo.path().join(".forge/forge.db"))
+        .expect("open forge.db")
+        .query_row(
+            "SELECT error_json FROM operations WHERE request_id = 'rq-code'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read error_json");
+    let value: serde_json::Value = serde_json::from_str(&stored).expect("parse error_json");
+    assert_eq!(value["code"], "STALE_BASE");
+    assert_eq!(value["message"], "stale base: HEAD moved");
 }

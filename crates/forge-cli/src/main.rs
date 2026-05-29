@@ -1,6 +1,7 @@
 use clap::{error::ErrorKind, Args, Parser, Subcommand};
 use forge_content::{classify_content_ref, ContentBackend, ContentRefKind};
-use forge_protocol::{ErrorObject, ResponseEnvelope, ResponseStatus};
+use forge_protocol::{ErrorObject, ResponseEnvelope, ResponseStatus, RetryMetadata};
+use forge_store::ForgeError;
 use serde_json::{json, Value};
 use std::env;
 use std::process::ExitCode;
@@ -317,7 +318,10 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
                     }
                 };
                 if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
-                    anyhow::bail!("dirty worktree has unsaved changes");
+                    return Err(ForgeError::DirtyWorktree {
+                        paths: current_content.changed_paths.clone(),
+                    }
+                    .into());
                 }
                 let content_ref = match forge_store::attempt_materialization_ref(&cwd, &attempt_id)?
                 {
@@ -374,7 +378,10 @@ fn restore_response(request_id: Option<String>, args: RestoreArgs) -> ResponseEn
         let current_content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
         let latest_content_ref = forge_store::latest_snapshot_content_ref(&cwd, None)?;
         if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
-            anyhow::bail!("dirty worktree has unsaved changes");
+            return Err(ForgeError::DirtyWorktree {
+                paths: current_content.changed_paths.clone(),
+            }
+            .into());
         }
         backend_for_content_ref(&content_ref)?.restore_snapshot(&cwd, &content_ref)?;
         let restored = forge_store::record_restore(&cwd, request_id, &args.snapshot_id)?;
@@ -465,7 +472,11 @@ fn decision_response(
             )?;
             let current_head = forge_content_git::current_head(&cwd)?;
             if current_head != proposal.base_head {
-                anyhow::bail!("stale base");
+                return Err(ForgeError::StaleBase {
+                    expected_head: proposal.base_head.clone(),
+                    actual_head: current_head,
+                }
+                .into());
             }
         }
         let record = forge_store::decide(
@@ -538,14 +549,17 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                 .as_deref()
                 {
                     Some("accepted") => {}
-                    Some("rejected") => anyhow::bail!("proposal was rejected"),
-                    _ => anyhow::bail!("proposal is not accepted"),
+                    Some("rejected") => return Err(ForgeError::Rejected.into()),
+                    _ => return Err(ForgeError::NotAccepted.into()),
                 }
                 let current_head = forge_content_git::current_head(&cwd)?;
                 if forge_store::publication_exists_for_branch(&cwd, &args.name)?
                     && forge_content_git::branch_exists(&cwd, &args.name)
                 {
-                    anyhow::bail!("branch already exists");
+                    return Err(ForgeError::BranchExists {
+                        name: args.name.clone(),
+                    }
+                    .into());
                 }
                 let commit_id = forge_export_git::export_branch(
                     &cwd,
@@ -594,20 +608,26 @@ fn replay_response(
         );
     }
     if existing.status == "failed" {
-        let message = existing
-            .error_json
-            .and_then(|value| {
-                value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
+        // The code is read directly from the stored `error_json` (recorded by
+        // `record_failed_operation`), never re-derived from the message — the
+        // substring ladder is gone. Older rows without a stored code fall back to
+        // COMMAND_FAILED.
+        let error_json = existing.error_json.unwrap_or_default();
+        let message = error_json
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
             .unwrap_or_else(|| "request id replayed failed operation".to_string());
+        let code = error_json
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("COMMAND_FAILED")
+            .to_string();
         return ResponseEnvelope::error(
             command,
             request_id,
             Some(existing.operation_id),
-            ErrorObject::new(error_code(command, &message), message),
+            ErrorObject::new(code, message),
         );
     }
     let request_id_value = request_id.as_deref().unwrap_or_default().to_string();
@@ -645,16 +665,13 @@ where
         match forge_store::acquire_repo_lock(&cwd) {
             Ok(guard) => guard,
             Err(error) => {
-                let code = if error.downcast_ref::<forge_store::LockTimeout>().is_some() {
-                    "LOCK_TIMEOUT"
-                } else {
-                    error_code(command, &error.to_string())
-                };
-                return ResponseEnvelope::error(
+                let (error_object, retry) = error_to_object(command, &error);
+                return ResponseEnvelope::error_with(
                     command,
                     request_id,
                     None,
-                    ErrorObject::new(code, error.to_string()),
+                    error_object,
+                    retry,
                 );
             }
         }
@@ -690,14 +707,20 @@ where
             if let Some(replay) = error.downcast_ref::<forge_store::RequestIdReplay>() {
                 return replay_response(command, request_id, replay.operation.clone());
             }
-            let message = error.to_string();
-            let failed_operation_id = if is_mutating_command(command) {
+            let (error_object, retry) = error_to_object(command, &error);
+            // Transient errors (the singleton CAS `CONFLICT`, `LOCK_TIMEOUT`) must
+            // NOT be persisted under the `--request-id` — a later retry of the same
+            // id should re-execute, not replay a sticky failure (R7). Deterministic
+            // domain failures keep the status-aware replay contract.
+            let failed_operation_id = if is_mutating_command(command) && !is_transient_error(&error)
+            {
                 env::current_dir().ok().and_then(|cwd| {
                     forge_store::record_failed_operation(
                         &cwd,
                         request_id.clone(),
                         command,
-                        &message,
+                        &error_object.code,
+                        &error_object.message,
                     )
                     .ok()
                     .map(|op| op.operation_id)
@@ -705,11 +728,12 @@ where
             } else {
                 None
             };
-            ResponseEnvelope::error(
+            ResponseEnvelope::error_with(
                 command,
                 request_id,
                 failed_operation_id,
-                ErrorObject::new(error_code(command, &message), message),
+                error_object,
+                retry,
             )
         }
     }
@@ -733,20 +757,10 @@ fn init_response(request_id: Option<String>, args: InitArgs) -> ResponseEnvelope
         Err(error) => {
             // init does not route through command_result, so map its errors here.
             // A contention timeout on the U5 init lock is the retryable LOCK_TIMEOUT;
-            // a genuine "not a git repo" still falls through error_code's init arm to
-            // NOT_A_GIT_REPOSITORY (no longer masking every init error as that code).
-            let code = if error.downcast_ref::<forge_store::LockTimeout>().is_some() {
-                "LOCK_TIMEOUT"
-            } else {
-                error_code("init", &error.to_string())
-            };
-            structured_error(
-                "init",
-                request_id,
-                code,
-                error.to_string(),
-                Value::Object(Default::default()),
-            )
+            // a genuine "not a git repo" still maps to NOT_A_GIT_REPOSITORY (init's
+            // un-masked classification, preserved through the typed mapping).
+            let (error_object, retry) = error_to_object("init", &error);
+            ResponseEnvelope::error_with("init", request_id, None, error_object, retry)
         }
     }
 }
@@ -807,42 +821,53 @@ fn print_human(response: &ResponseEnvelope) {
     }
 }
 
-fn error_code(command: &str, message: &str) -> &'static str {
-    if message.contains("request id already used") {
-        "REQUEST_ID_CONFLICT"
-    } else if message.contains("not initialized") {
-        "NOT_INITIALIZED"
-    } else if message.contains("no active attempt") {
-        "NO_ACTIVE_ATTEMPT"
-    } else if message.contains("AMBIGUOUS_ATTEMPT") {
-        "AMBIGUOUS_ATTEMPT"
-    } else if message.contains("UNKNOWN_ATTEMPT") {
-        "UNKNOWN_ATTEMPT"
-    } else if message.contains("AMBIGUOUS_PROPOSAL") {
-        "AMBIGUOUS_PROPOSAL"
-    } else if message.contains("UNKNOWN_PROPOSAL") {
-        "UNKNOWN_PROPOSAL"
-    } else if message.contains("UNKNOWN_INTENT") {
-        "UNKNOWN_INTENT"
-    } else if message.contains("no snapshot") {
-        "NO_SNAPSHOT"
-    } else if message.contains("no proposal") {
-        "NO_PROPOSAL"
-    } else if message.contains("not accepted") {
-        "NOT_ACCEPTED"
-    } else if message.contains("rejected") {
-        "REJECTED"
-    } else if message.contains("branch already exists") {
-        "BRANCH_EXISTS"
-    } else if message.contains("stale base") {
-        "STALE_BASE"
-    } else if message.contains("dirty worktree") {
-        "DIRTY_WORKTREE"
-    } else if command == "init" {
+/// Map a recovered error to its agent-visible `(ErrorObject, RetryMetadata)`.
+///
+/// No code is string-derived: a typed [`ForgeError`] supplies its own `code`,
+/// `details`, and retry classification; the standalone [`forge_store::LockTimeout`]
+/// sentinel maps to the retryable `LOCK_TIMEOUT`; everything else is an
+/// untyped failure — `COMMAND_FAILED`, or `NOT_A_GIT_REPOSITORY` for a genuine
+/// not-a-git-repo at `init` (the only place that classification is meaningful).
+fn error_to_object(command: &str, error: &anyhow::Error) -> (ErrorObject, RetryMetadata) {
+    let message = error.to_string();
+    if let Some(forge_error) = error.downcast_ref::<ForgeError>() {
+        let retry = if forge_error.retryable() {
+            RetryMetadata::retryable(forge_error.after_ms())
+        } else {
+            RetryMetadata::no()
+        };
+        return (
+            ErrorObject::new(forge_error.code(), message).with_details(forge_error.details()),
+            retry,
+        );
+    }
+    if let Some(lock_timeout) = error.downcast_ref::<forge_store::LockTimeout>() {
+        return (
+            ErrorObject::new("LOCK_TIMEOUT", message)
+                .with_details(json!({ "waited_ms": lock_timeout.waited_ms })),
+            RetryMetadata::retryable(Some(LOCK_TIMEOUT_RETRY_MS)),
+        );
+    }
+    let code = if command == "init" {
         "NOT_A_GIT_REPOSITORY"
     } else {
         "COMMAND_FAILED"
+    };
+    (ErrorObject::new(code, message), RetryMetadata::no())
+}
+
+/// Advisory backoff hint surfaced with a retryable `LOCK_TIMEOUT`.
+const LOCK_TIMEOUT_RETRY_MS: u64 = 50;
+
+/// Whether an error must NOT be persisted under its `--request-id`, so a retry
+/// re-executes instead of replaying a sticky failure (R7). True for the transient
+/// CAS (`CurrentStateChanged`) and a `LockTimeout`; false for deterministic
+/// domain failures, which keep the status-aware replay contract.
+fn is_transient_error(error: &anyhow::Error) -> bool {
+    if let Some(forge_error) = error.downcast_ref::<ForgeError>() {
+        return forge_error.retryable();
     }
+    error.downcast_ref::<forge_store::LockTimeout>().is_some()
 }
 
 fn decision_command(decision: &str) -> &'static str {

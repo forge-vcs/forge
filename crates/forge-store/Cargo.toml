@@ -6,6 +6,7 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+forge-content = { path = "../forge-content" }
 forge-content-native = { path = "../forge-content-native" }
 forge-core = { path = "../forge-core" }
 forge-policy = { path = "../forge-policy" }
@@ -14,5 +15,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+forge-core = { path = "../forge-core" }
 rusqlite.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true

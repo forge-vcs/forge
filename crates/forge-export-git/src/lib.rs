@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use forge_content::{classify_content_ref, ContentRefKind};
+use forge_store::ForgeError;
 use std::path::Path;
 use std::process::Command;
 
@@ -12,7 +13,11 @@ pub fn export_branch(
     message: &str,
 ) -> Result<String> {
     if current_target != base_commit {
-        return Err(anyhow!("stale base"));
+        return Err(ForgeError::StaleBase {
+            expected_head: base_commit.to_string(),
+            actual_head: current_target.to_string(),
+        }
+        .into());
     }
     let tree = git_tree_for_content_ref(repo_root, content_ref)?;
     if forge_content_git::branch_exists(repo_root, branch_name) {
@@ -30,7 +35,10 @@ pub fn export_branch(
         if existing_tree == tree && existing_parent == base_commit {
             return Ok(existing_commit);
         }
-        return Err(anyhow!("branch already exists"));
+        return Err(ForgeError::BranchExists {
+            name: branch_name.to_string(),
+        }
+        .into());
     }
     forge_content_git::create_branch_from_git_tree(
         repo_root,

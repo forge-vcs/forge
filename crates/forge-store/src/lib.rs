@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+mod error;
 mod repo_lock;
+pub use error::ForgeError;
 pub use repo_lock::{LockTimeout, RepoLock};
 
 const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
@@ -396,7 +398,11 @@ pub fn create_operation_view(
         )?;
 
         if parent_operation_id != expected_current_operation_id {
-            return Err(anyhow!("current operation changed"));
+            // The genuine optimistic singleton CAS: another writer advanced
+            // `current_state` between our read and write. This is the one
+            // transient/retryable domain error (R7) — surface it typed so the CLI
+            // classifies it `retryable` and does NOT persist it under a request-id.
+            return Err(ForgeError::CurrentStateChanged.into());
         }
 
         insert_operation_view(tx, &repo_id, Some(&parent_operation_id), input.clone())
@@ -407,7 +413,7 @@ pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     let root = git_root(cwd)?;
     let database_path = root.join(".forge/forge.db");
     if !database_path.exists() {
-        return Err(anyhow!("forge repository is not initialized"));
+        return Err(ForgeError::NotInitialized.into());
     }
     let mut connection = open_connection(&database_path)?;
     apply_migrations(&mut connection)?;
@@ -542,7 +548,10 @@ fn create_attempt(
                     |row| row.get(0),
                 )?;
                 if !exists {
-                    bail!("UNKNOWN_INTENT: unknown intent {id}");
+                    return Err(ForgeError::UnknownIntent {
+                        selector: id.to_string(),
+                    }
+                    .into());
                 }
                 id
             }
@@ -801,8 +810,8 @@ pub fn propose(
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
         // Determining read inside the IMMEDIATE txn: the proposal binds to the
         // latest snapshot observed on the same connection that writes it (U4).
-        let snapshot = latest_snapshot_on(tx, &attempt.attempt_id)?
-            .context("no snapshot saved for active attempt")?;
+        let snapshot =
+            latest_snapshot_on(tx, &attempt.attempt_id)?.ok_or(ForgeError::NoSnapshot)?;
         let proposal_id = new_id("proposal");
         let revision_id = new_id("revision");
         tx.execute(
@@ -1040,7 +1049,7 @@ pub fn record_publication(
     commit_id: String,
 ) -> Result<PublicationRecord> {
     let context = open_repository(cwd)?;
-    let proposal = proposal_by_id(&context, proposal_id)?.context("no proposal exists")?;
+    let proposal = proposal_by_id(&context, proposal_id)?.ok_or(ForgeError::NoProposal)?;
     let mut connection = open_connection(&context.database_path)?;
     // Note: the git branch side-effect happens in the CLI before this call, so
     // the replay guard provides DB-row idempotency only; making the export
@@ -1090,7 +1099,14 @@ pub fn show(cwd: &Path, attempt_id: Option<&str>) -> Result<ShowRecord> {
     let context = open_repository(cwd)?;
     let attempt = match resolve_attempt_in_context(&context, attempt_id) {
         Ok(resolved) => Some(resolved.attempt),
-        Err(error) if error.to_string().contains("no active attempt") => None,
+        Err(error)
+            if matches!(
+                error.downcast_ref::<ForgeError>(),
+                Some(ForgeError::NoActiveAttempt)
+            ) =>
+        {
+            None
+        }
         Err(error) => return Err(error),
     };
     Ok(ShowRecord {
@@ -1344,6 +1360,7 @@ pub fn record_failed_operation(
     cwd: &Path,
     request_id: Option<String>,
     command: &str,
+    code: &str,
     message: &str,
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
@@ -1368,7 +1385,7 @@ pub fn record_failed_operation(
                 command,
                 context.current_operation_id,
                 view_id,
-                json!({ "message": message }).to_string(),
+                json!({ "message": message, "code": code }).to_string(),
                 now
             ],
         )?;
@@ -1415,8 +1432,10 @@ fn resolve_attempt_in_context(
     attempt_id: Option<&str>,
 ) -> Result<ResolvedAttempt> {
     if let Some(attempt_id) = attempt_id {
-        let attempt = attempt_by_id(context, attempt_id)?
-            .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
+        let attempt =
+            attempt_by_id(context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+                selector: attempt_id.to_string(),
+            })?;
         return Ok(ResolvedAttempt { attempt });
     }
 
@@ -1430,18 +1449,17 @@ fn resolve_attempt_in_context(
 
     let attempts = active_attempts(context)?;
     match attempts.as_slice() {
-        [] => bail!("no active attempt"),
+        [] => Err(ForgeError::NoActiveAttempt.into()),
         [attempt] => Ok(ResolvedAttempt {
             attempt: attempt.clone(),
         }),
-        _ => bail!(
-            "AMBIGUOUS_ATTEMPT: {}",
-            attempts
+        _ => Err(ForgeError::AmbiguousAttempt {
+            candidate_ids: attempts
                 .iter()
-                .map(|attempt| attempt.attempt_id.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+                .map(|attempt| attempt.attempt_id.clone())
+                .collect(),
+        }
+        .into()),
     }
 }
 
@@ -1518,8 +1536,10 @@ pub fn list_attempts(cwd: &Path) -> Result<Vec<AttemptSummary>> {
 
 pub fn show_attempt(cwd: &Path, attempt_id: &str) -> Result<AttemptShowRecord> {
     let context = open_repository(cwd)?;
-    let attempt = attempt_by_id(&context, attempt_id)?
-        .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
+    let attempt =
+        attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+            selector: attempt_id.to_string(),
+        })?;
     Ok(AttemptShowRecord {
         attempt: AttemptSummary {
             attached: context.attached_attempt_id.as_deref() == Some(attempt.attempt_id.as_str()),
@@ -1541,8 +1561,10 @@ pub fn attach_attempt(
     attempt_id: &str,
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
-    let attempt = attempt_by_id(&context, attempt_id)?
-        .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
+    let attempt =
+        attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+            selector: attempt_id.to_string(),
+        })?;
     let mut connection = open_connection(&context.database_path)?;
     let op = with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
@@ -1572,8 +1594,10 @@ pub fn attach_attempt(
 
 pub fn attempt_materialization_ref(cwd: &Path, attempt_id: &str) -> Result<Option<String>> {
     let context = open_repository(cwd)?;
-    let attempt = attempt_by_id(&context, attempt_id)?
-        .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
+    let attempt =
+        attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+            selector: attempt_id.to_string(),
+        })?;
     Ok(latest_snapshot_for_attempt(&context, &attempt.attempt_id)?
         .map(|snapshot| snapshot.content_ref))
 }
@@ -1581,7 +1605,9 @@ pub fn attempt_materialization_ref(cwd: &Path, attempt_id: &str) -> Result<Optio
 pub fn attempt_base_head(cwd: &Path, attempt_id: &str) -> Result<String> {
     let context = open_repository(cwd)?;
     Ok(attempt_by_id(&context, attempt_id)?
-        .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?
+        .ok_or_else(|| ForgeError::UnknownAttempt {
+            selector: attempt_id.to_string(),
+        })?
         .base_head)
 }
 
@@ -1661,30 +1687,32 @@ fn resolve_proposal(
     allow_single_default: bool,
 ) -> Result<ResolvedProposal> {
     if let Some(proposal_id) = proposal_id {
-        let proposal = proposal_by_id(context, proposal_id)?
-            .ok_or_else(|| anyhow!("UNKNOWN_PROPOSAL: unknown proposal {proposal_id}"))?;
+        let proposal =
+            proposal_by_id(context, proposal_id)?.ok_or_else(|| ForgeError::UnknownProposal {
+                selector: proposal_id.to_string(),
+            })?;
         if proposal.attempt_id != attempt_id {
-            bail!(
-                "UNKNOWN_PROPOSAL: proposal {proposal_id} does not belong to attempt {attempt_id}"
-            );
+            return Err(ForgeError::UnknownProposal {
+                selector: proposal_id.to_string(),
+            }
+            .into());
         }
         return Ok(ResolvedProposal { proposal });
     }
 
     let proposals = proposals_for_attempt(context, attempt_id)?;
     match proposals.as_slice() {
-        [] => bail!("no proposal exists"),
+        [] => Err(ForgeError::NoProposal.into()),
         [proposal] if allow_single_default => Ok(ResolvedProposal {
             proposal: proposal.clone(),
         }),
-        _ => bail!(
-            "AMBIGUOUS_PROPOSAL: {}",
-            proposals
+        _ => Err(ForgeError::AmbiguousProposal {
+            candidate_ids: proposals
                 .iter()
-                .map(|proposal| proposal.proposal_id.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+                .map(|proposal| proposal.proposal_id.clone())
+                .collect(),
+        }
+        .into()),
     }
 }
 

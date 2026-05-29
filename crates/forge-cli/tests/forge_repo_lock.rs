@@ -46,6 +46,16 @@ fn mutating_command_times_out_with_lock_timeout_when_lock_held() {
             .failure(),
     );
     assert_eq!(out["errors"][0]["code"], "LOCK_TIMEOUT");
+    // LOCK_TIMEOUT is transient: the top-level envelope `retry.retryable` is true
+    // (NER-133 R6 / deferred finding #2), and the waited_ms surfaces in the error
+    // object's details so a client knows how long it waited. `retry` is on the
+    // envelope; `details` is on the error object — assert both placements.
+    assert_eq!(out["retry"]["retryable"], true);
+    assert!(out["retry"]["after_ms"].is_number());
+    assert!(
+        out["errors"][0]["details"]["waited_ms"].is_number(),
+        "waited_ms must surface in the error details: {out}"
+    );
 
     // After release, the same command acquires the lock and succeeds.
     held.unlock().expect("release the repo lock");

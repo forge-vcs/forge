@@ -359,6 +359,7 @@ dependencies = [
  "forge-content",
  "forge-content-git",
  "forge-content-native",
+ "forge-store",
  "tempfile",
 ]
 
@@ -382,6 +383,7 @@ name = "forge-store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "forge-content",
  "forge-content-native",
  "forge-core",
  "forge-policy",

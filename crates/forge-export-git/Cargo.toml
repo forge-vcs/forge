@@ -9,4 +9,5 @@ anyhow.workspace = true
 forge-content = { path = "../forge-content" }
 forge-content-git = { path = "../forge-content-git" }
 forge-content-native = { path = "../forge-content-native" }
+forge-store = { path = "../forge-store" }
 tempfile.workspace = true

@@ -23,6 +23,15 @@ impl RetryMetadata {
             after_ms: None,
         }
     }
+
+    /// A retryable result with an advisory backoff hint (HTTP `Retry-After`-style).
+    /// Bounding the number of retries is the client's responsibility.
+    pub fn retryable(after_ms: Option<u64>) -> Self {
+        Self {
+            retryable: true,
+            after_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,6 +95,25 @@ impl ResponseEnvelope {
         operation_id: Option<String>,
         error: ErrorObject,
     ) -> Self {
+        Self::error_with(
+            command,
+            request_id,
+            operation_id,
+            error,
+            RetryMetadata::no(),
+        )
+    }
+
+    /// Build an error envelope with an explicit [`RetryMetadata`] (e.g. a
+    /// retryable `LOCK_TIMEOUT` / `CONFLICT`). `retry` is a top-level envelope
+    /// field, not part of the [`ErrorObject`].
+    pub fn error_with(
+        command: impl Into<String>,
+        request_id: Option<String>,
+        operation_id: Option<String>,
+        error: ErrorObject,
+        retry: RetryMetadata,
+    ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION.to_string(),
             command: command.into(),
@@ -95,7 +123,7 @@ impl ResponseEnvelope {
             data: Value::Object(Default::default()),
             warnings: Vec::new(),
             errors: vec![error],
-            retry: RetryMetadata::no(),
+            retry,
         }
     }
 }
