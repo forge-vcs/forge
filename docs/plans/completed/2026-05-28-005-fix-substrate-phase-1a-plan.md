@@ -1,7 +1,7 @@
 ---
 title: "fix: Phase 1a substrate — durability, WAL concurrency, collision-safe IDs, idempotent replay"
 type: fix
-status: active
+status: completed
 date: 2026-05-28
 origin: docs/ROADMAP.md  # Phase 1a; tracked as Linear NER-131
 deepened: 2026-05-28
