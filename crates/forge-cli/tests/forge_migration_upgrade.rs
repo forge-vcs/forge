@@ -32,7 +32,7 @@ fn open(db: &Path) -> Connection {
 fn stamp_future_version(db: &Path) {
     let conn = open(db);
     conn.execute(
-        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (3, 'future', 0)",
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (4, 'future', 0)",
         [],
     )
     .expect("stamp future version");

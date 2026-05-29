@@ -262,6 +262,12 @@ fn ambiguous_proposal_requires_explicit_selector() {
     repo.forge().args(["--json", "propose"]).assert().success();
     std::fs::write(repo.path().join("README.md"), "proposal two\n").expect("write two");
     repo.forge().args(["--json", "save"]).assert().success();
+    // A passing command on proposal two's snapshot so the evidence gate lets the
+    // explicit `accept --proposal <two>` proceed (NER-135).
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
     let second = json_output(repo.forge().args(["--json", "propose"]).assert().success());
 
     let ambiguous = json_output(repo.forge().args(["--json", "accept"]).assert().failure());

@@ -83,6 +83,14 @@ pub enum ForgeError {
         requested_attempt: String,
         attached_attempt: String,
     },
+    /// `accept` is gated on a passing check by default (NER-135 R6) but the
+    /// proposal's check did not pass. `status` is the overall check status
+    /// (`failed`/`missing`/`stale`); `unmet` lists the `"program arg…"` identities
+    /// of the non-passed gates. Deterministic — run the required gates on the
+    /// proposed snapshot (or `accept --allow-unverified` to bypass with a warning).
+    /// `unmet` entries are redacted for secret-like `key=value` argv in
+    /// [`ForgeError::details`]; [`std::fmt::Display`] never prints them.
+    CheckNotPassed { status: String, unmet: Vec<String> },
 }
 
 impl ForgeError {
@@ -109,6 +117,7 @@ impl ForgeError {
             ForgeError::UnknownSchemaVersion { .. } => "SCHEMA_VERSION_UNSUPPORTED",
             ForgeError::MigrationFailed { .. } => "MIGRATION_FAILED",
             ForgeError::AttemptWorktreeMismatch { .. } => "ATTEMPT_WORKTREE_MISMATCH",
+            ForgeError::CheckNotPassed { .. } => "CHECK_NOT_PASSED",
         }
     }
 
@@ -162,6 +171,18 @@ impl ForgeError {
                 "requested_attempt": requested_attempt,
                 "attached_attempt": attached_attempt,
             }),
+            ForgeError::CheckNotPassed { status, unmet } => {
+                // Gate identities are argv strings persisted (intents.check_spec_json)
+                // and surfaced WITHOUT execution, so — unlike captured evidence, which
+                // requires running the command and already redacts its output — they
+                // get a redaction pass here for secret-like `key=value` argv (NER-135).
+                // Full arg-level scanning is Phase 5 (see schema notes.secret_protection).
+                let redacted: Vec<String> = unmet
+                    .iter()
+                    .map(|identity| forge_content::redact_secret_like_text(identity).0)
+                    .collect();
+                json!({ "status": status, "unmet": redacted })
+            }
             _ => Value::Object(Default::default()),
         }
     }
@@ -248,6 +269,11 @@ impl std::fmt::Display for ForgeError {
             } => write!(
                 f,
                 "worktree is materialized for attempt {attached_attempt}, not the requested {requested_attempt}; run `forge attempt attach {requested_attempt}` first"
+            ),
+            ForgeError::CheckNotPassed { status, unmet } => write!(
+                f,
+                "check did not pass (status: {status}); {} required gate(s) unmet",
+                unmet.len()
             ),
         }
     }
@@ -391,6 +417,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             after_ms: None,
             details_keys: &["requested_attempt", "attached_attempt"],
         },
+        ErrorCodeSpec {
+            code: "CHECK_NOT_PASSED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["status", "unmet"],
+        },
     ]
 }
 
@@ -492,6 +524,14 @@ mod tests {
             .code(),
             "ATTEMPT_WORKTREE_MISMATCH"
         );
+        assert_eq!(
+            ForgeError::CheckNotPassed {
+                status: "failed".into(),
+                unmet: vec!["cargo test".into()]
+            }
+            .code(),
+            "CHECK_NOT_PASSED"
+        );
     }
 
     #[test]
@@ -550,6 +590,30 @@ mod tests {
             2,
             "details must carry exactly the two id keys"
         );
+    }
+
+    /// NER-135: the `CHECK_NOT_PASSED` details carry exactly `status` + `unmet`, and
+    /// each `unmet` gate identity is run through the shared `key=value` secret
+    /// redactor so a secret accidentally embedded in a `--require` gate spec (which is
+    /// persisted and surfaced WITHOUT execution) does not leak through error details.
+    #[test]
+    fn details_redact_secret_like_unmet() {
+        let details = ForgeError::CheckNotPassed {
+            status: "failed".into(),
+            unmet: vec!["cargo test".into(), "deploy --token=ghp_supersecret".into()],
+        }
+        .details();
+        assert_eq!(details["status"], "failed");
+        let unmet = details["unmet"].as_array().expect("unmet array");
+        let serialized = Value::Array(unmet.clone()).to_string();
+        assert!(serialized.contains("cargo test"), "plain gate kept");
+        assert!(
+            !serialized.contains("ghp_supersecret"),
+            "secret-like argv value must be redacted in unmet"
+        );
+        assert!(serialized.contains("[REDACTED]"));
+        let object = details.as_object().expect("details object");
+        assert_eq!(object.len(), 2, "details carry exactly status + unmet");
     }
 
     #[test]
@@ -638,6 +702,10 @@ mod tests {
                 requested_attempt: "attempt_x".into(),
                 attached_attempt: "attempt_w".into(),
             },
+            ForgeError::CheckNotPassed {
+                status: "failed".into(),
+                unmet: vec!["cargo test".into()],
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -662,7 +730,8 @@ mod tests {
                 | ForgeError::CurrentStateChanged
                 | ForgeError::UnknownSchemaVersion { .. }
                 | ForgeError::MigrationFailed { .. }
-                | ForgeError::AttemptWorktreeMismatch { .. } => {}
+                | ForgeError::AttemptWorktreeMismatch { .. }
+                | ForgeError::CheckNotPassed { .. } => {}
             }
         }
 

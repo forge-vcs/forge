@@ -38,6 +38,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "002_columns",
         include_str!("../migrations/002_columns.sql"),
     ),
+    (
+        3,
+        "003_check_spec",
+        include_str!("../migrations/003_check_spec.sql"),
+    ),
 ];
 
 /// The highest migration version this binary knows how to apply.
@@ -377,7 +382,7 @@ mod tests {
 
     #[test]
     fn schema_head_is_max_version() {
-        assert_eq!(schema_head(), 2);
+        assert_eq!(schema_head(), 3);
     }
 
     #[test]
@@ -388,18 +393,20 @@ mod tests {
         assert_eq!(checksum, checksum_of("ALTER TABLE x ADD COLUMN y TEXT;"));
     }
 
-    /// Fresh apply reaches HEAD=2 with non-NULL checksums for both rows.
+    /// Fresh apply reaches HEAD=3 with non-NULL checksums for every row.
     #[test]
     fn fresh_apply_reaches_head_with_checksums() {
         let mut conn = mem_conn();
         apply_pending_migrations(&mut conn).expect("apply migrations");
 
         let versions = applied_versions(&conn);
-        assert_eq!(versions.len(), 2);
+        assert_eq!(versions.len(), 3);
         assert_eq!(versions[0].0, 1);
         assert_eq!(versions[1].0, 2);
+        assert_eq!(versions[2].0, 3);
         assert!(versions[0].1.is_some(), "001 checksum must be non-NULL");
         assert!(versions[1].1.is_some(), "002 checksum must be non-NULL");
+        assert!(versions[2].1.is_some(), "003 checksum must be non-NULL");
     }
 
     /// Build genesis case B — a GENUINE old v1 DB — by running the reverted-001
@@ -600,7 +607,7 @@ mod tests {
 
         apply_pending_migrations(&mut conn).expect("cd1bb3b v1 must converge, not brick");
 
-        // Both columns now present; version advanced to HEAD (2).
+        // Both columns now present; version advanced to HEAD (3).
         assert!(
             column_set(&conn, "repositories")
                 .iter()
@@ -614,8 +621,8 @@ mod tests {
             "attached_attempt_id added by the reconciling 002"
         );
         let versions = applied_versions(&conn);
-        assert_eq!(versions.last().expect("at least one version").0, 2);
-        assert_eq!(current_schema_version(&conn).expect("version probe"), 2);
+        assert_eq!(versions.last().expect("at least one version").0, 3);
+        assert_eq!(current_schema_version(&conn).expect("version probe"), 3);
     }
 
     /// FIX A: a genuinely-failing migration statement (a malformed `ALTER`, not a
