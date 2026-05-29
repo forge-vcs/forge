@@ -6,6 +6,23 @@ pub const SECRET_RISK_SENSITIVITY: &str = "secret_risk";
 pub const GIT_TREE_PREFIX: &str = "git-tree:";
 pub const FORGE_TREE_PREFIX: &str = "forge-tree:";
 
+/// Filename prefix for the per-file temp written during a crash-atomic restore
+/// (NER-132 U4). These temps live transiently in worktree directories (for a
+/// same-filesystem rename); the native backend materializes through them and
+/// `forge_store::doctor` scans for orphans by this prefix. Defined here, in the
+/// shared base crate, so both content backends exclude it identically.
+pub const RESTORE_TEMP_PREFIX: &str = ".forge-restore-";
+
+/// True if `path`'s final component is a crash-atomic-restore temp
+/// (`.forge-restore-*`). Such a temp orphaned by a restore killed mid-flight must
+/// never be captured into a snapshot or export, so both backends exclude it via
+/// `is_ignored_by_policy`.
+pub fn is_restore_temp_path(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|name| name.starts_with(RESTORE_TEMP_PREFIX))
+}
+
 /// Test-only crash injection (NER-132 U6). In **debug builds only**, if the
 /// `FORGE_CRASH_POINT` environment variable names `point`, hard-abort the process
 /// (`std::process::abort`) to simulate a kill at a durability boundary — skipping

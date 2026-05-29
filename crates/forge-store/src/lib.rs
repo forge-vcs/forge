@@ -1240,8 +1240,11 @@ fn scan_restore_temps(root: &Path) -> Result<Vec<String>> {
             let name = name.to_string_lossy();
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
-                // Never descend into git's or forge's own state.
-                if dir == root && (name == ".git" || name == ".forge") {
+                // Never descend into git's or forge's own state — at ANY depth, so a
+                // submodule's nested .git (a large, unbounded object tree) is skipped
+                // too. Restore temps only land in worktree dirs forge materializes
+                // into, never inside a git/forge store, so this loses no real signal.
+                if name == ".git" || name == ".forge" {
                     continue;
                 }
                 stack.push(entry.path());

@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
-use forge_content::{is_secret_risk_path, ContentBackend, SnapshotContent, FORGE_TREE_PREFIX};
+use forge_content::{
+    is_restore_temp_path, is_secret_risk_path, ContentBackend, SnapshotContent, FORGE_TREE_PREFIX,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,12 +15,11 @@ use std::process::Command;
 
 const SCHEMA_VERSION: u32 = 1;
 
-/// Filename prefix for the per-file temp written during a crash-atomic restore
-/// (NER-132 U4). A crash mid-restore leaves such a temp in a worktree directory;
-/// `forge_store::doctor` scans the worktree for this prefix to report a
-/// half-applied worktree, since `tempfile`'s Drop-based cleanup does not run on a
-/// hard kill. Public so the store's doctor uses the exact same marker.
-pub const RESTORE_TEMP_PREFIX: &str = ".forge-restore-";
+/// Re-exported from `forge_content` so `forge_store::doctor` keeps referencing
+/// `forge_content_native::RESTORE_TEMP_PREFIX`, while the canonical definition and
+/// its matching `is_restore_temp_path` exclusion predicate live in the shared base
+/// crate both backends depend on (NER-132 U4).
+pub use forge_content::RESTORE_TEMP_PREFIX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -423,6 +424,10 @@ fn materialize_tree(
                 let parent = full
                     .parent()
                     .ok_or_else(|| anyhow!("restore target {} has no parent", full.display()))?;
+                // Record which ancestor directories are newly created so their own
+                // entries can be made durable below (mirrors write_object) — a freshly
+                // created dir's entry is not durable until the dir it lives in is fsynced.
+                let newly_created = missing_dirs(parent);
                 fs::create_dir_all(parent)?;
                 // Crash-atomic restore (NER-132 U4): write to a temp file in the
                 // destination's own parent directory — guaranteeing a
@@ -445,6 +450,16 @@ fn materialize_tree(
                 // restore to bound the fsync cost on large worktrees.
                 if synced_dirs.insert(parent.to_path_buf()) {
                     sync_dir(parent)?;
+                }
+                // Make each newly created ancestor directory durable by fsyncing the
+                // directory that gained the new entry (mirrors write_object), deduped
+                // across the whole restore so each dir is fsynced at most once.
+                for dir in &newly_created {
+                    if let Some(grandparent) = dir.parent() {
+                        if synced_dirs.insert(grandparent.to_path_buf()) {
+                            sync_dir(grandparent)?;
+                        }
+                    }
                 }
                 target_paths.insert(rel);
                 // Crash boundary (NER-132 U6, debug-only): this file is fully
@@ -541,6 +556,7 @@ fn is_ignored_by_policy(path: &str) -> bool {
         || path.starts_with(".git/")
         || path == ".forge"
         || path.starts_with(".forge/")
+        || is_restore_temp_path(path)
         || is_secret_risk_path(path)
 }
 
@@ -672,6 +688,11 @@ mod tests {
         // prefix; pin it so a future refactor of the exclusion rule cannot drop it.
         assert!(is_ignored_by_policy(".forge/forge.lock"));
         assert!(is_ignored_by_policy(".forge"));
+        // Restore temps live in worktree dirs (NER-132 U4), not under .forge, so they
+        // need their own exclusion — an orphan from a crash-interrupted restore must
+        // never land in a snapshot/export.
+        assert!(is_ignored_by_policy(".forge-restore-abc123"));
+        assert!(is_ignored_by_policy("src/nested/.forge-restore-xyz"));
         // A normal worktree file is still snapshot-eligible.
         assert!(!is_ignored_by_policy("README.md"));
     }
