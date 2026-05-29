@@ -144,16 +144,18 @@ fn init_is_idempotent() {
 }
 
 #[test]
-fn existing_repository_without_content_backend_column_migrates_on_normal_command() {
+fn at_head_database_reports_healthy_schema_on_normal_command() {
+    // This test previously DROPped `content_backend` while leaving version=2 and
+    // asserted the next command auto-repaired the column. The NER-133 U3
+    // version-gated migration runner deliberately does NOT auto-repair structural
+    // drift on an at-HEAD DB (it skips when MAX(version) == HEAD); genuine v1->v2
+    // upgrade is covered by `forge-store`'s `migrations::tests` (genesis case B),
+    // where the FK on `attached_attempt_id` can be handled without the artificial
+    // one-column state that DROP-on-a-v2-DB would create. Here we assert the new
+    // behavior: a normal command on an unmodified at-HEAD DB reports a healthy
+    // schema at the current head.
     let repo = TestRepo::new_git();
     repo.forge().args(["--json", "init"]).assert().success();
-    {
-        let connection =
-            Connection::open(repo.path().join(".forge/forge.db")).expect("open forge db");
-        connection
-            .execute("ALTER TABLE repositories DROP COLUMN content_backend", [])
-            .expect("simulate older schema");
-    }
 
     let output = repo
         .forge()
@@ -165,14 +167,7 @@ fn existing_repository_without_content_backend_column_migrates_on_normal_command
         .clone();
     let json: Value = serde_json::from_slice(&output).expect("valid json");
     assert_eq!(json["data"]["ok"], true);
-
-    let connection = Connection::open(repo.path().join(".forge/forge.db")).expect("open forge db");
-    let backend: String = connection
-        .query_row("SELECT content_backend FROM repositories", [], |row| {
-            row.get(0)
-        })
-        .expect("content backend default");
-    assert_eq!(backend, "git");
+    assert_eq!(json["data"]["schema_version"], 2);
 }
 
 #[test]

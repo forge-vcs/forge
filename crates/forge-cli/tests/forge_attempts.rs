@@ -30,15 +30,15 @@ fn git(cwd: &std::path::Path, args: &[&str]) -> String {
 }
 
 #[test]
-fn start_attaches_created_attempt_and_migrates_existing_database() {
+fn start_attaches_created_attempt() {
+    // The "migrate an existing DB" half of this test used to DELETE the version-2
+    // row while leaving its inline column in place — an artificial one-column state
+    // that the version-gated migration runner (NER-133 U3) would try to re-ALTER
+    // and fail with "duplicate column name". Genuine v1->v2 upgrade convergence is
+    // now covered by `forge-store`'s `migrations::tests` (genesis case B), so this
+    // test focuses on the CLI attach behavior against a normal at-HEAD DB.
     let repo = TestRepo::new_git();
     repo.forge().args(["--json", "init"]).assert().success();
-    {
-        let connection = Connection::open(repo.path().join(".forge/forge.db")).expect("open db");
-        connection
-            .execute("DELETE FROM schema_migrations WHERE version = 2", [])
-            .expect("remove migration marker");
-    }
 
     let started = json_output(
         repo.forge()

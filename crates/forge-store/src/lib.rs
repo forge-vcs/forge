@@ -11,11 +11,10 @@ use std::process::Command;
 use std::time::Duration;
 
 mod error;
+mod migrations;
 mod repo_lock;
 pub use error::ForgeError;
 pub use repo_lock::{LockTimeout, RepoLock};
-
-const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InitRepository {
@@ -310,7 +309,7 @@ pub fn init_repository(
     let already_had_db = database_path.exists();
     let mut connection = open_connection(&database_path)
         .with_context(|| format!("failed to open {}", database_path.display()))?;
-    apply_migrations(&mut connection)?;
+    migrations::apply_pending_migrations(&mut connection)?;
 
     if let Some(existing) = read_init_repository(&connection, &root, &forge_dir, &database_path)? {
         return Ok(InitRepository {
@@ -416,7 +415,7 @@ pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
         return Err(ForgeError::NotInitialized.into());
     }
     let mut connection = open_connection(&database_path)?;
-    apply_migrations(&mut connection)?;
+    migrations::apply_pending_migrations(&mut connection)?;
     let (repo_id, content_backend, current_operation_id, current_view_id, attached_attempt_id): (
         String,
         String,
@@ -1156,7 +1155,7 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         })
         .optional()?
         .flatten();
-    if schema_version != Some(2) {
+    if schema_version != Some(migrations::schema_head()) {
         issues.push("schema mismatch".to_string());
     }
     let state_count: i64 = connection.query_row(
@@ -1972,87 +1971,6 @@ fn insert_operation_view(
     })
 }
 
-fn apply_migrations(connection: &mut Connection) -> Result<()> {
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            applied_at_ms INTEGER NOT NULL
-        );",
-    )?;
-
-    let applied = connection
-        .query_row(
-            "SELECT version FROM schema_migrations WHERE version = 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-
-    if applied.is_none() {
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(MIGRATION_001)?;
-        // INSERT OR IGNORE: idempotency shim (NER-132 U5) so a concurrent first-init
-        // — or a first-open racing under the .forge write lock — cannot collide on
-        // the version PRIMARY KEY. NER-133's numbered-migration runner replaces
-        // apply_migrations and must carry this idempotency invariant forward.
-        tx.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (1, '001_init', ?1)",
-            params![now_ms()],
-        )?;
-        tx.commit()?;
-    }
-    ensure_repository_content_backend_column(connection)?;
-    ensure_attached_attempt_column(connection)?;
-
-    let applied_002 = connection
-        .query_row(
-            "SELECT version FROM schema_migrations WHERE version = 2",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-    if applied_002.is_none() {
-        connection.execute(
-            // INSERT OR IGNORE: see the version-1 note (NER-132 U5); NER-133 owns the runner.
-            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (2, '002_attached_attempt', ?1)",
-            params![now_ms()],
-        )?;
-    }
-
-    Ok(())
-}
-
-fn ensure_repository_content_backend_column(connection: &Connection) -> Result<()> {
-    let mut statement = connection.prepare("PRAGMA table_info(repositories)")?;
-    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for column in columns {
-        if column? == "content_backend" {
-            return Ok(());
-        }
-    }
-    connection.execute(
-        "ALTER TABLE repositories ADD COLUMN content_backend TEXT NOT NULL DEFAULT 'git'",
-        [],
-    )?;
-    Ok(())
-}
-
-fn ensure_attached_attempt_column(connection: &Connection) -> Result<()> {
-    let mut statement = connection.prepare("PRAGMA table_info(current_state)")?;
-    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for column in columns {
-        if column? == "attached_attempt_id" {
-            return Ok(());
-        }
-    }
-    connection.execute(
-        "ALTER TABLE current_state ADD COLUMN attached_attempt_id TEXT REFERENCES attempts(id)",
-        [],
-    )?;
-    Ok(())
-}
-
 /// How long a connection waits on a held write lock before SQLite returns
 /// `SQLITE_BUSY`. Generous because contention here is brief (small txns) and the
 /// bounded retry in `with_immediate_retry` is only a defensive backstop.
@@ -2093,7 +2011,7 @@ const WRITE_TXN_MAX_ATTEMPTS: u32 = 6;
 /// `body` is `FnMut` because it may run once per retry attempt, so it must not
 /// move captured values out — writer closures therefore `.clone()` any owned
 /// input they consume (e.g. `request_id`, `OperationViewInput`) on each call.
-fn with_immediate_retry<T, F>(connection: &mut Connection, mut body: F) -> Result<T>
+pub(crate) fn with_immediate_retry<T, F>(connection: &mut Connection, mut body: F) -> Result<T>
 where
     F: FnMut(&Transaction<'_>) -> Result<T>,
 {
