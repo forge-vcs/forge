@@ -1154,6 +1154,49 @@ pub fn record_publication(
     })
 }
 
+/// Persist a single `conflict_sets` row recording a stale-base divergence, then
+/// return the new conflict-set id (NER-133 U7). This is a pure metadata insert —
+/// no merge/diff engine — written before the CLI raises [`ForgeError::StaleBase`]
+/// so the divergence survives the bail.
+///
+/// `context` is `"stale_base_accept"` or `"stale_base_export"`. `paths_json`
+/// carries `{expected_head, actual_head, paths, redacted_count}`; any secret-risk
+/// path in `paths` is dropped via [`forge_content::filter_secret_risk`] before
+/// serialization, so a secret-risk filename never reaches the stored JSON — only
+/// its count appears.
+///
+/// The caller already holds the per-command advisory lock (`accept`/`export
+/// branch` are mutating), so this does NOT acquire the lock; it is just a single
+/// `IMMEDIATE` DB transaction with no lock nesting.
+pub fn record_conflict_set(
+    cwd: &Path,
+    context: &str,
+    expected_head: &str,
+    actual_head: &str,
+    paths: &[String],
+) -> Result<String> {
+    let repo = open_repository(cwd)?;
+    let (kept, dropped) = forge_content::filter_secret_risk(paths);
+    let paths_json = json!({
+        "expected_head": expected_head,
+        "actual_head": actual_head,
+        "paths": kept,
+        "redacted_count": dropped.len(),
+    })
+    .to_string();
+    let conflict_set_id = new_id("conflict");
+    let mut connection = open_connection(&repo.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        tx.execute(
+            "INSERT INTO conflict_sets (id, repo_id, context, paths_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![conflict_set_id, repo.repo_id, context, paths_json, now_ms()],
+        )?;
+        Ok(())
+    })?;
+    Ok(conflict_set_id)
+}
+
 pub fn show(cwd: &Path, attempt_id: Option<&str>) -> Result<ShowRecord> {
     let context = open_repository(cwd)?;
     let attempt = match resolve_attempt_in_context(&context, attempt_id) {
@@ -2360,5 +2403,65 @@ mod tests {
             }
             .into()
         ));
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn record_conflict_set_redacts_secret_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "forge@example.test"]);
+        run_git(root, &["config", "user.name", "Forge Test"]);
+        fs::write(root.join("README.md"), "hello\n").expect("write readme");
+        run_git(root, &["add", "README.md"]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        init_repository(root, None, "git".to_string()).expect("init repository");
+
+        let paths = vec![
+            "src/main.rs".to_string(),
+            ".env".to_string(),
+            "k.pem".to_string(),
+        ];
+        let id = record_conflict_set(root, "stale_base_accept", "HEAD0", "HEAD1", &paths)
+            .expect("record conflict set");
+        assert!(id.starts_with("conflict_"), "unexpected id: {id}");
+
+        let database_path = root.join(".forge/forge.db");
+        let connection = Connection::open(&database_path).expect("open db");
+        let (context, paths_json): (String, String) = connection
+            .query_row(
+                "SELECT context, paths_json FROM conflict_sets WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query conflict row");
+
+        assert_eq!(context, "stale_base_accept");
+        let value: Value = serde_json::from_str(&paths_json).expect("parse paths_json");
+        assert_eq!(value["expected_head"], "HEAD0");
+        assert_eq!(value["actual_head"], "HEAD1");
+        assert_eq!(value["redacted_count"], 2);
+        assert!(
+            paths_json.contains("src/main.rs"),
+            "non-secret path must be kept: {paths_json}"
+        );
+        assert!(
+            !paths_json.contains(".env"),
+            "secret-risk path leaked: {paths_json}"
+        );
+        assert!(
+            !paths_json.contains("k.pem"),
+            "secret-risk path leaked: {paths_json}"
+        );
     }
 }

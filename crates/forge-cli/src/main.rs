@@ -487,6 +487,16 @@ fn decision_response(
             )?;
             let current_head = forge_content_git::current_head(&cwd)?;
             if current_head != proposal.base_head {
+                // Persist the stale-base divergence under the held lock BEFORE
+                // bailing, so the otherwise-unused `conflict_sets` table records it
+                // (NER-133 U7). Metadata only — no merge engine.
+                forge_store::record_conflict_set(
+                    &cwd,
+                    "stale_base_accept",
+                    &proposal.base_head,
+                    &current_head,
+                    &proposal.changed_paths,
+                )?;
                 return Err(ForgeError::StaleBase {
                     expected_head: proposal.base_head.clone(),
                     actual_head: current_head,
@@ -574,6 +584,24 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                     _ => return Err(ForgeError::NotAccepted.into()),
                 }
                 let current_head = forge_content_git::current_head(&cwd)?;
+                // CLI-layer stale-base pre-check mirroring `accept`: persist the
+                // divergence to `conflict_sets` under the held lock BEFORE bailing
+                // (NER-133 U7). `export_branch` keeps its own internal stale-base
+                // check as defense-in-depth; it just won't be reached on this path.
+                if current_head != proposal.base_head {
+                    forge_store::record_conflict_set(
+                        &cwd,
+                        "stale_base_export",
+                        &proposal.base_head,
+                        &current_head,
+                        &proposal.changed_paths,
+                    )?;
+                    return Err(ForgeError::StaleBase {
+                        expected_head: proposal.base_head.clone(),
+                        actual_head: current_head,
+                    }
+                    .into());
+                }
                 if forge_store::publication_exists_for_branch(&cwd, &args.name)?
                     && forge_content_git::branch_exists(&cwd, &args.name)
                 {
