@@ -720,13 +720,24 @@ fn init_response(request_id: Option<String>, args: InitArgs) -> ResponseEnvelope
             Some(repository.current_operation_id.clone()),
             serde_json::to_value(repository).unwrap(),
         ),
-        Err(error) => structured_error(
-            "init",
-            request_id,
-            "NOT_A_GIT_REPOSITORY",
-            error.to_string(),
-            Value::Object(Default::default()),
-        ),
+        Err(error) => {
+            // init does not route through command_result, so map its errors here.
+            // A contention timeout on the U5 init lock is the retryable LOCK_TIMEOUT;
+            // a genuine "not a git repo" still falls through error_code's init arm to
+            // NOT_A_GIT_REPOSITORY (no longer masking every init error as that code).
+            let code = if error.downcast_ref::<forge_store::LockTimeout>().is_some() {
+                "LOCK_TIMEOUT"
+            } else {
+                error_code("init", &error.to_string())
+            };
+            structured_error(
+                "init",
+                request_id,
+                code,
+                error.to_string(),
+                Value::Object(Default::default()),
+            )
+        }
     }
 }
 

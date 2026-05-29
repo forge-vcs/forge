@@ -296,6 +296,14 @@ pub fn init_repository(
     fs::create_dir_all(&forge_dir)
         .with_context(|| format!("failed to create {}", forge_dir.display()))?;
 
+    // Serialize concurrent first-inits of the same repo (NER-132 U5): hold the repo
+    // write lock across migration + the repository INSERT, so a racing init observes
+    // the winner's committed row via read_init_repository below and returns
+    // already_initialized rather than colliding on the repositories.root_path UNIQUE
+    // constraint. The lock file lives in the .forge dir just created. init does not
+    // route through the CLI command_result lock, so it acquires here, never nested.
+    let _init_lock = repo_lock::acquire(&forge_dir)?;
+
     let database_path = forge_dir.join("forge.db");
     let already_had_db = database_path.exists();
     let mut connection = open_connection(&database_path)
@@ -1953,8 +1961,12 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
     if applied.is_none() {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(MIGRATION_001)?;
+        // INSERT OR IGNORE: idempotency shim (NER-132 U5) so a concurrent first-init
+        // — or a first-open racing under the .forge write lock — cannot collide on
+        // the version PRIMARY KEY. NER-133's numbered-migration runner replaces
+        // apply_migrations and must carry this idempotency invariant forward.
         tx.execute(
-            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (1, '001_init', ?1)",
+            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (1, '001_init', ?1)",
             params![now_ms()],
         )?;
         tx.commit()?;
@@ -1971,7 +1983,8 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
         .optional()?;
     if applied_002.is_none() {
         connection.execute(
-            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (2, '002_attached_attempt', ?1)",
+            // INSERT OR IGNORE: see the version-1 note (NER-132 U5); NER-133 owns the runner.
+            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (2, '002_attached_attempt', ?1)",
             params![now_ms()],
         )?;
     }
