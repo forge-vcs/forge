@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use forge_content::{is_secret_risk_path, ContentBackend, SnapshotContent};
+use forge_content::{is_restore_temp_path, is_secret_risk_path, ContentBackend, SnapshotContent};
 use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
@@ -187,7 +187,10 @@ fn all_tracked_paths(repo_root: &Path) -> Result<Vec<String>> {
 }
 
 fn is_ignored_by_policy(path: &str) -> bool {
-    path.starts_with(".forge/") || path == ".forge" || is_secret_risk_path(path)
+    path.starts_with(".forge/")
+        || path == ".forge"
+        || is_restore_temp_path(path)
+        || is_secret_risk_path(path)
 }
 
 fn tree_paths(repo_root: &Path, tree: &str) -> Result<Vec<String>> {
@@ -235,7 +238,14 @@ mod tests {
         assert!(is_ignored_by_policy(".forge/forge.db"));
         assert!(is_ignored_by_policy(".forge/forge.db-wal"));
         assert!(is_ignored_by_policy(".forge/forge.db-shm"));
+        // The NER-132 advisory lock file is covered by the same blanket `.forge/`
+        // prefix; pin it symmetrically so the two backends cannot drift.
+        assert!(is_ignored_by_policy(".forge/forge.lock"));
         assert!(is_ignored_by_policy(".forge"));
+        // Restore temps live in worktree dirs (NER-132 U4); exclude them symmetrically
+        // so an orphaned temp never lands in a git-backed snapshot/export.
+        assert!(is_ignored_by_policy(".forge-restore-abc123"));
+        assert!(is_ignored_by_policy("src/nested/.forge-restore-xyz"));
         assert!(!is_ignored_by_policy("README.md"));
     }
 }

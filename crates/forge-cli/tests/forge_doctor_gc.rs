@@ -31,6 +31,44 @@ fn doctor_passes_healthy_repo_and_reports_dangling_temp_files() {
 }
 
 #[test]
+fn doctor_reports_half_applied_worktree_from_leftover_restore_temp() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+
+    // Healthy repo: the NER-132 categories are present and empty.
+    let healthy = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(healthy["data"]["ok"], true);
+    assert!(healthy["data"]["half_applied_worktrees"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(healthy["data"]["dangling_content_refs"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // Simulate a restore killed mid-flight: a `.forge-restore-*` temp left in a
+    // worktree subdirectory (tempfile's Drop does not run on a hard kill). doctor
+    // scans the worktree — not just `.forge/tmp` — so it must flag this.
+    let nested = repo.path().join("src");
+    std::fs::create_dir_all(&nested).expect("create nested worktree dir");
+    std::fs::write(nested.join(".forge-restore-abc123"), "partial").expect("plant restore temp");
+
+    let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(report["data"]["ok"], false);
+    assert!(report["data"]["half_applied_worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path.as_str().unwrap().contains(".forge-restore-abc123")));
+    assert!(report["data"]["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue.as_str().unwrap().contains("half-applied worktree")));
+}
+
+#[test]
 fn gc_dry_run_reports_without_deleting() {
     let repo = TestRepo::new_git();
     repo.forge().args(["--json", "init"]).assert().success();
@@ -82,6 +120,16 @@ fn doctor_reports_corrupt_native_content_and_gc_reports_unreachable_objects() {
         .unwrap()
         .iter()
         .any(|issue| issue
+            .as_str()
+            .unwrap()
+            .contains("missing native content object")));
+    // The failure is also surfaced under the dedicated machine-checkable category
+    // (NER-132 U7), not only the generic issues list.
+    assert!(missing["data"]["dangling_content_refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|reference| reference
             .as_str()
             .unwrap()
             .contains("missing native content object")));

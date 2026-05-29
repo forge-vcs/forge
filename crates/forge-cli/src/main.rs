@@ -344,6 +344,11 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
 fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> ResponseEnvelope {
     command_result("save", request_id, |cwd, request_id| {
         let content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
+        // Crash boundary (NER-132 U6, debug-only): objects are now durably fsynced
+        // but no content_ref row is committed. A crash here must never leave a
+        // committed ref pointing at a missing object — the objects are present, the
+        // ref is absent.
+        forge_content::maybe_crash("after_object_fsync_before_db_commit");
         let saved = forge_store::save_snapshot(
             &cwd,
             request_id,
@@ -351,6 +356,11 @@ fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> Respons
             content.content_ref,
             content.changed_paths,
         )?;
+        // Crash boundary (NER-132 U6, debug-only): the content_ref is committed and
+        // durable (synchronous=NORMAL fsyncs the WAL on commit) even if the WAL is
+        // not yet checkpointed. On reopen, WAL recovery must show the committed ref
+        // AND its durably-retained object.
+        forge_content::maybe_crash("after_db_commit_before_checkpoint");
         Ok((
             Some(saved.operation_id.clone()),
             serde_json::to_value(saved)?,
@@ -425,16 +435,14 @@ fn propose_response(request_id: Option<String>, args: AttemptScopedArgs) -> Resp
 
 fn check_response(request_id: Option<String>, args: ProposalScopedArgs) -> ResponseEnvelope {
     command_result("check", request_id, |cwd, request_id| {
-        let show = forge_store::show(&cwd, args.attempt.as_deref())?;
-        let latest_exit_code = show.latest_evidence.map(|e| e.exit_code);
-        let evaluation = forge_policy::evaluate(latest_exit_code);
+        // The pass/fail verdict is derived inside record_check's IMMEDIATE txn from
+        // the evidence row it binds (NER-132 U2), so there is no CLI-layer show()
+        // read for a concurrent, lock-free `run` to race.
         let check = forge_store::record_check(
             &cwd,
             request_id,
             args.attempt.as_deref(),
             args.proposal.as_deref(),
-            evaluation.status,
-            evaluation.reason,
         )?;
         Ok((
             Some(check.operation_id.clone()),
@@ -627,6 +635,33 @@ where
         }
     };
 
+    // Hold the repo-level advisory write lock across the whole critical section
+    // (determining reads + the write), so this command's CLI-layer reads — e.g.
+    // `accept`'s `current_head`/`base_head` compare — are atomic against other
+    // forge writers (NER-132). Acquired once, here; never nested. `run` and `init`
+    // are excluded (see `requires_repo_lock`). A contention timeout surfaces as the
+    // retryable `LOCK_TIMEOUT` code via the typed `LockTimeout` downcast.
+    let _repo_lock = if requires_repo_lock(command) {
+        match forge_store::acquire_repo_lock(&cwd) {
+            Ok(guard) => guard,
+            Err(error) => {
+                let code = if error.downcast_ref::<forge_store::LockTimeout>().is_some() {
+                    "LOCK_TIMEOUT"
+                } else {
+                    error_code(command, &error.to_string())
+                };
+                return ResponseEnvelope::error(
+                    command,
+                    request_id,
+                    None,
+                    ErrorObject::new(code, error.to_string()),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     // Pre-flight replay check: a sequential same-`request_id` retry replays the
     // original result without opening a write transaction. The concurrent race
     // (two retries that both pass this check before either commits) is closed by
@@ -695,13 +730,24 @@ fn init_response(request_id: Option<String>, args: InitArgs) -> ResponseEnvelope
             Some(repository.current_operation_id.clone()),
             serde_json::to_value(repository).unwrap(),
         ),
-        Err(error) => structured_error(
-            "init",
-            request_id,
-            "NOT_A_GIT_REPOSITORY",
-            error.to_string(),
-            Value::Object(Default::default()),
-        ),
+        Err(error) => {
+            // init does not route through command_result, so map its errors here.
+            // A contention timeout on the U5 init lock is the retryable LOCK_TIMEOUT;
+            // a genuine "not a git repo" still falls through error_code's init arm to
+            // NOT_A_GIT_REPOSITORY (no longer masking every init error as that code).
+            let code = if error.downcast_ref::<forge_store::LockTimeout>().is_some() {
+                "LOCK_TIMEOUT"
+            } else {
+                error_code("init", &error.to_string())
+            };
+            structured_error(
+                "init",
+                request_id,
+                code,
+                error.to_string(),
+                Value::Object(Default::default()),
+            )
+        }
     }
 }
 
@@ -823,4 +869,14 @@ fn is_mutating_command(command: &str) -> bool {
             | "reject"
             | "export branch"
     )
+}
+
+/// Whether `command_result` should hold the repo-level advisory write lock across
+/// this command's critical section (NER-132 U2). Excludes `run` — it executes its
+/// child inside the closure and must not hold the lock (PRD §10.6) — and `init`,
+/// which acquires the lock itself inside `init_repository` (it does not route
+/// through `command_result`). The lock is acquired exactly once per command, never
+/// nested, per the std file-locking re-entrancy caveat.
+fn requires_repo_lock(command: &str) -> bool {
+    is_mutating_command(command) && !matches!(command, "run" | "init")
 }

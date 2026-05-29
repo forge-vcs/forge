@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+mod repo_lock;
+pub use repo_lock::{LockTimeout, RepoLock};
+
 const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,6 +264,14 @@ pub struct DoctorReport {
     pub issues: Vec<String>,
     pub schema_version: Option<i64>,
     pub dangling_temp_files: Vec<String>,
+    /// `content_ref` rows whose referenced object is missing or fails
+    /// verification — the failure mode the store-before-DB ordering (NER-132)
+    /// makes impossible; this is the safety-net assertion. Empty in a healthy repo.
+    pub dangling_content_refs: Vec<String>,
+    /// Worktree paths holding a leftover crash-atomic-restore temp
+    /// (`.forge-restore-*`), the signature of a restore killed mid-flight. Empty
+    /// in a healthy repo.
+    pub half_applied_worktrees: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -284,6 +295,14 @@ pub fn init_repository(
     let forge_dir = root.join(".forge");
     fs::create_dir_all(&forge_dir)
         .with_context(|| format!("failed to create {}", forge_dir.display()))?;
+
+    // Serialize concurrent first-inits of the same repo (NER-132 U5): hold the repo
+    // write lock across migration + the repository INSERT, so a racing init observes
+    // the winner's committed row via read_init_repository below and returns
+    // already_initialized rather than colliding on the repositories.root_path UNIQUE
+    // constraint. The lock file lives in the .forge dir just created. init does not
+    // route through the CLI command_result lock, so it acquires here, never nested.
+    let _init_lock = repo_lock::acquire(&forge_dir)?;
 
     let database_path = forge_dir.join("forge.db");
     let already_had_db = database_path.exists();
@@ -419,6 +438,27 @@ pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
 
 pub fn repository_content_backend(cwd: &Path) -> Result<String> {
     Ok(open_repository(cwd)?.content_backend)
+}
+
+/// Acquire the repo-level advisory write lock for the repository containing `cwd`
+/// (PRD §10.6, NER-132). The CLI holds the returned guard across a mutating
+/// command's critical section so its determining reads and write are atomic
+/// against other `forge` writers.
+///
+/// Returns `Ok(None)` when there is no repository to lock — `cwd` is not inside a
+/// Git work tree, or `.forge` does not exist yet — so the caller's own logic
+/// surfaces the canonical "not initialized" error instead of a lock-file error.
+/// A genuine contention timeout surfaces as a [`LockTimeout`] (`Err`).
+pub fn acquire_repo_lock(cwd: &Path) -> Result<Option<RepoLock>> {
+    let root = match git_root(cwd) {
+        Ok(root) => root,
+        Err(_) => return Ok(None),
+    };
+    let forge_dir = root.join(".forge");
+    if !forge_dir.exists() {
+        return Ok(None);
+    }
+    repo_lock::acquire(&forge_dir).map(Some)
 }
 
 pub fn operation_for_request(cwd: &Path, request_id: &str) -> Result<Option<RequestIdOperation>> {
@@ -821,8 +861,6 @@ pub fn record_check(
     request_id: Option<String>,
     attempt_id: Option<&str>,
     proposal_id: Option<&str>,
-    status: String,
-    reason: String,
 ) -> Result<CheckRecord> {
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
@@ -839,7 +877,12 @@ pub fn record_check(
             let evidence_id = evidence.as_ref().map(|e| e.evidence_id.clone());
             let (status, reason) = match evidence.as_ref().and_then(|e| e.snapshot_id.as_deref()) {
                 Some(snapshot_id) if snapshot_id == proposal.snapshot_id => {
-                    (status.clone(), reason.clone())
+                    // Verdict computed in-txn from the same evidence row bound as
+                    // evidence_id, so a concurrent (lock-free) `run` committing newer
+                    // evidence cannot make the verdict disagree with evidence_id —
+                    // closes the check TOCTOU without relying on the lock (NER-132 U2).
+                    let evaluation = forge_policy::evaluate(evidence.as_ref().map(|e| e.exit_code));
+                    (evaluation.status, evaluation.reason)
                 }
                 Some(_) => (
                     "stale".to_string(),
@@ -1128,6 +1171,10 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
     }
     let native_store = forge_content_native::NativeObjectStore::new(&context.root_path);
     let mut reachable_native_objects = std::collections::BTreeSet::new();
+    // A committed `content_ref` whose object is missing or fails verification is
+    // the exact failure the store-before-DB ordering (NER-132) makes impossible;
+    // surface it as its own category so the exit criterion is machine-checkable.
+    let mut dangling_content_refs = Vec::new();
     let mut statement = connection.prepare(
         "SELECT 'snapshot ' || id, content_ref FROM snapshots
          UNION ALL
@@ -1144,23 +1191,70 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
                 .current_dir(&context.root_path)
                 .output()?;
             if !output.status.success() {
-                issues.push(format!("missing content ref for {label}"));
+                dangling_content_refs.push(format!("missing content ref for {label}"));
             }
         } else if content_ref.starts_with("forge-tree:") {
             match native_store.verify_content_ref(&content_ref) {
                 Ok(ids) => reachable_native_objects.extend(ids),
                 Err(error) => {
-                    issues.push(format!("invalid native content ref for {label}: {error}"))
+                    dangling_content_refs
+                        .push(format!("invalid native content ref for {label}: {error}"));
                 }
             }
         }
     }
+    issues.extend(dangling_content_refs.iter().cloned());
+
+    // A crash-atomic restore (NER-132 U4) killed mid-flight leaves a
+    // `.forge-restore-*` temp in a worktree directory; those live in the worktree,
+    // not `.forge/tmp`, so scan the work tree (excluding `.git`/`.forge`) for them.
+    let half_applied_worktrees = scan_restore_temps(&context.root_path)?;
+    if !half_applied_worktrees.is_empty() {
+        issues.push("half-applied worktree (leftover restore temp files)".to_string());
+    }
+
     Ok(DoctorReport {
         ok: issues.is_empty(),
         issues,
         schema_version,
         dangling_temp_files,
+        dangling_content_refs,
+        half_applied_worktrees,
     })
+}
+
+/// Recursively scan a work tree for leftover crash-atomic-restore temp files
+/// (`forge_content_native::RESTORE_TEMP_PREFIX`), skipping `.git` and `.forge`.
+/// A match is the signature of a restore killed mid-flight (NER-132 U4/U7).
+fn scan_restore_temps(root: &Path) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue, // unreadable dir is not a half-applied-restore signal
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                // Never descend into git's or forge's own state — at ANY depth, so a
+                // submodule's nested .git (a large, unbounded object tree) is skipped
+                // too. Restore temps only land in worktree dirs forge materializes
+                // into, never inside a git/forge store, so this loses no real signal.
+                if name == ".git" || name == ".forge" {
+                    continue;
+                }
+                stack.push(entry.path());
+            } else if name.starts_with(forge_content_native::RESTORE_TEMP_PREFIX) {
+                found.push(entry.path().to_string_lossy().into_owned());
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 pub fn pr_body(cwd: &Path) -> Result<String> {
@@ -1870,8 +1964,12 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
     if applied.is_none() {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(MIGRATION_001)?;
+        // INSERT OR IGNORE: idempotency shim (NER-132 U5) so a concurrent first-init
+        // — or a first-open racing under the .forge write lock — cannot collide on
+        // the version PRIMARY KEY. NER-133's numbered-migration runner replaces
+        // apply_migrations and must carry this idempotency invariant forward.
         tx.execute(
-            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (1, '001_init', ?1)",
+            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (1, '001_init', ?1)",
             params![now_ms()],
         )?;
         tx.commit()?;
@@ -1888,7 +1986,8 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
         .optional()?;
     if applied_002.is_none() {
         connection.execute(
-            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (2, '002_attached_attempt', ?1)",
+            // INSERT OR IGNORE: see the version-1 note (NER-132 U5); NER-133 owns the runner.
+            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (2, '002_attached_attempt', ?1)",
             params![now_ms()],
         )?;
     }

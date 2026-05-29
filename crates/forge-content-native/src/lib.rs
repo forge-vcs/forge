@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
-use forge_content::{is_secret_risk_path, ContentBackend, SnapshotContent, FORGE_TREE_PREFIX};
+use forge_content::{
+    is_restore_temp_path, is_secret_risk_path, ContentBackend, SnapshotContent, FORGE_TREE_PREFIX,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,6 +14,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SCHEMA_VERSION: u32 = 1;
+
+/// Re-exported from `forge_content` so `forge_store::doctor` keeps referencing
+/// `forge_content_native::RESTORE_TEMP_PREFIX`, while the canonical definition and
+/// its matching `is_restore_temp_path` exclusion predicate live in the shared base
+/// crate both backends depend on (NER-132 U4).
+pub use forge_content::RESTORE_TEMP_PREFIX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -108,7 +116,15 @@ impl ContentBackend for NativeContentBackend {
         let store = NativeObjectStore::new(repo_root);
         store.verify_content_ref(content_ref)?;
         let mut target_paths = BTreeSet::new();
-        materialize_tree(&store, repo_root, &root, "", &mut target_paths)?;
+        let mut synced_dirs = BTreeSet::new();
+        materialize_tree(
+            &store,
+            repo_root,
+            &root,
+            "",
+            &mut target_paths,
+            &mut synced_dirs,
+        )?;
         for path in materialized_paths(repo_root)? {
             if !target_paths.contains(&path) {
                 let full = repo_root.join(&path);
@@ -129,7 +145,15 @@ pub fn materialize_content_ref(
     let root = object_id_from_content_ref(content_ref)?;
     let store = NativeObjectStore::new(repo_root);
     let mut target_paths = BTreeSet::new();
-    materialize_tree(&store, destination, &root, "", &mut target_paths)
+    let mut synced_dirs = BTreeSet::new();
+    materialize_tree(
+        &store,
+        destination,
+        &root,
+        "",
+        &mut target_paths,
+        &mut synced_dirs,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -366,6 +390,7 @@ fn materialize_tree(
     tree_id: &ObjectId,
     prefix: &str,
     target_paths: &mut BTreeSet<String>,
+    synced_dirs: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
     if tree_id.kind()? != ObjectKind::Tree {
         bail!("native content root is not a tree");
@@ -396,12 +421,51 @@ fn materialize_tree(
                     fs::remove_dir_all(&full)
                         .with_context(|| format!("remove directory {}", full.display()))?;
                 }
-                if let Some(parent) = full.parent() {
-                    fs::create_dir_all(parent)?;
+                let parent = full
+                    .parent()
+                    .ok_or_else(|| anyhow!("restore target {} has no parent", full.display()))?;
+                // Record which ancestor directories are newly created so their own
+                // entries can be made durable below (mirrors write_object) — a freshly
+                // created dir's entry is not durable until the dir it lives in is fsynced.
+                let newly_created = missing_dirs(parent);
+                fs::create_dir_all(parent)?;
+                // Crash-atomic restore (NER-132 U4): write to a temp file in the
+                // destination's own parent directory — guaranteeing a
+                // same-filesystem rename even when `.forge` is a separate mount —
+                // set its mode, fsync it, then atomically rename into place. The
+                // `.forge-restore-` prefix lets `doctor` reclaim a temp orphaned by
+                // a crash mid-restore (tempfile's Drop does not run on a hard kill).
+                let mut temp = tempfile::Builder::new()
+                    .prefix(RESTORE_TEMP_PREFIX)
+                    .tempfile_in(parent)
+                    .with_context(|| format!("create restore temp file in {}", parent.display()))?;
+                temp.write_all(&bytes)?;
+                set_file_mode(temp.path(), entry.mode)?;
+                temp.as_file().sync_all()?;
+                temp.persist(&full)
+                    .map_err(|error| error.error)
+                    .with_context(|| format!("persist restored file {}", full.display()))?;
+                // The renamed file's directory entry must reach disk for the
+                // restore to be durable; fsync each parent directory once per
+                // restore to bound the fsync cost on large worktrees.
+                if synced_dirs.insert(parent.to_path_buf()) {
+                    sync_dir(parent)?;
                 }
-                fs::write(&full, bytes)?;
-                set_file_mode(&full, entry.mode)?;
+                // Make each newly created ancestor directory durable by fsyncing the
+                // directory that gained the new entry (mirrors write_object), deduped
+                // across the whole restore so each dir is fsynced at most once.
+                for dir in &newly_created {
+                    if let Some(grandparent) = dir.parent() {
+                        if synced_dirs.insert(grandparent.to_path_buf()) {
+                            sync_dir(grandparent)?;
+                        }
+                    }
+                }
                 target_paths.insert(rel);
+                // Crash boundary (NER-132 U6, debug-only): this file is fully
+                // renamed (whole, never torn) and its temp consumed; a crash here
+                // leaves a partially-restored worktree with no orphaned temp.
+                forge_content::maybe_crash("mid_restore");
             }
             TreeEntryKind::Dir => {
                 let full = repo_root.join(&rel);
@@ -410,7 +474,7 @@ fn materialize_tree(
                         .with_context(|| format!("remove file {}", full.display()))?;
                 }
                 fs::create_dir_all(full)?;
-                materialize_tree(store, repo_root, &child, &rel, target_paths)?;
+                materialize_tree(store, repo_root, &child, &rel, target_paths, synced_dirs)?;
             }
         }
     }
@@ -492,6 +556,7 @@ fn is_ignored_by_policy(path: &str) -> bool {
         || path.starts_with(".git/")
         || path == ".forge"
         || path.starts_with(".forge/")
+        || is_restore_temp_path(path)
         || is_secret_risk_path(path)
 }
 
@@ -619,7 +684,15 @@ mod tests {
         assert!(is_ignored_by_policy(".forge/forge.db"));
         assert!(is_ignored_by_policy(".forge/forge.db-wal"));
         assert!(is_ignored_by_policy(".forge/forge.db-shm"));
+        // The NER-132 advisory lock file is covered by the same blanket `.forge/`
+        // prefix; pin it so a future refactor of the exclusion rule cannot drop it.
+        assert!(is_ignored_by_policy(".forge/forge.lock"));
         assert!(is_ignored_by_policy(".forge"));
+        // Restore temps live in worktree dirs (NER-132 U4), not under .forge, so they
+        // need their own exclusion — an orphan from a crash-interrupted restore must
+        // never land in a snapshot/export.
+        assert!(is_ignored_by_policy(".forge-restore-abc123"));
+        assert!(is_ignored_by_policy("src/nested/.forge-restore-xyz"));
         // A normal worktree file is still snapshot-eligible.
         assert!(!is_ignored_by_policy("README.md"));
     }
@@ -656,5 +729,55 @@ mod tests {
             .write_object(ObjectKind::Blob, b"durable-payload")
             .unwrap();
         assert_eq!(store.read_object(&id).unwrap(), b"durable-payload");
+    }
+
+    #[test]
+    fn restore_roundtrips_atomically_and_leaves_no_temp() {
+        // Snapshot a source worktree, then materialize it into a fresh destination
+        // and over an existing (stale) file. The crash-atomic file arm uses
+        // temp+rename, so on a clean restore: content round-trips, the stale file
+        // is fully replaced, and no `.forge-restore-*` temp survives.
+        let src = tempfile::tempdir().unwrap();
+        // The native backend enumerates worktree paths via git (`ls-files` +
+        // `--others --exclude-standard`), so the source must be a git work tree;
+        // the untracked files below are picked up without staging.
+        assert!(Command::new("git")
+            .arg("init")
+            .current_dir(src.path())
+            .output()
+            .unwrap()
+            .status
+            .success());
+        fs::create_dir_all(src.path().join("dir")).unwrap();
+        fs::write(src.path().join("top.txt"), b"top-new").unwrap();
+        fs::write(src.path().join("dir/nested.txt"), b"nested-new").unwrap();
+        let backend = NativeContentBackend;
+        let content = backend.snapshot_worktree(src.path()).unwrap();
+
+        let dest = tempfile::tempdir().unwrap();
+        // A stale file at a target path must be replaced wholesale (never torn).
+        fs::write(dest.path().join("top.txt"), b"stale-old-and-longer").unwrap();
+        materialize_content_ref(src.path(), dest.path(), &content.content_ref).unwrap();
+
+        assert_eq!(fs::read(dest.path().join("top.txt")).unwrap(), b"top-new");
+        assert_eq!(
+            fs::read(dest.path().join("dir/nested.txt")).unwrap(),
+            b"nested-new"
+        );
+
+        // No restore temp may linger in the destination tree after a clean restore.
+        let mut leftover = Vec::new();
+        for dir in [dest.path().to_path_buf(), dest.path().join("dir")] {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                if name.starts_with(RESTORE_TEMP_PREFIX) {
+                    leftover.push(name);
+                }
+            }
+        }
+        assert!(
+            leftover.is_empty(),
+            "restore left orphaned temp files: {leftover:?}"
+        );
     }
 }

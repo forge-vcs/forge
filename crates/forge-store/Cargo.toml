@@ -8,6 +8,11 @@ version.workspace = true
 anyhow.workspace = true
 forge-content-native = { path = "../forge-content-native" }
 forge-core = { path = "../forge-core" }
+forge-policy = { path = "../forge-policy" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true
+tempfile.workspace = true

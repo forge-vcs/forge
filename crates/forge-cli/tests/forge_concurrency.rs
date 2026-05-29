@@ -213,6 +213,70 @@ fn init_opens_database_in_wal_mode() {
 }
 
 #[test]
+fn concurrent_init_of_same_repo_is_race_safe() {
+    // The wedge inits a repo once before agents fan out; that single init can race
+    // itself (e.g. two orchestrators). With the .forge write lock (NER-132 U5),
+    // exactly one process performs the real init and the rest observe its committed
+    // row and report already_initialized — never a raw UNIQUE-constraint error
+    // masked as NOT_A_GIT_REPOSITORY, never SQLITE_BUSY.
+    let repo = TestRepo::new_git();
+    let repo_path = repo.path().to_path_buf();
+
+    let handles: Vec<_> = (0..WORKERS)
+        .map(|_| {
+            let repo_path = repo_path.clone();
+            thread::spawn(move || run_forge(&repo_path, &["--json", "init"]))
+        })
+        .collect();
+    let runs: Vec<ForgeRun> = handles
+        .into_iter()
+        .map(|h| h.join().expect("init thread"))
+        .collect();
+
+    let mut fresh_inits = 0;
+    for (worker, run) in runs.iter().enumerate() {
+        assert_no_busy(run, &format!("init worker {worker}"));
+        assert!(
+            run.envelope_ok,
+            "init worker {worker} failed: {}\n{}",
+            run.stdout, run.stderr
+        );
+        assert!(
+            !format!("{}\n{}", run.stdout, run.stderr).contains("UNIQUE constraint"),
+            "raw SQLite UNIQUE text leaked from a racing init: {}",
+            run.stdout
+        );
+        assert_ne!(
+            run.error_code().as_deref(),
+            Some("NOT_A_GIT_REPOSITORY"),
+            "a racing init was misreported as NOT_A_GIT_REPOSITORY: {}",
+            run.stdout
+        );
+        let already_initialized = run
+            .json
+            .as_ref()
+            .and_then(|v| v["data"]["already_initialized"].as_bool())
+            .expect("already_initialized in init envelope");
+        if !already_initialized {
+            fresh_inits += 1;
+        }
+    }
+    assert_eq!(
+        fresh_inits, 1,
+        "exactly one process performs the real init; the rest report already_initialized"
+    );
+
+    // And exactly one repository row exists regardless of the race.
+    let repos: i64 = open_db(&repo_path)
+        .query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))
+        .expect("count repositories");
+    assert_eq!(
+        repos, 1,
+        "concurrent init created exactly one repository row"
+    );
+}
+
+#[test]
 fn eight_competing_processes_complete_without_sqlite_busy() {
     let repo = TestRepo::new_git();
     assert!(run_forge(repo.path(), &["--json", "init"]).envelope_ok);
