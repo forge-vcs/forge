@@ -264,6 +264,14 @@ pub struct DoctorReport {
     pub issues: Vec<String>,
     pub schema_version: Option<i64>,
     pub dangling_temp_files: Vec<String>,
+    /// `content_ref` rows whose referenced object is missing or fails
+    /// verification — the failure mode the store-before-DB ordering (NER-132)
+    /// makes impossible; this is the safety-net assertion. Empty in a healthy repo.
+    pub dangling_content_refs: Vec<String>,
+    /// Worktree paths holding a leftover crash-atomic-restore temp
+    /// (`.forge-restore-*`), the signature of a restore killed mid-flight. Empty
+    /// in a healthy repo.
+    pub half_applied_worktrees: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1152,6 +1160,10 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
     }
     let native_store = forge_content_native::NativeObjectStore::new(&context.root_path);
     let mut reachable_native_objects = std::collections::BTreeSet::new();
+    // A committed `content_ref` whose object is missing or fails verification is
+    // the exact failure the store-before-DB ordering (NER-132) makes impossible;
+    // surface it as its own category so the exit criterion is machine-checkable.
+    let mut dangling_content_refs = Vec::new();
     let mut statement = connection.prepare(
         "SELECT 'snapshot ' || id, content_ref FROM snapshots
          UNION ALL
@@ -1168,23 +1180,67 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
                 .current_dir(&context.root_path)
                 .output()?;
             if !output.status.success() {
-                issues.push(format!("missing content ref for {label}"));
+                dangling_content_refs.push(format!("missing content ref for {label}"));
             }
         } else if content_ref.starts_with("forge-tree:") {
             match native_store.verify_content_ref(&content_ref) {
                 Ok(ids) => reachable_native_objects.extend(ids),
                 Err(error) => {
-                    issues.push(format!("invalid native content ref for {label}: {error}"))
+                    dangling_content_refs
+                        .push(format!("invalid native content ref for {label}: {error}"));
                 }
             }
         }
     }
+    issues.extend(dangling_content_refs.iter().cloned());
+
+    // A crash-atomic restore (NER-132 U4) killed mid-flight leaves a
+    // `.forge-restore-*` temp in a worktree directory; those live in the worktree,
+    // not `.forge/tmp`, so scan the work tree (excluding `.git`/`.forge`) for them.
+    let half_applied_worktrees = scan_restore_temps(&context.root_path)?;
+    if !half_applied_worktrees.is_empty() {
+        issues.push("half-applied worktree (leftover restore temp files)".to_string());
+    }
+
     Ok(DoctorReport {
         ok: issues.is_empty(),
         issues,
         schema_version,
         dangling_temp_files,
+        dangling_content_refs,
+        half_applied_worktrees,
     })
+}
+
+/// Recursively scan a work tree for leftover crash-atomic-restore temp files
+/// (`forge_content_native::RESTORE_TEMP_PREFIX`), skipping `.git` and `.forge`.
+/// A match is the signature of a restore killed mid-flight (NER-132 U4/U7).
+fn scan_restore_temps(root: &Path) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue, // unreadable dir is not a half-applied-restore signal
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                // Never descend into git's or forge's own state.
+                if dir == root && (name == ".git" || name == ".forge") {
+                    continue;
+                }
+                stack.push(entry.path());
+            } else if name.starts_with(forge_content_native::RESTORE_TEMP_PREFIX) {
+                found.push(entry.path().to_string_lossy().into_owned());
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 pub fn pr_body(cwd: &Path) -> Result<String> {
