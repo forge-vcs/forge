@@ -1,7 +1,7 @@
 ---
 title: "fix: Phase 1b crash-correctness — store-before-DB ordering, atomic restore, repo write lock"
 type: fix
-status: active
+status: completed
 date: 2026-05-29
 origin: docs/ROADMAP.md (Phase 1b) · Linear NER-132
 ---
