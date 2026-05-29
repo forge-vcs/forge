@@ -3,6 +3,13 @@ use serde_json::Value;
 
 pub const SCHEMA_VERSION: &str = "forge.cli.v0";
 
+/// Advisory backoff hint (ms) surfaced with every retryable result — the typed
+/// `ForgeError` CONFLICT (`after_ms`), the standalone `LockTimeout` → `LOCK_TIMEOUT`
+/// mapping, and the published `forge schema` registry all share this single
+/// constant so they cannot drift apart. HTTP `Retry-After`-style: advisory only,
+/// the client bounds the number of retries.
+pub const RETRY_BACKOFF_MS: u64 = 50;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseStatus {
@@ -21,6 +28,15 @@ impl RetryMetadata {
         Self {
             retryable: false,
             after_ms: None,
+        }
+    }
+
+    /// A retryable result with an advisory backoff hint (HTTP `Retry-After`-style).
+    /// Bounding the number of retries is the client's responsibility.
+    pub fn retryable(after_ms: Option<u64>) -> Self {
+        Self {
+            retryable: true,
+            after_ms,
         }
     }
 }
@@ -86,6 +102,25 @@ impl ResponseEnvelope {
         operation_id: Option<String>,
         error: ErrorObject,
     ) -> Self {
+        Self::error_with(
+            command,
+            request_id,
+            operation_id,
+            error,
+            RetryMetadata::no(),
+        )
+    }
+
+    /// Build an error envelope with an explicit [`RetryMetadata`] (e.g. a
+    /// retryable `LOCK_TIMEOUT` / `CONFLICT`). `retry` is a top-level envelope
+    /// field, not part of the [`ErrorObject`].
+    pub fn error_with(
+        command: impl Into<String>,
+        request_id: Option<String>,
+        operation_id: Option<String>,
+        error: ErrorObject,
+        retry: RetryMetadata,
+    ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION.to_string(),
             command: command.into(),
@@ -95,7 +130,7 @@ impl ResponseEnvelope {
             data: Value::Object(Default::default()),
             warnings: Vec::new(),
             errors: vec![error],
-            retry: RetryMetadata::no(),
+            retry,
         }
     }
 }

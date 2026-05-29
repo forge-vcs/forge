@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use forge_content::{is_restore_temp_path, is_secret_risk_path, ContentBackend, SnapshotContent};
+use forge_content::{is_ignored_by_policy, ContentBackend, SnapshotContent};
 use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
@@ -186,13 +186,6 @@ fn all_tracked_paths(repo_root: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-fn is_ignored_by_policy(path: &str) -> bool {
-    path.starts_with(".forge/")
-        || path == ".forge"
-        || is_restore_temp_path(path)
-        || is_secret_risk_path(path)
-}
-
 fn tree_paths(repo_root: &Path, tree: &str) -> Result<Vec<String>> {
     let mut paths: Vec<String> = git(repo_root, &["ls-tree", "-r", "--name-only", tree])?
         .lines()
@@ -246,6 +239,14 @@ mod tests {
         // so an orphaned temp never lands in a git-backed snapshot/export.
         assert!(is_ignored_by_policy(".forge-restore-abc123"));
         assert!(is_ignored_by_policy("src/nested/.forge-restore-xyz"));
+        // Symmetric secret/internal-path assertions: both backends now route to the
+        // shared `forge_content::is_ignored_by_policy`, so the exclusion set cannot
+        // drift (NER-133 U6). The git backend also gains `.git` exclusion — harmless
+        // since git never reports `.git/` worktree paths.
+        assert!(is_ignored_by_policy(".env"));
+        assert!(is_ignored_by_policy("certs/server.pem"));
+        assert!(is_ignored_by_policy(".git"));
+        assert!(is_ignored_by_policy(".git/config"));
         assert!(!is_ignored_by_policy("README.md"));
     }
 }

@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+mod error;
+mod migrations;
 mod repo_lock;
+pub use error::{error_registry, ErrorCodeSpec, ForgeError};
 pub use repo_lock::{LockTimeout, RepoLock};
-
-const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InitRepository {
@@ -308,7 +309,7 @@ pub fn init_repository(
     let already_had_db = database_path.exists();
     let mut connection = open_connection(&database_path)
         .with_context(|| format!("failed to open {}", database_path.display()))?;
-    apply_migrations(&mut connection)?;
+    migrations::apply_pending_migrations(&mut connection)?;
 
     if let Some(existing) = read_init_repository(&connection, &root, &forge_dir, &database_path)? {
         return Ok(InitRepository {
@@ -379,38 +380,16 @@ pub fn init_repository(
     })
 }
 
-pub fn create_operation_view(
-    database_path: &Path,
-    expected_current_operation_id: &str,
-    input: OperationViewInput,
-) -> Result<OperationViewResult> {
-    let mut connection = open_connection(database_path)
-        .with_context(|| format!("failed to open {}", database_path.display()))?;
-    with_immediate_retry(&mut connection, |tx| {
-        // CAS read inside the IMMEDIATE txn: the parent-operation check and the
-        // write share one connection so the advance is atomic.
-        let (repo_id, parent_operation_id): (String, String) = tx.query_row(
-            "SELECT repo_id, current_operation_id FROM current_state WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-
-        if parent_operation_id != expected_current_operation_id {
-            return Err(anyhow!("current operation changed"));
-        }
-
-        insert_operation_view(tx, &repo_id, Some(&parent_operation_id), input.clone())
-    })
-}
-
 pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     let root = git_root(cwd)?;
     let database_path = root.join(".forge/forge.db");
     if !database_path.exists() {
-        return Err(anyhow!("forge repository is not initialized"));
+        return Err(ForgeError::NotInitialized.into());
     }
-    let mut connection = open_connection(&database_path)?;
-    apply_migrations(&mut connection)?;
+    // `open_repository` is a pure open+query: schema migrations are applied by the
+    // transient `migrate()` entrypoint at the top of `command_result` (and by
+    // `init_repository` under its own lock) — never here, where no lock is held.
+    let connection = open_connection(&database_path)?;
     let (repo_id, content_backend, current_operation_id, current_view_id, attached_attempt_id): (
         String,
         String,
@@ -459,6 +438,64 @@ pub fn acquire_repo_lock(cwd: &Path) -> Result<Option<RepoLock>> {
         return Ok(None);
     }
     repo_lock::acquire(&forge_dir).map(Some)
+}
+
+/// Bring the repository's schema up to this binary's head, acquiring the repo
+/// write lock **only when a migration is actually pending** (NER-133 U4).
+///
+/// This is the transient, self-acquiring entrypoint the CLI runs at the top of
+/// `command_result`, **before** any per-command lock — so it never nests inside an
+/// already-held lock. It mirrors [`acquire_repo_lock`]'s resolution so it no-ops
+/// when there is nothing to migrate, letting the command's own logic surface the
+/// canonical error:
+/// - `cwd` is not inside a Git work tree ⇒ `Ok(())` (the command surfaces
+///   not-a-git-repo / `NOT_INITIALIZED`).
+/// - `.forge/forge.db` does not exist ⇒ `Ok(())` (uninitialized — the command
+///   surfaces `NOT_INITIALIZED`).
+/// - DB version `== HEAD` ⇒ `Ok(())` on the cheap read, **no lock taken** (the
+///   common path, including every read-only command and `run`).
+/// - DB version `> HEAD` ⇒ `Err(ForgeError::UnknownSchemaVersion)`: the DB was
+///   written by a newer Forge; refuse without acquiring the lock. The CLI maps
+///   this to `SCHEMA_VERSION_UNSUPPORTED` and short-circuits before any write.
+/// - DB version `< HEAD` ⇒ acquire the repo lock **transiently**, apply the
+///   pending migrations (idempotent + version-gated, so a concurrent migrator that
+///   won the race is handled), then release the lock (Drop) before returning.
+pub fn migrate(cwd: &Path) -> Result<()> {
+    let root = match git_root(cwd) {
+        Ok(root) => root,
+        Err(_) => return Ok(()),
+    };
+    let forge_dir = root.join(".forge");
+    let database_path = forge_dir.join("forge.db");
+    if !database_path.exists() {
+        return Ok(());
+    }
+
+    let mut connection = open_connection(&database_path)?;
+    let db_version = migrations::current_schema_version(&connection)?;
+    let head = migrations::schema_head();
+
+    if db_version == head {
+        // Common fast path: nothing to do, take no lock.
+        return Ok(());
+    }
+    if db_version > head {
+        // A forward-versioned DB: refuse to write without taking the lock.
+        return Err(ForgeError::UnknownSchemaVersion {
+            db_version,
+            supported_head: head,
+        }
+        .into());
+    }
+
+    // Pending (`db_version < head`): acquire the repo lock transiently, apply, and
+    // release on Drop before returning. `apply_pending_migrations` re-reads the
+    // applied versions under the lock and is idempotent, so a concurrent migrator
+    // that won the race is a no-op here. Acquired exactly once, before the
+    // per-command lock — never nested.
+    let _lock = repo_lock::acquire(&forge_dir)?;
+    migrations::apply_pending_migrations(&mut connection)?;
+    Ok(())
 }
 
 pub fn operation_for_request(cwd: &Path, request_id: &str) -> Result<Option<RequestIdOperation>> {
@@ -542,7 +579,10 @@ fn create_attempt(
                     |row| row.get(0),
                 )?;
                 if !exists {
-                    bail!("UNKNOWN_INTENT: unknown intent {id}");
+                    return Err(ForgeError::UnknownIntent {
+                        selector: id.to_string(),
+                    }
+                    .into());
                 }
                 id
             }
@@ -801,8 +841,8 @@ pub fn propose(
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
         // Determining read inside the IMMEDIATE txn: the proposal binds to the
         // latest snapshot observed on the same connection that writes it (U4).
-        let snapshot = latest_snapshot_on(tx, &attempt.attempt_id)?
-            .context("no snapshot saved for active attempt")?;
+        let snapshot =
+            latest_snapshot_on(tx, &attempt.attempt_id)?.ok_or(ForgeError::NoSnapshot)?;
         let proposal_id = new_id("proposal");
         let revision_id = new_id("revision");
         tx.execute(
@@ -1040,7 +1080,7 @@ pub fn record_publication(
     commit_id: String,
 ) -> Result<PublicationRecord> {
     let context = open_repository(cwd)?;
-    let proposal = proposal_by_id(&context, proposal_id)?.context("no proposal exists")?;
+    let proposal = proposal_by_id(&context, proposal_id)?.ok_or(ForgeError::NoProposal)?;
     let mut connection = open_connection(&context.database_path)?;
     // Note: the git branch side-effect happens in the CLI before this call, so
     // the replay guard provides DB-row idempotency only; making the export
@@ -1086,11 +1126,61 @@ pub fn record_publication(
     })
 }
 
+/// Persist a single `conflict_sets` row recording a stale-base divergence, then
+/// return the new conflict-set id (NER-133 U7). This is a pure metadata insert —
+/// no merge/diff engine — written before the CLI raises [`ForgeError::StaleBase`]
+/// so the divergence survives the bail.
+///
+/// `context` is `"stale_base_accept"` or `"stale_base_export"`. `paths_json`
+/// carries `{expected_head, actual_head, paths, redacted_count}`; any secret-risk
+/// path in `paths` is dropped via [`forge_content::filter_secret_risk`] before
+/// serialization, so a secret-risk filename never reaches the stored JSON — only
+/// its count appears.
+///
+/// The caller already holds the per-command advisory lock (`accept`/`export
+/// branch` are mutating), so this does NOT acquire the lock; it is just a single
+/// `IMMEDIATE` DB transaction with no lock nesting.
+pub fn record_conflict_set(
+    cwd: &Path,
+    context: &str,
+    expected_head: &str,
+    actual_head: &str,
+    paths: &[String],
+) -> Result<String> {
+    let repo = open_repository(cwd)?;
+    let (kept, dropped) = forge_content::filter_secret_risk(paths);
+    let paths_json = json!({
+        "expected_head": expected_head,
+        "actual_head": actual_head,
+        "paths": kept,
+        "redacted_count": dropped.len(),
+    })
+    .to_string();
+    let conflict_set_id = new_id("conflict");
+    let mut connection = open_connection(&repo.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        tx.execute(
+            "INSERT INTO conflict_sets (id, repo_id, context, paths_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![conflict_set_id, repo.repo_id, context, paths_json, now_ms()],
+        )?;
+        Ok(())
+    })?;
+    Ok(conflict_set_id)
+}
+
 pub fn show(cwd: &Path, attempt_id: Option<&str>) -> Result<ShowRecord> {
     let context = open_repository(cwd)?;
     let attempt = match resolve_attempt_in_context(&context, attempt_id) {
         Ok(resolved) => Some(resolved.attempt),
-        Err(error) if error.to_string().contains("no active attempt") => None,
+        Err(error)
+            if matches!(
+                error.downcast_ref::<ForgeError>(),
+                Some(ForgeError::NoActiveAttempt)
+            ) =>
+        {
+            None
+        }
         Err(error) => return Err(error),
     };
     Ok(ShowRecord {
@@ -1140,7 +1230,7 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         })
         .optional()?
         .flatten();
-    if schema_version != Some(2) {
+    if schema_version != Some(migrations::schema_head()) {
         issues.push("schema mismatch".to_string());
     }
     let state_count: i64 = connection.query_row(
@@ -1257,15 +1347,19 @@ fn scan_restore_temps(root: &Path) -> Result<Vec<String>> {
     Ok(found)
 }
 
-pub fn pr_body(cwd: &Path) -> Result<String> {
+pub fn pr_body(cwd: &Path) -> Result<(String, Vec<String>)> {
     pr_body_for(cwd, None, None)
 }
 
+/// Render the PR-body markdown, returning `(body, excluded)`. Secret-risk-named
+/// changed paths are dropped from the "Changed Paths" list by the default-deny
+/// export policy (NER-133 U6) and returned in `excluded` so the CLI can surface them
+/// as `warnings[]`.
 pub fn pr_body_for(
     cwd: &Path,
     attempt_id: Option<&str>,
     proposal_id: Option<&str>,
-) -> Result<String> {
+) -> Result<(String, Vec<String>)> {
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
     let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
@@ -1275,8 +1369,9 @@ pub fn pr_body_for(
     let mut body = String::new();
     body.push_str("# Forge Proposal\n\n");
     body.push_str(&format!("Intent: {}\n\n", attempt.intent));
+    let (kept_paths, excluded_paths) = forge_content::filter_secret_risk(&proposal.changed_paths);
     body.push_str("## Changed Paths\n");
-    for path in proposal.changed_paths {
+    for path in &kept_paths {
         body.push_str(&format!("- {path}\n"));
     }
     body.push('\n');
@@ -1304,7 +1399,7 @@ pub fn pr_body_for(
             publication.branch_name, publication.commit_id
         ));
     }
-    Ok(body)
+    Ok((body, excluded_paths))
 }
 
 pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
@@ -1344,7 +1439,9 @@ pub fn record_failed_operation(
     cwd: &Path,
     request_id: Option<String>,
     command: &str,
+    code: &str,
     message: &str,
+    details: Value,
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
     let mut connection = open_connection(&context.database_path)?;
@@ -1368,7 +1465,11 @@ pub fn record_failed_operation(
                 command,
                 context.current_operation_id,
                 view_id,
-                json!({ "message": message }).to_string(),
+                // Persist the typed error's `details` alongside code/message so a
+                // later `--request-id` replay reconstructs the SAME details the first
+                // response carried (FIX C). Old rows lacking `details` fall back to
+                // an empty object at replay time.
+                json!({ "message": message, "code": code, "details": details }).to_string(),
                 now
             ],
         )?;
@@ -1395,6 +1496,11 @@ pub fn record_failed_operation(
             params![operation_id, view_id, now, context.current_operation_id],
         )?;
         if updated != 1 {
+            // Intentionally left UNTYPED (plain anyhow, not the retryable
+            // `CurrentStateChanged`): this is the failure-recording path, whose
+            // result the CLI already swallows with `.ok()` (command_result's error
+            // arm). A CAS loss here just means the failure was not recorded; it must
+            // not become a retryable CONFLICT.
             return Err(anyhow!("current operation changed"));
         }
         Ok(())
@@ -1415,8 +1521,10 @@ fn resolve_attempt_in_context(
     attempt_id: Option<&str>,
 ) -> Result<ResolvedAttempt> {
     if let Some(attempt_id) = attempt_id {
-        let attempt = attempt_by_id(context, attempt_id)?
-            .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
+        let attempt =
+            attempt_by_id(context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+                selector: attempt_id.to_string(),
+            })?;
         return Ok(ResolvedAttempt { attempt });
     }
 
@@ -1430,18 +1538,17 @@ fn resolve_attempt_in_context(
 
     let attempts = active_attempts(context)?;
     match attempts.as_slice() {
-        [] => bail!("no active attempt"),
+        [] => Err(ForgeError::NoActiveAttempt.into()),
         [attempt] => Ok(ResolvedAttempt {
             attempt: attempt.clone(),
         }),
-        _ => bail!(
-            "AMBIGUOUS_ATTEMPT: {}",
-            attempts
+        _ => Err(ForgeError::AmbiguousAttempt {
+            candidate_ids: attempts
                 .iter()
-                .map(|attempt| attempt.attempt_id.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+                .map(|attempt| attempt.attempt_id.clone())
+                .collect(),
+        }
+        .into()),
     }
 }
 
@@ -1518,8 +1625,10 @@ pub fn list_attempts(cwd: &Path) -> Result<Vec<AttemptSummary>> {
 
 pub fn show_attempt(cwd: &Path, attempt_id: &str) -> Result<AttemptShowRecord> {
     let context = open_repository(cwd)?;
-    let attempt = attempt_by_id(&context, attempt_id)?
-        .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
+    let attempt =
+        attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+            selector: attempt_id.to_string(),
+        })?;
     Ok(AttemptShowRecord {
         attempt: AttemptSummary {
             attached: context.attached_attempt_id.as_deref() == Some(attempt.attempt_id.as_str()),
@@ -1541,8 +1650,10 @@ pub fn attach_attempt(
     attempt_id: &str,
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
-    let attempt = attempt_by_id(&context, attempt_id)?
-        .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
+    let attempt =
+        attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+            selector: attempt_id.to_string(),
+        })?;
     let mut connection = open_connection(&context.database_path)?;
     let op = with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
@@ -1572,8 +1683,10 @@ pub fn attach_attempt(
 
 pub fn attempt_materialization_ref(cwd: &Path, attempt_id: &str) -> Result<Option<String>> {
     let context = open_repository(cwd)?;
-    let attempt = attempt_by_id(&context, attempt_id)?
-        .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
+    let attempt =
+        attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+            selector: attempt_id.to_string(),
+        })?;
     Ok(latest_snapshot_for_attempt(&context, &attempt.attempt_id)?
         .map(|snapshot| snapshot.content_ref))
 }
@@ -1581,7 +1694,9 @@ pub fn attempt_materialization_ref(cwd: &Path, attempt_id: &str) -> Result<Optio
 pub fn attempt_base_head(cwd: &Path, attempt_id: &str) -> Result<String> {
     let context = open_repository(cwd)?;
     Ok(attempt_by_id(&context, attempt_id)?
-        .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?
+        .ok_or_else(|| ForgeError::UnknownAttempt {
+            selector: attempt_id.to_string(),
+        })?
         .base_head)
 }
 
@@ -1661,30 +1776,32 @@ fn resolve_proposal(
     allow_single_default: bool,
 ) -> Result<ResolvedProposal> {
     if let Some(proposal_id) = proposal_id {
-        let proposal = proposal_by_id(context, proposal_id)?
-            .ok_or_else(|| anyhow!("UNKNOWN_PROPOSAL: unknown proposal {proposal_id}"))?;
+        let proposal =
+            proposal_by_id(context, proposal_id)?.ok_or_else(|| ForgeError::UnknownProposal {
+                selector: proposal_id.to_string(),
+            })?;
         if proposal.attempt_id != attempt_id {
-            bail!(
-                "UNKNOWN_PROPOSAL: proposal {proposal_id} does not belong to attempt {attempt_id}"
-            );
+            return Err(ForgeError::UnknownProposal {
+                selector: proposal_id.to_string(),
+            }
+            .into());
         }
         return Ok(ResolvedProposal { proposal });
     }
 
     let proposals = proposals_for_attempt(context, attempt_id)?;
     match proposals.as_slice() {
-        [] => bail!("no proposal exists"),
+        [] => Err(ForgeError::NoProposal.into()),
         [proposal] if allow_single_default => Ok(ResolvedProposal {
             proposal: proposal.clone(),
         }),
-        _ => bail!(
-            "AMBIGUOUS_PROPOSAL: {}",
-            proposals
+        _ => Err(ForgeError::AmbiguousProposal {
+            candidate_ids: proposals
                 .iter()
-                .map(|proposal| proposal.proposal_id.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+                .map(|proposal| proposal.proposal_id.clone())
+                .collect(),
+        }
+        .into()),
     }
 }
 
@@ -1936,93 +2053,20 @@ fn insert_operation_view(
         params![operation_id, view_id, now, expected_operation],
     )?;
     if updated != 1 {
-        return Err(anyhow!("current operation changed"));
+        // The optimistic singleton CAS lost the race: another writer advanced
+        // `current_state` between this command's determining read and its write.
+        // Surface it TYPED so the CLI classifies it `retryable` (code CONFLICT) and
+        // does NOT persist it under the `--request-id` — a retry re-executes against
+        // fresh state instead of replaying a poisoned failure (NER-133 FIX D / R7).
+        // Caveat: re-executing re-runs the command; for `forge run` that re-executes
+        // the child process (run records evidence via this fn and is the lock
+        // carve-out). See the `notes.retry_side_effects` entry in `forge schema`.
+        return Err(ForgeError::CurrentStateChanged.into());
     }
     Ok(OperationViewResult {
         operation_id,
         view_id,
     })
-}
-
-fn apply_migrations(connection: &mut Connection) -> Result<()> {
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            applied_at_ms INTEGER NOT NULL
-        );",
-    )?;
-
-    let applied = connection
-        .query_row(
-            "SELECT version FROM schema_migrations WHERE version = 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-
-    if applied.is_none() {
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(MIGRATION_001)?;
-        // INSERT OR IGNORE: idempotency shim (NER-132 U5) so a concurrent first-init
-        // — or a first-open racing under the .forge write lock — cannot collide on
-        // the version PRIMARY KEY. NER-133's numbered-migration runner replaces
-        // apply_migrations and must carry this idempotency invariant forward.
-        tx.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (1, '001_init', ?1)",
-            params![now_ms()],
-        )?;
-        tx.commit()?;
-    }
-    ensure_repository_content_backend_column(connection)?;
-    ensure_attached_attempt_column(connection)?;
-
-    let applied_002 = connection
-        .query_row(
-            "SELECT version FROM schema_migrations WHERE version = 2",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()?;
-    if applied_002.is_none() {
-        connection.execute(
-            // INSERT OR IGNORE: see the version-1 note (NER-132 U5); NER-133 owns the runner.
-            "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms) VALUES (2, '002_attached_attempt', ?1)",
-            params![now_ms()],
-        )?;
-    }
-
-    Ok(())
-}
-
-fn ensure_repository_content_backend_column(connection: &Connection) -> Result<()> {
-    let mut statement = connection.prepare("PRAGMA table_info(repositories)")?;
-    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for column in columns {
-        if column? == "content_backend" {
-            return Ok(());
-        }
-    }
-    connection.execute(
-        "ALTER TABLE repositories ADD COLUMN content_backend TEXT NOT NULL DEFAULT 'git'",
-        [],
-    )?;
-    Ok(())
-}
-
-fn ensure_attached_attempt_column(connection: &Connection) -> Result<()> {
-    let mut statement = connection.prepare("PRAGMA table_info(current_state)")?;
-    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
-    for column in columns {
-        if column? == "attached_attempt_id" {
-            return Ok(());
-        }
-    }
-    connection.execute(
-        "ALTER TABLE current_state ADD COLUMN attached_attempt_id TEXT REFERENCES attempts(id)",
-        [],
-    )?;
-    Ok(())
 }
 
 /// How long a connection waits on a held write lock before SQLite returns
@@ -2065,7 +2109,7 @@ const WRITE_TXN_MAX_ATTEMPTS: u32 = 6;
 /// `body` is `FnMut` because it may run once per retry attempt, so it must not
 /// move captured values out — writer closures therefore `.clone()` any owned
 /// input they consume (e.g. `request_id`, `OperationViewInput`) on each call.
-fn with_immediate_retry<T, F>(connection: &mut Connection, mut body: F) -> Result<T>
+pub(crate) fn with_immediate_retry<T, F>(connection: &mut Connection, mut body: F) -> Result<T>
 where
     F: FnMut(&Transaction<'_>) -> Result<T>,
 {
@@ -2349,5 +2393,129 @@ mod tests {
             }
             .into()
         ));
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// FIX D: `insert_operation_view`'s optimistic singleton CAS, when its captured
+    /// parent operation no longer matches live `current_state`, raises the typed,
+    /// retryable `ForgeError::CurrentStateChanged` (code `CONFLICT`) — NOT a plain
+    /// `anyhow!`. This is what the CLI's `is_transient_error` keys on to skip
+    /// recording the failure under the `--request-id`. Driven as a focused in-crate
+    /// unit test because `insert_operation_view` is private and the production fns
+    /// re-read `current_state` per call (so a stale parent can't be pinned through
+    /// the public API alone).
+    #[test]
+    fn insert_operation_view_stale_parent_raises_current_state_changed() {
+        let mut connection = Connection::open_in_memory().expect("open in-memory db");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("enable fks");
+        connection
+            .execute_batch(include_str!("../migrations/001_init.sql"))
+            .expect("baseline schema");
+
+        // Seed: a repo, a genesis operation+view that `current_state` points at, and
+        // a SECOND operation row (`op_stale`) that does NOT match current_state.
+        connection
+            .execute_batch(
+                "INSERT INTO repositories (id, root_path, created_at_ms)
+                     VALUES ('repo_1', '/tmp/repo', 0);
+                 INSERT INTO operations (id, repo_id, command, status, kind, created_at_ms)
+                     VALUES ('op_genesis', 'repo_1', 'init', 'succeeded', 'init', 0);
+                 INSERT INTO views (id, repo_id, operation_id, kind, state_json, created_at_ms)
+                     VALUES ('view_genesis', 'repo_1', 'op_genesis', 'initialized', '{}', 0);
+                 INSERT INTO current_state
+                     (singleton, repo_id, current_operation_id, current_view_id, updated_at_ms)
+                     VALUES (1, 'repo_1', 'op_genesis', 'view_genesis', 0);
+                 INSERT INTO operations (id, repo_id, command, status, kind, created_at_ms)
+                     VALUES ('op_stale', 'repo_1', 'save', 'succeeded', 'save', 0);",
+            )
+            .expect("seed rows");
+
+        let error = with_immediate_retry(&mut connection, |tx| {
+            // Pass `op_stale` as the parent: it exists (satisfies the FK) but does
+            // NOT equal current_state.current_operation_id (`op_genesis`), so the
+            // CAS `WHERE current_operation_id = 'op_stale'` updates zero rows.
+            insert_operation_view(
+                tx,
+                "repo_1",
+                Some("op_stale"),
+                OperationViewInput {
+                    request_id: None,
+                    command: "save".to_string(),
+                    kind: "snapshot_saved".to_string(),
+                    view_kind: ViewKind::Initialized,
+                    state: json!({ "lifecycle": "test" }),
+                },
+            )
+        })
+        .expect_err("a stale parent must lose the CAS");
+
+        let forge_error = error
+            .downcast_ref::<ForgeError>()
+            .expect("the CAS failure is a typed ForgeError");
+        assert_eq!(*forge_error, ForgeError::CurrentStateChanged);
+        assert_eq!(forge_error.code(), "CONFLICT");
+        assert!(forge_error.retryable());
+        assert_eq!(forge_error.after_ms(), Some(50));
+    }
+
+    #[test]
+    fn record_conflict_set_redacts_secret_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path();
+        run_git(root, &["init"]);
+        run_git(root, &["config", "user.email", "forge@example.test"]);
+        run_git(root, &["config", "user.name", "Forge Test"]);
+        fs::write(root.join("README.md"), "hello\n").expect("write readme");
+        run_git(root, &["add", "README.md"]);
+        run_git(root, &["commit", "-m", "initial"]);
+
+        init_repository(root, None, "git".to_string()).expect("init repository");
+
+        let paths = vec![
+            "src/main.rs".to_string(),
+            ".env".to_string(),
+            "k.pem".to_string(),
+        ];
+        let id = record_conflict_set(root, "stale_base_accept", "HEAD0", "HEAD1", &paths)
+            .expect("record conflict set");
+        assert!(id.starts_with("conflict_"), "unexpected id: {id}");
+
+        let database_path = root.join(".forge/forge.db");
+        let connection = Connection::open(&database_path).expect("open db");
+        let (context, paths_json): (String, String) = connection
+            .query_row(
+                "SELECT context, paths_json FROM conflict_sets WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query conflict row");
+
+        assert_eq!(context, "stale_base_accept");
+        let value: Value = serde_json::from_str(&paths_json).expect("parse paths_json");
+        assert_eq!(value["expected_head"], "HEAD0");
+        assert_eq!(value["actual_head"], "HEAD1");
+        assert_eq!(value["redacted_count"], 2);
+        assert!(
+            paths_json.contains("src/main.rs"),
+            "non-secret path must be kept: {paths_json}"
+        );
+        assert!(
+            !paths_json.contains(".env"),
+            "secret-risk path leaked: {paths_json}"
+        );
+        assert!(
+            !paths_json.contains("k.pem"),
+            "secret-risk path leaked: {paths_json}"
+        );
     }
 }

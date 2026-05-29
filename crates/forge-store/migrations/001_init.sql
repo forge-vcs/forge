@@ -1,14 +1,7 @@
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    applied_at_ms INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS repositories (
     id TEXT PRIMARY KEY,
     root_path TEXT NOT NULL UNIQUE,
     git_head TEXT,
-    content_backend TEXT NOT NULL DEFAULT 'git',
     created_at_ms INTEGER NOT NULL
 );
 
@@ -43,7 +36,6 @@ CREATE TABLE IF NOT EXISTS current_state (
     repo_id TEXT NOT NULL REFERENCES repositories(id),
     current_operation_id TEXT NOT NULL REFERENCES operations(id),
     current_view_id TEXT NOT NULL REFERENCES views(id),
-    attached_attempt_id TEXT REFERENCES attempts(id),
     updated_at_ms INTEGER NOT NULL
 );
 

@@ -99,6 +99,38 @@ pub fn is_secret_risk_path(path: &str) -> bool {
         || lower.contains("secret")
 }
 
+/// The single, shared export/snapshot exclusion predicate. Both content backends
+/// (`forge-content-git` and `forge-content-native`) and the export-git tree rewrite
+/// consult this so the secret/internal-path exclusion set cannot drift between them
+/// (NER-133 U6). Excludes Forge's own metadata (`.forge`), git's metadata (`.git` —
+/// harmless for the git backend, which never reports `.git/` worktree paths; note
+/// `.gitignore`/`.gitattributes`/`.github/` are NOT under `.git/` and remain
+/// eligible), crash-atomic-restore temps, and secret-risk-named paths.
+pub fn is_ignored_by_policy(path: &str) -> bool {
+    path == ".forge"
+        || path.starts_with(".forge/")
+        || path == ".git"
+        || path.starts_with(".git/")
+        || is_restore_temp_path(path)
+        || is_secret_risk_path(path)
+}
+
+/// Partition `paths` into `(kept, dropped)` by `is_secret_risk_path`, preserving the
+/// input order within each bucket. Used by the `pr_body` egress surface (NER-133 U6)
+/// to list only non-secret paths while surfacing the dropped ones as warnings.
+pub fn filter_secret_risk(paths: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for path in paths {
+        if is_secret_risk_path(path) {
+            dropped.push(path.clone());
+        } else {
+            kept.push(path.clone());
+        }
+    }
+    (kept, dropped)
+}
+
 pub fn redact_secret_like_text(text: &str) -> (String, bool) {
     let mut redacted_any = false;
     let mut redacted = Vec::new();
@@ -137,4 +169,41 @@ fn is_secret_like_key(key: &str) -> bool {
         || key.contains("apikey")
         || key.contains("access_key")
         || key.contains("private_key")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_policy_excludes_metadata_temps_and_secrets() {
+        // Forge + git metadata, restore temps, and secret-risk names are all excluded
+        // by the single shared predicate (NER-133 U6).
+        assert!(is_ignored_by_policy(".forge"));
+        assert!(is_ignored_by_policy(".forge/forge.db"));
+        assert!(is_ignored_by_policy(".git"));
+        assert!(is_ignored_by_policy(".git/config"));
+        assert!(is_ignored_by_policy(".forge-restore-abc123"));
+        assert!(is_ignored_by_policy(".env"));
+        assert!(is_ignored_by_policy("certs/server.pem"));
+        // git-adjacent dotfiles are NOT under `.git/` and stay eligible.
+        assert!(!is_ignored_by_policy(".gitignore"));
+        assert!(!is_ignored_by_policy(".gitattributes"));
+        assert!(!is_ignored_by_policy(".github/workflows/ci.yml"));
+        assert!(!is_ignored_by_policy("README.md"));
+    }
+
+    #[test]
+    fn filter_secret_risk_partitions_order_preserving() {
+        let paths = vec![
+            "a.txt".to_string(),
+            ".env".to_string(),
+            "b.txt".to_string(),
+            "certs/key.pem".to_string(),
+            "c.txt".to_string(),
+        ];
+        let (kept, dropped) = filter_secret_risk(&paths);
+        assert_eq!(kept, vec!["a.txt", "b.txt", "c.txt"]);
+        assert_eq!(dropped, vec![".env", "certs/key.pem"]);
+    }
 }

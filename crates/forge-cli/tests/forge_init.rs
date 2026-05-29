@@ -144,16 +144,18 @@ fn init_is_idempotent() {
 }
 
 #[test]
-fn existing_repository_without_content_backend_column_migrates_on_normal_command() {
+fn at_head_database_reports_healthy_schema_on_normal_command() {
+    // This test previously DROPped `content_backend` while leaving version=2 and
+    // asserted the next command auto-repaired the column. The NER-133 U3
+    // version-gated migration runner deliberately does NOT auto-repair structural
+    // drift on an at-HEAD DB (it skips when MAX(version) == HEAD); genuine v1->v2
+    // upgrade is covered by `forge-store`'s `migrations::tests` (genesis case B),
+    // where the FK on `attached_attempt_id` can be handled without the artificial
+    // one-column state that DROP-on-a-v2-DB would create. Here we assert the new
+    // behavior: a normal command on an unmodified at-HEAD DB reports a healthy
+    // schema at the current head.
     let repo = TestRepo::new_git();
     repo.forge().args(["--json", "init"]).assert().success();
-    {
-        let connection =
-            Connection::open(repo.path().join(".forge/forge.db")).expect("open forge db");
-        connection
-            .execute("ALTER TABLE repositories DROP COLUMN content_backend", [])
-            .expect("simulate older schema");
-    }
 
     let output = repo
         .forge()
@@ -165,14 +167,85 @@ fn existing_repository_without_content_backend_column_migrates_on_normal_command
         .clone();
     let json: Value = serde_json::from_slice(&output).expect("valid json");
     assert_eq!(json["data"]["ok"], true);
+    assert_eq!(json["data"]["schema_version"], 2);
+}
 
-    let connection = Connection::open(repo.path().join(".forge/forge.db")).expect("open forge db");
-    let backend: String = connection
-        .query_row("SELECT content_backend FROM repositories", [], |row| {
-            row.get(0)
-        })
-        .expect("content backend default");
-    assert_eq!(backend, "git");
+/// FIX K (U3): structural drift on an at-HEAD (version=2) DB is NOT auto-repaired
+/// by the version-gated migration runner — the runner skips entirely when
+/// MAX(version) == HEAD, so it never re-runs 002 to re-add a manually-dropped
+/// column. The drift is instead SURFACED, not silently fixed.
+///
+/// We DROP `repositories.content_backend` from an at-HEAD DB, run a normal command,
+/// and assert: (a) the column is NOT re-added (proving no auto-repair — the
+/// documented capability change vs. the old unconditional ALTERs), and (b) the
+/// drift surfaces rather than being swallowed. Note: because `open_repository`
+/// SELECTs `content_backend`, both the normal command and `forge doctor` surface
+/// the structural drift as an error rather than a clean `issues[]` drift report —
+/// the achievable end-to-end signal is that doctor does NOT report `ok: true` and
+/// the column was never auto-repaired.
+#[test]
+fn at_head_structural_drift_is_surfaced_not_auto_repaired() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+
+    let db_path = repo.path().join(".forge/forge.db");
+    {
+        let connection = Connection::open(&db_path).expect("open forge db");
+        // Drop a HEAD-schema column while leaving MAX(version) == 2 (at HEAD).
+        connection
+            .execute("ALTER TABLE repositories DROP COLUMN content_backend", [])
+            .expect("drop content_backend");
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("read version");
+        assert_eq!(version, 2, "DB must still be stamped at HEAD");
+    }
+
+    // Run a normal command: the migration runner skips at HEAD and must NOT
+    // auto-repair (re-add) the dropped column.
+    let _ = repo.forge().args(["--json", "show"]).assert();
+
+    // The column was NOT re-added — at-HEAD drift is not auto-repaired.
+    {
+        let connection = Connection::open(&db_path).expect("re-open forge db");
+        let has_content_backend: bool = connection
+            .prepare("PRAGMA table_info(repositories)")
+            .expect("prepare table_info")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query columns")
+            .any(|c| c.expect("column name") == "content_backend");
+        assert!(
+            !has_content_backend,
+            "at-HEAD drift must NOT be auto-repaired (column stays dropped)"
+        );
+        // Version is unchanged — the runner did not re-stamp or re-run a migration.
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("read version");
+        assert_eq!(version, 2);
+    }
+
+    // `forge doctor` surfaces the structural drift rather than reporting a healthy
+    // schema: it does not return `ok: true`. (Because `open_repository` reads the
+    // dropped column, doctor surfaces it as a structural error, not a clean drift
+    // report — the point FIX K pins is that drift is surfaced, not auto-repaired.)
+    let output = repo
+        .forge()
+        .args(["--json", "doctor"])
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_ne!(
+        json["data"]["ok"], true,
+        "doctor must NOT report a healthy schema on a drifted at-HEAD DB"
+    );
+    assert_eq!(json["status"], "error", "structural drift is surfaced");
 }
 
 #[test]
