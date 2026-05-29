@@ -1332,15 +1332,19 @@ fn scan_restore_temps(root: &Path) -> Result<Vec<String>> {
     Ok(found)
 }
 
-pub fn pr_body(cwd: &Path) -> Result<String> {
+pub fn pr_body(cwd: &Path) -> Result<(String, Vec<String>)> {
     pr_body_for(cwd, None, None)
 }
 
+/// Render the PR-body markdown, returning `(body, excluded)`. Secret-risk-named
+/// changed paths are dropped from the "Changed Paths" list by the default-deny
+/// export policy (NER-133 U6) and returned in `excluded` so the CLI can surface them
+/// as `warnings[]`.
 pub fn pr_body_for(
     cwd: &Path,
     attempt_id: Option<&str>,
     proposal_id: Option<&str>,
-) -> Result<String> {
+) -> Result<(String, Vec<String>)> {
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
     let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
@@ -1350,8 +1354,9 @@ pub fn pr_body_for(
     let mut body = String::new();
     body.push_str("# Forge Proposal\n\n");
     body.push_str(&format!("Intent: {}\n\n", attempt.intent));
+    let (kept_paths, excluded_paths) = forge_content::filter_secret_risk(&proposal.changed_paths);
     body.push_str("## Changed Paths\n");
-    for path in proposal.changed_paths {
+    for path in &kept_paths {
         body.push_str(&format!("- {path}\n"));
     }
     body.push('\n');
@@ -1379,7 +1384,7 @@ pub fn pr_body_for(
             publication.branch_name, publication.commit_id
         ));
     }
-    Ok(body)
+    Ok((body, excluded_paths))
 }
 
 pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {

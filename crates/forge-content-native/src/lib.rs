@@ -1,7 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use forge_content::{
-    is_restore_temp_path, is_secret_risk_path, ContentBackend, SnapshotContent, FORGE_TREE_PREFIX,
-};
+use forge_content::{is_ignored_by_policy, ContentBackend, SnapshotContent, FORGE_TREE_PREFIX};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -551,15 +549,6 @@ fn git(repo_root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-fn is_ignored_by_policy(path: &str) -> bool {
-    path == ".git"
-        || path.starts_with(".git/")
-        || path == ".forge"
-        || path.starts_with(".forge/")
-        || is_restore_temp_path(path)
-        || is_secret_risk_path(path)
-}
-
 fn validate_tree_entry(entry: &TreeEntry) -> Result<()> {
     if entry.name.is_empty()
         || entry.name == "."
@@ -693,6 +682,13 @@ mod tests {
         // never land in a snapshot/export.
         assert!(is_ignored_by_policy(".forge-restore-abc123"));
         assert!(is_ignored_by_policy("src/nested/.forge-restore-xyz"));
+        // Symmetric secret/internal-path assertions: both backends route to the shared
+        // `forge_content::is_ignored_by_policy`, so the exclusion set cannot drift
+        // (NER-133 U6).
+        assert!(is_ignored_by_policy(".env"));
+        assert!(is_ignored_by_policy("certs/server.pem"));
+        assert!(is_ignored_by_policy(".git"));
+        assert!(is_ignored_by_policy(".git/config"));
         // A normal worktree file is still snapshot-eligible.
         assert!(!is_ignored_by_policy("README.md"));
     }

@@ -265,6 +265,7 @@ fn start_response(request_id: Option<String>, args: IntentArgs) -> ResponseEnvel
         Ok((
             Some(started.operation_id.clone()),
             serde_json::to_value(started)?,
+            Vec::new(),
         ))
     })
 }
@@ -283,6 +284,7 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
                 Ok((
                     Some(started.operation_id.clone()),
                     serde_json::to_value(started)?,
+                    Vec::new(),
                 ))
             })
         }
@@ -290,6 +292,7 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
             Ok((
                 None,
                 json!({ "attempts": forge_store::list_attempts(&cwd)? }),
+                Vec::new(),
             ))
         }),
         AttemptCommand::Show { attempt_id } => {
@@ -297,6 +300,7 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
                 Ok((
                     None,
                     serde_json::to_value(forge_store::show_attempt(&cwd, &attempt_id)?)?,
+                    Vec::new(),
                 ))
             })
         }
@@ -344,6 +348,7 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
                         "content_ref": content_ref,
                         "current_view_id": attached.view_id
                     }),
+                    Vec::new(),
                 ))
             })
         }
@@ -373,6 +378,7 @@ fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> Respons
         Ok((
             Some(saved.operation_id.clone()),
             serde_json::to_value(saved)?,
+            Vec::new(),
         ))
     })
 }
@@ -397,6 +403,7 @@ fn restore_response(request_id: Option<String>, args: RestoreArgs) -> ResponseEn
                 "content_ref": content_ref,
                 "current_view_id": restored.view_id
             }),
+            Vec::new(),
         ))
     })
 }
@@ -431,6 +438,7 @@ fn run_response(request_id: Option<String>, args: RunArgs) -> ResponseEnvelope {
         Ok((
             Some(recorded.operation_id.clone()),
             serde_json::to_value(recorded)?,
+            Vec::new(),
         ))
     })
 }
@@ -441,6 +449,7 @@ fn propose_response(request_id: Option<String>, args: AttemptScopedArgs) -> Resp
         Ok((
             Some(proposal.operation_id.clone()),
             serde_json::to_value(proposal)?,
+            Vec::new(),
         ))
     })
 }
@@ -459,6 +468,7 @@ fn check_response(request_id: Option<String>, args: ProposalScopedArgs) -> Respo
         Ok((
             Some(check.operation_id.clone()),
             serde_json::to_value(check)?,
+            Vec::new(),
         ))
     })
 }
@@ -494,6 +504,7 @@ fn decision_response(
         Ok((
             Some(record.operation_id.clone()),
             serde_json::to_value(record)?,
+            Vec::new(),
         ))
     })
 }
@@ -501,7 +512,7 @@ fn decision_response(
 fn show_response(request_id: Option<String>, args: AttemptScopedArgs) -> ResponseEnvelope {
     command_result("show", request_id, |cwd, _request_id| {
         let show = forge_store::show(&cwd, args.attempt.as_deref())?;
-        Ok((None, serde_json::to_value(show)?))
+        Ok((None, serde_json::to_value(show)?, Vec::new()))
     })
 }
 
@@ -511,6 +522,7 @@ fn proposal_response(request_id: Option<String>, args: ProposalArgs) -> Response
             Ok((
                 None,
                 json!({ "proposals": forge_store::list_proposals(&cwd, args.attempt.as_deref())? }),
+                Vec::new(),
             ))
         }),
     }
@@ -519,7 +531,7 @@ fn proposal_response(request_id: Option<String>, args: ProposalArgs) -> Response
 fn doctor_response(request_id: Option<String>) -> ResponseEnvelope {
     command_result("doctor", request_id, |cwd, _request_id| {
         let report = forge_store::doctor(&cwd)?;
-        Ok((None, serde_json::to_value(report)?))
+        Ok((None, serde_json::to_value(report)?, Vec::new()))
     })
 }
 
@@ -529,16 +541,20 @@ fn gc_response(request_id: Option<String>, args: GcArgs) -> ResponseEnvelope {
             anyhow::bail!("gc only supports --dry-run in v0");
         }
         let report = forge_store::gc_dry_run(&cwd)?;
-        Ok((None, serde_json::to_value(report)?))
+        Ok((None, serde_json::to_value(report)?, Vec::new()))
     })
 }
 
 fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnvelope {
     match args.command {
         ExportCommand::PrBody(args) => command_result("export pr-body", request_id, |cwd, _| {
-            let body =
+            let (body, excluded) =
                 forge_store::pr_body_for(&cwd, args.attempt.as_deref(), args.proposal.as_deref())?;
-            Ok((None, json!({ "body": body })))
+            Ok((
+                None,
+                json!({ "body": body }),
+                secret_export_warnings(&excluded),
+            ))
         }),
         ExportCommand::Branch(args) => {
             command_result("export branch", request_id, |cwd, request_id| {
@@ -566,7 +582,7 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                     }
                     .into());
                 }
-                let commit_id = forge_export_git::export_branch(
+                let (commit_id, excluded) = forge_export_git::export_branch(
                     &cwd,
                     &args.name,
                     &proposal.base_head,
@@ -584,6 +600,7 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                 Ok((
                     Some(publication.operation_id.clone()),
                     serde_json::to_value(publication)?,
+                    secret_export_warnings(&excluded),
                 ))
             })
         }
@@ -644,9 +661,21 @@ fn replay_response(
     )
 }
 
+/// Format dropped secret-risk export paths as top-level `warnings[]` entries
+/// (NER-133 U6), shared by every export egress surface so the message is uniform.
+fn secret_export_warnings(excluded: &[String]) -> Vec<String> {
+    excluded
+        .iter()
+        .map(|path| format!("excluded secret-risk path from export: {path}"))
+        .collect()
+}
+
 fn command_result<F>(command: &'static str, request_id: Option<String>, f: F) -> ResponseEnvelope
 where
-    F: FnOnce(std::path::PathBuf, Option<String>) -> anyhow::Result<(Option<String>, Value)>,
+    F: FnOnce(
+        std::path::PathBuf,
+        Option<String>,
+    ) -> anyhow::Result<(Option<String>, Value, Vec<String>)>,
 {
     let cwd = match env::current_dir().map_err(anyhow::Error::from) {
         Ok(cwd) => cwd,
@@ -715,8 +744,10 @@ where
     let result = f(cwd, request_id.clone());
 
     match result {
-        Ok((operation_id, data)) => {
-            ResponseEnvelope::success(command, request_id, operation_id, data)
+        Ok((operation_id, data, warnings)) => {
+            let mut envelope = ResponseEnvelope::success(command, request_id, operation_id, data);
+            envelope.warnings = warnings;
+            envelope
         }
         Err(error) => {
             // A concurrent same-`request_id` writer won the race: the in-txn
