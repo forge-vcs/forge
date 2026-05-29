@@ -180,9 +180,11 @@ pub struct DecisionRecord {
     pub proposal_revision_id: String,
     pub decision: String,
     /// The check status observed in-txn when an `accept` was gated on evidence
-    /// (NER-135). `None` for `reject`. `Some("passed")` for a normal accept;
+    /// (NER-135). Omitted entirely for `reject` (the gate never runs), so the reject
+    /// response shape is unchanged. `Some("passed")` for a normal accept;
     /// `Some(<failed|missing|stale>)` only when `--allow-unverified` bypassed the
     /// gate, which the CLI surfaces as a `warnings[]` entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub check_status: Option<String>,
     pub operation_id: String,
 }
@@ -535,8 +537,9 @@ pub fn operation_for_request(cwd: &Path, request_id: &str) -> Result<Option<Requ
 /// `(program, args)` — the same shape `forge run -- <argv>` records as evidence, so
 /// a gate's identity matches its evidence. Returns `None` when no gate is declared
 /// (the policy engine's default mode). Quoting of whitespace-bearing args is a
-/// documented v0 limitation (deferred). Keeping this in the store means the CLI
-/// does not depend on `forge-policy` directly.
+/// documented v0 limitation (deferred). Lives in the store (which already depends on
+/// `forge-policy`) so the CLI need not name `forge_policy` types directly to build a
+/// spec — though it still transitively serializes them via `CheckRecord.gates`.
 pub fn check_spec_json_from_requires(requires: &[String]) -> Option<String> {
     let gates: Vec<forge_policy::Gate> = requires
         .iter()
@@ -1045,6 +1048,9 @@ pub fn record_check(
             Ok((check_result_id, outcome, evidence_id, op))
         },
     )?;
+    // Redact secret-like argv in the per-gate egress (the verdict was already
+    // computed in-txn from the raw identities; this only affects what is surfaced).
+    let gates = outcome.gates.into_iter().map(redact_gate_result).collect();
     Ok(CheckRecord {
         check_result_id,
         proposal_id: proposal.proposal_id,
@@ -1052,9 +1058,32 @@ pub fn record_check(
         status: outcome.status,
         reason: outcome.reason,
         evidence_id,
-        gates: outcome.gates,
+        gates,
         operation_id: op.operation_id,
     })
+}
+
+/// Redact secret-like `key=value` argv tokens (e.g. `--token=…`, `PASSWORD=…`) in a
+/// gate's program + each arg before the identity reaches a machine-visible egress —
+/// the `check` JSON `gates[]` here, and (per-token) `CHECK_NOT_PASSED.unmet` in
+/// `error.rs` (NER-135 code-review F2). Redacts PER-ARG: `redact_secret_like_text`
+/// keys on the first `=`/`:` of its input, so redacting each arg independently catches
+/// a secret in any position, where redacting a space-joined identity would only check
+/// its first token. Gate specs are persisted (`intents.check_spec_json`) and surfaced
+/// WITHOUT execution, so — unlike captured evidence — they get this egress pass. Full
+/// non-`key=value` arg scanning is Phase 5 (see schema `notes.secret_protection`).
+fn redact_gate_result(gate: forge_policy::GateResult) -> forge_policy::GateResult {
+    let program = forge_content::redact_secret_like_text(&gate.program).0;
+    let args = gate
+        .args
+        .iter()
+        .map(|arg| forge_content::redact_secret_like_text(arg).0)
+        .collect();
+    forge_policy::GateResult {
+        program,
+        args,
+        ..gate
+    }
 }
 
 /// Pick a single representative evidence id for the `check_results.evidence_id`
@@ -1084,9 +1113,18 @@ fn intent_check_spec(conn: &Connection, intent_id: &str) -> Result<forge_policy:
         )
         .optional()?
         .flatten();
-    Ok(stored
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default())
+    // Fail CLOSED, not open: a NULL column is a legitimately un-gated intent
+    // (default mode), but a non-NULL value that won't parse is corruption (manual
+    // edit, partial write, or a future spec shape this binary can't read). Silently
+    // collapsing it to an empty spec would downgrade a declared multi-gate intent to
+    // the permissive default mode, letting a gated `accept` slip through (NER-135
+    // code-review F1). The schema_version gate does not catch this — migration 003
+    // only adds the column, not a value-shape version — so the parse must error.
+    match stored {
+        None => Ok(forge_policy::CheckSpec::default()),
+        Some(json) => serde_json::from_str(&json)
+            .with_context(|| format!("corrupt check_spec_json for intent {intent_id}")),
+    }
 }
 
 /// Project every evidence row for an attempt into [`forge_policy::EvidenceFact`]s,

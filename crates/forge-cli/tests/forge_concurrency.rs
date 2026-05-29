@@ -501,13 +501,14 @@ fn concurrent_commands_against_behind_db_both_upgrade_and_succeed() {
 
     let connection = open_db(repo.path());
     // Exactly one set of version rows: the second upgrader's `INSERT OR IGNORE`
-    // is a no-op once the first commits version 2.
+    // is a no-op once the first commits version 3 (probe HEAD=3, the migration whose
+    // dedup the race actually exercises — code-review F5).
     let version_rows = count(
         &connection,
         "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
-        "2",
+        "3",
     );
-    assert_eq!(version_rows, 1, "exactly one version-2 row after the race");
+    assert_eq!(version_rows, 1, "exactly one version-3 row after the race");
     let head: i64 = connection
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",

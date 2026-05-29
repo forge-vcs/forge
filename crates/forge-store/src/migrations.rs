@@ -466,7 +466,10 @@ mod tests {
         .expect("stamp v2");
         apply_pending_migrations(&mut c).expect("inline v2 runs clean");
 
-        for table in ["repositories", "current_state"] {
+        // `intents` is included so migration 003's `check_spec_json` column is part of
+        // the by-name convergence guard (code-review F4): case C (merged-binary v2)
+        // is stamped only at version 2, so the runner must apply 003 to it.
+        for table in ["repositories", "current_state", "intents"] {
             let set_a = column_set(&a, table);
             let set_b = column_set(&b, table);
             let set_c = column_set(&c, table);

@@ -152,6 +152,25 @@ fn failing_gate_then_passing_other_command_stays_failed() {
 }
 
 #[test]
+fn declared_gate_is_stale_when_evidence_is_on_an_earlier_snapshot() {
+    // The declared-gate `stale` verdict end-to-end: the gate ran, but only on a
+    // prior snapshot, so it does not describe the proposed tree (code-review F3).
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    start_with_gates(&repo, "stale gate", &["sh -c true"]);
+    std::fs::write(repo.path().join("README.md"), "first\n").expect("write");
+    repo.forge().args(["--json", "save"]).assert().success();
+    run_cmd(&repo, &["sh", "-c", "true"]); // evidence binds snapshot A
+    std::fs::write(repo.path().join("README.md"), "second\n").expect("write");
+    repo.forge().args(["--json", "save"]).assert().success(); // snapshot B
+    repo.forge().args(["--json", "propose"]).assert().success(); // proposes B
+    let checked = json_output(repo.forge().args(["--json", "check"]).assert().success());
+    assert_eq!(checked["data"]["status"], "stale");
+    let gates = checked["data"]["gates"].as_array().expect("gates array");
+    assert_eq!(gates[0]["verdict"], "stale");
+}
+
+#[test]
 fn two_declared_gates_pass_only_when_all_pass() {
     let repo = TestRepo::new_git();
     repo.forge().args(["--json", "init"]).assert().success();
@@ -203,6 +222,14 @@ fn accept_requires_a_passing_check_by_default_and_allow_unverified_bypasses() {
     let blocked = json_output(repo.forge().args(["--json", "accept"]).assert().failure());
     assert_eq!(blocked["errors"][0]["code"], "CHECK_NOT_PASSED");
     assert_eq!(blocked["errors"][0]["details"]["status"], "missing");
+    // The unmet list names the gate the agent must satisfy (machine-actionable).
+    let unmet = blocked["errors"][0]["details"]["unmet"]
+        .as_array()
+        .expect("unmet array");
+    assert!(
+        unmet.iter().any(|u| u == "cargo test"),
+        "unmet must name the cargo test gate, got {unmet:?}"
+    );
 
     // --allow-unverified bypasses with a warning.
     let bypassed = json_output(

@@ -176,10 +176,19 @@ impl ForgeError {
                 // and surfaced WITHOUT execution, so — unlike captured evidence, which
                 // requires running the command and already redacts its output — they
                 // get a redaction pass here for secret-like `key=value` argv (NER-135).
-                // Full arg-level scanning is Phase 5 (see schema notes.secret_protection).
+                // Redact PER WHITESPACE TOKEN: `redact_secret_like_text` keys on the
+                // first `=`/`:` of its input, so a space-joined identity would only
+                // check its first token (code-review F2); tokenizing first catches a
+                // secret in any position. Full non-`key=value` scanning is Phase 5.
                 let redacted: Vec<String> = unmet
                     .iter()
-                    .map(|identity| forge_content::redact_secret_like_text(identity).0)
+                    .map(|identity| {
+                        identity
+                            .split_whitespace()
+                            .map(|token| forge_content::redact_secret_like_text(token).0)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
                     .collect();
                 json!({ "status": status, "unmet": redacted })
             }
@@ -600,7 +609,13 @@ mod tests {
     fn details_redact_secret_like_unmet() {
         let details = ForgeError::CheckNotPassed {
             status: "failed".into(),
-            unmet: vec!["cargo test".into(), "deploy --token=ghp_supersecret".into()],
+            unmet: vec![
+                "cargo test".into(),
+                "deploy --token=ghp_supersecret".into(),
+                // Multi-token identity where the secret is NOT the first `=` on the
+                // line — the per-token redaction must still catch it (code-review F2).
+                "cargo test FOO=bar --token=ghp_secondsecret".into(),
+            ],
         }
         .details();
         assert_eq!(details["status"], "failed");
@@ -610,6 +625,14 @@ mod tests {
         assert!(
             !serialized.contains("ghp_supersecret"),
             "secret-like argv value must be redacted in unmet"
+        );
+        assert!(
+            !serialized.contains("ghp_secondsecret"),
+            "a secret-like token after a non-secret key=value must still be redacted"
+        );
+        assert!(
+            serialized.contains("FOO=bar"),
+            "non-secret key=value token is preserved"
         );
         assert!(serialized.contains("[REDACTED]"));
         let object = details.as_object().expect("details object");
