@@ -153,13 +153,26 @@ impl NativeObjectStore {
         }
 
         let parent = path.parent().context("object path has no parent")?;
+        // Record which ancestor directories do not yet exist so their creation can be
+        // made durable after the object is written: a freshly created shard directory's
+        // own entry is not durable until the directory it lives in is fsynced.
+        let newly_created = missing_dirs(parent);
         fs::create_dir_all(parent)?;
         fs::create_dir_all(self.tmp_dir())?;
         let mut temp = tempfile::NamedTempFile::new_in(self.tmp_dir())?;
         temp.write_all(payload)?;
         temp.as_file_mut().sync_all()?;
         temp.persist(&path).map_err(|error| error.error)?;
-        best_effort_sync_dir(parent);
+        // The object's directory entry must reach disk before any DB row references it.
+        // A swallowed failure here is exactly the durability hole this fix closes.
+        sync_dir(parent)?;
+        // Make each newly created ancestor directory durable by fsyncing the directory
+        // that gained the new entry.
+        for dir in &newly_created {
+            if let Some(grandparent) = dir.parent() {
+                sync_dir(grandparent)?;
+            }
+        }
         Ok(id)
     }
 
@@ -502,10 +515,38 @@ fn ensure_child_kind(entry: &TreeEntry, child: &ObjectId) -> Result<()> {
     }
 }
 
-fn best_effort_sync_dir(path: &Path) {
-    if let Ok(file) = File::open(path) {
-        let _ = file.sync_all();
+/// Fsync a directory so a newly created or renamed entry within it is durable.
+/// Errors propagate — a swallowed directory sync silently breaks crash-durability,
+/// which is the hole this replaces. This is a deliberate fail-hard: a write whose
+/// directory entry may not survive a crash must not report success.
+/// Known limitation: a few filesystems (some network/overlay mounts) reject fsync on a
+/// directory fd (EINVAL/ENOTSUP), where directory durability is meaningless anyway; on
+/// those `.forge` locations write_object will now error. `.forge` is expected to be on a
+/// local filesystem (Phase 1b's WAL work makes that constraint explicit), so tolerating
+/// those errnos as a degraded no-op is deferred rather than guessed at here.
+fn sync_dir(path: &Path) -> Result<()> {
+    let dir = File::open(path)
+        .with_context(|| format!("open directory for fsync: {}", path.display()))?;
+    dir.sync_all()
+        .with_context(|| format!("fsync directory: {}", path.display()))?;
+    Ok(())
+}
+
+/// Ancestor directories of `dir` (inclusive) that do not yet exist, ordered
+/// shallowest-first. Lets the caller fsync only the directories whose creation is
+/// new, so already-durable directories are not re-synced on every write.
+fn missing_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = Some(dir);
+    while let Some(path) = current {
+        if path.exists() {
+            break;
+        }
+        missing.push(path.to_path_buf());
+        current = path.parent();
     }
+    missing.reverse();
+    missing
 }
 
 #[cfg(unix)]
@@ -568,5 +609,39 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("hash mismatch"));
+    }
+
+    #[test]
+    fn sync_dir_propagates_error_on_missing_path() {
+        // Directory fsync rarely fails on a healthy FS (and on macOS a dir fsync is a
+        // near-noop), so exercise the error path through a mockable seam: a path that
+        // cannot be opened must surface an Err rather than being swallowed.
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("does-not-exist");
+        assert!(sync_dir(&missing).is_err());
+    }
+
+    #[test]
+    fn missing_dirs_lists_uncreated_ancestors_shallowest_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = a.join("b");
+        let c = b.join("c");
+        // temp.path() already exists; a, b, c do not.
+        assert_eq!(missing_dirs(&c), vec![a.clone(), b.clone(), c.clone()]);
+        fs::create_dir_all(&c).unwrap();
+        assert!(missing_dirs(&c).is_empty());
+    }
+
+    #[test]
+    fn write_object_into_fresh_shard_is_durable_and_roundtrips() {
+        // A fresh store means the sha256/<prefix>/ shard dir is newly created, exercising
+        // the ancestor-fsync path; the object must round-trip after write_object returns Ok.
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let id = store
+            .write_object(ObjectKind::Blob, b"durable-payload")
+            .unwrap();
+        assert_eq!(store.read_object(&id).unwrap(), b"durable-payload");
     }
 }
