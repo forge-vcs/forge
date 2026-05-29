@@ -612,6 +612,19 @@ mod tests {
     }
 
     #[test]
+    fn wal_sidecars_are_excluded_by_policy() {
+        // WAL (enabled in forge-store::open_connection) makes `forge.db` travel
+        // with `-wal`/`-shm` sidecars holding committed-but-uncheckpointed data,
+        // including evidence excerpts. They must never leak into a snapshot/export.
+        assert!(is_ignored_by_policy(".forge/forge.db"));
+        assert!(is_ignored_by_policy(".forge/forge.db-wal"));
+        assert!(is_ignored_by_policy(".forge/forge.db-shm"));
+        assert!(is_ignored_by_policy(".forge"));
+        // A normal worktree file is still snapshot-eligible.
+        assert!(!is_ignored_by_policy("README.md"));
+    }
+
+    #[test]
     fn sync_dir_propagates_error_on_missing_path() {
         // Directory fsync rarely fails on a healthy FS (and on macOS a dir fsync is a
         // near-noop), so exercise the error path through a mockable seam: a path that

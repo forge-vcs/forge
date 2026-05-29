@@ -222,3 +222,20 @@ fn materialized_paths(repo_root: &Path) -> Result<Vec<String>> {
     paths.dedup();
     Ok(paths)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wal_sidecars_are_excluded_by_policy() {
+        // WAL (enabled in forge-store::open_connection) makes forge.db travel with
+        // `-wal`/`-shm` sidecars holding committed-but-uncheckpointed data; this
+        // backend must exclude them from exported trees just as the native one does.
+        assert!(is_ignored_by_policy(".forge/forge.db"));
+        assert!(is_ignored_by_policy(".forge/forge.db-wal"));
+        assert!(is_ignored_by_policy(".forge/forge.db-shm"));
+        assert!(is_ignored_by_policy(".forge"));
+        assert!(!is_ignored_by_policy("README.md"));
+    }
+}
