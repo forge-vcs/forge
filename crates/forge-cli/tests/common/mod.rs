@@ -25,6 +25,10 @@ impl TestRepo {
         self.temp_dir.path()
     }
 
+    // Not every integration-test crate that includes `common` drives the CLI
+    // through assert_cmd (the concurrency suite spawns raw processes), so this is
+    // dead in some compilation units.
+    #[allow(dead_code)]
     pub fn forge(&self) -> Command {
         let mut command = Command::cargo_bin("forge").expect("forge binary");
         command.current_dir(self.path());

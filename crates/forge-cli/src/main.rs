@@ -563,6 +563,54 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
     }
 }
 
+/// Build the replay response for an already-recorded `(repo, request_id)`
+/// operation, preserving the command-aware and status-aware contract: a
+/// different command is a `REQUEST_ID_CONFLICT`, a recorded failure replays the
+/// failure, and a recorded success replays `idempotent_replay: true`. Shared by
+/// the pre-flight check and the in-transaction `RequestIdReplay` path so both
+/// give byte-identical replays.
+fn replay_response(
+    command: &'static str,
+    request_id: Option<String>,
+    existing: forge_store::RequestIdOperation,
+) -> ResponseEnvelope {
+    if existing.command != command {
+        return ResponseEnvelope::error(
+            command,
+            request_id,
+            None,
+            ErrorObject::new(
+                "REQUEST_ID_CONFLICT",
+                format!("request id already used for command {}", existing.command),
+            ),
+        );
+    }
+    if existing.status == "failed" {
+        let message = existing
+            .error_json
+            .and_then(|value| {
+                value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "request id replayed failed operation".to_string());
+        return ResponseEnvelope::error(
+            command,
+            request_id,
+            Some(existing.operation_id),
+            ErrorObject::new(error_code(command, &message), message),
+        );
+    }
+    let request_id_value = request_id.as_deref().unwrap_or_default().to_string();
+    ResponseEnvelope::success(
+        command,
+        request_id,
+        Some(existing.operation_id),
+        json!({ "idempotent_replay": true, "request_id": request_id_value }),
+    )
+}
+
 fn command_result<F>(command: &'static str, request_id: Option<String>, f: F) -> ResponseEnvelope
 where
     F: FnOnce(std::path::PathBuf, Option<String>) -> anyhow::Result<(Option<String>, Value)>,
@@ -579,46 +627,17 @@ where
         }
     };
 
+    // Pre-flight replay check: a sequential same-`request_id` retry replays the
+    // original result without opening a write transaction. The concurrent race
+    // (two retries that both pass this check before either commits) is closed by
+    // the in-transaction `replay_guard` (U5), surfaced below as `RequestIdReplay`.
     if is_mutating_command(command) {
-        if let Some(existing_request_id) = request_id.clone() {
-            if let Some(existing) = forge_store::operation_for_request(&cwd, &existing_request_id)
+        if let Some(existing_request_id) = request_id.as_deref() {
+            if let Some(existing) = forge_store::operation_for_request(&cwd, existing_request_id)
                 .ok()
                 .flatten()
             {
-                if existing.command != command {
-                    return ResponseEnvelope::error(
-                        command,
-                        request_id,
-                        None,
-                        ErrorObject::new(
-                            "REQUEST_ID_CONFLICT",
-                            format!("request id already used for command {}", existing.command),
-                        ),
-                    );
-                }
-                if existing.status == "failed" {
-                    let message = existing
-                        .error_json
-                        .and_then(|value| {
-                            value
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        })
-                        .unwrap_or_else(|| "request id replayed failed operation".to_string());
-                    return ResponseEnvelope::error(
-                        command,
-                        request_id,
-                        Some(existing.operation_id),
-                        ErrorObject::new(error_code(command, &message), message),
-                    );
-                }
-                return ResponseEnvelope::success(
-                    command,
-                    request_id,
-                    Some(existing.operation_id),
-                    json!({ "idempotent_replay": true, "request_id": existing_request_id }),
-                );
+                return replay_response(command, request_id, existing);
             }
         }
     }
@@ -630,6 +649,12 @@ where
             ResponseEnvelope::success(command, request_id, operation_id, data)
         }
         Err(error) => {
+            // A concurrent same-`request_id` writer won the race: the in-txn
+            // `replay_guard` rolled this attempt back. Replay the committed
+            // operation instead of reporting a failure (U5, option a).
+            if let Some(replay) = error.downcast_ref::<forge_store::RequestIdReplay>() {
+                return replay_response(command, request_id, replay.operation.clone());
+            }
             let message = error.to_string();
             let failed_operation_id = if is_mutating_command(command) {
                 env::current_dir().ok().and_then(|cwd| {

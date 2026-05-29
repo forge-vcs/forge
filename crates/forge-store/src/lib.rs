@@ -1,11 +1,14 @@
 use anyhow::{anyhow, bail, Context, Result};
 use forge_core::{new_id, now_ms, OperationId, OperationStatus, RepositoryId, ViewId, ViewKind};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{
+    params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
 
@@ -300,26 +303,6 @@ pub fn init_repository(
     let operation_id = OperationId::new().to_string();
     let view_id = ViewId::new().to_string();
     let now = now_ms();
-    let tx = connection.transaction()?;
-
-    tx.execute(
-        "INSERT INTO repositories (id, root_path, git_head, content_backend, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![repo_id, root.to_string_lossy(), git_head, content_backend, now],
-    )?;
-    tx.execute(
-        "INSERT INTO operations (
-            id, repo_id, request_id, command, status, kind, parent_operation_id,
-            resulting_view_id, error_json, created_at_ms
-        ) VALUES (?1, ?2, ?3, 'init', ?4, 'repository_initialized', NULL, ?5, NULL, ?6)",
-        params![
-            operation_id,
-            repo_id,
-            request_id,
-            format!("{:?}", OperationStatus::Succeeded).to_lowercase(),
-            view_id,
-            now
-        ],
-    )?;
     let state_json = json!({
         "repository_id": repo_id,
         "root_path": root,
@@ -328,18 +311,41 @@ pub fn init_repository(
         "lifecycle": "initialized"
     })
     .to_string();
-    tx.execute(
-        "INSERT INTO views (id, repo_id, operation_id, kind, state_json, created_at_ms)
-         VALUES (?1, ?2, ?3, 'initialized', ?4, ?5)",
-        params![view_id, repo_id, operation_id, state_json, now],
-    )?;
-    tx.execute(
-        "INSERT INTO current_state (
-            singleton, repo_id, current_operation_id, current_view_id, attached_attempt_id, updated_at_ms
-        ) VALUES (1, ?1, ?2, ?3, NULL, ?4)",
-        params![repo_id, operation_id, view_id, now],
-    )?;
-    tx.commit()?;
+    // No replay guard here: `init` has its own idempotency via the
+    // `read_init_repository` short-circuit above; this only adds IMMEDIATE +
+    // busy-retry for R3 consistency.
+    with_immediate_retry(&mut connection, |tx| {
+        tx.execute(
+            "INSERT INTO repositories (id, root_path, git_head, content_backend, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![repo_id, root.to_string_lossy(), git_head, content_backend, now],
+        )?;
+        tx.execute(
+            "INSERT INTO operations (
+                id, repo_id, request_id, command, status, kind, parent_operation_id,
+                resulting_view_id, error_json, created_at_ms
+            ) VALUES (?1, ?2, ?3, 'init', ?4, 'repository_initialized', NULL, ?5, NULL, ?6)",
+            params![
+                operation_id,
+                repo_id,
+                request_id,
+                format!("{:?}", OperationStatus::Succeeded).to_lowercase(),
+                view_id,
+                now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO views (id, repo_id, operation_id, kind, state_json, created_at_ms)
+             VALUES (?1, ?2, ?3, 'initialized', ?4, ?5)",
+            params![view_id, repo_id, operation_id, state_json, now],
+        )?;
+        tx.execute(
+            "INSERT INTO current_state (
+                singleton, repo_id, current_operation_id, current_view_id, attached_attempt_id, updated_at_ms
+            ) VALUES (1, ?1, ?2, ?3, NULL, ?4)",
+            params![repo_id, operation_id, view_id, now],
+        )?;
+        Ok(())
+    })?;
 
     Ok(InitRepository {
         repository_id: repo_id,
@@ -361,20 +367,21 @@ pub fn create_operation_view(
 ) -> Result<OperationViewResult> {
     let mut connection = open_connection(database_path)
         .with_context(|| format!("failed to open {}", database_path.display()))?;
-    let tx = connection.transaction()?;
-    let (repo_id, parent_operation_id): (String, String) = tx.query_row(
-        "SELECT repo_id, current_operation_id FROM current_state WHERE singleton = 1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    with_immediate_retry(&mut connection, |tx| {
+        // CAS read inside the IMMEDIATE txn: the parent-operation check and the
+        // write share one connection so the advance is atomic.
+        let (repo_id, parent_operation_id): (String, String) = tx.query_row(
+            "SELECT repo_id, current_operation_id FROM current_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
 
-    if parent_operation_id != expected_current_operation_id {
-        return Err(anyhow!("current operation changed"));
-    }
+        if parent_operation_id != expected_current_operation_id {
+            return Err(anyhow!("current operation changed"));
+        }
 
-    let result = insert_operation_view(&tx, &repo_id, Some(&parent_operation_id), input)?;
-    tx.commit()?;
-    Ok(result)
+        insert_operation_view(tx, &repo_id, Some(&parent_operation_id), input.clone())
+    })
 }
 
 pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
@@ -484,64 +491,68 @@ fn create_attempt(
     command: &str,
 ) -> Result<StartAttempt> {
     let mut connection = open_connection(&context.database_path)?;
-    let tx = connection.transaction()?;
-    let now = now_ms();
-    let intent_id = match intent_id {
-        Some(id) => {
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM intents WHERE repo_id = ?1 AND id = ?2)",
-                params![context.repo_id, id],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                bail!("UNKNOWN_INTENT: unknown intent {id}");
+    let (intent_id, attempt_id, op) = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let now = now_ms();
+        let intent_id = match intent_id.clone() {
+            Some(id) => {
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM intents WHERE repo_id = ?1 AND id = ?2)",
+                    params![context.repo_id, id],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    bail!("UNKNOWN_INTENT: unknown intent {id}");
+                }
+                id
             }
-            id
-        }
-        None => {
-            let id = new_id("intent");
-            tx.execute(
-                "INSERT INTO intents (id, repo_id, text, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    id,
-                    context.repo_id,
-                    intent.unwrap_or_else(|| "local agent attempt".to_string()),
-                    now
-                ],
-            )?;
-            id
-        }
-    };
-    let attempt_id = new_id("attempt");
-    tx.execute(
-        "INSERT INTO attempts (id, repo_id, intent_id, base_head, status, created_at_ms)
-         VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
-        params![attempt_id, context.repo_id, intent_id, base_head, now],
-    )?;
-
-    let op = insert_operation_view(
-        &tx,
-        &context.repo_id,
-        Some(&context.current_operation_id),
-        OperationViewInput {
-            request_id,
-            command: command.to_string(),
-            kind: "attempt_started".to_string(),
-            view_kind: ViewKind::Initialized,
-            state: json!({
-                "lifecycle": "attempt_active",
-                "attempt_id": attempt_id,
-                "intent_id": intent_id
-            }),
-        },
-    )?;
-    if attach {
+            None => {
+                let id = new_id("intent");
+                tx.execute(
+                    "INSERT INTO intents (id, repo_id, text, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        id,
+                        context.repo_id,
+                        intent
+                            .clone()
+                            .unwrap_or_else(|| "local agent attempt".to_string()),
+                        now
+                    ],
+                )?;
+                id
+            }
+        };
+        let attempt_id = new_id("attempt");
         tx.execute(
-            "UPDATE current_state SET attached_attempt_id = ?1 WHERE singleton = 1",
-            params![attempt_id],
+            "INSERT INTO attempts (id, repo_id, intent_id, base_head, status, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
+            params![attempt_id, context.repo_id, intent_id, base_head, now],
         )?;
-    }
-    tx.commit()?;
+
+        let op = insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: command.to_string(),
+                kind: "attempt_started".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({
+                    "lifecycle": "attempt_active",
+                    "attempt_id": attempt_id,
+                    "intent_id": intent_id
+                }),
+            },
+        )?;
+        if attach {
+            tx.execute(
+                "UPDATE current_state SET attached_attempt_id = ?1 WHERE singleton = 1",
+                params![attempt_id],
+            )?;
+        }
+        Ok((intent_id, attempt_id, op))
+    })?;
 
     Ok(StartAttempt {
         intent_id,
@@ -563,46 +574,48 @@ pub fn save_snapshot(
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
     let mut connection = open_connection(&context.database_path)?;
-    let tx = connection.transaction()?;
-    let parent_snapshot_id: Option<String> = tx
-        .query_row(
-            "SELECT id FROM snapshots WHERE attempt_id = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
-            params![attempt.attempt_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let snapshot_id = new_id("snapshot");
-    tx.execute(
-        "INSERT INTO snapshots (
-            id, repo_id, attempt_id, parent_snapshot_id, content_ref, changed_paths_json, created_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            snapshot_id,
-            context.repo_id,
-            attempt.attempt_id,
-            parent_snapshot_id,
-            content_ref,
-            serde_json::to_string(&changed_paths)?,
-            now_ms()
-        ],
-    )?;
-    let op = insert_operation_view(
-        &tx,
-        &context.repo_id,
-        Some(&context.current_operation_id),
-        OperationViewInput {
-            request_id,
-            command: "save".to_string(),
-            kind: "snapshot_saved".to_string(),
-            view_kind: ViewKind::Initialized,
-            state: json!({
-                "lifecycle": "snapshot_saved",
-                "attempt_id": attempt.attempt_id,
-                "snapshot_id": snapshot_id
-            }),
-        },
-    )?;
-    tx.commit()?;
+    let (snapshot_id, parent_snapshot_id, op) = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let parent_snapshot_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM snapshots WHERE attempt_id = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+                params![attempt.attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let snapshot_id = new_id("snapshot");
+        tx.execute(
+            "INSERT INTO snapshots (
+                id, repo_id, attempt_id, parent_snapshot_id, content_ref, changed_paths_json, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                snapshot_id,
+                context.repo_id,
+                attempt.attempt_id,
+                parent_snapshot_id,
+                content_ref,
+                serde_json::to_string(&changed_paths)?,
+                now_ms()
+            ],
+        )?;
+        let op = insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "save".to_string(),
+                kind: "snapshot_saved".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({
+                    "lifecycle": "snapshot_saved",
+                    "attempt_id": attempt.attempt_id,
+                    "snapshot_id": snapshot_id
+                }),
+            },
+        )?;
+        Ok((snapshot_id, parent_snapshot_id, op))
+    })?;
     Ok(SnapshotRecord {
         snapshot_id,
         attempt_id: attempt.attempt_id,
@@ -640,20 +653,21 @@ pub fn record_restore(
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
     let mut connection = open_connection(&context.database_path)?;
-    let tx = connection.transaction()?;
-    let op = insert_operation_view(
-        &tx,
-        &context.repo_id,
-        Some(&context.current_operation_id),
-        OperationViewInput {
-            request_id,
-            command: "restore".to_string(),
-            kind: "snapshot_restored".to_string(),
-            view_kind: ViewKind::Initialized,
-            state: json!({ "lifecycle": "snapshot_restored", "snapshot_id": snapshot_id }),
-        },
-    )?;
-    tx.commit()?;
+    let op = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "restore".to_string(),
+                kind: "snapshot_restored".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({ "lifecycle": "snapshot_restored", "snapshot_id": snapshot_id }),
+            },
+        )
+    })?;
     Ok(op)
 }
 
@@ -665,67 +679,72 @@ pub fn record_evidence(
 ) -> Result<EvidenceRecord> {
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
-    let snapshot = latest_snapshot_for_attempt(&context, &attempt.attempt_id)?;
     let mut connection = open_connection(&context.database_path)?;
-    let tx = connection.transaction()?;
-    let evidence_id = new_id("evidence");
-    tx.execute(
-        "INSERT INTO evidence (
-            id, repo_id, attempt_id, snapshot_id, command, args_json, cwd, exit_code, started_at_ms, ended_at_ms,
-            stdout_excerpt, stderr_excerpt, stdout_truncated, stderr_truncated, timed_out,
-            sensitivity, visibility, trust, created_at_ms
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-        params![
-            evidence_id,
-            context.repo_id,
-            attempt.attempt_id,
-            snapshot.as_ref().map(|snapshot| snapshot.snapshot_id.clone()),
-            input.command,
-            serde_json::to_string(&input.args)?,
-            input.cwd,
-            input.exit_code,
-            input.started_at_ms,
-            input.ended_at_ms,
-            input.stdout_excerpt,
-            input.stderr_excerpt,
-            input.stdout_truncated as i64,
-            input.stderr_truncated as i64,
-            input.timed_out as i64,
-            input.sensitivity,
-            input.visibility,
-            input.trust,
-            now_ms()
-        ],
-    )?;
-    let op = insert_operation_view(
-        &tx,
-        &context.repo_id,
-        Some(&context.current_operation_id),
-        OperationViewInput {
-            request_id,
-            command: "run".to_string(),
-            kind: "evidence_captured".to_string(),
-            view_kind: ViewKind::Initialized,
-            state: json!({ "lifecycle": "evidence_captured", "evidence_id": evidence_id }),
-        },
-    )?;
-    tx.commit()?;
-    let latest = latest_evidence_for_attempt(&context, &attempt.attempt_id)?
-        .context("recorded evidence missing")?;
+    let (evidence_id, op) = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        // Determining read inside the IMMEDIATE txn: the snapshot the evidence is
+        // attributed to is read on the same connection that writes it (U4).
+        let snapshot = latest_snapshot_on(tx, &attempt.attempt_id)?;
+        let evidence_id = new_id("evidence");
+        tx.execute(
+            "INSERT INTO evidence (
+                id, repo_id, attempt_id, snapshot_id, command, args_json, cwd, exit_code, started_at_ms, ended_at_ms,
+                stdout_excerpt, stderr_excerpt, stdout_truncated, stderr_truncated, timed_out,
+                sensitivity, visibility, trust, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            params![
+                evidence_id,
+                context.repo_id,
+                attempt.attempt_id,
+                snapshot.as_ref().map(|snapshot| snapshot.snapshot_id.clone()),
+                input.command,
+                serde_json::to_string(&input.args)?,
+                input.cwd,
+                input.exit_code,
+                input.started_at_ms,
+                input.ended_at_ms,
+                input.stdout_excerpt,
+                input.stderr_excerpt,
+                input.stdout_truncated as i64,
+                input.stderr_truncated as i64,
+                input.timed_out as i64,
+                input.sensitivity,
+                input.visibility,
+                input.trust,
+                now_ms()
+            ],
+        )?;
+        let op = insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "run".to_string(),
+                kind: "evidence_captured".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({ "lifecycle": "evidence_captured", "evidence_id": evidence_id }),
+            },
+        )?;
+        Ok((evidence_id, op))
+    })?;
+    // The record echoes the inputs that were just written; reading the row back
+    // on a fresh connection could observe a concurrently-written newer row, so we
+    // return the canonical input values directly.
     Ok(EvidenceRecord {
         evidence_id,
         attempt_id: attempt.attempt_id,
-        command: latest.command,
-        args: latest.args,
-        exit_code: latest.exit_code as i32,
+        command: input.command,
+        args: input.args,
+        exit_code: input.exit_code,
         stdout_excerpt: input.stdout_excerpt,
         stderr_excerpt: input.stderr_excerpt,
         stdout_truncated: input.stdout_truncated,
         stderr_truncated: input.stderr_truncated,
         timed_out: input.timed_out,
-        sensitivity: latest.sensitivity,
+        sensitivity: input.sensitivity,
         visibility: input.visibility,
-        trust: latest.trust,
+        trust: input.trust,
         operation_id: op.operation_id,
     })
 }
@@ -737,50 +756,54 @@ pub fn propose(
 ) -> Result<ProposalRecord> {
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
-    let snapshot = latest_snapshot_for_attempt(&context, &attempt.attempt_id)?
-        .context("no snapshot saved for active attempt")?;
     let mut connection = open_connection(&context.database_path)?;
-    let tx = connection.transaction()?;
-    let proposal_id = new_id("proposal");
-    let revision_id = new_id("revision");
-    tx.execute(
-        "INSERT INTO proposals (id, repo_id, attempt_id, snapshot_id, base_head, content_ref, status, created_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'draft', ?7)",
-        params![
-            proposal_id,
-            context.repo_id,
-            attempt.attempt_id,
-            snapshot.snapshot_id,
-            attempt.base_head,
-            snapshot.content_ref,
-            now_ms()
-        ],
-    )?;
-    tx.execute(
-        "INSERT INTO proposal_revisions (id, proposal_id, snapshot_id, content_ref, changed_paths_json, created_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            revision_id,
-            proposal_id,
-            snapshot.snapshot_id,
-            snapshot.content_ref,
-            serde_json::to_string(&snapshot.changed_paths)?,
-            now_ms()
-        ],
-    )?;
-    let op = insert_operation_view(
-        &tx,
-        &context.repo_id,
-        Some(&context.current_operation_id),
-        OperationViewInput {
-            request_id,
-            command: "propose".to_string(),
-            kind: "proposal_created".to_string(),
-            view_kind: ViewKind::Initialized,
-            state: json!({ "lifecycle": "proposal_draft", "proposal_id": proposal_id }),
-        },
-    )?;
-    tx.commit()?;
+    let (proposal_id, revision_id, snapshot, op) = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        // Determining read inside the IMMEDIATE txn: the proposal binds to the
+        // latest snapshot observed on the same connection that writes it (U4).
+        let snapshot = latest_snapshot_on(tx, &attempt.attempt_id)?
+            .context("no snapshot saved for active attempt")?;
+        let proposal_id = new_id("proposal");
+        let revision_id = new_id("revision");
+        tx.execute(
+            "INSERT INTO proposals (id, repo_id, attempt_id, snapshot_id, base_head, content_ref, status, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'draft', ?7)",
+            params![
+                proposal_id,
+                context.repo_id,
+                attempt.attempt_id,
+                snapshot.snapshot_id,
+                attempt.base_head,
+                snapshot.content_ref,
+                now_ms()
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO proposal_revisions (id, proposal_id, snapshot_id, content_ref, changed_paths_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                revision_id,
+                proposal_id,
+                snapshot.snapshot_id,
+                snapshot.content_ref,
+                serde_json::to_string(&snapshot.changed_paths)?,
+                now_ms()
+            ],
+        )?;
+        let op = insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "propose".to_string(),
+                kind: "proposal_created".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({ "lifecycle": "proposal_draft", "proposal_id": proposal_id }),
+            },
+        )?;
+        Ok((proposal_id, revision_id, snapshot, op))
+    })?;
     Ok(ProposalRecord {
         proposal_id,
         proposal_revision_id: revision_id,
@@ -804,50 +827,60 @@ pub fn record_check(
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
     let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
-    let evidence = latest_evidence_for_attempt(&context, &attempt.attempt_id)?;
-    let evidence_id = evidence.as_ref().map(|e| e.evidence_id.clone());
-    let (status, reason) = match evidence.as_ref().and_then(|e| e.snapshot_id.as_deref()) {
-        Some(snapshot_id) if snapshot_id == proposal.snapshot_id => (status, reason),
-        Some(_) => (
-            "stale".to_string(),
-            "latest evidence does not match proposal revision snapshot".to_string(),
-        ),
-        None => (
-            "missing".to_string(),
-            "no evidence recorded for proposal revision snapshot".to_string(),
-        ),
-    };
     let mut connection = open_connection(&context.database_path)?;
-    let tx = connection.transaction()?;
-    let check_result_id = new_id("check");
-    tx.execute(
-        "INSERT INTO check_results (
-            id, repo_id, proposal_id, proposal_revision_id, status, reason, evidence_id, created_at_ms
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            check_result_id,
-            context.repo_id,
-            proposal.proposal_id,
-            proposal.proposal_revision_id,
-            status,
-            reason,
-            evidence_id,
-            now_ms()
-        ],
-    )?;
-    let op = insert_operation_view(
-        &tx,
-        &context.repo_id,
-        Some(&context.current_operation_id),
-        OperationViewInput {
-            request_id,
-            command: "check".to_string(),
-            kind: "proposal_checked".to_string(),
-            view_kind: ViewKind::Initialized,
-            state: json!({ "lifecycle": "checked", "check_result_id": check_result_id }),
+    let (check_result_id, status, reason, evidence_id, op) = with_immediate_retry(
+        &mut connection,
+        |tx| {
+            replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+            // Determining read inside the IMMEDIATE txn: the freshness verdict is
+            // derived from the latest evidence observed on the same connection
+            // that writes the check result (U4).
+            let evidence = latest_evidence_on(tx, &attempt.attempt_id)?;
+            let evidence_id = evidence.as_ref().map(|e| e.evidence_id.clone());
+            let (status, reason) = match evidence.as_ref().and_then(|e| e.snapshot_id.as_deref()) {
+                Some(snapshot_id) if snapshot_id == proposal.snapshot_id => {
+                    (status.clone(), reason.clone())
+                }
+                Some(_) => (
+                    "stale".to_string(),
+                    "latest evidence does not match proposal revision snapshot".to_string(),
+                ),
+                None => (
+                    "missing".to_string(),
+                    "no evidence recorded for proposal revision snapshot".to_string(),
+                ),
+            };
+            let check_result_id = new_id("check");
+            tx.execute(
+                "INSERT INTO check_results (
+                    id, repo_id, proposal_id, proposal_revision_id, status, reason, evidence_id, created_at_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    check_result_id,
+                    context.repo_id,
+                    proposal.proposal_id,
+                    proposal.proposal_revision_id,
+                    status,
+                    reason,
+                    evidence_id,
+                    now_ms()
+                ],
+            )?;
+            let op = insert_operation_view(
+                tx,
+                &context.repo_id,
+                Some(&context.current_operation_id),
+                OperationViewInput {
+                    request_id: request_id.clone(),
+                    command: "check".to_string(),
+                    kind: "proposal_checked".to_string(),
+                    view_kind: ViewKind::Initialized,
+                    state: json!({ "lifecycle": "checked", "check_result_id": check_result_id }),
+                },
+            )?;
+            Ok((check_result_id, status, reason, evidence_id, op))
         },
     )?;
-    tx.commit()?;
     Ok(CheckRecord {
         check_result_id,
         proposal_id: proposal.proposal_id,
@@ -870,37 +903,39 @@ pub fn decide(
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
     let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
     let mut connection = open_connection(&context.database_path)?;
-    let tx = connection.transaction()?;
-    let decision_id = new_id("decision");
-    tx.execute(
-        "INSERT INTO decisions (id, repo_id, proposal_id, proposal_revision_id, decision, created_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            decision_id,
-            context.repo_id,
-            proposal.proposal_id,
-            proposal.proposal_revision_id,
-            decision,
-            now_ms()
-        ],
-    )?;
-    tx.execute(
-        "UPDATE proposals SET status = ?1 WHERE id = ?2",
-        params![decision, proposal.proposal_id],
-    )?;
-    let op = insert_operation_view(
-        &tx,
-        &context.repo_id,
-        Some(&context.current_operation_id),
-        OperationViewInput {
-            request_id,
-            command: decision.to_string(),
-            kind: format!("proposal_{decision}"),
-            view_kind: ViewKind::Initialized,
-            state: json!({ "lifecycle": decision, "decision_id": decision_id }),
-        },
-    )?;
-    tx.commit()?;
+    let (decision_id, op) = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let decision_id = new_id("decision");
+        tx.execute(
+            "INSERT INTO decisions (id, repo_id, proposal_id, proposal_revision_id, decision, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                decision_id,
+                context.repo_id,
+                proposal.proposal_id,
+                proposal.proposal_revision_id,
+                decision,
+                now_ms()
+            ],
+        )?;
+        tx.execute(
+            "UPDATE proposals SET status = ?1 WHERE id = ?2",
+            params![decision, proposal.proposal_id],
+        )?;
+        let op = insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: decision.to_string(),
+                kind: format!("proposal_{decision}"),
+                view_kind: ViewKind::Initialized,
+                state: json!({ "lifecycle": decision, "decision_id": decision_id }),
+            },
+        )?;
+        Ok((decision_id, op))
+    })?;
     Ok(DecisionRecord {
         decision_id,
         proposal_id: proposal.proposal_id,
@@ -964,35 +999,40 @@ pub fn record_publication(
     let context = open_repository(cwd)?;
     let proposal = proposal_by_id(&context, proposal_id)?.context("no proposal exists")?;
     let mut connection = open_connection(&context.database_path)?;
-    let tx = connection.transaction()?;
-    let publication_id = new_id("publication");
-    tx.execute(
-        "INSERT INTO publications (
-            id, repo_id, proposal_id, proposal_revision_id, branch_name, commit_id, created_at_ms
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            publication_id,
-            context.repo_id,
-            proposal.proposal_id,
-            proposal.proposal_revision_id,
-            branch_name,
-            commit_id,
-            now_ms()
-        ],
-    )?;
-    let op = insert_operation_view(
-        &tx,
-        &context.repo_id,
-        Some(&context.current_operation_id),
-        OperationViewInput {
-            request_id,
-            command: "export branch".to_string(),
-            kind: "branch_exported".to_string(),
-            view_kind: ViewKind::Initialized,
-            state: json!({ "lifecycle": "published_branch", "publication_id": publication_id }),
-        },
-    )?;
-    tx.commit()?;
+    // Note: the git branch side-effect happens in the CLI before this call, so
+    // the replay guard provides DB-row idempotency only; making the export
+    // side-effect itself replay-safe is Phase 1b (PENDING-before-side-effect).
+    let (publication_id, op) = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let publication_id = new_id("publication");
+        tx.execute(
+            "INSERT INTO publications (
+                id, repo_id, proposal_id, proposal_revision_id, branch_name, commit_id, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                publication_id,
+                context.repo_id,
+                proposal.proposal_id,
+                proposal.proposal_revision_id,
+                branch_name,
+                commit_id,
+                now_ms()
+            ],
+        )?;
+        let op = insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "export branch".to_string(),
+                kind: "branch_exported".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({ "lifecycle": "published_branch", "publication_id": publication_id }),
+            },
+        )?;
+        Ok((publication_id, op))
+    })?;
     Ok(PublicationRecord {
         publication_id,
         proposal_id: proposal.proposal_id,
@@ -1214,52 +1254,57 @@ pub fn record_failed_operation(
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
     let mut connection = open_connection(&context.database_path)?;
-    let tx = connection.transaction()?;
     let operation_id = OperationId::new().to_string();
     let view_id = ViewId::new().to_string();
     let now = now_ms();
-    tx.execute(
-        "INSERT INTO operations (
-            id, repo_id, request_id, command, status, kind, parent_operation_id,
-            resulting_view_id, error_json, created_at_ms
-        ) VALUES (?1, ?2, ?3, ?4, 'failed', 'recoverable_failure', ?5, ?6, ?7, ?8)",
-        params![
-            operation_id,
-            context.repo_id,
-            request_id,
-            command,
-            context.current_operation_id,
-            view_id,
-            json!({ "message": message }).to_string(),
-            now
-        ],
-    )?;
-    tx.execute(
-        "INSERT INTO views (id, repo_id, operation_id, kind, state_json, created_at_ms)
-         VALUES (?1, ?2, ?3, 'failed', ?4, ?5)",
-        params![
-            view_id,
-            context.repo_id,
-            operation_id,
-            json!({
-                "lifecycle": "recoverable_failure",
-                "failed_command": command,
-                "message": message
-            })
-            .to_string(),
-            now
-        ],
-    )?;
-    let updated = tx.execute(
-        "UPDATE current_state
-         SET current_operation_id = ?1, current_view_id = ?2, updated_at_ms = ?3
-         WHERE singleton = 1 AND current_operation_id = ?4",
-        params![operation_id, view_id, now, context.current_operation_id],
-    )?;
-    if updated != 1 {
-        return Err(anyhow!("current operation changed"));
-    }
-    tx.commit()?;
+    // No replay guard: this records the failure of an operation that did not
+    // commit a row, so any pre-existing same-`request_id` row belongs to a
+    // distinct attempt and the unique index (caught as a non-busy error by the
+    // caller's `.ok()`) is the correct backstop. IMMEDIATE + retry only (R3).
+    with_immediate_retry(&mut connection, |tx| {
+        tx.execute(
+            "INSERT INTO operations (
+                id, repo_id, request_id, command, status, kind, parent_operation_id,
+                resulting_view_id, error_json, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, 'failed', 'recoverable_failure', ?5, ?6, ?7, ?8)",
+            params![
+                operation_id,
+                context.repo_id,
+                request_id,
+                command,
+                context.current_operation_id,
+                view_id,
+                json!({ "message": message }).to_string(),
+                now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO views (id, repo_id, operation_id, kind, state_json, created_at_ms)
+             VALUES (?1, ?2, ?3, 'failed', ?4, ?5)",
+            params![
+                view_id,
+                context.repo_id,
+                operation_id,
+                json!({
+                    "lifecycle": "recoverable_failure",
+                    "failed_command": command,
+                    "message": message
+                })
+                .to_string(),
+                now
+            ],
+        )?;
+        let updated = tx.execute(
+            "UPDATE current_state
+             SET current_operation_id = ?1, current_view_id = ?2, updated_at_ms = ?3
+             WHERE singleton = 1 AND current_operation_id = ?4",
+            params![operation_id, view_id, now, context.current_operation_id],
+        )?;
+        if updated != 1 {
+            return Err(anyhow!("current operation changed"));
+        }
+        Ok(())
+    })?;
     Ok(OperationViewResult {
         operation_id,
         view_id,
@@ -1405,27 +1450,29 @@ pub fn attach_attempt(
     let attempt = attempt_by_id(&context, attempt_id)?
         .ok_or_else(|| anyhow!("UNKNOWN_ATTEMPT: unknown attempt {attempt_id}"))?;
     let mut connection = open_connection(&context.database_path)?;
-    let tx = connection.transaction()?;
-    let op = insert_operation_view(
-        &tx,
-        &context.repo_id,
-        Some(&context.current_operation_id),
-        OperationViewInput {
-            request_id,
-            command: "attempt attach".to_string(),
-            kind: "attempt_attached".to_string(),
-            view_kind: ViewKind::Initialized,
-            state: json!({
-                "lifecycle": "attempt_attached",
-                "attempt_id": attempt.attempt_id
-            }),
-        },
-    )?;
-    tx.execute(
-        "UPDATE current_state SET attached_attempt_id = ?1 WHERE singleton = 1",
-        params![attempt.attempt_id],
-    )?;
-    tx.commit()?;
+    let op = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let op = insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "attempt attach".to_string(),
+                kind: "attempt_attached".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({
+                    "lifecycle": "attempt_attached",
+                    "attempt_id": attempt.attempt_id
+                }),
+            },
+        )?;
+        tx.execute(
+            "UPDATE current_state SET attached_attempt_id = ?1 WHERE singleton = 1",
+            params![attempt.attempt_id],
+        )?;
+        Ok(op)
+    })?;
     Ok(op)
 }
 
@@ -1449,6 +1496,16 @@ fn latest_snapshot_for_attempt(
     attempt_id: &str,
 ) -> Result<Option<SnapshotSummary>> {
     let connection = open_connection(&context.database_path)?;
+    latest_snapshot_on(&connection, attempt_id)
+}
+
+/// Determining "latest snapshot" read against a caller-supplied connection. A
+/// writer passes its own `IMMEDIATE` transaction (`&tx` deref-coerces to
+/// `&Connection`) so the read-then-write is atomic on one connection (U4).
+fn latest_snapshot_on(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<Option<SnapshotSummary>> {
     connection
         .query_row(
             "SELECT id, content_ref, changed_paths_json FROM snapshots
@@ -1472,6 +1529,15 @@ fn latest_evidence_for_attempt(
     attempt_id: &str,
 ) -> Result<Option<EvidenceSummary>> {
     let connection = open_connection(&context.database_path)?;
+    latest_evidence_on(&connection, attempt_id)
+}
+
+/// Determining "latest evidence" read against a caller-supplied connection (see
+/// [`latest_snapshot_on`]); used inside `record_check`'s `IMMEDIATE` txn (U4).
+fn latest_evidence_on(
+    connection: &Connection,
+    attempt_id: &str,
+) -> Result<Option<EvidenceSummary>> {
     connection
         .query_row(
             "SELECT id, snapshot_id, command, args_json, exit_code, sensitivity, trust FROM evidence
@@ -1802,7 +1868,7 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
         .optional()?;
 
     if applied.is_none() {
-        let tx = connection.transaction()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(MIGRATION_001)?;
         tx.execute(
             "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (1, '001_init', ?1)",
@@ -1860,10 +1926,166 @@ fn ensure_attached_attempt_column(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// How long a connection waits on a held write lock before SQLite returns
+/// `SQLITE_BUSY`. Generous because contention here is brief (small txns) and the
+/// bounded retry in `with_immediate_retry` is only a defensive backstop.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn open_connection(path: &Path) -> Result<Connection> {
     let connection = Connection::open(path)?;
+    // `busy_timeout` and `synchronous` are per-connection and must be re-applied
+    // on every open; `journal_mode=WAL` is persistent (header byte) but is cheap
+    // to re-assert. WAL lets readers run without blocking the single writer, so
+    // many `forge` processes can share one `.forge/forge.db` (R2).
+    connection.busy_timeout(BUSY_TIMEOUT)?;
+    // `journal_mode` returns a row, so `pragma_update` errors with
+    // `ExecuteReturnedResults`; `execute_batch` is the correct call.
+    connection.execute_batch("PRAGMA journal_mode=WAL;")?;
+    // NORMAL is the crash-safe WAL pairing: only the last commit can be lost on
+    // power loss, never the database. (FULL at decision points is deferred.)
+    connection.pragma_update(None, "synchronous", "NORMAL")?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(connection)
+}
+
+/// Upper bound on `IMMEDIATE`-txn attempts before a transient lock error is
+/// surfaced. `busy_timeout` already absorbs ordinary contention at `BEGIN`, so
+/// this only matters for `SQLITE_BUSY_SNAPSHOT` (which `busy_timeout` does not
+/// retry) and the rare post-timeout `SQLITE_BUSY`.
+const WRITE_TXN_MAX_ATTEMPTS: u32 = 6;
+
+/// Run `body` inside a `BEGIN IMMEDIATE` transaction, committing on success, and
+/// retry the whole transaction on transient `SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT`
+/// with bounded, jittered backoff (R3).
+///
+/// `IMMEDIATE` takes the write lock at `BEGIN`, so a read-then-write body cannot
+/// hit the deferred-upgrade `SQLITE_BUSY_SNAPSHOT` race; the 517 catch below is a
+/// defensive backstop. Non-busy errors (including [`RequestIdReplay`]) propagate
+/// immediately without retry.
+///
+/// `body` is `FnMut` because it may run once per retry attempt, so it must not
+/// move captured values out — writer closures therefore `.clone()` any owned
+/// input they consume (e.g. `request_id`, `OperationViewInput`) on each call.
+fn with_immediate_retry<T, F>(connection: &mut Connection, mut body: F) -> Result<T>
+where
+    F: FnMut(&Transaction<'_>) -> Result<T>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match run_immediate_once(connection, &mut body) {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if attempt < WRITE_TXN_MAX_ATTEMPTS && is_retryable_busy(&error) {
+                    sleep_backoff(attempt);
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// Single `IMMEDIATE` attempt. Split out so the `&mut Connection` borrow is
+/// released between retries (the txn is dropped — and thus rolled back — on any
+/// error before commit).
+fn run_immediate_once<T, F>(connection: &mut Connection, body: &mut F) -> Result<T>
+where
+    F: FnMut(&Transaction<'_>) -> Result<T>,
+{
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let value = body(&tx)?;
+    tx.commit()?;
+    Ok(value)
+}
+
+/// True if any link in the error's source chain is a `SQLITE_BUSY`-class failure.
+/// Matching the primary `DatabaseBusy` code covers every `SQLITE_BUSY_*` extended
+/// code, including `SQLITE_BUSY_SNAPSHOT` (517); the explicit 517 check documents
+/// that intent for reviewers.
+fn is_retryable_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        if let Some(rusqlite::Error::SqliteFailure(err, _)) =
+            cause.downcast_ref::<rusqlite::Error>()
+        {
+            matches!(
+                err.code,
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+            ) || err.extended_code == 517
+        } else {
+            false
+        }
+    })
+}
+
+/// Short, jittered backoff between busy retries. Jitter mixes the process id
+/// (distinct per concurrent process) with the wall-clock nanosecond (distinct
+/// per attempt) over a 0–24 ms window, so concurrent processes desynchronize
+/// rather than retrying in lockstep even when their clocks read the same coarse
+/// nanosecond. No `rand` dependency is pulled in.
+fn sleep_backoff(attempt: u32) {
+    let base_ms = (1u64 << attempt.min(5)).min(50); // 2, 4, 8, 16, 32, 50…
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let jitter_ms = u64::from(std::process::id()).wrapping_add(u64::from(nanos)) % 25;
+    std::thread::sleep(Duration::from_millis(base_ms + jitter_ms));
+}
+
+/// Signals that a writer observed an already-recorded operation for the same
+/// `(repo_id, request_id)` inside its `IMMEDIATE` transaction (U5). The writer
+/// rolls back without inserting domain rows; the CLI replays the carried
+/// operation's original result instead of treating this as a fresh write.
+#[derive(Debug, Clone)]
+pub struct RequestIdReplay {
+    pub operation: RequestIdOperation,
+}
+
+impl std::fmt::Display for RequestIdReplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "request id already recorded for command {}",
+            self.operation.command
+        )
+    }
+}
+
+impl std::error::Error for RequestIdReplay {}
+
+/// Re-check, as the first statement of an `IMMEDIATE` write transaction, whether
+/// this `(repo_id, request_id)` already produced a committed operation row. If so
+/// (a concurrent retry won the race), abort with [`RequestIdReplay`] carrying the
+/// existing row so the caller can replay rather than collide at commit (U5,
+/// option a). The same `created_at_ms DESC, rowid DESC` ordering as the CLI
+/// pre-flight read keeps replay deterministic.
+fn replay_guard(tx: &Transaction<'_>, repo_id: &str, request_id: Option<&str>) -> Result<()> {
+    let Some(request_id) = request_id else {
+        return Ok(());
+    };
+    let existing = tx
+        .query_row(
+            "SELECT id, command, status, error_json
+             FROM operations
+             WHERE repo_id = ?1 AND request_id = ?2
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            params![repo_id, request_id],
+            |row| {
+                let error_json: Option<String> = row.get(3)?;
+                Ok(RequestIdOperation {
+                    operation_id: row.get(0)?,
+                    command: row.get(1)?,
+                    status: row.get(2)?,
+                    error_json: error_json.and_then(|json| serde_json::from_str(&json).ok()),
+                })
+            },
+        )
+        .optional()?;
+    match existing {
+        Some(operation) => Err(RequestIdReplay { operation }.into()),
+        None => Ok(()),
+    }
 }
 
 fn read_init_repository(
@@ -1982,5 +2204,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(latest, "second");
+    }
+
+    #[test]
+    fn busy_classification_retries_only_busy_class_errors() {
+        use rusqlite::ffi::Error as FfiError;
+
+        // SQLITE_BUSY (5) and SQLITE_BUSY_SNAPSHOT (517) are the retryable cases.
+        let busy = anyhow::Error::from(rusqlite::Error::SqliteFailure(FfiError::new(5), None));
+        assert!(is_retryable_busy(&busy), "plain SQLITE_BUSY must retry");
+
+        let busy_snapshot =
+            anyhow::Error::from(rusqlite::Error::SqliteFailure(FfiError::new(517), None));
+        assert!(
+            is_retryable_busy(&busy_snapshot),
+            "SQLITE_BUSY_SNAPSHOT (517) must retry"
+        );
+
+        // Detected even when wrapped further up the anyhow source chain.
+        let wrapped = anyhow::Error::from(rusqlite::Error::SqliteFailure(FfiError::new(517), None))
+            .context("while committing writer txn");
+        assert!(
+            is_retryable_busy(&wrapped),
+            "chain walk must find a busy cause"
+        );
+
+        // A constraint violation (e.g. the request-id unique index) is NOT retryable.
+        let constraint =
+            anyhow::Error::from(rusqlite::Error::SqliteFailure(FfiError::new(19), None));
+        assert!(
+            !is_retryable_busy(&constraint),
+            "SQLITE_CONSTRAINT must not retry"
+        );
+
+        // Non-SQLite errors, including the replay sentinel, are not retryable.
+        assert!(!is_retryable_busy(&anyhow!("plain failure")));
+        assert!(!is_retryable_busy(
+            &RequestIdReplay {
+                operation: RequestIdOperation {
+                    operation_id: "op_x".to_string(),
+                    command: "save".to_string(),
+                    status: "succeeded".to_string(),
+                    error_json: None,
+                },
+            }
+            .into()
+        ));
     }
 }
