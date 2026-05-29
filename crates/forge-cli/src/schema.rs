@@ -26,7 +26,7 @@ pub fn contract() -> Value {
         "notes": {
             "retryable": "advisory; the client bounds retries (server sets after_ms only)",
             "retry_side_effects": "retrying a CONFLICT re-executes the command; for 'run' this re-executes the child process",
-            "secret_protection": "export secret-deny is path-name-level only in this version; secret values inside non-secret-named files are not scanned until Phase 5"
+            "secret_protection": "export secret-deny is path-name-level only in this version; secret values inside non-secret-named files, and command argv strings (including --require gate specs and CHECK_NOT_PASSED.unmet), are redacted only for known key=value secret patterns, not otherwise scanned until Phase 5"
         }
     })
 }
@@ -53,7 +53,7 @@ fn envelope_shape() -> Value {
 fn command_shapes() -> Value {
     let commands = [
         ("init", "Initializes a .forge repository; data carries root_path and the genesis operation."),
-        ("start", "Starts an intent + its first attempt; data carries the started attempt + operation_id."),
+        ("start", "Starts an intent + its first attempt; accepts repeatable --require <command> gates persisted on the intent; data carries the started attempt + operation_id."),
         ("attempt start", "Starts a new attempt for an existing intent; data carries the attempt + operation_id."),
         ("attempt list", "Lists attempts; data carries { attempts: [...] }."),
         ("attempt show", "Shows one attempt; data carries the attempt detail."),
@@ -62,8 +62,8 @@ fn command_shapes() -> Value {
         ("restore", "Restores a snapshot into the worktree (requires --yes); data carries the restore result."),
         ("run", "Runs a command and captures evidence; data carries the run record + operation_id."),
         ("propose", "Creates a proposal from the latest snapshot; data carries the proposal + operation_id."),
-        ("check", "Evaluates checks against a proposal; data carries the verdict + operation_id."),
-        ("accept", "Accepts a proposal (requires HEAD == base_head); data carries the decision + operation_id."),
+        ("check", "Evaluates the declarative multi-gate check against a proposal's snapshot; data carries the overall verdict + per-gate results (passed/failed/missing/stale) + operation_id."),
+        ("accept", "Accepts a proposal (requires HEAD == base_head AND a passing check by default; --allow-unverified bypasses the check with a warning); data carries the decision + operation_id."),
         ("reject", "Rejects a proposal; data carries the decision + operation_id."),
         ("show", "Shows the active attempt's current state; data carries the attempt view."),
         ("proposal list", "Lists proposals; data carries { proposals: [...] }."),

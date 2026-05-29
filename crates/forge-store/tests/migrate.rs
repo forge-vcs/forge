@@ -22,6 +22,8 @@ use std::path::Path;
 const BASELINE_001: &str = include_str!("../migrations/001_init.sql");
 /// The 002 ALTERs (both columns) — used to build an at-head fixture.
 const COLUMNS_002: &str = include_str!("../migrations/002_columns.sql");
+/// The 003 ALTER (`intents.check_spec_json`) — used to build an at-head fixture.
+const CHECK_SPEC_003: &str = include_str!("../migrations/003_check_spec.sql");
 
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
@@ -128,7 +130,11 @@ fn behind_db_upgrades_to_head() {
         has_column(&conn, "current_state", "attached_attempt_id"),
         "002 added attached_attempt_id"
     );
-    assert_eq!(max_version(&conn), 2, "reached HEAD=2");
+    assert!(
+        has_column(&conn, "intents", "check_spec_json"),
+        "003 added check_spec_json"
+    );
+    assert_eq!(max_version(&conn), 3, "reached HEAD=3");
 }
 
 #[test]
@@ -139,14 +145,18 @@ fn at_head_db_is_a_noop() {
         let conn = open(&db);
         conn.execute_batch(BASELINE_001).expect("apply baseline");
         conn.execute_batch(COLUMNS_002).expect("apply 002 ALTERs");
-        stamp_versions(&conn, &[(1, "001_init"), (2, "002_columns")]);
-        assert_eq!(max_version(&conn), 2);
+        conn.execute_batch(CHECK_SPEC_003).expect("apply 003 ALTER");
+        stamp_versions(
+            &conn,
+            &[(1, "001_init"), (2, "002_columns"), (3, "003_check_spec")],
+        );
+        assert_eq!(max_version(&conn), 3);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 2, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 3, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -157,8 +167,17 @@ fn head_plus_one_is_refused() {
         let conn = open(&db);
         conn.execute_batch(BASELINE_001).expect("apply baseline");
         conn.execute_batch(COLUMNS_002).expect("apply 002 ALTERs");
-        stamp_versions(&conn, &[(1, "001_init"), (2, "002_columns"), (3, "future")]);
-        assert_eq!(max_version(&conn), 3);
+        conn.execute_batch(CHECK_SPEC_003).expect("apply 003 ALTER");
+        stamp_versions(
+            &conn,
+            &[
+                (1, "001_init"),
+                (2, "002_columns"),
+                (3, "003_check_spec"),
+                (4, "future"),
+            ],
+        );
+        assert_eq!(max_version(&conn), 4);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -167,8 +186,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 3);
-            assert_eq!(*supported_head, 2);
+            assert_eq!(*db_version, 4);
+            assert_eq!(*supported_head, 3);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }

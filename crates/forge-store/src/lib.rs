@@ -167,6 +167,9 @@ pub struct CheckRecord {
     pub status: String,
     pub reason: String,
     pub evidence_id: Option<String>,
+    /// Per-gate verdicts from the policy engine (NER-135). Emit-only in v0 — not
+    /// persisted; Phase 6 (NER-137) adds a column when it consumes per-gate history.
+    pub gates: Vec<forge_policy::GateResult>,
     pub operation_id: String,
 }
 
@@ -176,6 +179,13 @@ pub struct DecisionRecord {
     pub proposal_id: String,
     pub proposal_revision_id: String,
     pub decision: String,
+    /// The check status observed in-txn when an `accept` was gated on evidence
+    /// (NER-135). Omitted entirely for `reject` (the gate never runs), so the reject
+    /// response shape is unchanged. `Some("passed")` for a normal accept;
+    /// `Some(<failed|missing|stale>)` only when `--allow-unverified` bypassed the
+    /// gate, which the CLI surfaces as a `warnings[]` entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_status: Option<String>,
     pub operation_id: String,
 }
 
@@ -522,11 +532,36 @@ pub fn operation_for_request(cwd: &Path, request_id: &str) -> Result<Option<Requ
         .map_err(Into::into)
 }
 
+/// Build the persisted check-spec JSON from repeatable `forge start --require
+/// "<cmd>"` values (NER-135). Each value is whitespace-tokenized into
+/// `(program, args)` — the same shape `forge run -- <argv>` records as evidence, so
+/// a gate's identity matches its evidence. Returns `None` when no gate is declared
+/// (the policy engine's default mode). Quoting of whitespace-bearing args is a
+/// documented v0 limitation (deferred). Lives in the store (which already depends on
+/// `forge-policy`) so the CLI need not name `forge_policy` types directly to build a
+/// spec — though it still transitively serializes them via `CheckRecord.gates`.
+pub fn check_spec_json_from_requires(requires: &[String]) -> Option<String> {
+    let gates: Vec<forge_policy::Gate> = requires
+        .iter()
+        .filter_map(|raw| {
+            let mut tokens = raw.split_whitespace();
+            let program = tokens.next()?.to_string();
+            let args = tokens.map(str::to_string).collect();
+            Some(forge_policy::Gate { program, args })
+        })
+        .collect();
+    if gates.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&forge_policy::CheckSpec { gates }).ok()
+}
+
 pub fn start_attempt(
     cwd: &Path,
     request_id: Option<String>,
     intent: String,
     base_head: String,
+    check_spec_json: Option<String>,
 ) -> Result<StartAttempt> {
     let context = open_repository(cwd)?;
     create_attempt(
@@ -537,6 +572,7 @@ pub fn start_attempt(
         base_head,
         true,
         "start",
+        check_spec_json,
     )
 }
 
@@ -555,9 +591,13 @@ pub fn start_attempt_for_intent(
         base_head,
         false,
         "attempt start",
+        // `attempt start` references an existing intent and inherits its gates; it
+        // never mints an intent, so it carries no check spec of its own (NER-135).
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_attempt(
     context: &RepositoryContext,
     request_id: Option<String>,
@@ -566,6 +606,7 @@ fn create_attempt(
     base_head: String,
     attach: bool,
     command: &str,
+    check_spec_json: Option<String>,
 ) -> Result<StartAttempt> {
     let mut connection = open_connection(&context.database_path)?;
     let (intent_id, attempt_id, op) = with_immediate_retry(&mut connection, |tx| {
@@ -589,13 +630,14 @@ fn create_attempt(
             None => {
                 let id = new_id("intent");
                 tx.execute(
-                    "INSERT INTO intents (id, repo_id, text, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO intents (id, repo_id, text, check_spec_json, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         id,
                         context.repo_id,
                         intent
                             .clone()
                             .unwrap_or_else(|| "local agent attempt".to_string()),
+                        check_spec_json,
                         now
                     ],
                 )?;
@@ -964,49 +1006,33 @@ pub fn record_check(
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
     let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
     let mut connection = open_connection(&context.database_path)?;
-    let (check_result_id, status, reason, evidence_id, op) = with_immediate_retry(
+    let (check_result_id, outcome, evidence_id, op) = with_immediate_retry(
         &mut connection,
         |tx| {
             replay_guard(tx, &context.repo_id, request_id.as_deref())?;
-            // Determining read inside the IMMEDIATE txn: the freshness verdict is
-            // derived from the latest evidence observed on the same connection
-            // that writes the check result (U4).
-            let evidence = latest_evidence_on(tx, &attempt.attempt_id)?;
-            let evidence_id = evidence.as_ref().map(|e| e.evidence_id.clone());
-            let (status, reason) = match evidence.as_ref().and_then(|e| e.snapshot_id.as_deref()) {
-                Some(snapshot_id) if snapshot_id == proposal.snapshot_id => {
-                    // Verdict computed in-txn from the same evidence row bound as
-                    // evidence_id, so a concurrent (lock-free) `run` committing newer
-                    // evidence cannot make the verdict disagree with evidence_id —
-                    // closes the check TOCTOU without relying on the lock (NER-132 U2).
-                    let evaluation = forge_policy::evaluate(evidence.as_ref().map(|e| e.exit_code));
-                    (evaluation.status, evaluation.reason)
-                }
-                Some(_) => (
-                    "stale".to_string(),
-                    "latest evidence does not match proposal revision snapshot".to_string(),
-                ),
-                None => (
-                    "missing".to_string(),
-                    "no evidence recorded for proposal revision snapshot".to_string(),
-                ),
-            };
+            // Aggregate over the proposed snapshot's FULL evidence set, read on the same
+            // connection that writes the check result — so a concurrent (lock-free) `run`
+            // committing newer evidence cannot make the verdict disagree with what is
+            // persisted (NER-132 U2 TOCTOU closure, preserved by the aggregate read).
+            // forge-policy is the single source of pass/fail/missing/stale (NER-135 R4).
+            let outcome = evaluate_check_on(tx, &attempt, &proposal)?;
+            let evidence_id = representative_evidence_id(&outcome);
             let check_result_id = new_id("check");
             tx.execute(
-                "INSERT INTO check_results (
-                    id, repo_id, proposal_id, proposal_revision_id, status, reason, evidence_id, created_at_ms
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    check_result_id,
-                    context.repo_id,
-                    proposal.proposal_id,
-                    proposal.proposal_revision_id,
-                    status,
-                    reason,
-                    evidence_id,
-                    now_ms()
-                ],
-            )?;
+            "INSERT INTO check_results (
+                id, repo_id, proposal_id, proposal_revision_id, status, reason, evidence_id, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                check_result_id,
+                context.repo_id,
+                proposal.proposal_id,
+                proposal.proposal_revision_id,
+                outcome.status,
+                outcome.reason,
+                evidence_id,
+                now_ms()
+            ],
+        )?;
             let op = insert_operation_view(
                 tx,
                 &context.repo_id,
@@ -1019,18 +1045,131 @@ pub fn record_check(
                     state: json!({ "lifecycle": "checked", "check_result_id": check_result_id }),
                 },
             )?;
-            Ok((check_result_id, status, reason, evidence_id, op))
+            Ok((check_result_id, outcome, evidence_id, op))
         },
     )?;
+    // Redact secret-like argv in the per-gate egress (the verdict was already
+    // computed in-txn from the raw identities; this only affects what is surfaced).
+    let gates = outcome.gates.into_iter().map(redact_gate_result).collect();
     Ok(CheckRecord {
         check_result_id,
         proposal_id: proposal.proposal_id,
         proposal_revision_id: proposal.proposal_revision_id,
-        status,
-        reason,
+        status: outcome.status,
+        reason: outcome.reason,
         evidence_id,
+        gates,
         operation_id: op.operation_id,
     })
+}
+
+/// Redact secret-like `key=value` argv tokens (e.g. `--token=…`, `PASSWORD=…`) in a
+/// gate's program + each arg before the identity reaches a machine-visible egress —
+/// the `check` JSON `gates[]` here, and (per-token) `CHECK_NOT_PASSED.unmet` in
+/// `error.rs` (NER-135 code-review F2). Redacts PER-ARG: `redact_secret_like_text`
+/// keys on the first `=`/`:` of its input, so redacting each arg independently catches
+/// a secret in any position, where redacting a space-joined identity would only check
+/// its first token. Gate specs are persisted (`intents.check_spec_json`) and surfaced
+/// WITHOUT execution, so — unlike captured evidence — they get this egress pass. Full
+/// non-`key=value` arg scanning is Phase 5 (see schema `notes.secret_protection`).
+fn redact_gate_result(gate: forge_policy::GateResult) -> forge_policy::GateResult {
+    let program = forge_content::redact_secret_like_text(&gate.program).0;
+    let args = gate
+        .args
+        .iter()
+        .map(|arg| forge_content::redact_secret_like_text(arg).0)
+        .collect();
+    forge_policy::GateResult {
+        program,
+        args,
+        ..gate
+    }
+}
+
+/// Pick a single representative evidence id for the `check_results.evidence_id`
+/// FK from a multi-gate outcome (best-effort — `CheckRecord.gates` carries the
+/// authoritative per-gate detail): the first failing gate's deciding evidence,
+/// else the first gate with any deciding evidence, else NULL.
+fn representative_evidence_id(outcome: &forge_policy::CheckOutcome) -> Option<String> {
+    outcome
+        .gates
+        .iter()
+        .find(|gate| {
+            gate.verdict == forge_policy::GateVerdict::Failed && gate.evidence_id.is_some()
+        })
+        .or_else(|| outcome.gates.iter().find(|gate| gate.evidence_id.is_some()))
+        .and_then(|gate| gate.evidence_id.clone())
+}
+
+/// Load an intent's declared check spec (NER-135). A NULL `check_spec_json`
+/// (un-declared intent, or any intent created before Phase 4) yields an empty
+/// spec — the policy engine's default mode.
+fn intent_check_spec(conn: &Connection, intent_id: &str) -> Result<forge_policy::CheckSpec> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT check_spec_json FROM intents WHERE id = ?1",
+            params![intent_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    // Fail CLOSED, not open: a NULL column is a legitimately un-gated intent
+    // (default mode), but a non-NULL value that won't parse is corruption (manual
+    // edit, partial write, or a future spec shape this binary can't read). Silently
+    // collapsing it to an empty spec would downgrade a declared multi-gate intent to
+    // the permissive default mode, letting a gated `accept` slip through (NER-135
+    // code-review F1). The schema_version gate does not catch this — migration 003
+    // only adds the column, not a value-shape version — so the parse must error.
+    match stored {
+        None => Ok(forge_policy::CheckSpec::default()),
+        Some(json) => serde_json::from_str(&json)
+            .with_context(|| format!("corrupt check_spec_json for intent {intent_id}")),
+    }
+}
+
+/// Project every evidence row for an attempt into [`forge_policy::EvidenceFact`]s,
+/// newest-first (matching the `created_at_ms DESC, rowid DESC` "latest" tiebreak).
+/// Pass a writer's `&tx` to keep the read inside its IMMEDIATE txn (NER-132 U2).
+fn evidence_facts_on(
+    conn: &Connection,
+    attempt_id: &str,
+) -> Result<Vec<forge_policy::EvidenceFact>> {
+    let mut statement = conn.prepare(
+        "SELECT id, command, args_json, exit_code, snapshot_id, created_at_ms, rowid FROM evidence
+         WHERE attempt_id = ?1 ORDER BY created_at_ms DESC, rowid DESC",
+    )?;
+    let rows = statement.query_map(params![attempt_id], |row| {
+        let args_json: String = row.get(2)?;
+        Ok(forge_policy::EvidenceFact {
+            evidence_id: row.get(0)?,
+            program: row.get(1)?,
+            args: serde_json::from_str(&args_json).unwrap_or_default(),
+            exit_code: row.get(3)?,
+            snapshot_id: row.get(4)?,
+            created_at_ms: row.get(5)?,
+            seq: row.get(6)?,
+        })
+    })?;
+    let mut facts = Vec::new();
+    for fact in rows {
+        facts.push(fact?);
+    }
+    Ok(facts)
+}
+
+/// Evaluate the declarative check for a proposal against the attempt's full
+/// evidence set, on a caller-supplied connection. The single source of truth for
+/// the verdict (NER-135 R4): `record_check` and the in-txn `accept` gate both call
+/// this on their own `&tx`, so the determining read stays inside the writer's
+/// transaction (NER-132 U2).
+fn evaluate_check_on(
+    conn: &Connection,
+    attempt: &AttemptRecord,
+    proposal: &ProposalSummary,
+) -> Result<forge_policy::CheckOutcome> {
+    let spec = intent_check_spec(conn, &attempt.intent_id)?;
+    let facts = evidence_facts_on(conn, &attempt.attempt_id)?;
+    Ok(forge_policy::evaluate(&spec, &proposal.snapshot_id, &facts))
 }
 
 pub fn decide(
@@ -1039,13 +1178,34 @@ pub fn decide(
     attempt_id: Option<&str>,
     proposal_id: Option<&str>,
     decision: &str,
+    enforce_check: bool,
 ) -> Result<DecisionRecord> {
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
     let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
     let mut connection = open_connection(&context.database_path)?;
-    let (decision_id, op) = with_immediate_retry(&mut connection, |tx| {
+    let (decision_id, check_status, op) = with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        // Evidence gate (NER-135 R6): for `accept`, re-evaluate the declarative
+        // check IN this IMMEDIATE txn (not on a separate connection), so the verdict
+        // that gates the decision is computed from the same facts the decision
+        // commits against — closing the TOCTOU against the lock-free `run` writer
+        // (NER-132 U2). `accept` re-evaluates rather than trusting a stored
+        // check_results row, so a green decision is bound to the current evidence on
+        // the proposal's snapshot. Still not tamper-proof (Phase 5).
+        let check_status = if decision == "accepted" {
+            let outcome = evaluate_check_on(tx, &attempt, &proposal)?;
+            if enforce_check && !outcome.passed() {
+                return Err(ForgeError::CheckNotPassed {
+                    status: outcome.status.clone(),
+                    unmet: outcome.unmet_identities(),
+                }
+                .into());
+            }
+            Some(outcome.status)
+        } else {
+            None
+        };
         let decision_id = new_id("decision");
         tx.execute(
             "INSERT INTO decisions (id, repo_id, proposal_id, proposal_revision_id, decision, created_at_ms)
@@ -1075,13 +1235,14 @@ pub fn decide(
                 state: json!({ "lifecycle": decision, "decision_id": decision_id }),
             },
         )?;
-        Ok((decision_id, op))
+        Ok((decision_id, check_status, op))
     })?;
     Ok(DecisionRecord {
         decision_id,
         proposal_id: proposal.proposal_id,
         proposal_revision_id: proposal.proposal_revision_id,
         decision: decision.to_string(),
+        check_status,
         operation_id: op.operation_id,
     })
 }

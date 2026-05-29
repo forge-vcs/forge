@@ -61,6 +61,7 @@ fn second_same_request_id_writer_aborts_via_in_txn_replay_guard() {
         Some("rq-1".to_string()),
         "intent one".to_string(),
         base.clone(),
+        None,
     )
     .expect("first start commits");
 
@@ -72,6 +73,7 @@ fn second_same_request_id_writer_aborts_via_in_txn_replay_guard() {
         Some("rq-1".to_string()),
         "intent one".to_string(),
         base,
+        None,
     )
     .expect_err("the second same-id write must abort as a replay");
     let replay = error
@@ -108,6 +110,7 @@ fn recorded_failure_replays_as_failure_via_in_txn_guard() {
         Some("rq-2".to_string()),
         "intent two".to_string(),
         base,
+        None,
     )
     .expect_err("a recorded failure replays rather than committing a new attempt");
     let replay = error
@@ -139,6 +142,7 @@ fn concurrent_same_request_id_start_commits_exactly_one_attempt() {
                     Some("rq-3".to_string()),
                     "race".to_string(),
                     base,
+                    None,
                 )
             })
         })

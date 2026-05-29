@@ -47,6 +47,12 @@ fn prepare_proposal(repo: &TestRepo) {
         .success();
     std::fs::write(repo.path().join("README.md"), "changed\n").expect("write readme");
     repo.forge().args(["--json", "save"]).assert().success();
+    // A passing command on the proposed snapshot, so the default-mode check passes
+    // and the evidence gate lets `accept` proceed (NER-135).
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
     repo.forge().args(["--json", "propose"]).assert().success();
     repo.forge().args(["--json", "check"]).assert().success();
 }

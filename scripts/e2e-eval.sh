@@ -58,7 +58,7 @@ echo; echo "=== LIFECYCLE (init→start→save→run→propose→check→accept�
 mkrepo life >/dev/null
 F init;    ck "init success" "$(pg "d['status']")" "success"
 F doctor;  ck "doctor ok" "$(pg "d['data']['ok']")" "True"
-ck "doctor schema_version=2" "$(pg "d['data']['schema_version']")" "2"
+ck "doctor schema_version=3" "$(pg "d['data']['schema_version']")" "3"
 F start "build a feature"; ck "start success" "$(pg "d['status']")" "success"
 echo "hello" > feature.txt
 F save;    ck "save success" "$(pg "d['status']")" "success"
@@ -70,15 +70,28 @@ F export branch eval-branch; ck "export branch success" "$(pg "d['status']")" "s
 git rev-parse --verify eval-branch >/dev/null 2>&1 && b=yes || b=no
 ck "exported git branch exists" "$b" "yes"
 
+echo; echo "=== DECLARATIVE CHECK GATES (NER-135) ==="
+mkrepo gates >/dev/null
+F init >/dev/null
+F start "gated feature" --require "cargo test"; ck "start with --require gate" "$(pg "d['status']")" "success"
+echo "gate me" > gated.txt
+F save >/dev/null
+F run -- sh -c true >/dev/null   # a trivial success that does NOT match the named gate
+F propose >/dev/null
+F check; ck "run -- true cannot satisfy a non-trivial gate" "$(pg "d['data']['status']")" "missing"
+ck "check JSON reports a per-gate verdict" "$(pg "d['data']['gates'][0]['verdict']")" "missing"
+F accept; ck "accept requires a passing check by default" "$(pg "d['errors'][0]['code']")" "CHECK_NOT_PASSED"
+F accept --allow-unverified; ck "accept --allow-unverified bypasses the gate" "$(pg "d['status']")" "success"
+
 echo; echo "=== MIGRATION state (live binary) ==="
 if [ "$have_sqlite" = 1 ]; then
   vers="$(db "$TMP/life" "SELECT group_concat(version) FROM schema_migrations ORDER BY version;")"
-  ck "schema_migrations has versions 1,2" "$vers" "1,2"
+  ck "schema_migrations has versions 1,2,3" "$vers" "1,2,3"
   nullck="$(db "$TMP/life" "SELECT count(*) FROM schema_migrations WHERE checksum IS NULL;")"
-  ck "both migration rows carry a checksum" "$nullck" "0"
+  ck "all migration rows carry a checksum" "$nullck" "0"
   # HEAD+1 read-only refuse on a separate repo
   mkrepo headplus1 >/dev/null; F init >/dev/null
-  db "$TMP/headplus1" "INSERT OR REPLACE INTO schema_migrations(version,name,applied_at_ms,checksum) VALUES (3,'future',0,NULL);"
+  db "$TMP/headplus1" "INSERT OR REPLACE INTO schema_migrations(version,name,applied_at_ms,checksum) VALUES (4,'future',0,NULL);"
   F show; ck "DB ahead of binary refuses read-only" "$(pg "d['errors'][0]['code']")" "SCHEMA_VERSION_UNSUPPORTED"
 else
   echo "  (skipped: sqlite3 unavailable)"

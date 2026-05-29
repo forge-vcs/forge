@@ -31,7 +31,7 @@ enum Command {
     Run(RunArgs),
     Propose(AttemptScopedArgs),
     Check(ProposalScopedArgs),
-    Accept(ProposalScopedArgs),
+    Accept(AcceptArgs),
     Reject(ProposalScopedArgs),
     Show(AttemptScopedArgs),
     Proposal(ProposalArgs),
@@ -51,6 +51,12 @@ struct InitArgs {
 #[derive(Debug, Args)]
 struct IntentArgs {
     intent: Option<String>,
+    /// A required check gate, given as the command that must pass on the proposed
+    /// snapshot (e.g. --require "cargo test"). Repeatable; all gates must pass for
+    /// `check` to be green and `accept` to proceed (NER-135). The value is
+    /// whitespace-tokenized into program + args.
+    #[arg(long)]
+    require: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -65,6 +71,18 @@ struct ProposalScopedArgs {
     attempt: Option<String>,
     #[arg(long)]
     proposal: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AcceptArgs {
+    #[arg(long)]
+    attempt: Option<String>,
+    #[arg(long)]
+    proposal: Option<String>,
+    /// Accept even when the proposal's check is not passing (NER-135). Default is to
+    /// require a passing check; this bypass emits a warnings[] entry.
+    #[arg(long)]
+    allow_unverified: bool,
 }
 
 #[derive(Debug, Args)]
@@ -174,8 +192,8 @@ fn main() -> ExitCode {
         Command::Run(args) => run_response(request_id, args),
         Command::Propose(args) => propose_response(request_id, args),
         Command::Check(args) => check_response(request_id, args),
-        Command::Accept(args) => decision_response(request_id, args, "accepted"),
-        Command::Reject(args) => decision_response(request_id, args, "rejected"),
+        Command::Accept(args) => accept_response(request_id, args),
+        Command::Reject(args) => reject_response(request_id, args),
         Command::Show(args) => show_response(request_id, args),
         Command::Proposal(args) => proposal_response(request_id, args),
         Command::Doctor => doctor_response(request_id),
@@ -257,12 +275,16 @@ fn request_id_from_args(args: &[String]) -> Option<String> {
 fn start_response(request_id: Option<String>, args: IntentArgs) -> ResponseEnvelope {
     command_result("start", request_id, |cwd, request_id| {
         let base_head = selected_backend(&cwd)?.current_base(&cwd)?;
+        // Persist declared check gates on the intent (NER-135); competing attempts
+        // under this intent inherit the same bar. None => default mode.
+        let check_spec_json = forge_store::check_spec_json_from_requires(&args.require);
         let started = forge_store::start_attempt(
             &cwd,
             request_id,
             args.intent
                 .unwrap_or_else(|| "local agent attempt".to_string()),
             base_head,
+            check_spec_json,
         )?;
         Ok((
             Some(started.operation_id.clone()),
@@ -498,46 +520,73 @@ fn check_response(request_id: Option<String>, args: ProposalScopedArgs) -> Respo
     })
 }
 
-fn decision_response(
-    request_id: Option<String>,
-    args: ProposalScopedArgs,
-    decision: &'static str,
-) -> ResponseEnvelope {
-    command_result(decision_command(decision), request_id, |cwd, request_id| {
-        if decision == "accepted" {
-            let proposal = forge_store::exportable_proposal(
+fn accept_response(request_id: Option<String>, args: AcceptArgs) -> ResponseEnvelope {
+    command_result("accept", request_id, |cwd, request_id| {
+        let proposal = forge_store::exportable_proposal(
+            &cwd,
+            args.attempt.as_deref(),
+            args.proposal.as_deref(),
+        )?;
+        let current_head = selected_backend(&cwd)?.current_base(&cwd)?;
+        if current_head != proposal.base_head {
+            // Persist the stale-base divergence under the held lock BEFORE bailing,
+            // so the otherwise-unused `conflict_sets` table records it (NER-133 U7).
+            // Metadata only — no merge engine. Best-effort: the conflict-set insert
+            // must NEVER mask the domain error, so its Result is discarded and
+            // STALE_BASE is always the surfaced error (FIX B). This CLI-layer read
+            // runs under the held repo lock; the evidence gate runs in-txn inside
+            // `decide` (NER-135), not here.
+            let _ = forge_store::record_conflict_set(
                 &cwd,
-                args.attempt.as_deref(),
-                args.proposal.as_deref(),
-            )?;
-            let current_head = selected_backend(&cwd)?.current_base(&cwd)?;
-            if current_head != proposal.base_head {
-                // Persist the stale-base divergence under the held lock BEFORE
-                // bailing, so the otherwise-unused `conflict_sets` table records it
-                // (NER-133 U7). Metadata only — no merge engine. Best-effort: the
-                // conflict-set insert must NEVER mask the domain error, so its
-                // Result is discarded and STALE_BASE is always the surfaced error
-                // (FIX B).
-                let _ = forge_store::record_conflict_set(
-                    &cwd,
-                    "stale_base_accept",
-                    &proposal.base_head,
-                    &current_head,
-                    &proposal.changed_paths,
-                );
-                return Err(ForgeError::StaleBase {
-                    expected_head: proposal.base_head.clone(),
-                    actual_head: current_head,
-                }
-                .into());
+                "stale_base_accept",
+                &proposal.base_head,
+                &current_head,
+                &proposal.changed_paths,
+            );
+            return Err(ForgeError::StaleBase {
+                expected_head: proposal.base_head.clone(),
+                actual_head: current_head,
             }
+            .into());
         }
+        // Evidence gate (NER-135 R6): enforced in-txn inside `decide` unless
+        // --allow-unverified. On bypass, surface the non-passing status as a warning.
         let record = forge_store::decide(
             &cwd,
             request_id,
             args.attempt.as_deref(),
             args.proposal.as_deref(),
-            decision,
+            "accepted",
+            !args.allow_unverified,
+        )?;
+        let mut warnings = Vec::new();
+        if args.allow_unverified {
+            if let Some(status) = record.check_status.as_deref() {
+                if status != "passed" {
+                    warnings.push(format!(
+                        "accepted without a passing check (--allow-unverified): status={status}"
+                    ));
+                }
+            }
+        }
+        Ok((
+            Some(record.operation_id.clone()),
+            serde_json::to_value(record)?,
+            warnings,
+        ))
+    })
+}
+
+fn reject_response(request_id: Option<String>, args: ProposalScopedArgs) -> ResponseEnvelope {
+    command_result("reject", request_id, |cwd, request_id| {
+        // Reject is never gated on evidence (enforce_check = false).
+        let record = forge_store::decide(
+            &cwd,
+            request_id,
+            args.attempt.as_deref(),
+            args.proposal.as_deref(),
+            "rejected",
+            false,
         )?;
         Ok((
             Some(record.operation_id.clone()),
@@ -1001,14 +1050,6 @@ fn is_transient_error(error: &anyhow::Error) -> bool {
         return forge_error.retryable();
     }
     error.downcast_ref::<forge_store::LockTimeout>().is_some()
-}
-
-fn decision_command(decision: &str) -> &'static str {
-    match decision {
-        "accepted" => "accept",
-        "rejected" => "reject",
-        _ => "decision",
-    }
 }
 
 fn is_mutating_command(command: &str) -> bool {

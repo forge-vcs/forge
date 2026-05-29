@@ -218,6 +218,10 @@ fn export_without_secret_paths_emits_no_warnings() {
         .success();
     std::fs::write(repo.path().join("README.md"), "clean\n").expect("write readme");
     repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
     repo.forge().args(["--json", "propose"]).assert().success();
     repo.forge().args(["--json", "check"]).assert().success();
     repo.forge().args(["--json", "accept"]).assert().success();
