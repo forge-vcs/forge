@@ -4,7 +4,7 @@
 - **Branch:** `ner-131-phase-1a-pr-b-concurrency`
 - **base-sha:** `0f64f45` (`docs: add Claude session-relay design brainstorm`)
 - **head-sha:** working tree at review time (committed as the PR B squash)
-- **Plan:** `docs/plans/2026-05-28-005-fix-substrate-phase-1a-plan.md` (U3–U6)
+- **Plan:** `docs/plans/completed/2026-05-28-005-fix-substrate-phase-1a-plan.md` (U3–U6)
 - **Tracking:** Linear **NER-131**
 
 Scope reviewed: U3 (WAL + `busy_timeout` + `synchronous=NORMAL`), U4 (`BEGIN IMMEDIATE` + bounded busy-retry on all 12 writer txns; determining reads moved inside the txn for propose/record_check/record_evidence), U5 (serialized `--request-id` replay via in-txn `replay_guard` + `RequestIdReplay` sentinel), U6 (multi-process exit-criteria tests).
