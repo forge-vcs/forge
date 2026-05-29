@@ -133,6 +133,28 @@ impl ContentBackend for NativeContentBackend {
         }
         Ok(())
     }
+
+    // NER-134: base anchoring still delegates to git at this stage. The native
+    // backend already shells git for `ls-files`/`diff`, so this keeps `base_head`
+    // and stale-base detection backend-agnostic *behind the trait* — git stays the
+    // materialization adapter, but core lifecycle code no longer calls git directly.
+    // Phase 7 (NER-138) replaces this with native base anchoring; until then a native
+    // repo legitimately produces and restores `git-tree:` base refs through the git
+    // backend (an implementer must NOT "fix" this to emit `forge-tree:` refs here).
+    // S1: returns only an opaque revision id — no filesystem paths in error context.
+    fn current_base(&self, repo_root: &Path) -> Result<String> {
+        Ok(git(repo_root, &["rev-parse", "--verify", "HEAD"])?
+            .trim()
+            .to_string())
+    }
+
+    // S2: the returned ref names git's tree, which already excludes
+    // `is_ignored_by_policy` paths via git's own tracking; preserved until the Phase 7
+    // native walker takes over. S1: no filesystem paths in error context.
+    fn base_content_ref(&self, repo_root: &Path, base: &str) -> Result<String> {
+        let tree = git(repo_root, &["rev-parse", &format!("{base}^{{tree}}")])?;
+        Ok(format!("git-tree:{}", tree.trim()))
+    }
 }
 
 pub fn materialize_content_ref(

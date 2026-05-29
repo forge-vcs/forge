@@ -73,6 +73,16 @@ pub enum ForgeError {
     },
     /// A migration failed to apply. (Raised by a later unit; defined now.)
     MigrationFailed { version: i64, message: String },
+    /// `save`/`restore` targeted an attempt different from the one the worktree is
+    /// currently materialized for (`attached_attempt_id`). Recording the worktree's
+    /// content under `requested_attempt` would silently contaminate it with
+    /// `attached_attempt`'s content (NER-134). Deterministic — re-run after
+    /// `attempt attach <requested_attempt>`. Both fields are opaque minted attempt
+    /// ids, never paths, so [`ForgeError::details`] emits them un-redacted.
+    AttemptWorktreeMismatch {
+        requested_attempt: String,
+        attached_attempt: String,
+    },
 }
 
 impl ForgeError {
@@ -98,6 +108,7 @@ impl ForgeError {
             ForgeError::CurrentStateChanged => "CONFLICT",
             ForgeError::UnknownSchemaVersion { .. } => "SCHEMA_VERSION_UNSUPPORTED",
             ForgeError::MigrationFailed { .. } => "MIGRATION_FAILED",
+            ForgeError::AttemptWorktreeMismatch { .. } => "ATTEMPT_WORKTREE_MISMATCH",
         }
     }
 
@@ -144,6 +155,13 @@ impl ForgeError {
             ForgeError::MigrationFailed { version, message } => {
                 json!({ "version": version, "message": message })
             }
+            ForgeError::AttemptWorktreeMismatch {
+                requested_attempt,
+                attached_attempt,
+            } => json!({
+                "requested_attempt": requested_attempt,
+                "attached_attempt": attached_attempt,
+            }),
             _ => Value::Object(Default::default()),
         }
     }
@@ -224,6 +242,13 @@ impl std::fmt::Display for ForgeError {
             ForgeError::MigrationFailed { version, message } => {
                 write!(f, "migration {version} failed: {message}")
             }
+            ForgeError::AttemptWorktreeMismatch {
+                requested_attempt,
+                attached_attempt,
+            } => write!(
+                f,
+                "worktree is materialized for attempt {attached_attempt}, not the requested {requested_attempt}; run `forge attempt attach {requested_attempt}` first"
+            ),
         }
     }
 }
@@ -360,6 +385,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             after_ms: None,
             details_keys: &["version", "message"],
         },
+        ErrorCodeSpec {
+            code: "ATTEMPT_WORKTREE_MISMATCH",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["requested_attempt", "attached_attempt"],
+        },
     ]
 }
 
@@ -453,6 +484,14 @@ mod tests {
             .code(),
             "MIGRATION_FAILED"
         );
+        assert_eq!(
+            ForgeError::AttemptWorktreeMismatch {
+                requested_attempt: "attempt_x".into(),
+                attached_attempt: "attempt_w".into()
+            }
+            .code(),
+            "ATTEMPT_WORKTREE_MISMATCH"
+        );
     }
 
     #[test]
@@ -491,6 +530,26 @@ mod tests {
         .details();
         assert_eq!(ambiguous["candidate_ids"][0], "one");
         assert_eq!(ambiguous["candidate_ids"][1], "two");
+    }
+
+    /// NER-134 security invariant: the mismatch payload carries exactly the two
+    /// opaque attempt-id keys and nothing path- or content-shaped, so it is exempt
+    /// from redaction by construction. Mirrors `details_carry_expected_keys`.
+    #[test]
+    fn attempt_worktree_mismatch_details_carry_only_ids() {
+        let details = ForgeError::AttemptWorktreeMismatch {
+            requested_attempt: "attempt_req".into(),
+            attached_attempt: "attempt_att".into(),
+        }
+        .details();
+        assert_eq!(details["requested_attempt"], "attempt_req");
+        assert_eq!(details["attached_attempt"], "attempt_att");
+        let object = details.as_object().expect("details object");
+        assert_eq!(
+            object.len(),
+            2,
+            "details must carry exactly the two id keys"
+        );
     }
 
     #[test]
@@ -575,6 +634,10 @@ mod tests {
                 version: 2,
                 message: "boom".into(),
             },
+            ForgeError::AttemptWorktreeMismatch {
+                requested_attempt: "attempt_x".into(),
+                attached_attempt: "attempt_w".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -598,7 +661,8 @@ mod tests {
                 | ForgeError::RequestIdConflict { .. }
                 | ForgeError::CurrentStateChanged
                 | ForgeError::UnknownSchemaVersion { .. }
-                | ForgeError::MigrationFailed { .. } => {}
+                | ForgeError::MigrationFailed { .. }
+                | ForgeError::AttemptWorktreeMismatch { .. } => {}
             }
         }
 

@@ -25,6 +25,7 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "CONFLICT",
     "SCHEMA_VERSION_UNSUPPORTED",
     "MIGRATION_FAILED",
+    "ATTEMPT_WORKTREE_MISMATCH",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.
