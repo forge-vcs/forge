@@ -60,6 +60,29 @@ pub trait ContentBackend {
     /// Restore the worktree to the tree named by `content_ref`. The native backend
     /// materializes each file crash-atomically (temp-file + rename + fsync; NER-132 U4).
     fn restore_snapshot(&self, repo_root: &Path, content_ref: &str) -> Result<()>;
+
+    /// The backend's current base-revision anchor, used to stamp a fresh attempt's
+    /// `base_head` and for stale-base detection (NER-134). Opaque to the core; for the
+    /// git backend it is the current `HEAD` commit. Confining this behind the trait
+    /// keeps git-worktree semantics out of core lifecycle code (PRD §23.4) and leaves
+    /// the seam for the Phase 7 native walker.
+    ///
+    /// **Security invariant (S1):** implementations must return only an opaque
+    /// revision identifier and must NOT embed filesystem paths in `anyhow` error
+    /// context — such strings bubble into the untyped envelope `message`, bypassing
+    /// the typed-error secret-path redaction that protects `details`.
+    fn current_base(&self, repo_root: &Path) -> Result<String>;
+
+    /// The restorable `content_ref` that materializes `base` (a value previously
+    /// returned by [`ContentBackend::current_base`], i.e. an attempt's `base_head`)
+    /// into the worktree (NER-134).
+    ///
+    /// **Security invariant (S2):** the returned ref must name a tree that already
+    /// excludes `is_ignored_by_policy` paths (today inherited from git's tree), so a
+    /// future native implementation cannot regress `.env`/private-key exclusion.
+    /// **Security invariant (S1):** as with `current_base`, no filesystem paths in
+    /// error context.
+    fn base_content_ref(&self, repo_root: &Path, base: &str) -> Result<String>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -419,3 +419,172 @@ fn competing_attempt_loop_exports_selected_proposal() {
         second_proposal["data"]["proposal_id"]
     );
 }
+
+#[test]
+fn save_records_target_attempt_not_materialized_attempt() {
+    // NER-134 exit criterion: `save --attempt X` must NOT record a different attempt's
+    // content when X is not the attempt the worktree is materialized for. Reproduces the
+    // footgun directly — `attempt start` neither materializes nor attaches, so after
+    // creating A2 the worktree still holds A1's content and `attached_attempt_id` still
+    // points at A1.
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    let first = json_output(
+        repo.forge()
+            .args(["--json", "start", "compete"])
+            .assert()
+            .success(),
+    );
+    let intent_id = first["data"]["intent_id"].as_str().unwrap();
+    let first_attempt = first["data"]["attempt_id"].as_str().unwrap();
+
+    std::fs::write(repo.path().join("README.md"), "attempt one\n").expect("write first");
+    repo.forge()
+        .args(["--json", "save", "--attempt", first_attempt])
+        .assert()
+        .success();
+
+    let second = json_output(
+        repo.forge()
+            .args(["--json", "attempt", "start", "--intent", intent_id])
+            .assert()
+            .success(),
+    );
+    let second_attempt = second["data"]["attempt_id"].as_str().unwrap();
+
+    // Worktree still holds A1's content and attached == A1. Saving to A2 must be refused
+    // with the typed mismatch error, carrying both opaque ids and a non-retryable verdict.
+    let mismatch = json_output(
+        repo.forge()
+            .args(["--json", "save", "--attempt", second_attempt])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(mismatch["errors"][0]["code"], "ATTEMPT_WORKTREE_MISMATCH");
+    assert_eq!(
+        mismatch["errors"][0]["details"]["requested_attempt"],
+        second_attempt
+    );
+    assert_eq!(
+        mismatch["errors"][0]["details"]["attached_attempt"],
+        first_attempt
+    );
+    assert_eq!(mismatch["retry"]["retryable"], false);
+
+    // Nothing was recorded under A2.
+    let shown_a2 = json_output(
+        repo.forge()
+            .args(["--json", "attempt", "show", second_attempt])
+            .assert()
+            .success(),
+    );
+    assert!(
+        shown_a2["data"]["latest_snapshot"].is_null(),
+        "no snapshot may exist for A2 after the refused save"
+    );
+
+    // The fix is to attach A2 first (re-materializes its base, re-binds the worktree);
+    // then `save --attempt A2` records A2's own content.
+    repo.forge()
+        .args(["--json", "attempt", "attach", second_attempt])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("README.md"), "attempt two\n").expect("write second");
+    let saved = json_output(
+        repo.forge()
+            .args(["--json", "save", "--attempt", second_attempt])
+            .assert()
+            .success(),
+    );
+    assert_eq!(saved["data"]["attempt_id"], second_attempt);
+    let shown_after = json_output(
+        repo.forge()
+            .args(["--json", "attempt", "show", second_attempt])
+            .assert()
+            .success(),
+    );
+    assert!(
+        !shown_after["data"]["latest_snapshot"].is_null(),
+        "A2 now has its own snapshot"
+    );
+}
+
+#[test]
+fn restore_rejects_cross_attempt_snapshot() {
+    // NER-134 Piece 1b: `restore <snapshot>` must refuse a snapshot owned by an attempt
+    // other than the one the worktree is bound to — otherwise restore is a second
+    // cross-attempt contamination vector (it would clobber the worktree with another
+    // attempt's content while `attached_attempt_id` stays put).
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    let first = json_output(
+        repo.forge()
+            .args(["--json", "start", "compete"])
+            .assert()
+            .success(),
+    );
+    let intent_id = first["data"]["intent_id"].as_str().unwrap();
+    let first_attempt = first["data"]["attempt_id"].as_str().unwrap();
+
+    std::fs::write(repo.path().join("README.md"), "attempt one\n").expect("write first");
+    let snap_one = json_output(
+        repo.forge()
+            .args(["--json", "save", "--attempt", first_attempt])
+            .assert()
+            .success(),
+    );
+    let snap_one_id = snap_one["data"]["snapshot_id"].as_str().unwrap();
+
+    // Create + attach A2, then snapshot it so it has its own snapshot.
+    let second = json_output(
+        repo.forge()
+            .args(["--json", "attempt", "start", "--intent", intent_id])
+            .assert()
+            .success(),
+    );
+    let second_attempt = second["data"]["attempt_id"].as_str().unwrap();
+    repo.forge()
+        .args(["--json", "attempt", "attach", second_attempt])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("README.md"), "attempt two\n").expect("write two");
+    let snap_two = json_output(
+        repo.forge()
+            .args(["--json", "save", "--attempt", second_attempt])
+            .assert()
+            .success(),
+    );
+    let snap_two_id = snap_two["data"]["snapshot_id"].as_str().unwrap();
+
+    // Worktree is bound to A2 and clean vs A2's latest. Restoring A1's snapshot must be
+    // refused with the typed mismatch error and must leave the worktree untouched.
+    let mismatch = json_output(
+        repo.forge()
+            .args(["--json", "restore", snap_one_id, "--yes"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(mismatch["errors"][0]["code"], "ATTEMPT_WORKTREE_MISMATCH");
+    assert_eq!(
+        mismatch["errors"][0]["details"]["requested_attempt"],
+        first_attempt
+    );
+    assert_eq!(
+        mismatch["errors"][0]["details"]["attached_attempt"],
+        second_attempt
+    );
+    // The mismatch is deterministic on both the save and restore surfaces — pin the
+    // contract so a refactor can't silently flip restore's classification (review T1).
+    assert_eq!(mismatch["retry"]["retryable"], false);
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        "attempt two\n",
+        "a refused restore must not clobber the worktree"
+    );
+
+    // Restoring A2's OWN snapshot is still allowed (worktree matches A2's latest).
+    repo.forge()
+        .args(["--json", "restore", snap_two_id, "--yes"])
+        .assert()
+        .success();
+}

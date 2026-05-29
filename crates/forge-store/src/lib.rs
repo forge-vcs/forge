@@ -653,6 +653,10 @@ pub fn save_snapshot(
 ) -> Result<SnapshotRecord> {
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    // Write-binding verification (NER-134): the authoritative, non-bypassable guard
+    // on the production write path. Refuse to record the worktree's content under an
+    // attempt other than the one the worktree is materialized for.
+    verify_worktree_binding(&context, &attempt.attempt_id)?;
     let mut connection = open_connection(&context.database_path)?;
     let (snapshot_id, parent_snapshot_id, op) = with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
@@ -705,6 +709,60 @@ pub fn save_snapshot(
         operation_id: op.operation_id,
         current_view_id: op.view_id,
     })
+}
+
+/// Write-binding verification (NER-134): refuse to act on the worktree under
+/// `target_attempt_id` when the worktree is currently materialized for a
+/// *different* attempt (`current_state.attached_attempt_id`).
+///
+/// The raw `attached_attempt_id` is consulted regardless of the attached attempt's
+/// active/abandoned status: if the worktree holds attempt `W`'s content, recording
+/// it under `X != W` is cross-attempt contamination even if `W` was later abandoned.
+/// `None` (nothing materialized — the single-attempt v0 flow, or after a forced
+/// detach) is always allowed: contamination requires a *different* attempt to have
+/// been materialized, and materialization always sets `attached_attempt_id`. The
+/// check runs only after attempt resolution succeeds, so an unqualified ambiguous
+/// selector still surfaces `AmbiguousAttempt` first.
+fn verify_worktree_binding(context: &RepositoryContext, target_attempt_id: &str) -> Result<()> {
+    if let Some(attached) = context.attached_attempt_id.as_deref() {
+        if attached != target_attempt_id {
+            return Err(ForgeError::AttemptWorktreeMismatch {
+                requested_attempt: target_attempt_id.to_string(),
+                attached_attempt: attached.to_string(),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the `save` target attempt and verify the worktree binding *before* the
+/// CLI snapshots the worktree (NER-134), so a mismatch fails fast without writing
+/// orphan content objects. Returns the resolved attempt id; the CLI passes it back
+/// as an explicit selector to [`save_snapshot`], whose own [`verify_worktree_binding`]
+/// call is the authoritative guard. Pure read — takes no advisory lock.
+pub fn verify_save_target(cwd: &Path, attempt_id: Option<&str>) -> Result<String> {
+    let context = open_repository(cwd)?;
+    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    verify_worktree_binding(&context, &attempt.attempt_id)?;
+    Ok(attempt.attempt_id)
+}
+
+/// The attempt that owns `snapshot_id` (NER-134 Piece 1b), so `restore` can refuse
+/// to materialize a snapshot belonging to an attempt other than the bound one.
+pub fn snapshot_owner_attempt_id(cwd: &Path, snapshot_id: &str) -> Result<String> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    connection
+        .query_row(
+            "SELECT attempt_id FROM snapshots WHERE repo_id = ?1 AND id = ?2",
+            params![context.repo_id, snapshot_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        // Defensive: `restore` resolves `snapshot_content_ref` first, so a missing
+        // snapshot already errors before this is reached.
+        .ok_or_else(|| ForgeError::NoSnapshot.into())
 }
 
 pub fn snapshot_content_ref(cwd: &Path, snapshot_id: &str) -> Result<String> {

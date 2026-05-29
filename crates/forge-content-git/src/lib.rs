@@ -59,6 +59,14 @@ impl ContentBackend for GitContentBackend {
         }
         Ok(())
     }
+
+    fn current_base(&self, repo_root: &Path) -> Result<String> {
+        current_head(repo_root)
+    }
+
+    fn base_content_ref(&self, repo_root: &Path, base: &str) -> Result<String> {
+        content_ref_for_commit_tree(repo_root, base)
+    }
 }
 
 pub fn current_head(repo_root: &Path) -> Result<String> {

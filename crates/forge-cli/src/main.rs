@@ -256,7 +256,7 @@ fn request_id_from_args(args: &[String]) -> Option<String> {
 
 fn start_response(request_id: Option<String>, args: IntentArgs) -> ResponseEnvelope {
     command_result("start", request_id, |cwd, request_id| {
-        let base_head = forge_content_git::current_head(&cwd)?;
+        let base_head = selected_backend(&cwd)?.current_base(&cwd)?;
         let started = forge_store::start_attempt(
             &cwd,
             request_id,
@@ -276,7 +276,7 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
     match args.command {
         AttemptCommand::Start(args) => {
             command_result("attempt start", request_id, |cwd, request_id| {
-                let base_head = forge_content_git::current_head(&cwd)?;
+                let base_head = selected_backend(&cwd)?.current_base(&cwd)?;
                 let started = forge_store::start_attempt_for_intent(
                     &cwd,
                     request_id,
@@ -308,8 +308,12 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
         }
         AttemptCommand::Attach { attempt_id } => {
             command_result("attempt attach", request_id, |cwd, request_id| {
+                // NER-134: worktree/base materialization goes through `ContentBackend`,
+                // not `forge_content_git::` directly, so git-worktree semantics stay out
+                // of core lifecycle code (PRD §23.4). Bind the configured backend once.
+                let backend = selected_backend(&cwd)?;
                 let target_base_head = forge_store::attempt_base_head(&cwd, &attempt_id)?;
-                let current_content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
+                let current_content = backend.snapshot_worktree(&cwd)?;
                 let resolved_current = forge_store::resolve_attempt(&cwd, None).ok();
                 let latest_content_ref = match resolved_current {
                     Some(resolved) => forge_store::latest_snapshot_content_ref(
@@ -317,15 +321,13 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
                         Some(&resolved.attempt.attempt_id),
                     )?
                     .or_else(|| {
-                        forge_content_git::content_ref_for_commit_tree(
-                            &cwd,
-                            &resolved.attempt.base_head,
-                        )
-                        .ok()
+                        backend
+                            .base_content_ref(&cwd, &resolved.attempt.base_head)
+                            .ok()
                     }),
                     None => {
-                        let head = forge_content_git::current_head(&cwd)?;
-                        Some(forge_content_git::content_ref_for_commit_tree(&cwd, &head)?)
+                        let head = backend.current_base(&cwd)?;
+                        Some(backend.base_content_ref(&cwd, &head)?)
                     }
                 };
                 if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
@@ -337,10 +339,11 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
                 let content_ref = match forge_store::attempt_materialization_ref(&cwd, &attempt_id)?
                 {
                     Some(content_ref) => content_ref,
-                    None => {
-                        forge_content_git::content_ref_for_commit_tree(&cwd, &target_base_head)?
-                    }
+                    None => backend.base_content_ref(&cwd, &target_base_head)?,
                 };
+                // Restore routes by the ref's own prefix: a `git-tree:` base ref is
+                // materialized by the git backend even in a native repo (intentional
+                // until the Phase 7 native walker; see ContentBackend::base_content_ref).
                 backend_for_content_ref(&content_ref)?.restore_snapshot(&cwd, &content_ref)?;
                 let attached = forge_store::attach_attempt(&cwd, request_id, &attempt_id)?;
                 Ok((
@@ -359,6 +362,11 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
 
 fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> ResponseEnvelope {
     command_result("save", request_id, |cwd, request_id| {
+        // NER-134: verify the worktree binding BEFORE snapshotting, so a mismatch fails
+        // fast without writing orphan content objects. `save_snapshot` re-checks
+        // authoritatively on the write path; this returns the resolved attempt id, which
+        // we pass back as an explicit selector.
+        let resolved_attempt = forge_store::verify_save_target(&cwd, args.attempt.as_deref())?;
         let content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
         // Crash boundary (NER-132 U6, debug-only): objects are now durably fsynced
         // but no content_ref row is committed. A crash here must never leave a
@@ -368,7 +376,7 @@ fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> Respons
         let saved = forge_store::save_snapshot(
             &cwd,
             request_id,
-            args.attempt.as_deref(),
+            Some(resolved_attempt.as_str()),
             content.content_ref,
             content.changed_paths,
         )?;
@@ -393,6 +401,21 @@ fn restore_response(request_id: Option<String>, args: RestoreArgs) -> ResponseEn
         if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
             return Err(ForgeError::DirtyWorktree {
                 paths: current_content.changed_paths.clone(),
+            }
+            .into());
+        }
+        // NER-134 Piece 1b: refuse to materialize a snapshot that belongs to an attempt
+        // other than the one the worktree is bound to — otherwise restore is a second
+        // cross-attempt contamination vector (it would clobber the worktree with another
+        // attempt's content while `attached_attempt_id` stays put, and a later
+        // `save --attempt <bound>` would record the wrong content). Checked BEFORE
+        // materialization so the worktree is never clobbered on the error path.
+        let bound_attempt = forge_store::resolve_attempt(&cwd, None)?.attempt.attempt_id;
+        let snapshot_attempt = forge_store::snapshot_owner_attempt_id(&cwd, &args.snapshot_id)?;
+        if snapshot_attempt != bound_attempt {
+            return Err(ForgeError::AttemptWorktreeMismatch {
+                requested_attempt: snapshot_attempt,
+                attached_attempt: bound_attempt,
             }
             .into());
         }
@@ -487,7 +510,7 @@ fn decision_response(
                 args.attempt.as_deref(),
                 args.proposal.as_deref(),
             )?;
-            let current_head = forge_content_git::current_head(&cwd)?;
+            let current_head = selected_backend(&cwd)?.current_base(&cwd)?;
             if current_head != proposal.base_head {
                 // Persist the stale-base divergence under the held lock BEFORE
                 // bailing, so the otherwise-unused `conflict_sets` table records it
@@ -588,7 +611,7 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                     Some("rejected") => return Err(ForgeError::Rejected.into()),
                     _ => return Err(ForgeError::NotAccepted.into()),
                 }
-                let current_head = forge_content_git::current_head(&cwd)?;
+                let current_head = selected_backend(&cwd)?.current_base(&cwd)?;
                 // CLI-layer stale-base pre-check mirroring `accept`: persist the
                 // divergence to `conflict_sets` under the held lock BEFORE bailing
                 // (NER-133 U7). `export_branch` keeps its own internal stale-base
@@ -610,6 +633,13 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                     }
                     .into());
                 }
+                // git-export interop adapter (NER-134): branch existence/creation is the
+                // git-export *target* (publication), not worktree management — ROADMAP
+                // keeps git export as interop, so this `forge_content_git::branch_exists`
+                // intentionally remains. All worktree/base materialization now goes
+                // through `ContentBackend`; this and the `GitContentBackend` constructors
+                // in `selected_backend`/`backend_for_content_ref` are the only
+                // `forge_content_git::` references left in core lifecycle code.
                 if forge_store::publication_exists_for_branch(&cwd, &args.name)?
                     && forge_content_git::branch_exists(&cwd, &args.name)
                 {
