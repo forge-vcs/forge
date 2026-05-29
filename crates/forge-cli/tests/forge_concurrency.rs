@@ -442,6 +442,91 @@ fn concurrent_same_request_id_for_different_command_conflicts() {
     }
 }
 
+/// Rewrite a freshly-init'd v2 DB into a GENUINE v1 (NER-133 U4): drop both
+/// columns 002 adds and set the recorded version back to 1. We must drop the
+/// columns (not just lower the version) — re-applying 002 over a DB that still
+/// carries them would hit "duplicate column name". SQLite allows dropping both
+/// because each is a column-level definition (the `attached_attempt_id` FK is a
+/// column-level `REFERENCES`, not a table constraint).
+fn rewrite_to_genuine_v1(repo: &Path) {
+    let connection = open_db(repo);
+    connection
+        .execute_batch(
+            "ALTER TABLE repositories DROP COLUMN content_backend;
+             ALTER TABLE current_state DROP COLUMN attached_attempt_id;
+             DELETE FROM schema_migrations WHERE version > 1;",
+        )
+        .expect("rewrite to genuine v1");
+}
+
+#[test]
+fn concurrent_commands_against_behind_db_both_upgrade_and_succeed() {
+    // Two processes run mutating commands against the same behind (v1) DB. The
+    // transient `migrate()` lock (acquired BEFORE each command's per-command lock,
+    // never nested) serializes the upgrade against an in-flight unrelated mutating
+    // command on the same `.forge/forge.lock`: both upgrade transparently and
+    // succeed, the schema lands at HEAD=2 with exactly one set of version rows, and
+    // no SQLITE_BUSY-class error surfaces — proving migrate-vs-locked-writer does
+    // not deadlock.
+    let repo = TestRepo::new_git();
+    assert!(run_forge(repo.path(), &["--json", "init"]).envelope_ok);
+    rewrite_to_genuine_v1(repo.path());
+
+    let repo_path = repo.path().to_path_buf();
+    // Distinct intents + no shared --request-id, so each command is independent and
+    // must fully succeed (not replay). `start` is mutating, so each also takes the
+    // per-command lock after migrate releases the transient one.
+    let handles: Vec<_> = (0..2)
+        .map(|worker| {
+            let repo_path = repo_path.clone();
+            thread::spawn(move || {
+                let intent = format!("behind-db-upgrade-{worker}");
+                run_forge(&repo_path, &["--json", "start", &intent])
+            })
+        })
+        .collect();
+    let outcomes: Vec<ForgeRun> = handles
+        .into_iter()
+        .map(|h| h.join().expect("worker thread"))
+        .collect();
+
+    for (worker, run) in outcomes.iter().enumerate() {
+        assert_no_busy(run, &format!("behind-db worker {worker}"));
+        assert!(
+            run.envelope_ok,
+            "behind-db worker {worker} did not succeed: {}\nstderr: {}",
+            run.stdout, run.stderr
+        );
+    }
+
+    let connection = open_db(repo.path());
+    // Exactly one set of version rows: the second upgrader's `INSERT OR IGNORE`
+    // is a no-op once the first commits version 2.
+    let version_rows = count(
+        &connection,
+        "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+        "2",
+    );
+    assert_eq!(version_rows, 1, "exactly one version-2 row after the race");
+    let head: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )
+        .expect("max version");
+    assert_eq!(head, 2, "schema reached HEAD after the concurrent upgrade");
+    // The upgrade actually applied: 002's columns are present.
+    let has_backend: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('repositories') WHERE name = 'content_backend'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("probe content_backend");
+    assert_eq!(has_backend, 1, "002 re-added content_backend");
+}
+
 #[test]
 fn no_swallowed_sync_remains_on_durability_paths() {
     // R1 exit criterion: no `let _ = .*sync` may remain on an object-write

@@ -655,6 +655,19 @@ where
         }
     };
 
+    // Bring the schema to this binary's head BEFORE any per-command lock and
+    // BEFORE the pre-flight replay check (NER-133 U4). `migrate` takes the repo
+    // lock transiently only when a migration is pending and releases it before
+    // returning, so it never nests inside the per-command lock or the `run` child
+    // exec. A forward-versioned DB (HEAD+1) returns `UnknownSchemaVersion` here,
+    // mapped to `SCHEMA_VERSION_UNSUPPORTED` and returned immediately — this MUST
+    // short-circuit before `record_failed_operation` so the binary never writes
+    // into a schema it is explicitly refusing.
+    if let Err(error) = forge_store::migrate(&cwd) {
+        let (error_object, retry) = error_to_object(command, &error);
+        return ResponseEnvelope::error_with(command, request_id, None, error_object, retry);
+    }
+
     // Hold the repo-level advisory write lock across the whole critical section
     // (determining reads + the write), so this command's CLI-layer reads — e.g.
     // `accept`'s `current_head`/`base_head` compare — are atomic against other

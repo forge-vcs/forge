@@ -25,7 +25,7 @@
 use crate::ForgeError;
 use anyhow::Result;
 use forge_core::now_ms;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -47,6 +47,35 @@ pub(crate) fn schema_head() -> i64 {
         .map(|(version, _, _)| *version)
         .max()
         .unwrap_or(0)
+}
+
+/// Read the DB's recorded schema version — `MAX(version)` from
+/// `schema_migrations` — as a cheap, lock-free probe. Returns `0` for a brand-new
+/// or empty DB: either the `schema_migrations` table does not exist yet (never
+/// migrated) or it holds no rows (`MAX` is `NULL`). This deliberately reads only
+/// the version ledger, never any domain row, so the transient `migrate()`
+/// fast-path can decide up-to-date / pending / ahead without touching the lock.
+pub(crate) fn current_schema_version(conn: &Connection) -> Result<i64> {
+    // A DB that has never been migrated has no `schema_migrations` table; probe
+    // `sqlite_master` first so the absent-table case is `0`, not an error.
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(0);
+    }
+    // `MAX(version)` is `NULL` on an empty table; coalesce to `0`.
+    let version: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(version)
 }
 
 /// Hex-encoded SHA-256 of a migration's SQL text.

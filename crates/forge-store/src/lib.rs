@@ -414,8 +414,10 @@ pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     if !database_path.exists() {
         return Err(ForgeError::NotInitialized.into());
     }
-    let mut connection = open_connection(&database_path)?;
-    migrations::apply_pending_migrations(&mut connection)?;
+    // `open_repository` is a pure open+query: schema migrations are applied by the
+    // transient `migrate()` entrypoint at the top of `command_result` (and by
+    // `init_repository` under its own lock) — never here, where no lock is held.
+    let connection = open_connection(&database_path)?;
     let (repo_id, content_backend, current_operation_id, current_view_id, attached_attempt_id): (
         String,
         String,
@@ -464,6 +466,64 @@ pub fn acquire_repo_lock(cwd: &Path) -> Result<Option<RepoLock>> {
         return Ok(None);
     }
     repo_lock::acquire(&forge_dir).map(Some)
+}
+
+/// Bring the repository's schema up to this binary's head, acquiring the repo
+/// write lock **only when a migration is actually pending** (NER-133 U4).
+///
+/// This is the transient, self-acquiring entrypoint the CLI runs at the top of
+/// `command_result`, **before** any per-command lock — so it never nests inside an
+/// already-held lock. It mirrors [`acquire_repo_lock`]'s resolution so it no-ops
+/// when there is nothing to migrate, letting the command's own logic surface the
+/// canonical error:
+/// - `cwd` is not inside a Git work tree ⇒ `Ok(())` (the command surfaces
+///   not-a-git-repo / `NOT_INITIALIZED`).
+/// - `.forge/forge.db` does not exist ⇒ `Ok(())` (uninitialized — the command
+///   surfaces `NOT_INITIALIZED`).
+/// - DB version `== HEAD` ⇒ `Ok(())` on the cheap read, **no lock taken** (the
+///   common path, including every read-only command and `run`).
+/// - DB version `> HEAD` ⇒ `Err(ForgeError::UnknownSchemaVersion)`: the DB was
+///   written by a newer Forge; refuse without acquiring the lock. The CLI maps
+///   this to `SCHEMA_VERSION_UNSUPPORTED` and short-circuits before any write.
+/// - DB version `< HEAD` ⇒ acquire the repo lock **transiently**, apply the
+///   pending migrations (idempotent + version-gated, so a concurrent migrator that
+///   won the race is handled), then release the lock (Drop) before returning.
+pub fn migrate(cwd: &Path) -> Result<()> {
+    let root = match git_root(cwd) {
+        Ok(root) => root,
+        Err(_) => return Ok(()),
+    };
+    let forge_dir = root.join(".forge");
+    let database_path = forge_dir.join("forge.db");
+    if !database_path.exists() {
+        return Ok(());
+    }
+
+    let mut connection = open_connection(&database_path)?;
+    let db_version = migrations::current_schema_version(&connection)?;
+    let head = migrations::schema_head();
+
+    if db_version == head {
+        // Common fast path: nothing to do, take no lock.
+        return Ok(());
+    }
+    if db_version > head {
+        // A forward-versioned DB: refuse to write without taking the lock.
+        return Err(ForgeError::UnknownSchemaVersion {
+            db_version,
+            supported_head: head,
+        }
+        .into());
+    }
+
+    // Pending (`db_version < head`): acquire the repo lock transiently, apply, and
+    // release on Drop before returning. `apply_pending_migrations` re-reads the
+    // applied versions under the lock and is idempotent, so a concurrent migrator
+    // that won the race is a no-op here. Acquired exactly once, before the
+    // per-command lock — never nested.
+    let _lock = repo_lock::acquire(&forge_dir)?;
+    migrations::apply_pending_migrations(&mut connection)?;
+    Ok(())
 }
 
 pub fn operation_for_request(cwd: &Path, request_id: &str) -> Result<Option<RequestIdOperation>> {
