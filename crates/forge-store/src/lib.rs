@@ -380,34 +380,6 @@ pub fn init_repository(
     })
 }
 
-pub fn create_operation_view(
-    database_path: &Path,
-    expected_current_operation_id: &str,
-    input: OperationViewInput,
-) -> Result<OperationViewResult> {
-    let mut connection = open_connection(database_path)
-        .with_context(|| format!("failed to open {}", database_path.display()))?;
-    with_immediate_retry(&mut connection, |tx| {
-        // CAS read inside the IMMEDIATE txn: the parent-operation check and the
-        // write share one connection so the advance is atomic.
-        let (repo_id, parent_operation_id): (String, String) = tx.query_row(
-            "SELECT repo_id, current_operation_id FROM current_state WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-
-        if parent_operation_id != expected_current_operation_id {
-            // The genuine optimistic singleton CAS: another writer advanced
-            // `current_state` between our read and write. This is the one
-            // transient/retryable domain error (R7) — surface it typed so the CLI
-            // classifies it `retryable` and does NOT persist it under a request-id.
-            return Err(ForgeError::CurrentStateChanged.into());
-        }
-
-        insert_operation_view(tx, &repo_id, Some(&parent_operation_id), input.clone())
-    })
-}
-
 pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     let root = git_root(cwd)?;
     let database_path = root.join(".forge/forge.db");
@@ -1469,6 +1441,7 @@ pub fn record_failed_operation(
     command: &str,
     code: &str,
     message: &str,
+    details: Value,
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
     let mut connection = open_connection(&context.database_path)?;
@@ -1492,7 +1465,11 @@ pub fn record_failed_operation(
                 command,
                 context.current_operation_id,
                 view_id,
-                json!({ "message": message, "code": code }).to_string(),
+                // Persist the typed error's `details` alongside code/message so a
+                // later `--request-id` replay reconstructs the SAME details the first
+                // response carried (FIX C). Old rows lacking `details` fall back to
+                // an empty object at replay time.
+                json!({ "message": message, "code": code, "details": details }).to_string(),
                 now
             ],
         )?;
@@ -1519,6 +1496,11 @@ pub fn record_failed_operation(
             params![operation_id, view_id, now, context.current_operation_id],
         )?;
         if updated != 1 {
+            // Intentionally left UNTYPED (plain anyhow, not the retryable
+            // `CurrentStateChanged`): this is the failure-recording path, whose
+            // result the CLI already swallows with `.ok()` (command_result's error
+            // arm). A CAS loss here just means the failure was not recorded; it must
+            // not become a retryable CONFLICT.
             return Err(anyhow!("current operation changed"));
         }
         Ok(())
@@ -2071,7 +2053,15 @@ fn insert_operation_view(
         params![operation_id, view_id, now, expected_operation],
     )?;
     if updated != 1 {
-        return Err(anyhow!("current operation changed"));
+        // The optimistic singleton CAS lost the race: another writer advanced
+        // `current_state` between this command's determining read and its write.
+        // Surface it TYPED so the CLI classifies it `retryable` (code CONFLICT) and
+        // does NOT persist it under the `--request-id` — a retry re-executes against
+        // fresh state instead of replaying a poisoned failure (NER-133 FIX D / R7).
+        // Caveat: re-executing re-runs the command; for `forge run` that re-executes
+        // the child process (run records evidence via this fn and is the lock
+        // carve-out). See the `notes.retry_side_effects` entry in `forge schema`.
+        return Err(ForgeError::CurrentStateChanged.into());
     }
     Ok(OperationViewResult {
         operation_id,
@@ -2412,6 +2402,70 @@ mod tests {
             .status()
             .expect("run git");
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// FIX D: `insert_operation_view`'s optimistic singleton CAS, when its captured
+    /// parent operation no longer matches live `current_state`, raises the typed,
+    /// retryable `ForgeError::CurrentStateChanged` (code `CONFLICT`) — NOT a plain
+    /// `anyhow!`. This is what the CLI's `is_transient_error` keys on to skip
+    /// recording the failure under the `--request-id`. Driven as a focused in-crate
+    /// unit test because `insert_operation_view` is private and the production fns
+    /// re-read `current_state` per call (so a stale parent can't be pinned through
+    /// the public API alone).
+    #[test]
+    fn insert_operation_view_stale_parent_raises_current_state_changed() {
+        let mut connection = Connection::open_in_memory().expect("open in-memory db");
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .expect("enable fks");
+        connection
+            .execute_batch(include_str!("../migrations/001_init.sql"))
+            .expect("baseline schema");
+
+        // Seed: a repo, a genesis operation+view that `current_state` points at, and
+        // a SECOND operation row (`op_stale`) that does NOT match current_state.
+        connection
+            .execute_batch(
+                "INSERT INTO repositories (id, root_path, created_at_ms)
+                     VALUES ('repo_1', '/tmp/repo', 0);
+                 INSERT INTO operations (id, repo_id, command, status, kind, created_at_ms)
+                     VALUES ('op_genesis', 'repo_1', 'init', 'succeeded', 'init', 0);
+                 INSERT INTO views (id, repo_id, operation_id, kind, state_json, created_at_ms)
+                     VALUES ('view_genesis', 'repo_1', 'op_genesis', 'initialized', '{}', 0);
+                 INSERT INTO current_state
+                     (singleton, repo_id, current_operation_id, current_view_id, updated_at_ms)
+                     VALUES (1, 'repo_1', 'op_genesis', 'view_genesis', 0);
+                 INSERT INTO operations (id, repo_id, command, status, kind, created_at_ms)
+                     VALUES ('op_stale', 'repo_1', 'save', 'succeeded', 'save', 0);",
+            )
+            .expect("seed rows");
+
+        let error = with_immediate_retry(&mut connection, |tx| {
+            // Pass `op_stale` as the parent: it exists (satisfies the FK) but does
+            // NOT equal current_state.current_operation_id (`op_genesis`), so the
+            // CAS `WHERE current_operation_id = 'op_stale'` updates zero rows.
+            insert_operation_view(
+                tx,
+                "repo_1",
+                Some("op_stale"),
+                OperationViewInput {
+                    request_id: None,
+                    command: "save".to_string(),
+                    kind: "snapshot_saved".to_string(),
+                    view_kind: ViewKind::Initialized,
+                    state: json!({ "lifecycle": "test" }),
+                },
+            )
+        })
+        .expect_err("a stale parent must lose the CAS");
+
+        let forge_error = error
+            .downcast_ref::<ForgeError>()
+            .expect("the CAS failure is a typed ForgeError");
+        assert_eq!(*forge_error, ForgeError::CurrentStateChanged);
+        assert_eq!(forge_error.code(), "CONFLICT");
+        assert!(forge_error.retryable());
+        assert_eq!(forge_error.after_ms(), Some(50));
     }
 
     #[test]

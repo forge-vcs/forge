@@ -111,6 +111,80 @@ fn export_branch_excludes_secret_path_native_backend() {
     assert_branch_excludes_secret(&repo, "forge/secret-native");
 }
 
+/// FIX F (defense-in-depth): the native `synthesize_git_tree` path now deletes
+/// secret-risk-named files from the temp worktree BEFORE `git add -A`, so the
+/// secret bytes never enter `.git/objects`. The user-facing assertion is that the
+/// exported native tree excludes the secret (covered by
+/// `export_branch_excludes_secret_path_native_backend`); here we additionally
+/// assert the secret string is absent from the materialized-then-exported tree's
+/// blobs by grepping the exported branch content.
+#[test]
+fn native_export_does_not_stage_secret_blob() {
+    let repo = TestRepo::new_git();
+    prepare_proposal_with_secret(&repo, &["--json", "init", "--content-backend", "native"]);
+
+    let exported = json_output(
+        repo.forge()
+            .args(["--json", "export", "branch", "forge/secret-native-blob"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(exported["data"]["branch_name"], "forge/secret-native-blob");
+    assert_branch_excludes_secret(&repo, "forge/secret-native-blob");
+
+    // The secret value must not be reachable from the exported branch tree: no blob
+    // under the tree carries the .env contents.
+    let listing = git(
+        repo.path(),
+        &["ls-tree", "-r", "--name-only", "forge/secret-native-blob"],
+    );
+    assert!(
+        !listing.lines().any(|line| line == ".env"),
+        "exported native tree must not reference a .env blob, got:\n{listing}"
+    );
+    for path in listing.lines() {
+        let blob = git(
+            repo.path(),
+            &["show", &format!("forge/secret-native-blob:{path}")],
+        );
+        assert!(
+            !blob.contains("SECRET=abc123"),
+            "no exported blob may carry the secret value (path {path})"
+        );
+    }
+}
+
+/// FIX J (U6 warnings): exercising a NON-empty `warnings[]` end-to-end through the
+/// CLI is impossible because the snapshot-time exclusion strips secret-named paths
+/// before they ever reach a content tree — so the export-layer rewrite finds
+/// nothing to drop and `warnings[]` stays empty. The drop+warning (the `excluded`
+/// vec the CLI maps to `warnings[]`) is therefore exercised where a tree CAN
+/// contain a secret: `forge-export-git`'s `export_branch_reports_dropped_secret_in_excluded`
+/// unit test. This CLI test documents and pins the end-to-end invariant: a normal
+/// secret-bearing accept produces a clean export with EMPTY warnings (the secret is
+/// gone by snapshot time, not merely warned about at export time).
+#[test]
+fn cli_export_warnings_empty_because_secret_stripped_at_snapshot_time() {
+    let repo = TestRepo::new_git();
+    prepare_proposal_with_secret(&repo, &["--json", "init"]);
+
+    let exported = json_output(
+        repo.forge()
+            .args(["--json", "export", "branch", "forge/u6-warnings"])
+            .assert()
+            .success(),
+    );
+    // Empty because the secret never reached the tree (stripped at snapshot time),
+    // not because the export rewrite failed to detect it. The non-empty-warnings
+    // path is proven in forge-export-git's unit test (see doc comment above).
+    assert!(
+        warnings(&exported).is_empty(),
+        "end-to-end warnings are empty (secret stripped pre-tree), got {:?}",
+        warnings(&exported)
+    );
+    assert_branch_excludes_secret(&repo, "forge/u6-warnings");
+}
+
 #[test]
 fn export_pr_body_omits_secret_path() {
     let repo = TestRepo::new_git();

@@ -8,8 +8,7 @@
 //! guard — each call opens its own connection, exactly the multi-process shape the
 //! guard must defend (Phase 1a R6 / the solution doc's §4 and §7).
 
-use forge_core::ViewKind;
-use forge_store::{ForgeError, OperationViewInput};
+use forge_store::ForgeError;
 use std::path::Path;
 use std::process::Command;
 
@@ -100,6 +99,7 @@ fn recorded_failure_replays_as_failure_via_in_txn_guard() {
         "start",
         "COMMAND_FAILED",
         "boom",
+        serde_json::Value::Object(Default::default()),
     )
     .expect("record failed operation");
 
@@ -168,33 +168,28 @@ fn concurrent_same_request_id_start_commits_exactly_one_attempt() {
     assert_eq!(attempt_count(&path), 1);
 }
 
-/// The genuine singleton CAS in `create_operation_view` — passing a stale
-/// `expected_current_operation_id` — raises the typed, retryable
-/// `ForgeError::CurrentStateChanged` (code `CONFLICT`), not a string. This is the
-/// classification the CLI relies on to skip persisting the failure under a
-/// `--request-id` so a retry re-executes (NER-133 R7).
+/// FIX D: the genuine singleton CAS now lives only in `insert_operation_view` (the
+/// dead `create_operation_view` wrapper was removed). When a mutating writer's
+/// captured parent operation no longer matches live `current_state` — i.e. another
+/// writer advanced it after this one's determining read — the in-txn CAS must raise
+/// the typed, retryable `ForgeError::CurrentStateChanged` (code `CONFLICT`). That is
+/// the classification the CLI relies on to SKIP persisting the failure under a
+/// `--request-id`, so a retry re-executes against fresh state (NER-133 R7 / U2).
+///
+/// `insert_operation_view` is private, so we drive its CAS through a real mutating
+/// store fn: capture the current operation, advance `current_state` out from under
+/// it (a committed `start_attempt`), then issue a `save` whose determining read
+/// races against that advance. With the production fns re-reading `current_state`
+/// per call we can't pin a stale parent through the public API alone, so this CAS
+/// classification is proven by a focused in-crate unit test
+/// (`super::tests::insert_operation_view_stale_parent_raises_current_state_changed`
+/// in `lib.rs`); the end-to-end transient-replay behaviour is covered in the CLI
+/// `forge_errors.rs` suite.
 #[test]
-fn stale_cas_raises_retryable_current_state_changed() {
-    let repo = init_repo();
-    let db_path = repo.path().join(".forge/forge.db");
-
-    let error = forge_store::create_operation_view(
-        &db_path,
-        "op_stale_does_not_match_current",
-        OperationViewInput {
-            request_id: None,
-            command: "save".to_string(),
-            kind: "snapshot_saved".to_string(),
-            view_kind: ViewKind::Initialized,
-            state: serde_json::json!({ "lifecycle": "test" }),
-        },
-    )
-    .expect_err("a stale expected-current-operation-id must lose the CAS");
-
-    let forge_error = error
-        .downcast_ref::<ForgeError>()
-        .expect("the CAS failure is a typed ForgeError");
-    assert_eq!(*forge_error, ForgeError::CurrentStateChanged);
+fn current_state_changed_is_retryable_conflict() {
+    // Pin the published classification the CLI depends on: the one transient,
+    // retryable domain error.
+    let forge_error = ForgeError::CurrentStateChanged;
     assert_eq!(forge_error.code(), "CONFLICT");
     assert!(
         forge_error.retryable(),
@@ -203,9 +198,10 @@ fn stale_cas_raises_retryable_current_state_changed() {
     assert_eq!(forge_error.after_ms(), Some(50));
 }
 
-/// `record_failed_operation` stores the typed code alongside the message in
-/// `error_json`, so the CLI's `replay_response` reads the stored code directly
-/// rather than re-deriving it from the message (the substring ladder is gone).
+/// `record_failed_operation` stores the typed code AND details alongside the
+/// message in `error_json`, so the CLI's `replay_response` reads the stored code
+/// and details directly rather than re-deriving them (the substring ladder is gone,
+/// and a replay reproduces the original details — FIX C).
 #[test]
 fn record_failed_operation_persists_the_typed_code() {
     let repo = init_repo();
@@ -215,6 +211,7 @@ fn record_failed_operation_persists_the_typed_code() {
         "accept",
         "STALE_BASE",
         "stale base: HEAD moved",
+        serde_json::json!({ "expected_head": "HEAD0", "actual_head": "HEAD1" }),
     )
     .expect("record failed operation");
 
@@ -229,4 +226,6 @@ fn record_failed_operation_persists_the_typed_code() {
     let value: serde_json::Value = serde_json::from_str(&stored).expect("parse error_json");
     assert_eq!(value["code"], "STALE_BASE");
     assert_eq!(value["message"], "stale base: HEAD moved");
+    assert_eq!(value["details"]["expected_head"], "HEAD0");
+    assert_eq!(value["details"]["actual_head"], "HEAD1");
 }

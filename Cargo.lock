@@ -387,6 +387,7 @@ dependencies = [
  "forge-content-native",
  "forge-core",
  "forge-policy",
+ "forge-protocol",
  "rusqlite",
  "serde",
  "serde_json",

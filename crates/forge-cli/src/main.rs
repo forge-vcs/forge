@@ -2,7 +2,9 @@ mod schema;
 
 use clap::{error::ErrorKind, Args, Parser, Subcommand};
 use forge_content::{classify_content_ref, ContentBackend, ContentRefKind};
-use forge_protocol::{ErrorObject, ResponseEnvelope, ResponseStatus, RetryMetadata};
+use forge_protocol::{
+    ErrorObject, ResponseEnvelope, ResponseStatus, RetryMetadata, RETRY_BACKOFF_MS,
+};
 use forge_store::ForgeError;
 use serde_json::{json, Value};
 use std::env;
@@ -489,14 +491,17 @@ fn decision_response(
             if current_head != proposal.base_head {
                 // Persist the stale-base divergence under the held lock BEFORE
                 // bailing, so the otherwise-unused `conflict_sets` table records it
-                // (NER-133 U7). Metadata only — no merge engine.
-                forge_store::record_conflict_set(
+                // (NER-133 U7). Metadata only — no merge engine. Best-effort: the
+                // conflict-set insert must NEVER mask the domain error, so its
+                // Result is discarded and STALE_BASE is always the surfaced error
+                // (FIX B).
+                let _ = forge_store::record_conflict_set(
                     &cwd,
                     "stale_base_accept",
                     &proposal.base_head,
                     &current_head,
                     &proposal.changed_paths,
-                )?;
+                );
                 return Err(ForgeError::StaleBase {
                     expected_head: proposal.base_head.clone(),
                     actual_head: current_head,
@@ -589,13 +594,16 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                 // (NER-133 U7). `export_branch` keeps its own internal stale-base
                 // check as defense-in-depth; it just won't be reached on this path.
                 if current_head != proposal.base_head {
-                    forge_store::record_conflict_set(
+                    // Best-effort metadata (FIX B): conflict-set persistence must
+                    // never mask the domain error, so discard the Result and always
+                    // surface STALE_BASE.
+                    let _ = forge_store::record_conflict_set(
                         &cwd,
                         "stale_base_export",
                         &proposal.base_head,
                         &current_head,
                         &proposal.changed_paths,
-                    )?;
+                    );
                     return Err(ForgeError::StaleBase {
                         expected_head: proposal.base_head.clone(),
                         actual_head: current_head,
@@ -673,11 +681,18 @@ fn replay_response(
             .and_then(Value::as_str)
             .unwrap_or("COMMAND_FAILED")
             .to_string();
+        // Re-attach the stored `details` so a replayed failure carries the SAME
+        // structured payload as the first response (FIX C). Old rows recorded before
+        // details were persisted lack the key — default to an empty object.
+        let details = error_json
+            .get("details")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(Default::default()));
         return ResponseEnvelope::error(
             command,
             request_id,
             Some(existing.operation_id),
-            ErrorObject::new(code, message),
+            ErrorObject::new(code, message).with_details(details),
         );
     }
     let request_id_value = request_id.as_deref().unwrap_or_default().to_string();
@@ -798,6 +813,10 @@ where
                         command,
                         &error_object.code,
                         &error_object.message,
+                        // Carry the typed error's details so a replay reproduces them
+                        // (FIX C). `error_object.details` is the empty object for
+                        // untyped failures.
+                        error_object.details.clone(),
                     )
                     .ok()
                     .map(|op| op.operation_id)
@@ -932,7 +951,7 @@ fn error_to_object(command: &str, error: &anyhow::Error) -> (ErrorObject, RetryM
         return (
             ErrorObject::new("LOCK_TIMEOUT", message)
                 .with_details(json!({ "waited_ms": lock_timeout.waited_ms })),
-            RetryMetadata::retryable(Some(LOCK_TIMEOUT_RETRY_MS)),
+            RetryMetadata::retryable(Some(RETRY_BACKOFF_MS)),
         );
     }
     let code = if command == "init" {
@@ -942,9 +961,6 @@ fn error_to_object(command: &str, error: &anyhow::Error) -> (ErrorObject, RetryM
     };
     (ErrorObject::new(code, message), RetryMetadata::no())
 }
-
-/// Advisory backoff hint surfaced with a retryable `LOCK_TIMEOUT`.
-const LOCK_TIMEOUT_RETRY_MS: u64 = 50;
 
 /// Whether an error must NOT be persisted under its `--request-id`, so a retry
 /// re-executes instead of replaying a sticky failure (R7). True for the transient

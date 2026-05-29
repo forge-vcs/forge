@@ -221,10 +221,16 @@ fn deterministic_failure_under_request_id_replays_with_same_code() {
             .failure(),
     );
     assert_eq!(first["errors"][0]["code"], "STALE_BASE");
+    let first_expected = first["errors"][0]["details"]["expected_head"].clone();
+    let first_actual = first["errors"][0]["details"]["actual_head"].clone();
+    assert!(first_expected.is_string(), "first response has details");
+    assert!(first_actual.is_string(), "first response has details");
 
-    // Replaying the same request id reproduces the SAME code, read from the stored
-    // error_json (not re-derived from the message). The deterministic failure was
-    // persisted, so the replay yields the recorded operation id.
+    // Replaying the same request id reproduces the SAME code AND the SAME details,
+    // read from the stored error_json (not re-derived from the message). The
+    // deterministic failure was persisted, so the replay yields the recorded
+    // operation id. FIX C: a replayed failure must carry identical details, not an
+    // empty object.
     let replay = json_output(
         repo.forge()
             .args(["--json", "--request-id", "rq-stale", "accept"])
@@ -233,4 +239,12 @@ fn deterministic_failure_under_request_id_replays_with_same_code() {
     );
     assert_eq!(replay["errors"][0]["code"], "STALE_BASE");
     assert_eq!(replay["operation_id"], first["operation_id"]);
+    assert_eq!(
+        replay["errors"][0]["details"]["expected_head"], first_expected,
+        "replayed STALE_BASE must carry the same expected_head detail"
+    );
+    assert_eq!(
+        replay["errors"][0]["details"]["actual_head"], first_actual,
+        "replayed STALE_BASE must carry the same actual_head detail"
+    );
 }

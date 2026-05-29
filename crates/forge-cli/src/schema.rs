@@ -13,12 +13,8 @@
 //! `Value`. It is static — `forge schema` works without a repo (no migrate, no
 //! lock, no cwd dependency).
 
-use forge_protocol::SCHEMA_VERSION;
+use forge_protocol::{RETRY_BACKOFF_MS, SCHEMA_VERSION};
 use serde_json::{json, Value};
-
-/// Advisory backoff hint surfaced with a retryable `LOCK_TIMEOUT` (mirrors the
-/// `LOCK_TIMEOUT_RETRY_MS` constant in `main.rs`).
-const LOCK_TIMEOUT_RETRY_MS: u64 = 50;
 
 /// Build the published `forge.cli.v0` machine contract.
 pub fn contract() -> Value {
@@ -29,6 +25,7 @@ pub fn contract() -> Value {
         "errors": error_registry(),
         "notes": {
             "retryable": "advisory; the client bounds retries (server sets after_ms only)",
+            "retry_side_effects": "retrying a CONFLICT re-executes the command; for 'run' this re-executes the child process",
             "secret_protection": "export secret-deny is path-name-level only in this version; secret values inside non-secret-named files are not scanned until Phase 5"
         }
     })
@@ -104,7 +101,7 @@ fn error_registry() -> Value {
     entries.push(cli_error(
         "LOCK_TIMEOUT",
         true,
-        Some(LOCK_TIMEOUT_RETRY_MS),
+        Some(RETRY_BACKOFF_MS),
         &["waited_ms"],
     ));
     entries.push(cli_error("COMMAND_FAILED", false, None, &[]));

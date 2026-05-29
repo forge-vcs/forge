@@ -3,6 +3,13 @@ use serde_json::Value;
 
 pub const SCHEMA_VERSION: &str = "forge.cli.v0";
 
+/// Advisory backoff hint (ms) surfaced with every retryable result — the typed
+/// `ForgeError` CONFLICT (`after_ms`), the standalone `LockTimeout` → `LOCK_TIMEOUT`
+/// mapping, and the published `forge schema` registry all share this single
+/// constant so they cannot drift apart. HTTP `Retry-After`-style: advisory only,
+/// the client bounds the number of retries.
+pub const RETRY_BACKOFF_MS: u64 = 50;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseStatus {

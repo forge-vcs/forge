@@ -117,6 +117,68 @@ fn conflict_and_lock_timeout_are_retryable() {
 }
 
 #[test]
+fn lock_timeout_and_conflict_after_ms_share_the_backoff_constant() {
+    // FIX E: the three historically-duplicated `50` backoff constants are now one
+    // shared `forge_protocol::RETRY_BACKOFF_MS`. The published LOCK_TIMEOUT and
+    // CONFLICT `after_ms` must both equal it, so a future edit to the constant can
+    // never silently desync the published contract from the runtime classifier.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let doc = schema_in(temp.path());
+    let errors = doc["errors"].as_array().expect("errors array");
+    let after_ms = |code: &str| -> u64 {
+        errors
+            .iter()
+            .find(|entry| entry["code"] == code)
+            .unwrap_or_else(|| panic!("registry entry for {code}"))["after_ms"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{code} after_ms is a number"))
+    };
+    assert_eq!(after_ms("LOCK_TIMEOUT"), forge_protocol::RETRY_BACKOFF_MS);
+    assert_eq!(after_ms("CONFLICT"), forge_protocol::RETRY_BACKOFF_MS);
+}
+
+/// Every CLI-level code that `main.rs` can construct directly (never via
+/// `ForgeError`). FIX G drift guard: a CLI code added to `main.rs` but omitted from
+/// `schema.rs`'s hand-append is caught here.
+const CLI_LEVEL_CODES: &[&str] = &[
+    "LOCK_TIMEOUT",
+    "COMMAND_FAILED",
+    "NOT_A_GIT_REPOSITORY",
+    "UNKNOWN_ARGUMENT",
+    "MISSING_ARGUMENT",
+    "USAGE_ERROR",
+    "CONFIRMATION_REQUIRED",
+];
+
+#[test]
+fn registry_contains_every_cli_level_code() {
+    // FIX G: assert the published registry names the COMPLETE set of CLI-level
+    // codes in addition to every ForgeError code — so a future hand-appended CLI
+    // code that is forgotten in schema.rs fails this test.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let doc = schema_in(temp.path());
+    let codes: HashSet<String> = doc["errors"]
+        .as_array()
+        .expect("errors array")
+        .iter()
+        .map(|entry| entry["code"].as_str().expect("code string").to_string())
+        .collect();
+
+    for code in CLI_LEVEL_CODES {
+        assert!(
+            codes.contains(*code),
+            "published registry is missing CLI-level code {code}"
+        );
+    }
+    for code in FORGE_ERROR_CODES {
+        assert!(
+            codes.contains(*code),
+            "published registry is missing ForgeError code {code}"
+        );
+    }
+}
+
+#[test]
 fn commands_list_the_lifecycle() {
     let temp = tempfile::tempdir().expect("temp dir");
     let doc = schema_in(temp.path());

@@ -17,12 +17,8 @@
 //! `error_code()` produced), its `retryable()` classification, an `after_ms()`
 //! backoff hint, and a structured (secret-redacted) `details()` payload.
 
+use forge_protocol::RETRY_BACKOFF_MS;
 use serde_json::{json, Value};
-
-/// Backoff hint (ms) returned for retryable variants — advisory, HTTP
-/// `Retry-After`-style. Bounding the number of retries is the client's
-/// responsibility.
-const RETRY_BACKOFF_MS: u64 = 50;
 
 /// Placeholder substituted for a secret-risk path in any machine-visible payload,
 /// so a secret filename never reaches `errors[].details` or the persisted ledger.
@@ -65,7 +61,7 @@ pub enum ForgeError {
     NotInitialized,
     /// A `--request-id` was reused for a different command.
     RequestIdConflict { existing_command: String },
-    /// The genuine optimistic singleton CAS in `create_operation_view` lost the
+    /// The genuine optimistic singleton CAS in `insert_operation_view` lost the
     /// race (another writer advanced `current_state` concurrently). **Transient /
     /// retryable** — the only domain error a client may safely re-run.
     CurrentStateChanged,
@@ -106,8 +102,9 @@ impl ForgeError {
     }
 
     /// Whether a client may safely re-run the command. True only for the genuine
-    /// transient CAS (`CurrentStateChanged`); the standalone [`crate::LockTimeout`]
-    /// is also retryable but is classified at the CLI where it is downcast.
+    /// transient CAS in `insert_operation_view` (`CurrentStateChanged`); the
+    /// standalone [`crate::LockTimeout`] is also retryable but is classified at the
+    /// CLI where it is downcast.
     pub fn retryable(&self) -> bool {
         matches!(self, ForgeError::CurrentStateChanged)
     }

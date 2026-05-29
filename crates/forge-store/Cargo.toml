@@ -10,6 +10,7 @@ forge-content = { path = "../forge-content" }
 forge-content-native = { path = "../forge-content-native" }
 forge-core = { path = "../forge-core" }
 forge-policy = { path = "../forge-policy" }
+forge-protocol = { path = "../forge-protocol" }
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

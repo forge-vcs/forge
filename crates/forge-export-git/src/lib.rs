@@ -101,6 +101,13 @@ fn git_tree_for_content_ref(repo_root: &Path, content_ref: &str) -> Result<Strin
 fn synthesize_git_tree(repo_root: &Path, content_ref: &str) -> Result<String> {
     let worktree = tempfile::tempdir()?;
     forge_content_native::materialize_content_ref(repo_root, worktree.path(), content_ref)?;
+    // Defense-in-depth (NER-133 FIX F): delete secret-risk-named files from the temp
+    // worktree BEFORE `git add -A`, so their bytes never enter `.git/objects` as
+    // loose blobs in the first place. `filter_secret_paths_from_tree` remains the
+    // backstop that drops them from the FINAL tree, but that backstop runs only
+    // after `add` has already hashed the file into the object store; removing them
+    // here closes that window for the native materialize path.
+    remove_secret_risk_files(worktree.path(), worktree.path())?;
     let index_dir = tempfile::tempdir()?;
     let index_path = index_dir.path().join("index");
     git_with_index_and_worktree(repo_root, worktree.path(), &index_path, &["add", "-A", "."])?;
@@ -109,6 +116,30 @@ fn synthesize_git_tree(repo_root: &Path, content_ref: &str) -> Result<String> {
             .trim()
             .to_string(),
     )
+}
+
+/// Recursively delete files whose path (relative to `root`) is secret-risk by name
+/// (NER-133 FIX F). Walks `dir`, removing matching files so they are never staged.
+/// `.git` is skipped — the temp worktree has none yet, but the guard is cheap.
+fn remove_secret_risk_files(root: &Path, dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            remove_secret_risk_files(root, &path)?;
+        } else {
+            let relative = path.strip_prefix(root).unwrap_or(&path);
+            let relative_str = relative.to_string_lossy();
+            if forge_content::is_secret_risk_path(&relative_str) {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn git(repo_root: &Path, args: &[&str]) -> Result<String> {
@@ -249,6 +280,58 @@ mod tests {
         assert_eq!(
             dropped,
             vec![".env".to_string(), "certs/server.pem".to_string()]
+        );
+    }
+
+    /// FIX J (U6 warnings): `export_branch` must REPORT the dropped secret-risk
+    /// paths in its `excluded` return — the vec the CLI turns into non-empty
+    /// `warnings[]`. End-to-end through the CLI this can't be exercised because the
+    /// snapshot-time exclusion strips secrets before they ever reach a tree; here we
+    /// hand-build a git-tree content ref that DOES contain a secret and drive the
+    /// real `export_branch`, asserting the secret is both dropped from the tree and
+    /// named in `excluded`.
+    #[test]
+    fn export_branch_reports_dropped_secret_in_excluded() {
+        let repo = init_repo();
+        // Seed a base commit so `base_commit` resolves and the branch can be created.
+        std::fs::write(repo.path().join("seed.txt"), "seed\n").expect("seed");
+        git(repo.path(), &["add", "."]).expect("git add");
+        git(repo.path(), &["commit", "-m", "base"]).expect("git commit");
+        let base_commit = git(repo.path(), &["rev-parse", "HEAD"])
+            .expect("rev-parse")
+            .trim()
+            .to_string();
+
+        // A git-tree content ref carrying a secret-named file the export must drop.
+        let tree = build_tree(
+            repo.path(),
+            &[("README.md", "hi\n"), (".env", "SECRET=1\n")],
+        );
+        let content_ref = format!("git-tree:{tree}");
+
+        let (_commit, excluded) = export_branch(
+            repo.path(),
+            "forge/with-secret",
+            &base_commit,
+            &base_commit,
+            &content_ref,
+            "msg",
+        )
+        .expect("export branch");
+
+        assert_eq!(
+            excluded,
+            vec![".env".to_string()],
+            "the dropped secret path must be reported (becomes a CLI warning)"
+        );
+        let listing = git(
+            repo.path(),
+            &["ls-tree", "-r", "--name-only", "forge/with-secret"],
+        )
+        .expect("ls-tree branch");
+        assert!(
+            !listing.lines().any(|line| line == ".env"),
+            "exported branch tree must not contain .env"
         );
     }
 

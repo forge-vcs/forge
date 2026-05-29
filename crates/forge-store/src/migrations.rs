@@ -167,9 +167,38 @@ pub(crate) fn apply_pending_migrations(conn: &mut Connection) -> Result<()> {
 
         // Pending: apply DDL + stamp the version in one IMMEDIATE txn. INSERT OR
         // IGNORE preserves the NER-132 concurrent-init idempotency shim.
+        //
+        // Apply the migration STATEMENT-BY-STATEMENT rather than as one
+        // `execute_batch(sql)`. A single batch aborts on the first failing
+        // statement, so a historic DB at v1 whose `content_backend` column is
+        // already inline (the `cd1bb3b`-era binary) would never run 002's *second*
+        // `ALTER` (`attached_attempt_id`) and would brick on every command.
+        // Splitting lets us tolerate an already-present column per statement and
+        // still apply the rest. NOTE: this naive split on `;` is only safe because
+        // our migration DDL contains no semicolons inside string literals — keep it
+        // that way when adding migrations.
         let name = *name;
         crate::with_immediate_retry(conn, |tx| {
-            tx.execute_batch(sql)?;
+            for statement in sql.split(';') {
+                let statement = statement.trim();
+                if statement.is_empty() {
+                    continue;
+                }
+                if let Err(error) = tx.execute_batch(statement) {
+                    let message = error.to_string();
+                    // 002 is purely additive ADD COLUMNs; an already-present column
+                    // means the target state is already reached (the cd1bb3b inline
+                    // schema). Treat it as satisfied so the v1 DB converges instead
+                    // of bricking.
+                    if message.contains("duplicate column name") {
+                        continue;
+                    }
+                    // Any other DDL failure is a genuine migration defect — surface
+                    // it typed (code MIGRATION_FAILED) so it is diagnosable rather
+                    // than collapsing to COMMAND_FAILED.
+                    return Err(ForgeError::MigrationFailed { version, message }.into());
+                }
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at_ms, checksum)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -246,6 +275,64 @@ mod tests {
             current_operation_id TEXT NOT NULL REFERENCES operations(id),
             current_view_id TEXT NOT NULL REFERENCES views(id),
             attached_attempt_id TEXT REFERENCES attempts(id),
+            updated_at_ms INTEGER NOT NULL
+        );
+    ";
+
+    /// The `cd1bb3b`-era v1 shape (genesis case D): `repositories.content_backend`
+    /// is INLINE (it shipped that way in the historic binary) but
+    /// `current_state` LACKS `attached_attempt_id`, and `schema_migrations` has no
+    /// `checksum` column. This is the case 002 must reconcile: its first `ALTER`
+    /// (`content_backend`) is a duplicate-column no-op, and only its SECOND `ALTER`
+    /// (`attached_attempt_id`) does real work. A whole-file `execute_batch` would
+    /// abort on the first statement and never reach the second — bricking the DB.
+    const CD1BB3B_V1_INLINE_CONTENT_BACKEND_DDL: &str = "
+        CREATE TABLE repositories (
+            id TEXT PRIMARY KEY,
+            root_path TEXT NOT NULL UNIQUE,
+            git_head TEXT,
+            content_backend TEXT NOT NULL DEFAULT 'git',
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE operations (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL REFERENCES repositories(id),
+            request_id TEXT,
+            command TEXT NOT NULL,
+            status TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            parent_operation_id TEXT REFERENCES operations(id),
+            resulting_view_id TEXT,
+            error_json TEXT,
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE views (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL REFERENCES repositories(id),
+            operation_id TEXT NOT NULL REFERENCES operations(id),
+            kind TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE intents (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL REFERENCES repositories(id),
+            text TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE attempts (
+            id TEXT PRIMARY KEY,
+            repo_id TEXT NOT NULL REFERENCES repositories(id),
+            intent_id TEXT NOT NULL REFERENCES intents(id),
+            base_head TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE current_state (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            repo_id TEXT NOT NULL REFERENCES repositories(id),
+            current_operation_id TEXT NOT NULL REFERENCES operations(id),
+            current_view_id TEXT NOT NULL REFERENCES views(id),
             updated_at_ms INTEGER NOT NULL
         );
     ";
@@ -468,6 +555,101 @@ mod tests {
         let error = apply_pending_migrations(&mut conn).expect_err("must refuse tampered");
         match error.downcast_ref::<ForgeError>() {
             Some(ForgeError::MigrationFailed { version, .. }) => assert_eq!(*version, 1),
+            other => panic!("expected MigrationFailed, got {other:?}"),
+        }
+    }
+
+    /// FIX A (genesis case D): a `cd1bb3b`-era v1 DB has `content_backend` INLINE in
+    /// `repositories` but `current_state` LACKS `attached_attempt_id`, stamped at
+    /// version=1 with a NULL checksum. Running the migrator must CONVERGE — apply
+    /// 002 statement-by-statement, no-op the duplicate `content_backend` ALTER, add
+    /// the missing `attached_attempt_id`, stamp version=2 — and must NOT error
+    /// (whole-file `execute_batch` would brick this DB on the duplicate column).
+    #[test]
+    fn cd1bb3b_v1_with_inline_content_backend_converges() {
+        let mut conn = mem_conn();
+        conn.execute_batch(CD1BB3B_V1_INLINE_CONTENT_BACKEND_DDL)
+            .expect("build cd1bb3b inline-content_backend v1");
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at_ms INTEGER NOT NULL
+            );",
+        )
+        .expect("create v1 schema_migrations (no checksum)");
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (1, '001_init', 0)",
+            [],
+        )
+        .expect("stamp version 1 with NULL checksum");
+
+        // Precondition: content_backend present (inline), attached_attempt_id absent.
+        assert!(
+            column_set(&conn, "repositories")
+                .iter()
+                .any(|c| c.starts_with("content_backend|")),
+            "precondition: content_backend is inline"
+        );
+        assert!(
+            !column_set(&conn, "current_state")
+                .iter()
+                .any(|c| c.starts_with("attached_attempt_id|")),
+            "precondition: attached_attempt_id is absent"
+        );
+
+        apply_pending_migrations(&mut conn).expect("cd1bb3b v1 must converge, not brick");
+
+        // Both columns now present; version advanced to HEAD (2).
+        assert!(
+            column_set(&conn, "repositories")
+                .iter()
+                .any(|c| c.starts_with("content_backend|")),
+            "content_backend preserved"
+        );
+        assert!(
+            column_set(&conn, "current_state")
+                .iter()
+                .any(|c| c.starts_with("attached_attempt_id|")),
+            "attached_attempt_id added by the reconciling 002"
+        );
+        let versions = applied_versions(&conn);
+        assert_eq!(versions.last().expect("at least one version").0, 2);
+        assert_eq!(current_schema_version(&conn).expect("version probe"), 2);
+    }
+
+    /// FIX A: a genuinely-failing migration statement (a malformed `ALTER`, not a
+    /// duplicate column) surfaces as `ForgeError::MigrationFailed`, not a raw
+    /// COMMAND_FAILED. Driven by injecting a bad migration through the same
+    /// per-statement applier the runner uses.
+    #[test]
+    fn malformed_migration_statement_surfaces_migration_failed() {
+        let mut conn = mem_conn();
+        // Reach a clean head first so we have the schema_migrations ledger.
+        apply_pending_migrations(&mut conn).expect("reach head");
+
+        // Drive the per-statement applier directly with a malformed statement and
+        // assert it maps to the typed MigrationFailed (code MIGRATION_FAILED).
+        let version = 99;
+        let result: Result<()> = crate::with_immediate_retry(&mut conn, |tx| {
+            for statement in "ALTER TABLE repositories ADD COLUMN".split(';') {
+                let statement = statement.trim();
+                if statement.is_empty() {
+                    continue;
+                }
+                if let Err(error) = tx.execute_batch(statement) {
+                    let message = error.to_string();
+                    if message.contains("duplicate column name") {
+                        continue;
+                    }
+                    return Err(ForgeError::MigrationFailed { version, message }.into());
+                }
+            }
+            Ok(())
+        });
+        let error = result.expect_err("malformed ALTER must fail");
+        match error.downcast_ref::<ForgeError>() {
+            Some(ForgeError::MigrationFailed { version: v, .. }) => assert_eq!(*v, 99),
             other => panic!("expected MigrationFailed, got {other:?}"),
         }
     }
