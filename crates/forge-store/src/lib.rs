@@ -853,8 +853,6 @@ pub fn record_check(
     request_id: Option<String>,
     attempt_id: Option<&str>,
     proposal_id: Option<&str>,
-    status: String,
-    reason: String,
 ) -> Result<CheckRecord> {
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
@@ -871,7 +869,12 @@ pub fn record_check(
             let evidence_id = evidence.as_ref().map(|e| e.evidence_id.clone());
             let (status, reason) = match evidence.as_ref().and_then(|e| e.snapshot_id.as_deref()) {
                 Some(snapshot_id) if snapshot_id == proposal.snapshot_id => {
-                    (status.clone(), reason.clone())
+                    // Verdict computed in-txn from the same evidence row bound as
+                    // evidence_id, so a concurrent (lock-free) `run` committing newer
+                    // evidence cannot make the verdict disagree with evidence_id —
+                    // closes the check TOCTOU without relying on the lock (NER-132 U2).
+                    let evaluation = forge_policy::evaluate(evidence.as_ref().map(|e| e.exit_code));
+                    (evaluation.status, evaluation.reason)
                 }
                 Some(_) => (
                     "stale".to_string(),

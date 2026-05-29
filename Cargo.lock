@@ -296,7 +296,6 @@ dependencies = [
  "forge-content-native",
  "forge-evidence",
  "forge-export-git",
- "forge-policy",
  "forge-protocol",
  "forge-store",
  "predicates",
