@@ -1,0 +1,161 @@
+//! Store-level idempotent-replay coverage (NER-132 U8).
+//!
+//! The CLI's `command_result` pre-flight short-circuits a *sequential* same
+//! `--request-id` retry before any transaction opens, so the **in-transaction**
+//! `replay_guard` branch (and the failed-operation replay it carries) is rarely
+//! exercised end-to-end. forge-store writers have no such pre-flight, so calling
+//! them directly with a repeated request id deterministically drives the in-txn
+//! guard — each call opens its own connection, exactly the multi-process shape the
+//! guard must defend (Phase 1a R6 / the solution doc's §4 and §7).
+
+use std::path::Path;
+use std::process::Command;
+
+/// Create a one-commit git repo and `forge init` it, returning the temp dir.
+fn init_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run_git(dir.path(), &["init"]);
+    run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+    run_git(dir.path(), &["config", "user.name", "Test"]);
+    std::fs::write(dir.path().join("README.md"), "x").expect("seed file");
+    run_git(dir.path(), &["add", "."]);
+    run_git(dir.path(), &["commit", "-m", "init"]);
+    forge_store::init_repository(dir.path(), None, "git".to_string()).expect("forge init");
+    dir
+}
+
+fn run_git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run git")
+        .status;
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn head(dir: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .expect("rev-parse");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn attempt_count(dir: &Path) -> i64 {
+    rusqlite::Connection::open(dir.join(".forge/forge.db"))
+        .expect("open forge.db")
+        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .expect("count attempts")
+}
+
+#[test]
+fn second_same_request_id_writer_aborts_via_in_txn_replay_guard() {
+    let repo = init_repo();
+    let base = head(repo.path());
+
+    let first = forge_store::start_attempt(
+        repo.path(),
+        Some("rq-1".to_string()),
+        "intent one".to_string(),
+        base.clone(),
+    )
+    .expect("first start commits");
+
+    // No CLI pre-flight here: this second call enters the IMMEDIATE txn, and
+    // replay_guard observes the first attempt's committed operation row (on a
+    // separate connection) and aborts with the RequestIdReplay sentinel.
+    let error = forge_store::start_attempt(
+        repo.path(),
+        Some("rq-1".to_string()),
+        "intent one".to_string(),
+        base,
+    )
+    .expect_err("the second same-id write must abort as a replay");
+    let replay = error
+        .downcast_ref::<forge_store::RequestIdReplay>()
+        .expect("in-txn RequestIdReplay sentinel");
+    assert_eq!(replay.operation.operation_id, first.operation_id);
+    assert_eq!(replay.operation.status, "succeeded");
+    assert_eq!(replay.operation.command, "start");
+
+    // Exactly one attempt row exists despite two same-id calls.
+    assert_eq!(attempt_count(repo.path()), 1);
+}
+
+#[test]
+fn recorded_failure_replays_as_failure_via_in_txn_guard() {
+    let repo = init_repo();
+    let base = head(repo.path());
+
+    // As the CLI does on a domain error, record a failed operation under a request
+    // id (it commits no domain row). Retrying the same id through a writer must
+    // surface that recorded failure so the CLI's status-aware replay reproduces it.
+    forge_store::record_failed_operation(repo.path(), Some("rq-2".to_string()), "start", "boom")
+        .expect("record failed operation");
+
+    let error = forge_store::start_attempt(
+        repo.path(),
+        Some("rq-2".to_string()),
+        "intent two".to_string(),
+        base,
+    )
+    .expect_err("a recorded failure replays rather than committing a new attempt");
+    let replay = error
+        .downcast_ref::<forge_store::RequestIdReplay>()
+        .expect("RequestIdReplay sentinel");
+    assert_eq!(replay.operation.status, "failed");
+    assert_eq!(replay.operation.command, "start");
+
+    // The replayed failure created no attempt.
+    assert_eq!(attempt_count(repo.path()), 0);
+}
+
+#[test]
+fn concurrent_same_request_id_start_commits_exactly_one_attempt() {
+    let repo = init_repo();
+    let base = head(repo.path());
+    let path = repo.path().to_path_buf();
+
+    // Two threads, separate connections, same request id. BEGIN IMMEDIATE
+    // serializes them: one commits the attempt; the loser, taking the write lock
+    // after the winner commits, observes the in-txn replay guard.
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let path = path.clone();
+            let base = base.clone();
+            std::thread::spawn(move || {
+                forge_store::start_attempt(
+                    &path,
+                    Some("rq-3".to_string()),
+                    "race".to_string(),
+                    base,
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("worker thread"))
+        .collect();
+
+    let committed = results.iter().filter(|result| result.is_ok()).count();
+    let replayed = results
+        .iter()
+        .filter(|result| {
+            result
+                .as_ref()
+                .err()
+                .map(|error| {
+                    error
+                        .downcast_ref::<forge_store::RequestIdReplay>()
+                        .is_some()
+                })
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(committed, 1, "exactly one start commits");
+    assert_eq!(replayed, 1, "the loser observes the in-txn replay guard");
+    assert_eq!(attempt_count(&path), 1);
+}
