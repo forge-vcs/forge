@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+mod repo_lock;
+pub use repo_lock::{LockTimeout, RepoLock};
+
 const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
 
 #[derive(Debug, Clone, Serialize)]
@@ -419,6 +422,27 @@ pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
 
 pub fn repository_content_backend(cwd: &Path) -> Result<String> {
     Ok(open_repository(cwd)?.content_backend)
+}
+
+/// Acquire the repo-level advisory write lock for the repository containing `cwd`
+/// (PRD §10.6, NER-132). The CLI holds the returned guard across a mutating
+/// command's critical section so its determining reads and write are atomic
+/// against other `forge` writers.
+///
+/// Returns `Ok(None)` when there is no repository to lock — `cwd` is not inside a
+/// Git work tree, or `.forge` does not exist yet — so the caller's own logic
+/// surfaces the canonical "not initialized" error instead of a lock-file error.
+/// A genuine contention timeout surfaces as a [`LockTimeout`] (`Err`).
+pub fn acquire_repo_lock(cwd: &Path) -> Result<Option<RepoLock>> {
+    let root = match git_root(cwd) {
+        Ok(root) => root,
+        Err(_) => return Ok(None),
+    };
+    let forge_dir = root.join(".forge");
+    if !forge_dir.exists() {
+        return Ok(None);
+    }
+    repo_lock::acquire(&forge_dir).map(Some)
 }
 
 pub fn operation_for_request(cwd: &Path, request_id: &str) -> Result<Option<RequestIdOperation>> {

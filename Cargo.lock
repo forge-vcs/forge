@@ -385,9 +385,11 @@ dependencies = [
  "anyhow",
  "forge-content-native",
  "forge-core",
+ "forge-policy",
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
