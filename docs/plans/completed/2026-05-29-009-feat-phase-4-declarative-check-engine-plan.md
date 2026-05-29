@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 4 — Declarative multi-gate check engine (NER-135)"
 type: feat
-status: active
+status: completed
 date: 2026-05-29
 deepened: 2026-05-29
 origin: docs/ROADMAP.md (Phase 4) + Linear NER-135
