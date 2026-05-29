@@ -235,6 +235,9 @@ mod tests {
         assert!(is_ignored_by_policy(".forge/forge.db"));
         assert!(is_ignored_by_policy(".forge/forge.db-wal"));
         assert!(is_ignored_by_policy(".forge/forge.db-shm"));
+        // The NER-132 advisory lock file is covered by the same blanket `.forge/`
+        // prefix; pin it symmetrically so the two backends cannot drift.
+        assert!(is_ignored_by_policy(".forge/forge.lock"));
         assert!(is_ignored_by_policy(".forge"));
         assert!(!is_ignored_by_policy("README.md"));
     }

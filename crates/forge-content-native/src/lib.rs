@@ -664,6 +664,9 @@ mod tests {
         assert!(is_ignored_by_policy(".forge/forge.db"));
         assert!(is_ignored_by_policy(".forge/forge.db-wal"));
         assert!(is_ignored_by_policy(".forge/forge.db-shm"));
+        // The NER-132 advisory lock file is covered by the same blanket `.forge/`
+        // prefix; pin it so a future refactor of the exclusion rule cannot drop it.
+        assert!(is_ignored_by_policy(".forge/forge.lock"));
         assert!(is_ignored_by_policy(".forge"));
         // A normal worktree file is still snapshot-eligible.
         assert!(!is_ignored_by_policy("README.md"));

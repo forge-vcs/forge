@@ -12,8 +12,20 @@ pub struct SnapshotContent {
     pub changed_paths: Vec<String>,
 }
 
+/// A pluggable content store for snapshotting and restoring worktrees.
+///
+/// **Store-before-DB durability contract (NER-132):** `snapshot_worktree` returns
+/// only after every object backing the returned `content_ref` is durable on disk
+/// (file contents *and* the directory entry fsynced). Forge commits the referencing
+/// row to SQLite *after* this call returns, so a committed `content_ref` always
+/// implies a durably-retained object — a crash can lose the not-yet-committed row,
+/// but never leave a committed row pointing at a missing object. The native backend
+/// satisfies this via temp-file + fsync + atomic rename + parent-dir fsync in
+/// `write_object`; the git backend delegates to git's loose-object durability.
 pub trait ContentBackend {
     fn snapshot_worktree(&self, repo_root: &Path) -> Result<SnapshotContent>;
+    /// Restore the worktree to the tree named by `content_ref`. The native backend
+    /// materializes each file crash-atomically (temp-file + rename + fsync; NER-132 U4).
     fn restore_snapshot(&self, repo_root: &Path, content_ref: &str) -> Result<()>;
 }
 
