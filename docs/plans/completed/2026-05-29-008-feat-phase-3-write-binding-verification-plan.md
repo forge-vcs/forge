@@ -1,7 +1,7 @@
 ---
 title: "Forge M2 Phase 3 — Write-Binding Verification + ContentBackend Worktree Isolation"
 type: feat
-status: in_progress
+status: completed
 date: 2026-05-29
 deepened: 2026-05-29
 origin: docs/brainstorms/2026-05-28-competing-local-attempts-requirements.md
