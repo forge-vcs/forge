@@ -4,7 +4,7 @@
 - **Branch:** `ner-132-phase-1b-crash-correctness`
 - **base-sha:** `c3e2ce7` (`docs: add M1 Phase 1b + Phase 2 kickoff handoff (#8)`)
 - **head-sha:** `04f4fcc` (review fixes applied on the branch)
-- **Plan:** `docs/plans/2026-05-29-006-fix-phase-1b-crash-correctness-plan.md` (U1–U8)
+- **Plan:** `docs/plans/completed/2026-05-29-006-fix-phase-1b-crash-correctness-plan.md` (U1–U8)
 - **Tracking:** Linear **NER-132**
 
 Scope reviewed: the full Phase 1b branch diff (~1100 lines code+tests across `forge-store`, `forge-content`, `forge-content-native`, `forge-content-git`, `forge-cli`) — advisory `.forge` write lock (std `try_lock`, typed `LockTimeout`), lock wiring at the `command_result` boundary, in-txn `check` verdict, crash-atomic worktree restore, store-before-DB contract, race-safe concurrent init, extended `doctor`, and the crash-injection harness.
