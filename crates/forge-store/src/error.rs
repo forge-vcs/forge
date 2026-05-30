@@ -138,6 +138,16 @@ pub enum ForgeError {
         published_digest: String,
         recomputed_digest: String,
     },
+    /// A commit handed to `verify-branch` carries no Forge provenance trailer
+    /// (NER-137): it was not produced by `forge export branch` (a plain git commit, or
+    /// one predating Phase 6). Distinct from `PROVENANCE_MISMATCH` (a trailer that
+    /// disagrees with the ledger) so an agent gating CI can tell "not a Forge artifact"
+    /// from "tampered/mismatched". `branch` is the ref the caller passed; `missing_field`
+    /// names the absent trailer line. Non-retryable; carries no path/excerpt.
+    MissingProvenanceTrailer {
+        branch: String,
+        missing_field: String,
+    },
 }
 
 impl ForgeError {
@@ -167,6 +177,7 @@ impl ForgeError {
             ForgeError::CheckNotPassed { .. } => "CHECK_NOT_PASSED",
             ForgeError::EvidenceTampered { .. } => "EVIDENCE_TAMPERED",
             ForgeError::ProvenanceMismatch { .. } => "PROVENANCE_MISMATCH",
+            ForgeError::MissingProvenanceTrailer { .. } => "MISSING_PROVENANCE_TRAILER",
         }
     }
 
@@ -255,6 +266,10 @@ impl ForgeError {
                 "published_digest": published_digest,
                 "recomputed_digest": recomputed_digest,
             }),
+            ForgeError::MissingProvenanceTrailer {
+                branch,
+                missing_field,
+            } => json!({ "branch": branch, "missing_field": missing_field }),
             _ => Value::Object(Default::default()),
         }
     }
@@ -359,6 +374,13 @@ impl std::fmt::Display for ForgeError {
             } => write!(
                 f,
                 "provenance mismatch for proposal {proposal_id}: published trailer digest {published_digest} does not match the digest recomputed from the local ledger ({recomputed_digest})"
+            ),
+            ForgeError::MissingProvenanceTrailer {
+                branch,
+                missing_field,
+            } => write!(
+                f,
+                "commit {branch} carries no Forge provenance trailer (missing {missing_field}); it was not produced by `forge export branch`"
             ),
         }
     }
@@ -520,6 +542,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             after_ms: None,
             details_keys: &["proposal_id", "published_digest", "recomputed_digest"],
         },
+        ErrorCodeSpec {
+            code: "MISSING_PROVENANCE_TRAILER",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["branch", "missing_field"],
+        },
     ]
 }
 
@@ -646,6 +674,14 @@ mod tests {
             .code(),
             "PROVENANCE_MISMATCH"
         );
+        assert_eq!(
+            ForgeError::MissingProvenanceTrailer {
+                branch: "forge/x".into(),
+                missing_field: "provenance_digest".into(),
+            }
+            .code(),
+            "MISSING_PROVENANCE_TRAILER"
+        );
     }
 
     #[test]
@@ -741,6 +777,23 @@ mod tests {
             object.len(),
             3,
             "details must carry exactly proposal_id + the two digests"
+        );
+    }
+
+    #[test]
+    fn missing_provenance_trailer_details_carry_only_ids() {
+        let details = ForgeError::MissingProvenanceTrailer {
+            branch: "forge/x".into(),
+            missing_field: "provenance_digest".into(),
+        }
+        .details();
+        assert_eq!(details["branch"], "forge/x");
+        assert_eq!(details["missing_field"], "provenance_digest");
+        let object = details.as_object().expect("details object");
+        assert_eq!(
+            object.len(),
+            2,
+            "details must carry exactly branch + missing_field"
         );
     }
 
@@ -898,6 +951,10 @@ mod tests {
                 published_digest: "aaa".into(),
                 recomputed_digest: "bbb".into(),
             },
+            ForgeError::MissingProvenanceTrailer {
+                branch: "forge/x".into(),
+                missing_field: "provenance_digest".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -925,7 +982,8 @@ mod tests {
                 | ForgeError::AttemptWorktreeMismatch { .. }
                 | ForgeError::CheckNotPassed { .. }
                 | ForgeError::EvidenceTampered { .. }
-                | ForgeError::ProvenanceMismatch { .. } => {}
+                | ForgeError::ProvenanceMismatch { .. }
+                | ForgeError::MissingProvenanceTrailer { .. } => {}
             }
         }
 

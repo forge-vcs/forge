@@ -1644,7 +1644,7 @@ pub fn build_publication_trailer(
             let redacted = redact_gate_result(gate.clone());
             format!(
                 "{}={}",
-                gate_identity(&redacted.program, &redacted.args),
+                forge_policy::identity_string(&redacted.program, &redacted.args),
                 verdict_label(redacted.verdict)
             )
         })
@@ -1690,14 +1690,6 @@ pub fn render_trailer_message(trailer: &PublicationTrailer) -> String {
     message.push_str(&format!("Forge-Decision-Actor: {}\n", trailer.actor));
     message.push_str(&format!("Forge-Gates: {}\n", trailer.gates.join("; ")));
     message
-}
-
-fn gate_identity(program: &str, args: &[String]) -> String {
-    if args.is_empty() {
-        program.to_string()
-    } else {
-        format!("{program} {}", args.join(" "))
-    }
 }
 
 fn verdict_label(verdict: forge_policy::GateVerdict) -> &'static str {
@@ -1763,21 +1755,33 @@ fn evidence_content_hash_of(conn: &Connection, evidence_id: &str) -> Result<Stri
 
 /// The latest decision row's `(content_hash, actor)` for a revision — the decision
 /// digest folded into the provenance digest, and the deciding actor for the trailer.
+///
+/// **Fail-closed:** errors `NotAccepted` when the revision has no decision row, or its
+/// latest decision is not `accepted` (NER-137 code-review). `export branch` already
+/// gates on `accepted` before assembling the trailer, but `verify-branch` calls
+/// `build_publication_trailer` independently — without this guard a manufactured commit
+/// referencing a never-accepted revision would produce a self-consistent (empty-decision)
+/// digest that `verify-branch` would confirm as `verified`.
 fn decision_digest_and_actor(
     conn: &Connection,
     repo_id: &str,
     proposal_revision_id: &str,
 ) -> Result<(String, String)> {
-    let row: Option<(Option<String>, String)> = conn
+    let row: Option<(Option<String>, String, String)> = conn
         .query_row(
-            "SELECT content_hash, actor FROM decisions
+            "SELECT content_hash, actor, decision FROM decisions
              WHERE repo_id = ?1 AND proposal_revision_id = ?2
              ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
             params![repo_id, proposal_revision_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let (hash, actor) = row.unwrap_or((None, "unknown".to_string()));
+    let Some((hash, actor, decision)) = row else {
+        return Err(ForgeError::NotAccepted.into());
+    };
+    if decision != "accepted" {
+        return Err(ForgeError::NotAccepted.into());
+    }
     Ok((hash.unwrap_or_default(), actor))
 }
 
@@ -2998,7 +3002,7 @@ fn rank_compare_rows(rows: &mut Vec<AttemptCompareRow>) {
     for (index, row) in ranked.iter_mut().enumerate() {
         let rank = (index + 1) as u32;
         row.rank = Some(rank);
-        row.rank_reason = if row.check_status.as_deref() == Some("passed") {
+        let mut reason = if row.check_status.as_deref() == Some("passed") {
             format!(
                 "rank {rank}: all required gates passing ({} failing tests, {} passing)",
                 row.metrics.tests_failed.unwrap_or(0),
@@ -3010,6 +3014,15 @@ fn rank_compare_rows(rows: &mut Vec<AttemptCompareRow>) {
                 row.check_status.as_deref().unwrap_or("unknown")
             )
         };
+        // A legacy_unverified attempt is rankable (its deciding evidence predates
+        // Phase 5 and was never hash-verified), so a rank-only consumer must still see
+        // that caveat in the explanation (NER-137 code-review).
+        if row.integrity == INTEGRITY_LEGACY {
+            reason.push_str(
+                " — NOTE: deciding evidence is legacy_unverified (pre-Phase-5, not hash-verified)",
+            );
+        }
+        row.rank_reason = reason;
     }
     for row in &mut unranked {
         row.rank = None;

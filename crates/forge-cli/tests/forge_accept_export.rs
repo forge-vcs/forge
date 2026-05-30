@@ -291,6 +291,27 @@ fn verify_branch_fails_closed_on_a_tampered_deciding_row() {
 }
 
 #[test]
+fn verify_branch_on_a_non_forge_commit_is_a_typed_missing_trailer_error() {
+    // NER-137 code-review: an agent gating CI must tell "not a Forge artifact" from a
+    // mismatch/tamper — a plain git commit (no Forge-* trailer) → MISSING_PROVENANCE_TRAILER,
+    // not COMMAND_FAILED.
+    let repo = TestRepo::new_git();
+    prepare_proposal(&repo);
+    // HEAD is the repo's initial git commit — it carries no Forge provenance trailer.
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "export", "verify-branch", "HEAD"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(out["errors"][0]["code"], "MISSING_PROVENANCE_TRAILER");
+    assert_eq!(
+        out["errors"][0]["details"]["missing_field"],
+        "proposal_revision_id"
+    );
+}
+
+#[test]
 fn verify_branch_reports_provenance_mismatch_for_a_rewritten_trailer() {
     // NER-137 U6: a commit whose Forge-Provenance-Digest was rewritten (without a
     // matching ledger) → PROVENANCE_MISMATCH, fail-closed.

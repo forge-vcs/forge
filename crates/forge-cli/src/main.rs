@@ -462,6 +462,16 @@ fn compare_response(
             let ref_b = forge_store::attempt_proposal_content_ref(&cwd, &pair[1])?;
             let tree_diff = forge_export_git::diff_trees(&cwd, &ref_a, &ref_b, true)?;
             warnings.extend(secret_export_warnings(&tree_diff.dropped_secret_paths));
+            // Surface hunk truncation at the envelope level so an agent that only reads
+            // warnings[] (not data.diff.files[].truncated) knows the diff is incomplete.
+            for file in &tree_diff.files {
+                if file.truncated {
+                    warnings.push(format!(
+                        "diff hunk truncated for {} (body exceeded the per-file cap)",
+                        file.path
+                    ));
+                }
+            }
             data["diff"] = serde_json::to_value(&tree_diff)?;
         }
         Ok((None, data, warnings))

@@ -58,15 +58,35 @@ pub fn diff_trees(
     let tree_a = git_tree_for_content_ref(repo_root, content_ref_a)?;
     let tree_b = git_tree_for_content_ref(repo_root, content_ref_b)?;
 
-    // name-status: one `<STATUS>\t<path>` (or `<STATUS>\t<old>\t<new>` for R/C) per file.
-    let name_status = git(repo_root, &["diff", "--name-status", &tree_a, &tree_b])?;
-    // numstat: `<ins>\t<del>\t<path>`; binary files report `-\t-\t<path>`.
-    let numstat = git(repo_root, &["diff", "--numstat", &tree_a, &tree_b])?;
+    // `-z` (NUL-delimited, never C-quoted) is load-bearing for the secret-path drop:
+    // without it git C-quotes any path containing a tab/newline/non-ASCII byte (e.g.
+    // `.env\ttest` -> `".env\ttest"`), which would slip `is_secret_risk_path` and leak
+    // the filename. `--no-renames` keeps both passes keyed on the same plain path (a
+    // rename otherwise shows in numstat as `old => new`, losing its counts).
+    // name-status -z: `<STATUS>\0<path>\0` records. numstat -z: `<ins>\t<del>\t<path>\0`.
+    let name_status = git(
+        repo_root,
+        &[
+            "diff",
+            "-z",
+            "--no-renames",
+            "--name-status",
+            &tree_a,
+            &tree_b,
+        ],
+    )?;
+    let numstat = git(
+        repo_root,
+        &["diff", "-z", "--no-renames", "--numstat", &tree_a, &tree_b],
+    )?;
 
     let mut counts: std::collections::HashMap<String, (Option<u64>, Option<u64>, bool)> =
         std::collections::HashMap::new();
-    for line in numstat.lines() {
-        let mut parts = line.split('\t');
+    for record in numstat.split('\0') {
+        if record.is_empty() {
+            continue;
+        }
+        let mut parts = record.splitn(3, '\t');
         let (Some(ins), Some(del), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
             continue;
         };
@@ -79,13 +99,13 @@ pub fn diff_trees(
 
     let mut files = Vec::new();
     let mut dropped_secret_paths = Vec::new();
-    for line in name_status.lines() {
-        let mut parts = line.split('\t');
-        let Some(status) = parts.next() else { continue };
-        // For rename/copy the final field is the new path; for the rest it is the path.
-        let Some(path) = parts.next_back() else {
-            continue;
-        };
+    // name-status -z emits alternating `status`, `path` fields (NUL-separated).
+    let mut fields = name_status.split('\0');
+    while let Some(status) = fields.next() {
+        if status.is_empty() {
+            break; // trailing field after the last NUL
+        }
+        let Some(path) = fields.next() else { break };
         if forge_content::is_secret_risk_path(path) {
             dropped_secret_paths.push(path.to_string());
             continue;
@@ -206,12 +226,20 @@ pub fn verify_publication_trailer(
 ) -> Result<TrailerVerification> {
     let message = read_commit_message(repo_root, branch_or_commit)?;
     let trailers = parse_forge_trailers(&message);
-    let revision_id = trailers.proposal_revision_id.ok_or_else(|| {
-        anyhow!("commit {branch_or_commit} carries no Forge-Proposal-Revision-Id trailer")
-    })?;
-    let published = trailers.provenance_digest.ok_or_else(|| {
-        anyhow!("commit {branch_or_commit} carries no Forge-Provenance-Digest trailer")
-    })?;
+    let revision_id =
+        trailers
+            .proposal_revision_id
+            .ok_or_else(|| ForgeError::MissingProvenanceTrailer {
+                branch: branch_or_commit.to_string(),
+                missing_field: "proposal_revision_id".to_string(),
+            })?;
+    let published =
+        trailers
+            .provenance_digest
+            .ok_or_else(|| ForgeError::MissingProvenanceTrailer {
+                branch: branch_or_commit.to_string(),
+                missing_field: "provenance_digest".to_string(),
+            })?;
 
     let recomputed = forge_store::build_publication_trailer(repo_root, &revision_id)?;
     if recomputed.provenance_digest != published {
@@ -639,6 +667,41 @@ mod tests {
         assert_eq!(diff.dropped_secret_paths, vec![".env".to_string()]);
         // The non-secret change is still present with its hunk.
         assert!(diff.files.iter().any(|f| f.path == "README.md"));
+    }
+
+    #[test]
+    fn diff_trees_keeps_counts_for_a_rename() {
+        // With `--no-renames` a rename shows as D(old)+A(new), both keyed on a plain
+        // path so numstat counts are preserved (the rename `old => new` numstat key
+        // would otherwise lose them).
+        let repo = init_repo();
+        let a = build_tree(repo.path(), &[("foo.txt", "line1\nline2\n")]);
+        let b = build_tree(repo.path(), &[("bar.txt", "line1\nline2\n")]);
+        let diff = diff_trees(repo.path(), &ref_of(&a), &ref_of(&b), false).expect("diff");
+        let by_path: std::collections::HashMap<_, _> =
+            diff.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        assert_eq!(by_path["foo.txt"].status, "D");
+        assert_eq!(by_path["foo.txt"].deletions, Some(2));
+        assert_eq!(by_path["bar.txt"].status, "A");
+        assert_eq!(by_path["bar.txt"].insertions, Some(2));
+    }
+
+    #[test]
+    fn diff_trees_drops_a_secret_path_with_non_ascii_bytes() {
+        // `-z` emits paths unquoted; without it git C-quotes a non-ASCII path and the
+        // secret-risk drop would miss it (a filename leak). `.env.café` matches `.env.*`.
+        let repo = init_repo();
+        let a = build_tree(repo.path(), &[("README.md", "x\n")]);
+        let b = build_tree(
+            repo.path(),
+            &[("README.md", "x\n"), (".env.café", "SECRET=1\n")],
+        );
+        let diff = diff_trees(repo.path(), &ref_of(&a), &ref_of(&b), true).expect("diff");
+        assert!(
+            diff.files.iter().all(|f| f.path != ".env.café"),
+            "non-ascii secret path must be dropped, not leaked"
+        );
+        assert!(diff.dropped_secret_paths.iter().any(|p| p == ".env.café"));
     }
 
     #[test]

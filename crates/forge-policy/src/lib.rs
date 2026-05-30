@@ -330,7 +330,10 @@ fn latest<'a>(facts: impl Iterator<Item = &'a EvidenceFact>) -> Option<&'a Evide
     })
 }
 
-fn identity_string(program: &str, args: &[String]) -> String {
+/// The canonical `"program arg…"` identity string for a `(program, args)` gate.
+/// Public so the store can render the same identity into a provenance trailer without
+/// duplicating the format (NER-137 code-review).
+pub fn identity_string(program: &str, args: &[String]) -> String {
     if args.is_empty() {
         program.to_string()
     } else {
