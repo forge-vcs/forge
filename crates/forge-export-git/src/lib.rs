@@ -1,8 +1,146 @@
 use anyhow::{anyhow, Result};
 use forge_content::{classify_content_ref, ContentRefKind};
 use forge_store::ForgeError;
+use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
+
+/// Per-file hunk-body byte cap, mirroring `forge_evidence::EXCERPT_LIMIT` (4096). A
+/// local const so the diff adapter does not depend on `forge-evidence`; the value is
+/// the same so diff hunks and captured evidence excerpts share one bound. A hunk
+/// longer than this is truncated with `truncated: true`.
+const HUNK_LIMIT: usize = 4096;
+
+/// One file's change between two trees (NER-137, Phase 6). `status` is git's
+/// name-status letter (`A`/`M`/`D`/`R…`/`C…`). `insertions`/`deletions` come from
+/// numstat (`None` for a binary file, which git reports as `-`). `hunk` carries the
+/// redacted, bounded unified diff body and is populated only when hunks were
+/// requested and the file is non-secret and non-binary.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    pub status: String,
+    pub insertions: Option<u64>,
+    pub deletions: Option<u64>,
+    pub binary: bool,
+    pub hunk: Option<String>,
+    pub truncated: bool,
+}
+
+/// The content-level diff between two proposals' trees, produced via the git adapter
+/// (NER-137 feature 3 — native diff with rename detection is Phase 8). Secret-risk
+/// paths are dropped from `files` and listed in `dropped_secret_paths` so the caller
+/// can surface them as a warning rather than leaking the filename.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TreeDiff {
+    pub files: Vec<FileDiff>,
+    pub dropped_secret_paths: Vec<String>,
+}
+
+/// Diff two proposals' `content_ref`s at file (and optionally hunk) granularity,
+/// **via the git adapter** (NER-137 U2). Both refs are resolved to git tree hashes
+/// through [`git_tree_for_content_ref`] — the one resolver the export path already
+/// uses — so `git-tree:` and `forge-tree:` refs diff uniformly. Secret-risk-named
+/// paths are dropped before any hunk is read; binary files emit no hunk; emitted
+/// hunks are redacted (`redact_evidence_excerpt`) and bounded to [`HUNK_LIMIT`].
+///
+/// `include_hunks` is lazy by design (NER-137): the per-attempt compare summary uses
+/// the cheap name-status/numstat (`include_hunks = false`), and the expensive hunk
+/// bodies are produced only on the explicit pairwise `compare --diff` path — so a
+/// bare `forge compare` over many intents never fans out into per-file `git diff`
+/// subprocesses.
+pub fn diff_trees(
+    repo_root: &Path,
+    content_ref_a: &str,
+    content_ref_b: &str,
+    include_hunks: bool,
+) -> Result<TreeDiff> {
+    let tree_a = git_tree_for_content_ref(repo_root, content_ref_a)?;
+    let tree_b = git_tree_for_content_ref(repo_root, content_ref_b)?;
+
+    // name-status: one `<STATUS>\t<path>` (or `<STATUS>\t<old>\t<new>` for R/C) per file.
+    let name_status = git(repo_root, &["diff", "--name-status", &tree_a, &tree_b])?;
+    // numstat: `<ins>\t<del>\t<path>`; binary files report `-\t-\t<path>`.
+    let numstat = git(repo_root, &["diff", "--numstat", &tree_a, &tree_b])?;
+
+    let mut counts: std::collections::HashMap<String, (Option<u64>, Option<u64>, bool)> =
+        std::collections::HashMap::new();
+    for line in numstat.lines() {
+        let mut parts = line.split('\t');
+        let (Some(ins), Some(del), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let binary = ins == "-" || del == "-";
+        counts.insert(
+            path.to_string(),
+            (ins.parse().ok(), del.parse().ok(), binary),
+        );
+    }
+
+    let mut files = Vec::new();
+    let mut dropped_secret_paths = Vec::new();
+    for line in name_status.lines() {
+        let mut parts = line.split('\t');
+        let Some(status) = parts.next() else { continue };
+        // For rename/copy the final field is the new path; for the rest it is the path.
+        let Some(path) = parts.last() else { continue };
+        if forge_content::is_secret_risk_path(path) {
+            dropped_secret_paths.push(path.to_string());
+            continue;
+        }
+        let (insertions, deletions, binary) =
+            counts.get(path).copied().unwrap_or((None, None, false));
+        let (hunk, truncated) = if include_hunks && !binary {
+            read_hunk(repo_root, &tree_a, &tree_b, path)?
+        } else {
+            (None, false)
+        };
+        files.push(FileDiff {
+            path: path.to_string(),
+            status: status.to_string(),
+            insertions,
+            deletions,
+            binary,
+            hunk,
+            truncated,
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    dropped_secret_paths.sort();
+    Ok(TreeDiff {
+        files,
+        dropped_secret_paths,
+    })
+}
+
+/// Read one file's unified-diff hunk between two trees, redact it, and bound it to
+/// [`HUNK_LIMIT`]. The diff body is captured-output-shaped, so it goes through the
+/// same `redact_evidence_excerpt` (entropy/JSON/PEM/credential-URL detectors, with
+/// the hex/UUID allowlist that spares Forge's own SHAs) the evidence path uses.
+fn read_hunk(
+    repo_root: &Path,
+    tree_a: &str,
+    tree_b: &str,
+    path: &str,
+) -> Result<(Option<String>, bool)> {
+    let raw = git(repo_root, &["diff", tree_a, tree_b, "--", path])?;
+    if raw.is_empty() {
+        return Ok((None, false));
+    }
+    let (redacted, _kinds) = forge_content::redact_evidence_excerpt(&raw);
+    let truncated = redacted.len() > HUNK_LIMIT;
+    let bounded = if truncated {
+        // Truncate on a char boundary so we never split a UTF-8 sequence.
+        let mut end = HUNK_LIMIT;
+        while end > 0 && !redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        redacted[..end].to_string()
+    } else {
+        redacted
+    };
+    Ok((Some(bounded), truncated))
+}
 
 /// Export the accepted proposal as a new branch, returning `(commit_id, excluded)`.
 ///
@@ -348,5 +486,82 @@ mod tests {
 
         assert_eq!(new_tree, tree, "clean tree returned unchanged (fast path)");
         assert!(dropped.is_empty());
+    }
+
+    fn ref_of(tree: &str) -> String {
+        format!("git-tree:{tree}")
+    }
+
+    #[test]
+    fn diff_trees_reports_modified_file_with_counts_and_hunk() {
+        let repo = init_repo();
+        let a = build_tree(repo.path(), &[("README.md", "one\ntwo\n")]);
+        let b = build_tree(repo.path(), &[("README.md", "one\ntwo\nthree\n")]);
+
+        let diff = diff_trees(repo.path(), &ref_of(&a), &ref_of(&b), true).expect("diff");
+        assert_eq!(diff.files.len(), 1);
+        let file = &diff.files[0];
+        assert_eq!(file.path, "README.md");
+        assert_eq!(file.status, "M");
+        assert_eq!(file.insertions, Some(1));
+        assert_eq!(file.deletions, Some(0));
+        assert!(!file.binary);
+        assert!(file.hunk.as_deref().unwrap().contains("+three"));
+        assert!(diff.dropped_secret_paths.is_empty());
+    }
+
+    #[test]
+    fn diff_trees_reports_added_and_deleted() {
+        let repo = init_repo();
+        let a = build_tree(repo.path(), &[("keep.txt", "x\n"), ("gone.txt", "y\n")]);
+        let b = build_tree(repo.path(), &[("keep.txt", "x\n"), ("new.txt", "z\n")]);
+
+        let diff = diff_trees(repo.path(), &ref_of(&a), &ref_of(&b), false).expect("diff");
+        let by_path: std::collections::HashMap<_, _> =
+            diff.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        assert_eq!(by_path["gone.txt"].status, "D");
+        assert_eq!(by_path["new.txt"].status, "A");
+        // include_hunks = false -> no hunk bodies.
+        assert!(diff.files.iter().all(|f| f.hunk.is_none()));
+    }
+
+    #[test]
+    fn diff_trees_identical_trees_is_empty() {
+        let repo = init_repo();
+        let a = build_tree(repo.path(), &[("README.md", "same\n")]);
+        let diff = diff_trees(repo.path(), &ref_of(&a), &ref_of(&a), true).expect("diff");
+        assert!(diff.files.is_empty());
+        assert!(diff.dropped_secret_paths.is_empty());
+    }
+
+    #[test]
+    fn diff_trees_drops_secret_paths_and_reads_no_hunk_for_them() {
+        let repo = init_repo();
+        let a = build_tree(repo.path(), &[("README.md", "hi\n")]);
+        let b = build_tree(
+            repo.path(),
+            &[("README.md", "hi there\n"), (".env", "SECRET=abc\n")],
+        );
+        let diff = diff_trees(repo.path(), &ref_of(&a), &ref_of(&b), true).expect("diff");
+        assert!(
+            diff.files.iter().all(|f| f.path != ".env"),
+            ".env must be dropped from the diff"
+        );
+        assert_eq!(diff.dropped_secret_paths, vec![".env".to_string()]);
+        // The non-secret change is still present with its hunk.
+        assert!(diff.files.iter().any(|f| f.path == "README.md"));
+    }
+
+    #[test]
+    fn diff_trees_bounds_a_large_hunk() {
+        let repo = init_repo();
+        let a = build_tree(repo.path(), &[("big.txt", "start\n")]);
+        // A change far larger than HUNK_LIMIT so the hunk body must be truncated.
+        let big = format!("start\n{}", "line\n".repeat(2000));
+        let b = build_tree(repo.path(), &[("big.txt", &big)]);
+        let diff = diff_trees(repo.path(), &ref_of(&a), &ref_of(&b), true).expect("diff");
+        let file = diff.files.iter().find(|f| f.path == "big.txt").unwrap();
+        assert!(file.truncated, "hunk should be marked truncated");
+        assert!(file.hunk.as_deref().unwrap().len() <= HUNK_LIMIT);
     }
 }
