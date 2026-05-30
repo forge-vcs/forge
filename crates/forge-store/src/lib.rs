@@ -1620,27 +1620,17 @@ pub fn reconcile_native_head(cwd: &Path) -> Result<()> {
     let refs = forge_content_native::NativeRefStore::new(&context.root_path);
     let current_head = refs.read_head()?;
     let connection = open_connection(&context.database_path)?;
-    let latest: Option<String> = connection
-        .query_row(
-            "SELECT commit_id FROM decisions \
-             WHERE repo_id = ?1 AND commit_id IS NOT NULL \
-             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
-            params![context.repo_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(latest) = latest else {
-        return Ok(()); // no justified commits yet (genesis-only / git repo)
+    let Some(tip) = native_tip(&context, &connection)? else {
+        return Ok(()); // genesis-only / git repo — nothing to reconcile
     };
-    let latest_id = forge_content_native::ObjectId::parse(&latest)?;
-    if current_head.as_ref() == Some(&latest_id) {
+    if current_head.as_ref() == Some(&tip) {
         return Ok(()); // HEAD already current
     }
     // Walk the tip's ancestry: every object must exist (a miss is the store-before-DB
     // violation), there is no cycle, and the current HEAD must be an ancestor of the tip
     // (HEAD lags, never forks). Linear history → follow the first parent.
     let store = forge_content_native::NativeObjectStore::new(&context.root_path);
-    let mut cursor = Some(latest_id.clone());
+    let mut cursor = Some(tip.clone());
     let mut seen = std::collections::BTreeSet::new();
     let mut head_reached = current_head.is_none();
     while let Some(cid) = cursor {
@@ -1658,7 +1648,7 @@ pub fn reconcile_native_head(cwd: &Path) -> Result<()> {
         }
         let commit = store.read_commit(&cid).map_err(|_| {
             // The tip miss is a dangling commit_id; a deeper miss is a dangling parent.
-            let kind = if cid == latest_id {
+            let kind = if cid == tip {
                 NativeHistoryCorruptKind::DanglingCommitId
             } else {
                 NativeHistoryCorruptKind::DanglingParent
@@ -1679,13 +1669,122 @@ pub fn reconcile_native_head(cwd: &Path) -> Result<()> {
         // serialized accepts cannot produce: the store is corrupt.
         return Err(ForgeError::NativeHistoryCorrupt {
             kind: NativeHistoryCorruptKind::DanglingParent,
-            commit_id: latest_id.to_string(),
+            commit_id: tip.to_string(),
             related_id: current_head.map(|head| head.to_string()),
         }
         .into());
     }
-    refs.set_head(&latest_id)?;
+    refs.set_head(&tip)?;
     Ok(())
+}
+
+/// The authoritative native history tip: the latest accepted `decisions.commit_id` (by
+/// op-log chain order, `rowid DESC` tiebreak) if any justified commit exists, else the
+/// ref-store HEAD (the genesis), else `None`. Shared by `reconcile_native_head` (the advance
+/// target) and `native_log` (the walk origin) so the two can never disagree on the tip —
+/// `log` is read-only and never writes HEAD, so it tolerates a not-yet-reconciled HEAD by
+/// resolving the tip from the ledger directly.
+fn native_tip(
+    context: &RepositoryContext,
+    connection: &Connection,
+) -> Result<Option<forge_content_native::ObjectId>> {
+    let latest: Option<String> = connection
+        .query_row(
+            "SELECT commit_id FROM decisions \
+             WHERE repo_id = ?1 AND commit_id IS NOT NULL \
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            params![context.repo_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match latest {
+        Some(commit) => Ok(Some(forge_content_native::ObjectId::parse(&commit)?)),
+        None => forge_content_native::NativeRefStore::new(&context.root_path).read_head(),
+    }
+}
+
+/// One commit in the native history, as surfaced by `forge log` through the JSON contract
+/// ("show every change under this intent and the evidence that justified it"). Optional
+/// justification fields are omitted when absent (genesis), matching the on-object shape.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitView {
+    pub commit_id: String,
+    pub tree: String,
+    pub parents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_revision_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authored_time: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_digest: Option<String>,
+}
+
+/// Walk the native commit DAG from the authoritative tip (NER-138 Phase 7 slice 3),
+/// tip→genesis, returning each commit's justification. Read-only (no lock, no HEAD write).
+/// When `intent` is `Some`, only commits whose `intent_id` matches are returned — the literal
+/// "show every change under this intent" query. A missing tip/parent object surfaces typed
+/// `NativeHistoryCorrupt` (DanglingCommitId for the tip, DanglingParent deeper); a parent
+/// cycle is `Cycle`.
+pub fn native_log(cwd: &Path, intent: Option<&str>) -> Result<Vec<CommitView>> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let tip = native_tip(&context, &connection)?;
+    let mut out = Vec::new();
+    let mut cursor = tip.clone();
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(cid) = cursor {
+        if !seen.insert(cid.clone()) {
+            return Err(ForgeError::NativeHistoryCorrupt {
+                kind: NativeHistoryCorruptKind::Cycle,
+                commit_id: cid.to_string(),
+                related_id: None,
+            }
+            .into());
+        }
+        let commit = store.read_commit(&cid).map_err(|_| {
+            let kind = if Some(&cid) == tip.as_ref() {
+                NativeHistoryCorruptKind::DanglingCommitId
+            } else {
+                NativeHistoryCorruptKind::DanglingParent
+            };
+            anyhow::Error::from(ForgeError::NativeHistoryCorrupt {
+                kind,
+                commit_id: cid.to_string(),
+                related_id: None,
+            })
+        })?;
+        let matches = intent
+            .map(|want| commit.intent_id.as_deref() == Some(want))
+            .unwrap_or(true);
+        if matches {
+            out.push(CommitView {
+                commit_id: cid.to_string(),
+                tree: commit.tree.clone(),
+                parents: commit.parents.clone(),
+                intent_id: commit.intent_id.clone(),
+                proposal_revision_id: commit.proposal_revision_id.clone(),
+                decision_id: commit.decision_id.clone(),
+                actor: commit.actor.clone(),
+                authored_time: commit.authored_time,
+                evidence_digest: commit
+                    .evidence_digest
+                    .as_ref()
+                    .map(|h| h.as_str().to_string()),
+            });
+        }
+        cursor = match commit.parents.first() {
+            Some(parent) => Some(forge_content_native::ObjectId::parse(parent)?),
+            None => None,
+        };
+    }
+    Ok(out)
 }
 
 /// Verify an accepted proposal's decision row integrity before trusting `accepted`

@@ -197,6 +197,70 @@ fn reconcile_advances_head_from_a_torn_accept() {
 }
 
 #[test]
+fn native_log_walks_the_dag_tip_to_genesis() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    let commit_id = accepted["data"]["commit_id"].as_str().unwrap().to_string();
+
+    let logged = json_output(repo.forge().args(["--json", "log"]).assert().success());
+    let commits = logged["data"]["commits"].as_array().expect("commits array");
+    // The accepted commit is the tip (first), with its full justification; genesis follows.
+    assert!(commits.len() >= 2, "tip + genesis at minimum");
+    assert_eq!(commits[0]["commit_id"], commit_id);
+    assert!(commits[0]["decision_id"].is_string());
+    assert!(commits[0]["actor"].is_string());
+    assert!(commits[0]["authored_time"].is_i64());
+    // intent_id is the opaque intent id (not the intent text).
+    assert!(commits[0]["intent_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("intent"));
+    // The last entry is the genesis: empty parents, no justification fields.
+    let genesis = commits.last().unwrap();
+    assert_eq!(genesis["parents"].as_array().unwrap().len(), 0);
+    assert!(genesis.get("decision_id").is_none());
+
+    // log is read-only: it took no lock and did not advance HEAD.
+    assert_eq!(head(repo.path()).as_deref(), Some(commit_id.as_str()));
+}
+
+#[test]
+fn native_log_filters_by_intent() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    repo.forge().args(["--json", "accept"]).assert().success();
+
+    // The intent id is the opaque id the commit recorded — discover it from an unfiltered log.
+    let all = json_output(repo.forge().args(["--json", "log"]).assert().success());
+    let intent_id = all["data"]["commits"][0]["intent_id"]
+        .as_str()
+        .expect("the accepted commit carries an intent id")
+        .to_string();
+
+    let matching = json_output(
+        repo.forge()
+            .args(["--json", "log", "--intent", &intent_id])
+            .assert()
+            .success(),
+    );
+    assert!(
+        !matching["data"]["commits"].as_array().unwrap().is_empty(),
+        "the accepted commit is under its intent id"
+    );
+    let none = json_output(
+        repo.forge()
+            .args(["--json", "log", "--intent", "no-such-intent"])
+            .assert()
+            .success(),
+    );
+    assert!(
+        none["data"]["commits"].as_array().unwrap().is_empty(),
+        "no commits under an unknown intent"
+    );
+}
+
+#[test]
 fn dangling_ledger_commit_id_surfaces_native_history_corrupt() {
     let repo = TestRepo::new_git();
     prepare_native_proposal(&repo);

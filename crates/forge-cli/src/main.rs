@@ -37,6 +37,8 @@ enum Command {
     Proposal(ProposalArgs),
     /// Compare competing attempts (per intent) on verified evidence + rank them.
     Compare(CompareArgs),
+    /// Walk the native commit history (tip→genesis) and the evidence that justified it.
+    Log(LogArgs),
     Doctor,
     Gc(GcArgs),
     Export(ExportArgs),
@@ -57,6 +59,13 @@ struct CompareArgs {
     /// proposals (via the git adapter): `--diff <attempt_a> <attempt_b>`.
     #[arg(long, num_args = 2, value_names = ["ATTEMPT_A", "ATTEMPT_B"])]
     diff: Option<Vec<String>>,
+}
+
+#[derive(Debug, Args)]
+struct LogArgs {
+    /// Show only commits recorded under this intent ("show every change under this intent").
+    #[arg(long)]
+    intent: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -249,6 +258,7 @@ fn main() -> ExitCode {
         Command::Show(args) => show_response(request_id, args),
         Command::Proposal(args) => proposal_response(request_id, args),
         Command::Compare(args) => compare_response(request_id, "compare", args),
+        Command::Log(args) => log_response(request_id, args),
         Command::Doctor => doctor_response(request_id),
         Command::Gc(args) => gc_response(request_id, args),
         Command::Export(args) => export_response(request_id, args),
@@ -716,6 +726,16 @@ fn proposal_response(request_id: Option<String>, args: ProposalArgs) -> Response
             ))
         }),
     }
+}
+
+fn log_response(request_id: Option<String>, args: LogArgs) -> ResponseEnvelope {
+    // Read-only: "log" is not a mutating command, so command_result takes no lock and runs
+    // no reconcile — `native_log` resolves the authoritative tip from the ledger directly,
+    // tolerating a not-yet-reconciled HEAD.
+    command_result("log", request_id, |cwd, _request_id| {
+        let commits = forge_store::native_log(&cwd, args.intent.as_deref())?;
+        Ok((None, json!({ "commits": commits }), Vec::new()))
+    })
 }
 
 fn doctor_response(request_id: Option<String>) -> ResponseEnvelope {

@@ -71,6 +71,7 @@ fn command_shapes() -> Value {
         ("proposal list", "Lists proposals; data carries { proposals: [...] }."),
         ("compare", "Compares competing attempts on verified evidence and ranks them; data carries { intents: [{ intent_id, intent, attempts: [{ attempt_id, gates, metrics, integrity, decision_status, publication_status, rank, rank_reason, ... }] }] }. Read-only and advisory; a cheap-check-tampered attempt is integrity=tampered with rank=null. With --diff <a> <b>, data also carries the file/hunk diff between the two attempts' proposals (via the git adapter)."),
         ("attempt compare", "Alias of `compare` scoped to attempts; same data shape."),
+        ("log", "Walks the native commit history tip→genesis via the JSON contract; data carries { commits: [{ commit_id, tree, parents, intent_id, proposal_revision_id, decision_id, actor, authored_time, evidence_digest }] }. Read-only; --intent <id> filters to commits under one intent (\"show every change under this intent\"). Native-backend repos only (a git-backend repo has no native history)."),
         ("doctor", "Reports repository health; data carries the diagnostic checks."),
         ("gc", "Garbage-collection (--dry-run only in v0); data carries the dry-run plan."),
         ("export branch", "Exports an accepted proposal to a new git branch with a structured Forge-* provenance trailer (incl. a content-addressed Forge-Provenance-Digest); secret-risk paths are dropped with a warning."),
