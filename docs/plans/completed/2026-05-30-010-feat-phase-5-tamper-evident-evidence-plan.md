@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 5 — Tamper-evident, structured evidence + actor/identity model"
 type: feat
-status: active
+status: completed
 date: 2026-05-30
 deepened: 2026-05-30
 origin: docs/ROADMAP.md  # Phase 5 section; ticket NER-136. No dedicated *-requirements.md — the ROADMAP Phase 5 entry + the competing-attempts brainstorm (the wedge) are the source.
