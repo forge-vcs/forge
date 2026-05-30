@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 7 Slice 2 — Native commit object format + ref store + backend-agnostic base_head + native changed_paths"
 type: feat
-status: active
+status: completed
 date: 2026-05-30
 deepened: 2026-05-30
 origin: docs/handoffs/2026-05-30-ner-138-phase-7-slice-2-kickoff.md  # NER-138 Phase 7, slice 2 of 3 (XL phase). Source requirements = the slice-2 kickoff handoff + ROADMAP Phase 7 + slice-1 completed plan + slice-1 learnings. No dedicated *-requirements.md.
