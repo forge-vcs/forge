@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use forge_content::{is_ignored_by_policy, ContentBackend, SnapshotContent, FORGE_TREE_PREFIX};
+use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -503,7 +504,7 @@ fn materialize_tree(
 
 fn scan_worktree(repo_root: &Path) -> Result<Vec<FileEntry>> {
     let mut files = Vec::new();
-    for path in snapshot_candidate_paths(repo_root)? {
+    for path in walk_worktree(repo_root)? {
         if is_ignored_by_policy(&path) {
             continue;
         }
@@ -518,19 +519,116 @@ fn scan_worktree(repo_root: &Path) -> Result<Vec<FileEntry>> {
         });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    // Defensive: the serial `ignore` Walk yields each path once, so this dedup is a no-op
+    // today — but it guarantees a future change (a second walk root, follow_links, or a
+    // parallel walker) can never feed `write_tree` two entries with the same name.
+    files.dedup_by(|a, b| a.path == b.path);
     Ok(files)
 }
 
-fn snapshot_candidate_paths(repo_root: &Path) -> Result<Vec<String>> {
-    let mut paths = BTreeSet::new();
-    for args in [
-        ["ls-files"].as_slice(),
-        ["ls-files", "--others", "--exclude-standard"].as_slice(),
-    ] {
-        let output = git(repo_root, args)?;
-        paths.extend(output.lines().map(str::to_string));
+/// Enumerate snapshot-candidate worktree paths natively, without the `git` binary
+/// (NER-138 Phase 7 slice 1). Uses the `ignore` crate to honor repo-local `.gitignore`
+/// (nested, with negation) and `.forgeignore`; the authoritative secret/internal
+/// exclusion is left to `is_ignored_by_policy` in the caller (`scan_worktree`).
+///
+/// Exclusion precedence (highest wins):
+///   `is_ignored_by_policy` (`.forge/`, `.git/`, `.forge-restore-*`, secret-risk —
+///       always wins, not negatable)
+///     > `.forgeignore`  (Forge-specific; a `!`-negation can re-include a `.gitignore` drop)
+///     > `.gitignore`    (repo-local, nested, with negation)
+///     > built-in defaults
+///
+/// The walker is intentionally **environment-independent**: it does NOT consult
+/// `.git/info/exclude` or the user's global `core.excludesfile`, so a repo's native
+/// snapshot set is reproducible across machines (the Phase 7 goal). This is a deliberate,
+/// documented divergence from `git ls-files --others --exclude-standard`. Resolves the
+/// `PRD.md` `.forgeignore` open question for the native backend.
+fn walk_worktree(repo_root: &Path) -> Result<Vec<String>> {
+    let mut builder = WalkBuilder::new(repo_root);
+    builder
+        .hidden(false) // git lists dotfiles (.gitignore, .gitattributes, .github/)
+        .ignore(false) // git does not honor the `ignore` crate's own `.ignore` files
+        .git_ignore(true) // honor repo-local .gitignore (nested, with negation)
+        .git_exclude(false) // env-independent: do not read .git/info/exclude
+        .git_global(false) // env-independent: do not read global core.excludesfile
+        .parents(false) // the repo root is the ignore boundary (matches git)
+        .require_git(false) // honor .gitignore even without a .git directory
+        .follow_links(false) // do not traverse into symlinked directories
+        .add_custom_ignore_filename(".forgeignore") // higher precedence than .gitignore
+        .sort_by_file_name(|a, b| a.cmp(b));
+
+    // Prune descent into `is_ignored_by_policy` directories (`.git`, `.forge`) at the walk
+    // layer so we never recurse through e.g. thousands of `.git` internals just to discard
+    // them. This *reuses* the shared predicate (it is not a fork): the post-walk
+    // `is_ignored_by_policy` filter in `scan_worktree` remains the authoritative backstop.
+    let prune_root = repo_root.to_path_buf();
+    builder.filter_entry(move |entry| match rel_path(&prune_root, entry.path()) {
+        Some(rel) => !is_ignored_by_policy(&rel),
+        None => true, // the walk root itself has no relative path; always descend it
+    });
+
+    let mut paths = Vec::new();
+    for result in builder.build() {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(error) => match map_walk_error(&error) {
+                Some(mapped) => return Err(mapped),
+                None => continue,
+            },
+        };
+        // Skip directories; yield regular files AND symlinks so the downstream
+        // `fs::metadata`/`is_file` gate (which follows links) decides symlink-to-file
+        // capture — preserving today's behavior (Phase 7 does not add symlink content).
+        match entry.file_type() {
+            Some(file_type) if file_type.is_dir() => continue,
+            None => continue, // no file type (e.g. the stdin sentinel) — never a worktree file
+            _ => {}
+        }
+        if let Some(rel) = rel_path(repo_root, entry.path()) {
+            paths.push(rel);
+        }
     }
-    Ok(paths.into_iter().collect())
+    Ok(paths)
+}
+
+/// Map a walk error to either `None` (skip — a benign mid-walk disappearance) or a
+/// **path-free** `anyhow` error (security invariant S1: no filesystem path may reach the
+/// untyped envelope `message`, which would bypass typed-error secret-path redaction).
+/// `ignore::Error`'s own `Display` embeds the offending path, so we never forward it —
+/// only the path-free `io::ErrorKind` is surfaced. A `NotFound` (a file that vanished
+/// between enumeration and read, realistic under a concurrent agent fleet) is benign and
+/// skipped, mirroring the `fs::metadata` skip in `scan_worktree`.
+fn map_walk_error(error: &ignore::Error) -> Option<anyhow::Error> {
+    match error.io_error() {
+        Some(io) if io.kind() == std::io::ErrorKind::NotFound => None,
+        Some(io) => Some(anyhow!("failed to walk worktree: {}", io.kind())),
+        None => Some(anyhow!("failed to walk worktree")),
+    }
+}
+
+/// Repo-relative, forward-slash path for a walked entry, or `None` for the walk root
+/// itself. Joins only `Normal` components so a filename containing a backslash on Unix is
+/// preserved and Windows separators normalize to `/` — matching `is_secret_risk_path`'s
+/// `rsplit('/')` and the tree builder's path handling.
+///
+/// Non-UTF-8 bytes in a filename are best-effort: `to_string_lossy` substitutes U+FFFD, so
+/// such a path may not round-trip and the file is dropped at the downstream `fs::metadata`
+/// gate. This is no worse than the prior git `ls-files` `.lines()` parsing (which C-quoted
+/// such names); faithful non-UTF-8 capture is out of slice-1 scope. The secret backstop is
+/// unaffected — `is_secret_risk_path` lowercases the (lossy) filename before matching.
+fn rel_path(repo_root: &Path, full: &Path) -> Option<String> {
+    let rel = full.strip_prefix(repo_root).ok()?;
+    let parts: Vec<String> = rel
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(os) => Some(os.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
 }
 
 fn materialized_paths(repo_root: &Path) -> Result<BTreeSet<String>> {
@@ -756,16 +854,9 @@ mod tests {
         // temp+rename, so on a clean restore: content round-trips, the stale file
         // is fully replaced, and no `.forge-restore-*` temp survives.
         let src = tempfile::tempdir().unwrap();
-        // The native backend enumerates worktree paths via git (`ls-files` +
-        // `--others --exclude-standard`), so the source must be a git work tree;
-        // the untracked files below are picked up without staging.
-        assert!(Command::new("git")
-            .arg("init")
-            .current_dir(src.path())
-            .output()
-            .unwrap()
-            .status
-            .success());
+        // The native walker (NER-138 Phase 7 slice 1) enumerates worktree paths via the
+        // `ignore` crate, so a `.git` directory is no longer required to snapshot; the
+        // untracked files below are picked up directly from the filesystem.
         fs::create_dir_all(src.path().join("dir")).unwrap();
         fs::write(src.path().join("top.txt"), b"top-new").unwrap();
         fs::write(src.path().join("dir/nested.txt"), b"nested-new").unwrap();
@@ -797,5 +888,460 @@ mod tests {
             leftover.is_empty(),
             "restore left orphaned temp files: {leftover:?}"
         );
+    }
+
+    // --- NER-138 Phase 7 slice 1: native walker differential harness ---
+    //
+    // These tests prove the native `ignore`-crate walker's snapshot set equals the prior
+    // git-based set across a parity corpus (incl. secret-risk exclusion), and assert each
+    // index-vs-filesystem divergence class explicitly rather than masking it. The harness
+    // is the safety net that justifies removing the `git ls-files` shell-out from the
+    // native snapshot path (R5). Most are git-backed; the `.forgeignore` and special-byte
+    // cases are native-only (git knows nothing of `.forgeignore`, and the special-byte
+    // case is exactly the C-quote leak the native walker structurally cures).
+
+    /// Run a git command in `repo`, asserting success. Test setup only.
+    #[cfg(test)]
+    fn run_git(repo: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .unwrap()
+                .status
+                .success(),
+            "git {args:?} failed"
+        );
+    }
+
+    #[cfg(test)]
+    fn init_git_repo(repo: &Path) {
+        run_git(repo, &["init"]);
+        run_git(repo, &["config", "user.email", "t@example.com"]);
+        run_git(repo, &["config", "user.name", "forge-test"]);
+    }
+
+    /// The pre-slice-1 git-based candidate enumeration, retained ONLY as the differential
+    /// harness's reference set. Mirrors the removed `snapshot_candidate_paths` (the union of
+    /// `git ls-files` and `git ls-files --others --exclude-standard`) followed by the same
+    /// downstream filters `scan_worktree` applies (`is_ignored_by_policy` + `is_file`).
+    /// Production no longer shells git for snapshotting (R1); this lives in the test module
+    /// so the harness can prove native-walk set == prior git-based set.
+    #[cfg(test)]
+    fn git_based_scan(repo: &Path) -> Vec<String> {
+        let mut candidates = BTreeSet::new();
+        for args in [
+            ["ls-files"].as_slice(),
+            ["ls-files", "--others", "--exclude-standard"].as_slice(),
+        ] {
+            candidates.extend(git(repo, args).unwrap().lines().map(str::to_string));
+        }
+        let mut files: Vec<String> = candidates
+            .into_iter()
+            .filter(|path| !is_ignored_by_policy(path))
+            .filter(|path| matches!(fs::metadata(repo.join(path)), Ok(meta) if meta.is_file()))
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// The native walker's final scan set (post policy backstop + `is_file` gate), sorted.
+    #[cfg(test)]
+    fn native_scan(repo: &Path) -> Vec<String> {
+        let mut files: Vec<String> = scan_worktree(repo)
+            .unwrap()
+            .into_iter()
+            .map(|file| file.path)
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn native_walk_matches_git_based_set_on_parity_corpus() {
+        // Parity corpus: only paths whose membership is identical between git's index-based
+        // enumeration and a filesystem walk (no index-only paths — those are asserted as
+        // divergences below). Includes tracked, untracked, gitignored (+ negation),
+        // secret-risk, internal, and restore-temp-at-depth cases.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo(repo);
+
+        fs::create_dir_all(repo.join("src/nested")).unwrap();
+        fs::write(repo.join("README.md"), b"readme").unwrap();
+        fs::write(repo.join("src/main.rs"), b"fn main() {}").unwrap();
+        fs::write(repo.join("src/nested/deep.txt"), b"deep").unwrap();
+        fs::write(repo.join(".gitattributes"), b"* text=auto\n").unwrap();
+        // *.log ignored, but keep.log re-included by a negation (parent not excluded).
+        fs::write(repo.join(".gitignore"), b"*.log\n!keep.log\n").unwrap();
+        run_git(repo, &["add", "-A"]);
+        run_git(repo, &["commit", "-m", "init"]);
+
+        // Untracked, non-ignored.
+        fs::write(repo.join("untracked.txt"), b"u").unwrap();
+        // Untracked + gitignored (excluded) and the negated re-include (kept).
+        fs::write(repo.join("debug.log"), b"d").unwrap();
+        fs::write(repo.join("keep.log"), b"k").unwrap();
+        // Secret-risk + internal: excluded by is_ignored_by_policy in BOTH pipelines.
+        fs::write(repo.join(".env"), b"SECRET=x").unwrap();
+        fs::create_dir_all(repo.join("certs")).unwrap();
+        fs::write(repo.join("certs/server.pem"), b"key").unwrap();
+        fs::create_dir_all(repo.join(".forge")).unwrap();
+        fs::write(repo.join(".forge/forge.db"), b"db").unwrap();
+        // Orphaned restore temp at depth (policy-excluded at any depth, not via .gitignore).
+        fs::write(repo.join("src/nested/.forge-restore-abc"), b"tmp").unwrap();
+
+        assert_eq!(
+            native_scan(repo),
+            git_based_scan(repo),
+            "native walk set must equal the prior git-based set on the parity corpus"
+        );
+
+        // Pin the content the equality locks in.
+        let native = native_scan(repo);
+        for kept in [
+            "README.md",
+            "src/main.rs",
+            "src/nested/deep.txt",
+            ".gitattributes",
+            ".gitignore",
+            "untracked.txt",
+            "keep.log",
+        ] {
+            assert!(
+                native.contains(&kept.to_string()),
+                "expected {kept} in {native:?}"
+            );
+        }
+        for dropped in [".env", "certs/server.pem", "debug.log", ".forge/forge.db"] {
+            assert!(
+                !native.contains(&dropped.to_string()),
+                "unexpected {dropped} in {native:?}"
+            );
+        }
+        assert!(
+            !native.iter().any(|p| p.contains(".forge-restore-")),
+            "restore temp leaked into snapshot set: {native:?}"
+        );
+    }
+
+    #[test]
+    fn walk_does_not_recurse_into_git_or_forge() {
+        // filter_entry must prune `.git`/`.forge` descent so the walk never yields their
+        // internals (a real `.git` holds thousands of files; statting them every save is
+        // pure waste, and they must never reach the snapshot anyway).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo(repo);
+        fs::write(repo.join("README.md"), b"x").unwrap();
+        fs::create_dir_all(repo.join(".forge/objects/sha256/ab")).unwrap();
+        fs::write(repo.join(".forge/forge.db"), b"db").unwrap();
+        fs::write(repo.join(".forge/objects/sha256/ab/deadbeef"), b"obj").unwrap();
+
+        let walked = walk_worktree(repo).unwrap();
+        assert!(
+            walked.iter().all(|p| {
+                p != ".git" && !p.starts_with(".git/") && p != ".forge" && !p.starts_with(".forge/")
+            }),
+            "walk recursed into .git/ or .forge/: {walked:?}"
+        );
+        assert!(walked.contains(&"README.md".to_string()));
+    }
+
+    #[test]
+    fn force_added_gitignored_file_is_index_only_divergence() {
+        // Divergence class 1: git's index lists a force-added (`add -f`) file even though
+        // .gitignore matches it; the native filesystem walk drops it (no index concept).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo(repo);
+        fs::write(repo.join(".gitignore"), b"forced.bin\n").unwrap();
+        fs::write(repo.join("forced.bin"), b"x").unwrap();
+        run_git(repo, &["add", "-f", "forced.bin"]);
+        run_git(repo, &["add", ".gitignore"]);
+        run_git(repo, &["commit", "-m", "force"]);
+
+        assert!(
+            git_based_scan(repo).contains(&"forced.bin".to_string()),
+            "git index lists the force-added file"
+        );
+        assert!(
+            !native_scan(repo).contains(&"forced.bin".to_string()),
+            "native filesystem walk drops the gitignored file (no index concept)"
+        );
+        // The force-added path is the ONLY difference: the two scans agree on everything else.
+        let strip = |set: Vec<String>| -> Vec<String> {
+            set.into_iter().filter(|p| p != "forced.bin").collect()
+        };
+        assert_eq!(strip(native_scan(repo)), strip(git_based_scan(repo)));
+    }
+
+    #[test]
+    fn tracked_then_later_ignored_file_is_index_only_divergence() {
+        // Divergence class 2: a normally-committed file later matched by an added
+        // .gitignore rule — git's ls-files still lists it (tracked); native walk drops it.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo(repo);
+        fs::write(repo.join("data.gen"), b"x").unwrap();
+        run_git(repo, &["add", "data.gen"]);
+        run_git(repo, &["commit", "-m", "track"]);
+        fs::write(repo.join(".gitignore"), b"*.gen\n").unwrap();
+
+        assert!(git_based_scan(repo).contains(&"data.gen".to_string()));
+        assert!(!native_scan(repo).contains(&"data.gen".to_string()));
+        // The now-ignored tracked path is the ONLY difference between the two scans.
+        let strip = |set: Vec<String>| -> Vec<String> {
+            set.into_iter().filter(|p| p != "data.gen").collect()
+        };
+        assert_eq!(strip(native_scan(repo)), strip(git_based_scan(repo)));
+    }
+
+    #[test]
+    fn tracked_then_deleted_from_disk_converges_after_metadata_gate() {
+        // Divergence class 3: git's raw `ls-files` lists a tracked path even after it is
+        // deleted from the worktree (still in the index); the native walk cannot see a
+        // nonexistent file. Both *scan* pipelines converge because the `fs::metadata`
+        // `is_file` gate drops the now-missing path from the git reference too.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo(repo);
+        fs::write(repo.join("gone.txt"), b"x").unwrap();
+        fs::write(repo.join("stay.txt"), b"y").unwrap();
+        run_git(repo, &["add", "-A"]);
+        run_git(repo, &["commit", "-m", "add"]);
+        fs::remove_file(repo.join("gone.txt")).unwrap();
+
+        assert!(
+            git(repo, &["ls-files"])
+                .unwrap()
+                .lines()
+                .any(|l| l == "gone.txt"),
+            "git index still lists the deleted path"
+        );
+        assert!(!native_scan(repo).contains(&"gone.txt".to_string()));
+        // After the metadata gate the two scans agree (both keep stay.txt, drop gone.txt).
+        assert_eq!(native_scan(repo), git_based_scan(repo));
+    }
+
+    #[test]
+    fn walk_is_environment_independent_of_info_exclude() {
+        // Divergence class 4 (load-bearing for Phase 7): the native walker is intentionally
+        // MORE inclusive than `git ls-files --others --exclude-standard` — it ignores
+        // `.git/info/exclude` and the user's global core.excludesfile so a repo's snapshot
+        // set is reproducible across machines. This pins that git_exclude(false)/git_global(false)
+        // are real: a path excluded ONLY via `.git/info/exclude` is dropped by git but KEPT by
+        // the native walk. If a crate upgrade or edit flipped those toggles, this catches it.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo(repo);
+        fs::write(repo.join("keep-me.txt"), b"x").unwrap();
+        fs::write(repo.join(".git/info/exclude"), b"keep-me.txt\n").unwrap();
+
+        let git_others = git(repo, &["ls-files", "--others", "--exclude-standard"]).unwrap();
+        assert!(
+            !git_others.lines().any(|l| l == "keep-me.txt"),
+            "git --exclude-standard drops a .git/info/exclude path"
+        );
+        assert!(
+            native_scan(repo).contains(&"keep-me.txt".to_string()),
+            "native walk must ignore .git/info/exclude (reproducibility): {:?}",
+            native_scan(repo)
+        );
+    }
+
+    // Divergence classes intentionally NOT asserted, with rationale (plan R5/U3):
+    //   • Case-folded `.gitignore` on a case-insensitive filesystem (macOS): a rule like
+    //     `SECRET.txt` drops `secret.txt` under git's core.ignorecase, but the native walk
+    //     matches case-sensitively, so membership can differ. Asserting it would be
+    //     platform-dependent (green on Linux CI, divergent on macOS), so it is documented as
+    //     an accepted divergence rather than pinned by a flaky test. Secret hygiene is
+    //     unaffected: `is_secret_risk_path` lowercases the filename, so a case-variant secret
+    //     name is still excluded by the policy backstop.
+    //   • Submodule gitlinks: `git ls-files` lists a gitlink path; a filesystem walk
+    //     descends/skips it differently. A real submodule fixture in a unit test is
+    //     impractical (a second repo + offline `submodule add`), so this class is scoped out
+    //     by comment per the plan's allowance.
+
+    #[test]
+    fn nested_subdir_gitignore_is_honored() {
+        // R2's headline claim is "nested, with negation". A .gitignore in a SUBDIRECTORY
+        // (not just the root) must scope to that directory — the deceptively-hard part the
+        // `ignore` crate exists to handle. Pin it so a crate-version bump can't regress it.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo(repo);
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/.gitignore"), b"local.tmp\n!keep.tmp\n").unwrap();
+        fs::write(repo.join("src/local.tmp"), b"x").unwrap();
+        fs::write(repo.join("src/keep.tmp"), b"x").unwrap();
+        fs::write(repo.join("src/main.rs"), b"x").unwrap();
+        fs::write(repo.join("local.tmp"), b"x").unwrap(); // root: NOT covered by src/.gitignore
+
+        let native = native_scan(repo);
+        assert!(
+            !native.contains(&"src/local.tmp".to_string()),
+            "nested .gitignore must exclude src/local.tmp: {native:?}"
+        );
+        assert!(
+            native.contains(&"src/keep.tmp".to_string()),
+            "nested negation must re-include src/keep.tmp: {native:?}"
+        );
+        assert!(native.contains(&"src/main.rs".to_string()));
+        assert!(
+            native.contains(&"local.tmp".to_string()),
+            "root local.tmp is outside src/.gitignore's scope: {native:?}"
+        );
+        // The nested rule is repo-local, so native and git agree.
+        assert_eq!(native, git_based_scan(repo));
+    }
+
+    #[test]
+    fn empty_worktree_snapshots_and_roundtrips() {
+        // A fresh dir with no files: walk_worktree returns empty, snapshot_worktree builds an
+        // empty root tree, and the snapshot materializes. No git binary needed for the walk.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        assert!(walk_worktree(repo).unwrap().is_empty());
+        let content = NativeContentBackend
+            .snapshot_worktree(repo)
+            .expect("empty worktree snapshots");
+        assert!(content.content_ref.starts_with(FORGE_TREE_PREFIX));
+        let dest = tempfile::tempdir().unwrap();
+        materialize_content_ref(repo, dest.path(), &content.content_ref)
+            .expect("empty snapshot materializes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_symlink_to_file_is_captured() {
+        // Regression guard for the file_type trap: a symlink's own file_type is is_symlink,
+        // so a walk-layer is_file() filter would drop a tracked symlink-to-file that today's
+        // fs::metadata (which follows the link) captures. The walker must yield symlinks.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_git_repo(repo);
+        fs::write(repo.join("target.txt"), b"content").unwrap();
+        symlink("target.txt", repo.join("link.txt")).unwrap();
+        run_git(repo, &["add", "-A"]);
+        run_git(repo, &["commit", "-m", "link"]);
+
+        let native = native_scan(repo);
+        assert!(
+            native.contains(&"link.txt".to_string()),
+            "tracked symlink-to-file must be captured: {native:?}"
+        );
+        assert!(native.contains(&"target.txt".to_string()));
+        assert_eq!(native, git_based_scan(repo));
+    }
+
+    #[test]
+    fn native_walk_excludes_secret_with_special_byte_in_name() {
+        // The structural cure for the C-quote class (Phase 6 §5): the native walker passes
+        // the REAL filename to is_secret_risk_path, never a git-C-quoted string. `.env.café`
+        // matches starts_with(".env.") on its real name and is excluded; git ls-tree/ls-files
+        // would C-quote it (`".env.caf\303\251"`) and the leading quote would defeat the
+        // prefix match — the leak this design avoids. No git repo needed (require_git(false)).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join(".env.café"), b"SECRET=1").unwrap();
+        fs::write(repo.join("plain.txt"), b"x").unwrap();
+        let native = native_scan(repo);
+        assert!(
+            !native.iter().any(|p| p.contains(".env.caf")),
+            "special-byte secret name must be excluded: {native:?}"
+        );
+        assert!(native.contains(&"plain.txt".to_string()));
+    }
+
+    #[test]
+    fn walk_error_is_path_free_and_skips_not_found() {
+        // S1: a walk error must never leak a filesystem path (which would bypass typed-error
+        // redaction). `ignore::Error`'s own Display embeds the path, so map_walk_error emits
+        // only the path-free io::ErrorKind. A NotFound is benign (mid-walk delete) → skipped.
+        use std::io::{Error as IoError, ErrorKind};
+        let secret = PathBuf::from("/tmp/.env.supersecret-leak");
+
+        let perm = ignore::Error::WithPath {
+            path: secret.clone(),
+            err: Box::new(ignore::Error::Io(IoError::new(
+                ErrorKind::PermissionDenied,
+                secret.display().to_string(),
+            ))),
+        };
+        let mapped = map_walk_error(&perm).expect("non-NotFound walk errors surface");
+        let top = mapped.to_string();
+        let chain = format!("{mapped:#}");
+        assert!(
+            !top.contains(".env.supersecret") && !chain.contains(".env.supersecret"),
+            "S1: walk error leaked a path: top={top:?} chain={chain:?}"
+        );
+        assert!(top.contains("permission denied"));
+
+        let gone = ignore::Error::WithPath {
+            path: secret,
+            err: Box::new(ignore::Error::Io(IoError::from(ErrorKind::NotFound))),
+        };
+        assert!(
+            map_walk_error(&gone).is_none(),
+            "NotFound is benign and skipped, not surfaced as an error"
+        );
+    }
+
+    // --- NER-138 Phase 7 slice 1: .forgeignore precedence (native-only) ---
+
+    #[test]
+    fn forgeignore_excludes_paths_gitignore_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join(".forgeignore"), b"*.tmp\n").unwrap();
+        fs::write(repo.join("scratch.tmp"), b"x").unwrap();
+        fs::write(repo.join("keep.txt"), b"x").unwrap();
+        let walked = walk_worktree(repo).unwrap();
+        assert!(
+            !walked.contains(&"scratch.tmp".to_string()),
+            ".forgeignore *.tmp must exclude scratch.tmp: {walked:?}"
+        );
+        assert!(walked.contains(&"keep.txt".to_string()));
+    }
+
+    #[test]
+    fn forgeignore_negation_reincludes_gitignored_path() {
+        // .forgeignore has higher precedence than .gitignore (add_custom_ignore_filename),
+        // so a ! negation there re-includes a path .gitignore excluded.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join(".gitignore"), b"*.log\n").unwrap();
+        fs::write(repo.join(".forgeignore"), b"!keep.log\n").unwrap();
+        fs::write(repo.join("debug.log"), b"x").unwrap();
+        fs::write(repo.join("keep.log"), b"x").unwrap();
+        let walked = walk_worktree(repo).unwrap();
+        assert!(
+            !walked.contains(&"debug.log".to_string()),
+            ".gitignore still excludes debug.log: {walked:?}"
+        );
+        assert!(
+            walked.contains(&"keep.log".to_string()),
+            ".forgeignore ! must re-include keep.log (higher precedence): {walked:?}"
+        );
+    }
+
+    #[test]
+    fn forgeignore_cannot_reinclude_policy_excluded_secret() {
+        // The is_ignored_by_policy backstop runs AFTER the ignore engine and is not
+        // negatable: even an explicit !.env in .forgeignore cannot re-include a secret.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join(".forgeignore"), b"!.env\n").unwrap();
+        fs::write(repo.join(".env"), b"SECRET=1").unwrap();
+        fs::write(repo.join("ok.txt"), b"x").unwrap();
+        let native = native_scan(repo);
+        assert!(
+            !native.iter().any(|p| p == ".env"),
+            ".env must stay excluded by the always-wins policy backstop: {native:?}"
+        );
+        assert!(native.contains(&"ok.txt".to_string()));
     }
 }

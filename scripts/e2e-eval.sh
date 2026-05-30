@@ -70,6 +70,31 @@ F export branch eval-branch; ck "export branch success" "$(pg "d['status']")" "s
 git rev-parse --verify eval-branch >/dev/null 2>&1 && b=yes || b=no
 ck "exported git branch exists" "$b" "yes"
 
+echo; echo "=== LIFECYCLE (native backend, NER-138 Phase 7 walker) ==="
+# Drives the native ignore-crate walker through the real binary. Git stays in PATH: native
+# changed_paths/base_head still shell git until slice 2, so this is NOT a full git-independence
+# check (that lands in slice 3). Snapshot-level secret exclusion is proven rigorously by the
+# Rust differential harness; here we smoke the lifecycle, assert the forge-tree content ref
+# (proving the native walker produced the snapshot), and check observable ignore/secret hygiene.
+mkrepo life-native >/dev/null
+F init --content-backend native; ck "native init success" "$(pg "d['status']")" "success"
+F start "native feature"; ck "native start success" "$(pg "d['status']")" "success"
+printf '*.log\n' > .gitignore
+echo "feature" > feature.txt
+echo "noise" > debug.log
+printf 'API_TOKEN=supersecret\n' > .env
+F save; ck "native save success" "$(pg "d['status']")" "success"
+ckc "native save content_ref is forge-tree" "$(pg "d['data']['content_ref']")" "forge-tree:"
+nsnap="$(pg "d['data']['snapshot_id']")"
+ck "native walker keeps feature.txt" "$(pg "'feature.txt' in d['data']['changed_paths']")" "True"
+ck "native walker drops gitignored debug.log" "$(pg "'debug.log' in d['data']['changed_paths']")" "False"
+ck "native walker drops secret .env" "$(pg "'.env' in d['data']['changed_paths']")" "False"
+F run -- true; ck "native run success" "$(pg "d['status']")" "success"
+F propose; ck "native propose success" "$(pg "d['status']")" "success"
+F check; ck "native check success" "$(pg "d['status']")" "success"
+F accept; ck "native accept success" "$(pg "d['status']")" "success"
+F restore "$nsnap" --yes; ck "native restore round-trips" "$(pg "d['status']")" "success"
+
 echo; echo "=== DECLARATIVE CHECK GATES (NER-135) ==="
 mkrepo gates >/dev/null
 F init >/dev/null
