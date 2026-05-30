@@ -10,6 +10,9 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+// `Command` is now used only by the `#[cfg(test)]` differential harness (slice-1 parity
+// proofs); native base/changed-paths no longer shell git (NER-138 Phase 7 slice 2).
+#[cfg(test)]
 use std::process::Command;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -25,6 +28,11 @@ pub use forge_content::RESTORE_TEMP_PREFIX;
 pub enum ObjectKind {
     Blob,
     Tree,
+    /// An intent-aware commit/Change node (NER-138 Phase 7 slice 2). The handoff
+    /// names this "Commit/Change"; it is implemented as a single kind — there is no
+    /// separate `Change` kind. Domain-separated from `Blob`/`Tree` via the `as_str`
+    /// tag below so the same payload hashes to a distinct id per kind.
+    Commit,
 }
 
 impl ObjectKind {
@@ -32,6 +40,7 @@ impl ObjectKind {
         match self {
             ObjectKind::Blob => "blob",
             ObjectKind::Tree => "tree",
+            ObjectKind::Commit => "commit",
         }
     }
 }
@@ -65,7 +74,7 @@ impl ObjectId {
             bail!("malformed native object id");
         }
         match parts[1] {
-            "blob" | "tree" => {}
+            "blob" | "tree" | "commit" => {}
             _ => bail!("unsupported native object type"),
         }
         if parts[3].len() != 64 || !parts[3].bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -81,6 +90,7 @@ impl ObjectId {
         match self.kind.as_str() {
             "blob" => Ok(ObjectKind::Blob),
             "tree" => Ok(ObjectKind::Tree),
+            "commit" => Ok(ObjectKind::Commit),
             _ => bail!("unsupported native object type"),
         }
     }
@@ -104,9 +114,13 @@ impl ContentBackend for NativeContentBackend {
         let store = NativeObjectStore::new(repo_root);
         let files = scan_worktree(repo_root)?;
         let root = write_tree(&store, repo_root, &files, "")?;
+        // NER-138 Phase 7 slice 2: changed_paths is now a native name-level diff of the
+        // base HEAD tree against the freshly-built worktree tree — reusing `root` rather
+        // than re-walking/re-hashing the worktree.
+        let changed = changed_paths(&store, repo_root, &root)?;
         Ok(SnapshotContent {
             content_ref: format!("{FORGE_TREE_PREFIX}{root}"),
-            changed_paths: changed_paths(repo_root)?,
+            changed_paths: changed,
         })
     }
 
@@ -135,27 +149,63 @@ impl ContentBackend for NativeContentBackend {
         Ok(())
     }
 
-    // NER-134: base anchoring still delegates to git at this stage. The native
-    // backend already shells git for `ls-files`/`diff`, so this keeps `base_head`
-    // and stale-base detection backend-agnostic *behind the trait* — git stays the
-    // materialization adapter, but core lifecycle code no longer calls git directly.
-    // Phase 7 (NER-138) replaces this with native base anchoring; until then a native
-    // repo legitimately produces and restores `git-tree:` base refs through the git
-    // backend (an implementer must NOT "fix" this to emit `forge-tree:` refs here).
-    // S1: returns only an opaque revision id — no filesystem paths in error context.
+    // NER-138 Phase 7 slice 2: native base anchoring. `current_base` returns the native
+    // history tip — the ref store's `HEAD` — lazily creating a genesis root commit over
+    // the start-time worktree on first call (see `ensure_head`). The git delegation (and
+    // the Phase-3 "do NOT emit forge-tree: base refs yet" guard) are gone: a native repo
+    // now anchors on its own `f1:commit:` id, not a git commit, stable across worktree
+    // edits. S1: returns an opaque revision id; no filesystem paths in error context.
     fn current_base(&self, repo_root: &Path) -> Result<String> {
-        Ok(git(repo_root, &["rev-parse", "--verify", "HEAD"])?
-            .trim()
-            .to_string())
+        Ok(ensure_head(repo_root)?.to_string())
     }
 
-    // S2: the returned ref names git's tree, which already excludes
-    // `is_ignored_by_policy` paths via git's own tracking; preserved until the Phase 7
-    // native walker takes over. S1: no filesystem paths in error context.
+    // NER-138 Phase 7 slice 2: resolve a native base commit to the restorable content ref
+    // that materializes its tree (for `attempt attach`). S2: the tree was built by the
+    // policy-filtered walker, so it already excludes `is_ignored_by_policy` paths
+    // (.env/keys never materialized). S1: a parse/read failure surfaces a path-free error
+    // (`read_commit` carries only the opaque object id).
     fn base_content_ref(&self, repo_root: &Path, base: &str) -> Result<String> {
-        let tree = git(repo_root, &["rev-parse", &format!("{base}^{{tree}}")])?;
-        Ok(format!("git-tree:{}", tree.trim()))
+        let store = NativeObjectStore::new(repo_root);
+        let commit = store.read_commit(&ObjectId::parse(base)?)?;
+        Ok(format!("{FORGE_TREE_PREFIX}{}", commit.tree))
     }
+}
+
+/// Ensure the native ref store has a `HEAD` and return it (NER-138 Phase 7 slice 2).
+///
+/// If a tip already exists, return it. Otherwise create the **genesis root commit** over
+/// the current worktree tree (parentless, null justification), persist it, point `HEAD` at
+/// it, and return its id. This is an intentional "ensure the base anchor exists" side
+/// effect, not a pure read: in the normal lifecycle the first `current_base` caller is
+/// `start`, so the genesis captures the *start-time* worktree as the base — never a
+/// mid-`save` dirty tree, because `save` requires an active attempt that `start` created.
+/// Every `current_base` caller is a mutating command holding the advisory lock
+/// (acquire-once); `ensure_head` itself never acquires the lock, so genesis creation
+/// cannot deadlock or race. Idempotent: the commit is content-addressed and `set_head` is
+/// an atomic overwrite, so a repeated call returns the same id.
+fn ensure_head(repo_root: &Path) -> Result<ObjectId> {
+    let refs = NativeRefStore::new(repo_root);
+    if let Some(head) = refs.read_head()? {
+        return Ok(head);
+    }
+    let store = NativeObjectStore::new(repo_root);
+    let files = scan_worktree(repo_root)?;
+    let tree = write_tree(&store, repo_root, &files, "")?;
+    let genesis = CommitObject {
+        schema_version: SCHEMA_VERSION,
+        tree: tree.to_string(),
+        parents: Vec::new(),
+        intent_id: None,
+        proposal_revision_id: None,
+        decision_id: None,
+        evidence_digest: None,
+    };
+    // Store-before-DB: the genesis object + HEAD are durable before `current_base`
+    // returns, so the `attempts.base_head` row that records this id is written only after
+    // its referent is on disk.
+    let id = store.write_commit(&genesis)?;
+    refs.set_head(&id)?;
+    Ok(id)
 }
 
 pub fn materialize_content_ref(
@@ -232,6 +282,29 @@ impl NativeObjectStore {
         Ok(payload)
     }
 
+    /// Write a native commit object (NER-138 Phase 7 slice 2), returning its
+    /// content-addressed id. Inherits `write_object`'s store-before-DB durability
+    /// (temp + fsync + atomic rename + parent-dir fsync) verbatim.
+    fn write_commit(&self, commit: &CommitObject) -> Result<ObjectId> {
+        let payload = serde_json::to_vec(commit)?;
+        self.write_object(ObjectKind::Commit, &payload)
+    }
+
+    /// Read and validate a native commit object. S1: never interpolates a filesystem
+    /// path — `read_object`'s context carries only the opaque object id.
+    fn read_commit(&self, id: &ObjectId) -> Result<CommitObject> {
+        if id.kind()? != ObjectKind::Commit {
+            bail!("native object is not a commit");
+        }
+        let payload = self.read_object(id)?;
+        let commit: CommitObject = serde_json::from_slice(&payload)
+            .with_context(|| format!("malformed native commit object {}", id))?;
+        if commit.schema_version != SCHEMA_VERSION {
+            bail!("unsupported native commit schema version");
+        }
+        Ok(commit)
+    }
+
     pub fn verify_content_ref(&self, content_ref: &str) -> Result<BTreeSet<ObjectId>> {
         let root = object_id_from_content_ref(content_ref)?;
         let mut seen = BTreeSet::new();
@@ -257,7 +330,12 @@ impl NativeObjectStore {
                 }
                 let digest = entry.file_name().to_string_lossy().into_owned();
                 let bytes = fs::read(entry.path())?;
-                for kind in [ObjectKind::Blob, ObjectKind::Tree] {
+                // Recover each loose object's kind by re-hashing its bytes under every
+                // kind and matching the digest; domain separation guarantees at most one
+                // match. NER-138 Phase 7 slice 2 adds `Commit` to the scan. Slice 3's
+                // object-kind headers replace this multi-hash scan (kill the double/triple
+                // hash; see lib.rs object-kind-header work).
+                for kind in [ObjectKind::Blob, ObjectKind::Tree, ObjectKind::Commit] {
                     let id = ObjectId::new(kind, &bytes);
                     if id.digest == digest {
                         ids.insert(id);
@@ -301,10 +379,111 @@ impl NativeObjectStore {
     }
 }
 
+/// The native ref store (NER-138 Phase 7 slice 2): a small, crash-atomic, lock-agnostic
+/// holder for the history tip (`HEAD` → a commit id). Slice 2 writes `HEAD` exactly once
+/// (the genesis commit); advancing it as commits are recorded at `accept` is slice 3.
+///
+/// Writes inherit `NativeObjectStore::write_object`'s durability discipline verbatim
+/// (temp in `.forge/tmp` + `sync_all` + atomic rename + parent-dir fsync incl.
+/// newly-created ancestors; a swallowed dir fsync is the durability hole this avoids).
+/// The store NEVER acquires `.forge/forge.lock` — its callers (mutating commands) already
+/// hold it (acquire-once-never-nested), so creating the genesis from inside `current_base`
+/// cannot deadlock or race. The ref file lives under `.forge/`, so `is_ignored_by_policy`
+/// already excludes it from every snapshot/export.
+#[derive(Debug, Clone)]
+pub struct NativeRefStore {
+    root: PathBuf,
+}
+
+impl NativeRefStore {
+    pub fn new(repo_root: &Path) -> Self {
+        Self {
+            root: repo_root.to_path_buf(),
+        }
+    }
+
+    fn head_path(&self) -> PathBuf {
+        self.root.join(".forge/refs/HEAD")
+    }
+
+    fn tmp_dir(&self) -> PathBuf {
+        self.root.join(".forge/tmp")
+    }
+
+    /// The current history tip, or `None` if no tip has been written yet. S1: a read or
+    /// parse failure surfaces a path-free error (only the `io::ErrorKind` or the malformed
+    /// contents/kind, never the filesystem path).
+    pub fn read_head(&self) -> Result<Option<ObjectId>> {
+        let raw = match fs::read_to_string(self.head_path()) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(anyhow!("failed to read native HEAD: {}", error.kind())),
+        };
+        let id = ObjectId::parse(raw.trim())?;
+        if id.kind()? != ObjectKind::Commit {
+            bail!("native HEAD does not name a commit");
+        }
+        Ok(Some(id))
+    }
+
+    /// Atomically set the history tip. Crash-atomic (temp + fsync + rename + dir fsync) so
+    /// a committed `base_head`/`decisions.commit_id` row never references a HEAD that did
+    /// not reach disk. S1: the underlying `io::Error`s are path-free by construction.
+    pub fn set_head(&self, id: &ObjectId) -> Result<()> {
+        let path = self.head_path();
+        let parent = path.parent().context("native HEAD path has no parent")?;
+        // Record newly-created ancestors so their own dir entries can be made durable
+        // below (mirrors write_object): a freshly created dir's entry is not durable
+        // until the dir it lives in is fsynced.
+        let newly_created = missing_dirs(parent);
+        fs::create_dir_all(parent)?;
+        fs::create_dir_all(self.tmp_dir())?;
+        let mut temp = tempfile::NamedTempFile::new_in(self.tmp_dir())?;
+        temp.write_all(id.to_string().as_bytes())?;
+        temp.as_file_mut().sync_all()?;
+        temp.persist(&path).map_err(|error| error.error)?;
+        sync_dir(parent)?;
+        for dir in &newly_created {
+            if let Some(grandparent) = dir.parent() {
+                sync_dir(grandparent)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TreeObject {
     schema_version: u32,
     entries: Vec<TreeEntry>,
+}
+
+/// A native commit/Change object (NER-138 Phase 7 slice 2). Content-addressed and
+/// domain-separated via `ObjectId::new(ObjectKind::Commit, ..)`, it makes history
+/// intent-aware: it references its root `tree`, zero-or-more parent commit ids, and
+/// (nullable) the intent / proposal-revision / decision that justified it plus an
+/// evidence digest. Slice 2 writes only the genesis shape (empty `parents`, all-`None`
+/// justification); slice 3 writes justified commits at `accept`.
+///
+/// `evidence_digest`, when present, MUST be an opaque lowercase-hex digest (e.g. the
+/// ledger's evidence `content_hash`) — never an excerpt or any free text. The commit
+/// payload is written via `write_object` and never passes through
+/// `redact_evidence_excerpt`, so admitting excerpt text here would be a secret-leaking
+/// egress: the field stays a hash by contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CommitObject {
+    schema_version: u32,
+    tree: String,
+    #[serde(default)]
+    parents: Vec<String>,
+    #[serde(default)]
+    intent_id: Option<String>,
+    #[serde(default)]
+    proposal_revision_id: Option<String>,
+    #[serde(default)]
+    decision_id: Option<String>,
+    #[serde(default)]
+    evidence_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,20 +818,93 @@ fn materialized_paths(repo_root: &Path) -> Result<BTreeSet<String>> {
     Ok(paths)
 }
 
-fn changed_paths(repo_root: &Path) -> Result<Vec<String>> {
-    let mut paths = Vec::new();
-    if let Ok(output) = git(repo_root, &["diff", "--name-only", "HEAD", "--", "."]) {
-        paths.extend(output.lines().map(str::to_string));
+/// Name-level diff of the base commit's tree against the freshly-built worktree tree
+/// (NER-138 Phase 7 slice 2), replacing the prior `git diff --name-only HEAD` +
+/// `git ls-files --others` shell-out. A path is reported when its file blob id differs
+/// between the two trees: added (worktree-only), removed (base-only), or modified (same
+/// path, different blob). **Name granularity only — hunk-level diff is Phase 8.** This is
+/// reproducibility-over-parity: it does not chase exact `git diff` output.
+///
+/// The base tree is `ensure_head`'s commit tree (the genesis, established at `start`); by
+/// `save` time it is the start-time anchor, so the diff reflects edits since `start`. If
+/// the base tree equals the worktree tree (nothing changed, or a just-created genesis),
+/// the result is empty. Policy-excluded paths cannot appear in either tree (the walker
+/// filters them), but the final `retain` mirrors the git backend's backstop.
+fn changed_paths(
+    store: &NativeObjectStore,
+    repo_root: &Path,
+    worktree_root: &ObjectId,
+) -> Result<Vec<String>> {
+    let head = ensure_head(repo_root)?;
+    let base_tree = ObjectId::parse(&store.read_commit(&head)?.tree)?;
+    if &base_tree == worktree_root {
+        return Ok(Vec::new());
     }
-    if let Ok(output) = git(repo_root, &["ls-files", "--others", "--exclude-standard"]) {
-        paths.extend(output.lines().map(str::to_string));
+    let base = flatten_tree(store, &base_tree)?;
+    let worktree = flatten_tree(store, worktree_root)?;
+    let mut changed = BTreeSet::new();
+    for (path, blob) in &worktree {
+        if base.get(path) != Some(blob) {
+            changed.insert(path.clone()); // added or modified
+        }
     }
-    paths.retain(|path| !is_ignored_by_policy(path));
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+    for path in base.keys() {
+        if !worktree.contains_key(path) {
+            changed.insert(path.clone()); // removed
+        }
+    }
+    Ok(changed
+        .into_iter()
+        .filter(|path| !is_ignored_by_policy(path))
+        .collect())
 }
 
+/// Flatten a native tree into a map of repo-relative file path → blob object id, recursing
+/// into directory entries. Used by `changed_paths` for the name-level base-vs-worktree diff.
+fn flatten_tree(store: &NativeObjectStore, tree_id: &ObjectId) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    flatten_tree_into(store, tree_id, "", &mut out)?;
+    Ok(out)
+}
+
+fn flatten_tree_into(
+    store: &NativeObjectStore,
+    tree_id: &ObjectId,
+    prefix: &str,
+    out: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let payload = store.read_object(tree_id)?;
+    let tree: TreeObject = serde_json::from_slice(&payload)
+        .with_context(|| format!("malformed native tree object {}", tree_id))?;
+    if tree.schema_version != SCHEMA_VERSION {
+        bail!("unsupported native tree schema version");
+    }
+    for entry in tree.entries {
+        validate_tree_entry(&entry)?;
+        let path = if prefix.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{prefix}/{}", entry.name)
+        };
+        match entry.kind {
+            TreeEntryKind::File => {
+                out.insert(path, entry.object);
+            }
+            TreeEntryKind::Dir => {
+                let child = ObjectId::parse(&entry.object)?;
+                flatten_tree_into(store, &child, &path, out)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Retained ONLY for the `#[cfg(test)]` differential harness (`git_based_scan` and the
+/// index-vs-filesystem divergence tests), which prove the slice-1 native walker's snapshot
+/// set still equals the prior git-based set. NER-138 Phase 7 slice 2 removed the last
+/// production caller: native `current_base`/`base_content_ref`/`changed_paths` are now
+/// git-binary-free, so this helper is compiled only in test builds.
+#[cfg(test)]
 fn git(repo_root: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
@@ -762,9 +1014,16 @@ mod tests {
     fn object_ids_are_domain_separated() {
         let blob = ObjectId::new(ObjectKind::Blob, b"same");
         let tree = ObjectId::new(ObjectKind::Tree, b"same");
+        let commit = ObjectId::new(ObjectKind::Commit, b"same");
         assert_eq!(blob, ObjectId::new(ObjectKind::Blob, b"same"));
+        // The same payload hashes to three distinct ids — the domain set is `commit`-aware
+        // (NER-138 Phase 7 slice 2).
         assert_ne!(blob, tree);
+        assert_ne!(blob, commit);
+        assert_ne!(tree, commit);
         assert!(ObjectId::parse(&blob.to_string()).is_ok());
+        assert!(ObjectId::parse(&commit.to_string()).is_ok());
+        assert_eq!(commit.kind().unwrap(), ObjectKind::Commit);
         assert!(ObjectId::parse("f1:blob:sha256:not-hex").is_err());
     }
 
@@ -1343,5 +1602,219 @@ mod tests {
             ".env must stay excluded by the always-wins policy backstop: {native:?}"
         );
         assert!(native.contains(&"ok.txt".to_string()));
+    }
+
+    // --- NER-138 Phase 7 slice 2: native commit objects, ref store, base anchoring ---
+
+    #[test]
+    fn commit_object_roundtrips_and_is_recovered_by_all_object_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        // Genesis shape: empty parents, all-None justification (what slice 2 writes).
+        let genesis = CommitObject {
+            schema_version: SCHEMA_VERSION,
+            tree: format!("f1:tree:sha256:{}", "a".repeat(64)),
+            parents: Vec::new(),
+            intent_id: None,
+            proposal_revision_id: None,
+            decision_id: None,
+            evidence_digest: None,
+        };
+        let gid = store.write_commit(&genesis).unwrap();
+        assert!(gid.to_string().starts_with("f1:commit:sha256:"));
+        assert_eq!(store.read_commit(&gid).unwrap(), genesis);
+        // Fully-populated (justified) shape — exercises every field even though slice 2
+        // only writes genesis (slice 3 writes justified commits). evidence_digest is an
+        // opaque lowercase-hex digest, never excerpt text.
+        let justified = CommitObject {
+            schema_version: SCHEMA_VERSION,
+            tree: format!("f1:tree:sha256:{}", "b".repeat(64)),
+            parents: vec![gid.to_string()],
+            intent_id: Some("intent_x".to_string()),
+            proposal_revision_id: Some("revision_x".to_string()),
+            decision_id: Some("decision_x".to_string()),
+            evidence_digest: Some("c".repeat(64)),
+        };
+        let jid = store.write_commit(&justified).unwrap();
+        assert_eq!(store.read_commit(&jid).unwrap(), justified);
+        assert!(
+            justified
+                .evidence_digest
+                .as_deref()
+                .unwrap()
+                .chars()
+                .all(|c| c.is_ascii_hexdigit()),
+            "evidence_digest is an opaque hex digest, never excerpt text"
+        );
+        // The triple-kind all_object_ids scan recovers both commit ids.
+        let ids = store.all_object_ids().unwrap();
+        assert!(ids.contains(&gid) && ids.contains(&jid));
+    }
+
+    #[test]
+    fn read_commit_rejects_wrong_kind_and_bad_schema() {
+        let id = ObjectId::parse(&format!("f1:commit:sha256:{}", "d".repeat(64))).unwrap();
+        assert_eq!(id.kind().unwrap(), ObjectKind::Commit);
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let blob = store
+            .write_object(ObjectKind::Blob, b"not a commit")
+            .unwrap();
+        assert!(store
+            .read_commit(&blob)
+            .unwrap_err()
+            .to_string()
+            .contains("not a commit"));
+    }
+
+    #[test]
+    fn ref_store_head_roundtrips_and_replaces_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let refs = NativeRefStore::new(temp.path());
+        assert!(
+            refs.read_head().unwrap().is_none(),
+            "absent HEAD reads as None"
+        );
+        let first = ObjectId::new(ObjectKind::Commit, b"first");
+        refs.set_head(&first).unwrap();
+        assert_eq!(refs.read_head().unwrap(), Some(first));
+        // Atomic replace: a second set is read back whole (never torn), into a freshly
+        // created `.forge/refs/` (ancestor-fsync path).
+        let second = ObjectId::new(ObjectKind::Commit, b"second");
+        refs.set_head(&second).unwrap();
+        assert_eq!(refs.read_head().unwrap(), Some(second));
+    }
+
+    #[test]
+    fn ref_store_corrupt_head_error_is_path_free() {
+        // S1: a corrupt/garbage HEAD must surface a path-free error.
+        let temp = tempfile::tempdir().unwrap();
+        let refs = NativeRefStore::new(temp.path());
+        fs::create_dir_all(temp.path().join(".forge/refs")).unwrap();
+        fs::write(
+            temp.path().join(".forge/refs/HEAD"),
+            b"garbage-not-an-object-id",
+        )
+        .unwrap();
+        let error = refs.read_head().unwrap_err();
+        let repo_str = temp.path().to_string_lossy();
+        assert!(
+            !error.to_string().contains(&*repo_str) && !format!("{error:#}").contains(&*repo_str),
+            "S1: corrupt-HEAD error leaked a path: {error:#}"
+        );
+    }
+
+    #[test]
+    fn current_base_creates_stable_genesis_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("a.txt"), b"hello").unwrap();
+        let backend = NativeContentBackend;
+        let base = backend.current_base(repo).unwrap();
+        assert!(
+            base.starts_with("f1:commit:sha256:"),
+            "native base is a commit id, not a git SHA: {base}"
+        );
+        // Idempotent: HEAD now exists, so a second call returns the same genesis id.
+        assert_eq!(backend.current_base(repo).unwrap(), base);
+        // Stability (the stale-base correctness property): editing/adding worktree files
+        // must NOT move the base anchor.
+        fs::write(repo.join("a.txt"), b"changed").unwrap();
+        fs::write(repo.join("b.txt"), b"new").unwrap();
+        assert_eq!(
+            backend.current_base(repo).unwrap(),
+            base,
+            "base anchor must not move on worktree edits"
+        );
+    }
+
+    #[test]
+    fn base_content_ref_materializes_policy_excluded_tree() {
+        // S2: base_content_ref names a forge-tree: that excludes is_ignored_by_policy paths.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("keep.txt"), b"data").unwrap();
+        fs::write(repo.join(".env"), b"SECRET=1").unwrap();
+        fs::write(repo.join("server.pem"), b"key").unwrap();
+        let backend = NativeContentBackend;
+        let base = backend.current_base(repo).unwrap();
+        let content_ref = backend.base_content_ref(repo, &base).unwrap();
+        assert!(
+            content_ref.starts_with(FORGE_TREE_PREFIX),
+            "base content ref is a native forge-tree: ref: {content_ref}"
+        );
+        let dest = tempfile::tempdir().unwrap();
+        materialize_content_ref(repo, dest.path(), &content_ref).unwrap();
+        assert_eq!(fs::read(dest.path().join("keep.txt")).unwrap(), b"data");
+        assert!(
+            !dest.path().join(".env").exists(),
+            "S2: secret must not materialize from the base tree"
+        );
+        assert!(!dest.path().join("server.pem").exists());
+    }
+
+    #[test]
+    fn base_content_ref_missing_commit_is_path_free() {
+        // S1: resolving a base that points at a missing commit object surfaces a path-free
+        // error (no repo/temp-dir path in the envelope or its chain).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let backend = NativeContentBackend;
+        let missing = format!("f1:commit:sha256:{}", "0".repeat(64));
+        let error = backend.base_content_ref(repo, &missing).unwrap_err();
+        let repo_str = repo.to_string_lossy();
+        assert!(
+            !error.to_string().contains(&*repo_str) && !format!("{error:#}").contains(&*repo_str),
+            "S1: base_content_ref leaked a path: {error:#}"
+        );
+    }
+
+    #[test]
+    fn native_changed_paths_reports_added_modified_removed() {
+        // No git binary involved — pure native tree diff.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("keep.txt"), b"v1").unwrap();
+        fs::write(repo.join("gone.txt"), b"bye").unwrap();
+        let backend = NativeContentBackend;
+        // First snapshot establishes the genesis base over the current worktree.
+        let first = backend.snapshot_worktree(repo).unwrap();
+        assert!(
+            first.changed_paths.is_empty(),
+            "genesis-equals-worktree yields no changes: {:?}",
+            first.changed_paths
+        );
+        // Modify, add, remove.
+        fs::write(repo.join("keep.txt"), b"v2").unwrap();
+        fs::write(repo.join("new.txt"), b"hi").unwrap();
+        fs::remove_file(repo.join("gone.txt")).unwrap();
+        let mut changed = backend.snapshot_worktree(repo).unwrap().changed_paths;
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec![
+                "gone.txt".to_string(),
+                "keep.txt".to_string(),
+                "new.txt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn native_changed_paths_excludes_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("app.txt"), b"v1").unwrap();
+        let backend = NativeContentBackend;
+        backend.snapshot_worktree(repo).unwrap(); // establish genesis
+        fs::write(repo.join(".env"), b"SECRET=1").unwrap();
+        fs::write(repo.join("app.txt"), b"v2").unwrap();
+        let snap = backend.snapshot_worktree(repo).unwrap();
+        assert!(snap.changed_paths.contains(&"app.txt".to_string()));
+        assert!(
+            !snap.changed_paths.iter().any(|p| p.contains(".env")),
+            "secret must never surface in changed_paths: {:?}",
+            snap.changed_paths
+        );
     }
 }
