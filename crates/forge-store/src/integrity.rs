@@ -27,6 +27,11 @@ const EVIDENCE_TAG: &[u8] = b"forge.evidence.v0\0";
 const OPERATION_TAG: &[u8] = b"forge.op.v0\0";
 /// Domain-separation tag for a decision-row digest.
 const DECISION_TAG: &[u8] = b"forge.decision.v0\0";
+/// Domain-separation tag for a publication provenance digest (NER-137). The trailer is
+/// a new *aggregate* record kind — it bundles the proposal identity, the deciding
+/// evidence rows' Phase 5 `content_hash`es, the decision digest, and the gate outcomes
+/// — so it gets its own tag and can never collide with an evidence/decision/op digest.
+const PUBLICATION_TAG: &[u8] = b"forge.publication.v0\0";
 
 /// The documented genesis parent hash: 64 hex zeros (a SHA-256 hex digest is 64
 /// chars). Used as the `parent_hash` input for the `init` genesis operation and as
@@ -205,6 +210,34 @@ pub fn operation_link_hash(
     writer.finish()
 }
 
+/// The fields of a published proposal that a provenance trailer commits to (NER-137).
+/// The "content-addressed evidence digest" is `evidence_hashes` — the deciding gates'
+/// Phase 5 `content_hash`es, in gate order — so the digest is recomputable from the
+/// local ledger and changes if any deciding evidence row is edited. `gate_outcomes`
+/// are canonical (sorted) `"identity=verdict"` strings.
+pub struct PublicationDigestInput<'a> {
+    pub proposal_id: &'a str,
+    pub proposal_revision_id: &'a str,
+    pub evidence_hashes: &'a [String],
+    pub decision_digest: &'a str,
+    pub gate_outcomes: &'a [String],
+}
+
+/// The hex SHA-256 provenance digest carried in a published commit's
+/// `Forge-Provenance-Digest` trailer (NER-137). Built with the same length-prefixed,
+/// domain-separated `DigestWriter` discipline as every other digest — never an ad-hoc
+/// `format!` + hash — so `verify-branch` recomputes it from the ledger by construction.
+pub fn publication_digest(input: &PublicationDigestInput) -> String {
+    let mut writer = DigestWriter::new(PUBLICATION_TAG);
+    writer
+        .str(input.proposal_id)
+        .str(input.proposal_revision_id)
+        .str_slice(input.evidence_hashes)
+        .str(input.decision_digest)
+        .str_slice(input.gate_outcomes);
+    writer.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +389,78 @@ mod tests {
         let with_domain = operation_link_hash(GENESIS_PARENT_HASH, &op, Some("dd"));
         assert_ne!(genesis, other_parent);
         assert_ne!(genesis, with_domain);
+    }
+
+    fn sample_publication() -> (String, String, Vec<String>, String, Vec<String>) {
+        (
+            "proposal_1".to_string(),
+            "revision_1".to_string(),
+            vec!["evhash_a".to_string(), "evhash_b".to_string()],
+            "decdigest".to_string(),
+            vec!["cargo test=passed".to_string()],
+        )
+    }
+
+    fn pub_digest_of(p: &str, r: &str, ev: &[String], dec: &str, gates: &[String]) -> String {
+        publication_digest(&PublicationDigestInput {
+            proposal_id: p,
+            proposal_revision_id: r,
+            evidence_hashes: ev,
+            decision_digest: dec,
+            gate_outcomes: gates,
+        })
+    }
+
+    #[test]
+    fn publication_digest_is_deterministic_and_a_known_golden_vector() {
+        let (p, r, ev, dec, gates) = sample_publication();
+        let a = pub_digest_of(&p, &r, &ev, &dec, &gates);
+        let b = pub_digest_of(&p, &r, &ev, &dec, &gates);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        // Pin the encoding so a field-order / length-prefix change is a test failure,
+        // not a silent change to every published commit's digest.
+        assert_eq!(
+            a,
+            "824f0e1d7e7c5d712cd26ac57ece58fd670cd88d0a57edb3e84ce98700fa6d9d"
+        );
+    }
+
+    #[test]
+    fn publication_digest_changes_with_any_folded_field() {
+        let (p, r, ev, dec, gates) = sample_publication();
+        let base = pub_digest_of(&p, &r, &ev, &dec, &gates);
+        // A different deciding evidence hash (the content-addressed part) changes it.
+        let mut ev2 = ev.clone();
+        ev2[0] = "TAMPERED".to_string();
+        assert_ne!(base, pub_digest_of(&p, &r, &ev2, &dec, &gates));
+        // A different decision digest changes it.
+        assert_ne!(base, pub_digest_of(&p, &r, &ev, "other", &gates));
+        // A different gate outcome changes it.
+        assert_ne!(
+            base,
+            pub_digest_of(&p, &r, &ev, &dec, &["cargo test=failed".to_string()])
+        );
+        // Length-prefix injectivity: dropping an evidence hash is not the same as
+        // joining two.
+        let joined = vec!["evhash_aevhash_b".to_string()];
+        assert_ne!(base, pub_digest_of(&p, &r, &joined, &dec, &gates));
+    }
+
+    #[test]
+    fn publication_digest_does_not_collide_with_other_record_kinds() {
+        let (p, r, ev, dec, gates) = sample_publication();
+        let publication = pub_digest_of(&p, &r, &ev, &dec, &gates);
+        let evidence = evidence_digest(&sample_evidence());
+        let decision = decision_digest(&DecisionDigestInput {
+            proposal_id: "p",
+            proposal_revision_id: "r",
+            decision: "accepted",
+            actor: "unknown",
+            created_at_ms: 150,
+        });
+        assert_ne!(publication, evidence);
+        assert_ne!(publication, decision);
     }
 }

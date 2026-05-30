@@ -1595,6 +1595,192 @@ fn decision_high_water(conn: &Connection) -> Result<i64> {
     Ok(mark.unwrap_or(0))
 }
 
+/// A published proposal's provenance trailer (NER-137): the values that go into the
+/// `Forge-*` commit trailer lines. `provenance_digest` is the content-addressed digest
+/// `verify-branch` recomputes from the local ledger.
+#[derive(Debug, Clone)]
+pub struct PublicationTrailer {
+    pub proposal_id: String,
+    pub proposal_revision_id: String,
+    pub intent: String,
+    pub provenance_digest: String,
+    pub actor: String,
+    /// Canonical, secret-redacted `"identity=verdict"` strings, sorted.
+    pub gates: Vec<String>,
+}
+
+/// Assemble the provenance trailer for an accepted proposal revision, **re-verifying
+/// the deciding evidence first** (NER-137 R8 — `evaluate_check_on` raises
+/// `EVIDENCE_TAMPERED` on a tampered deciding row, so export fails closed before the
+/// branch is created). The "content-addressed evidence digest" folds the deciding
+/// gates' Phase 5 `content_hash`es, so it recomputes from the ledger by construction.
+pub fn build_publication_trailer(
+    cwd: &Path,
+    proposal_revision_id: &str,
+) -> Result<PublicationTrailer> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let (proposal, attempt) =
+        proposal_and_attempt_for_revision(&context, &connection, proposal_revision_id)?;
+
+    // R8: integrity-verifying check — a tampered deciding row fails closed here.
+    let outcome = evaluate_check_on(&connection, &attempt, &proposal)?;
+
+    let mut evidence_hashes = Vec::new();
+    for gate in &outcome.gates {
+        if let Some(evidence_id) = &gate.evidence_id {
+            evidence_hashes.push(evidence_content_hash_of(&connection, evidence_id)?);
+        }
+    }
+    let (decision_digest, actor) =
+        decision_digest_and_actor(&connection, &context.repo_id, proposal_revision_id)?;
+
+    // Canonical, redacted gate outcomes (the commit is a published egress, so gate
+    // identities go through the per-token redactor) — sorted for a stable digest.
+    let mut gate_outcomes: Vec<String> = outcome
+        .gates
+        .iter()
+        .map(|gate| {
+            let redacted = redact_gate_result(gate.clone());
+            format!(
+                "{}={}",
+                gate_identity(&redacted.program, &redacted.args),
+                verdict_label(redacted.verdict)
+            )
+        })
+        .collect();
+    gate_outcomes.sort();
+
+    let provenance_digest = integrity::publication_digest(&integrity::PublicationDigestInput {
+        proposal_id: &proposal.proposal_id,
+        proposal_revision_id,
+        evidence_hashes: &evidence_hashes,
+        decision_digest: &decision_digest,
+        gate_outcomes: &gate_outcomes,
+    });
+
+    Ok(PublicationTrailer {
+        proposal_id: proposal.proposal_id,
+        proposal_revision_id: proposal_revision_id.to_string(),
+        intent: attempt.intent,
+        provenance_digest,
+        actor,
+        gates: gate_outcomes,
+    })
+}
+
+/// Render a publication trailer into a git commit message body: a human first line +
+/// the intent, then the machine `Forge-*` trailer lines (one `Forge-Provenance-Digest`,
+/// no Evidence/Publication split). Parsed back by `parse_forge_trailers` (NER-137 U6).
+pub fn render_trailer_message(trailer: &PublicationTrailer) -> String {
+    let mut message = format!("Forge accepted proposal {}\n\n", trailer.proposal_id);
+    if !trailer.intent.is_empty() {
+        message.push_str(&trailer.intent);
+        message.push_str("\n\n");
+    }
+    message.push_str(&format!("Forge-Proposal-Id: {}\n", trailer.proposal_id));
+    message.push_str(&format!(
+        "Forge-Proposal-Revision-Id: {}\n",
+        trailer.proposal_revision_id
+    ));
+    message.push_str(&format!(
+        "Forge-Provenance-Digest: {}\n",
+        trailer.provenance_digest
+    ));
+    message.push_str(&format!("Forge-Decision-Actor: {}\n", trailer.actor));
+    message.push_str(&format!("Forge-Gates: {}\n", trailer.gates.join("; ")));
+    message
+}
+
+fn gate_identity(program: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{program} {}", args.join(" "))
+    }
+}
+
+fn verdict_label(verdict: forge_policy::GateVerdict) -> &'static str {
+    match verdict {
+        forge_policy::GateVerdict::Passed => "passed",
+        forge_policy::GateVerdict::Failed => "failed",
+        forge_policy::GateVerdict::Missing => "missing",
+        forge_policy::GateVerdict::Stale => "stale",
+    }
+}
+
+/// Resolve the `(ProposalSummary, AttemptRecord)` a proposal-revision id names.
+fn proposal_and_attempt_for_revision(
+    context: &RepositoryContext,
+    conn: &Connection,
+    proposal_revision_id: &str,
+) -> Result<(ProposalSummary, AttemptRecord)> {
+    let proposal = conn
+        .query_row(
+            "SELECT p.id, pr.id, p.attempt_id, p.snapshot_id, p.base_head, pr.content_ref, pr.changed_paths_json
+             FROM proposal_revisions pr
+             JOIN proposals p ON p.id = pr.proposal_id
+             WHERE p.repo_id = ?1 AND pr.id = ?2",
+            params![context.repo_id, proposal_revision_id],
+            |row| {
+                let changed_paths_json: String = row.get(6)?;
+                Ok(ProposalSummary {
+                    proposal_id: row.get(0)?,
+                    proposal_revision_id: row.get(1)?,
+                    attempt_id: row.get(2)?,
+                    snapshot_id: row.get(3)?,
+                    base_head: row.get(4)?,
+                    content_ref: row.get(5)?,
+                    changed_paths: serde_json::from_str(&changed_paths_json).unwrap_or_default(),
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| ForgeError::UnknownProposal {
+            selector: proposal_revision_id.to_string(),
+        })?;
+    let attempt = attempt_by_id(context, &proposal.attempt_id)?.ok_or_else(|| {
+        ForgeError::UnknownAttempt {
+            selector: proposal.attempt_id.clone(),
+        }
+    })?;
+    Ok((proposal, attempt))
+}
+
+/// The stored `content_hash` of an evidence row (empty string when NULL — a legacy
+/// pre-Phase-5 row; the digest still computes deterministically).
+fn evidence_content_hash_of(conn: &Connection, evidence_id: &str) -> Result<String> {
+    let hash: Option<String> = conn
+        .query_row(
+            "SELECT content_hash FROM evidence WHERE id = ?1",
+            params![evidence_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(hash.unwrap_or_default())
+}
+
+/// The latest decision row's `(content_hash, actor)` for a revision — the decision
+/// digest folded into the provenance digest, and the deciding actor for the trailer.
+fn decision_digest_and_actor(
+    conn: &Connection,
+    repo_id: &str,
+    proposal_revision_id: &str,
+) -> Result<(String, String)> {
+    let row: Option<(Option<String>, String)> = conn
+        .query_row(
+            "SELECT content_hash, actor FROM decisions
+             WHERE repo_id = ?1 AND proposal_revision_id = ?2
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            params![repo_id, proposal_revision_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (hash, actor) = row.unwrap_or((None, "unknown".to_string()));
+    Ok((hash.unwrap_or_default(), actor))
+}
+
 pub fn exportable_proposal(
     cwd: &Path,
     attempt_id: Option<&str>,

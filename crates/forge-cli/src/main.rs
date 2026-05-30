@@ -787,13 +787,21 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                     }
                     .into());
                 }
+                // Assemble the provenance trailer from the local ledger (NER-137):
+                // this re-verifies the deciding evidence (R8 — EVIDENCE_TAMPERED fails
+                // closed here, before the branch) and folds the deciding evidence
+                // content_hashes + decision digest into a content-addressed digest the
+                // published commit carries and `verify-branch` recomputes.
+                let trailer =
+                    forge_store::build_publication_trailer(&cwd, &proposal.proposal_revision_id)?;
+                let message = forge_store::render_trailer_message(&trailer);
                 let (commit_id, excluded) = forge_export_git::export_branch(
                     &cwd,
                     &args.name,
                     &proposal.base_head,
                     &current_head,
                     &proposal.content_ref,
-                    "Forge accepted proposal",
+                    &message,
                 )?;
                 let actor = resolve_actor(args.actor.as_deref());
                 let publication = forge_store::record_publication(

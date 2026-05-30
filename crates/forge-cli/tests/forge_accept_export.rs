@@ -195,6 +195,45 @@ fn export_requires_acceptance_for_exact_latest_revision() {
 }
 
 #[test]
+fn export_carries_a_structured_provenance_trailer() {
+    // NER-137 U5: the published commit replaces the constant "Forge accepted proposal"
+    // message with a structured Forge-* trailer; exactly one digest line.
+    let repo = TestRepo::new_git();
+    prepare_proposal(&repo);
+    repo.forge()
+        .args(["--json", "accept", "--actor", "alice"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "export", "branch", "forge/with-trailer"])
+        .assert()
+        .success();
+
+    let message = git(
+        repo.path(),
+        &["show", "-s", "--format=%B", "forge/with-trailer"],
+    );
+    assert!(message.contains("Forge-Proposal-Id: "), "{message}");
+    assert!(message.contains("Forge-Proposal-Revision-Id: "));
+    assert!(message.contains("Forge-Decision-Actor: alice"));
+    assert!(message.contains("Forge-Gates: "));
+
+    let digest_lines: Vec<&str> = message
+        .lines()
+        .filter(|l| l.starts_with("Forge-Provenance-Digest: "))
+        .collect();
+    assert_eq!(digest_lines.len(), 1, "exactly one digest line");
+    let digest = digest_lines[0]
+        .trim_start_matches("Forge-Provenance-Digest: ")
+        .trim();
+    assert_eq!(digest.len(), 64, "64-hex provenance digest");
+    assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    // The split that an earlier draft carried must NOT appear.
+    assert!(!message.contains("Forge-Evidence-Digest"));
+    assert!(!message.contains("Forge-Publication-Digest"));
+}
+
+#[test]
 fn native_accepted_proposal_exports_to_git_branch() {
     let repo = TestRepo::new_git();
     prepare_native_proposal(&repo);
