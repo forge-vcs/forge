@@ -199,6 +199,10 @@ fn ensure_head(repo_root: &Path) -> Result<ObjectId> {
         proposal_revision_id: None,
         decision_id: None,
         evidence_digest: None,
+        // Genesis has no decider; `actor`/`authored_time` stay `None` and (via
+        // skip_serializing_if) are omitted, so the genesis hash is byte-identical to slice 2.
+        actor: None,
+        authored_time: None,
     };
     // Store-before-DB: the genesis object + HEAD are durable before `current_base`
     // returns, so the `attempts.base_head` row that records this id is written only after
@@ -285,14 +289,14 @@ impl NativeObjectStore {
     /// Write a native commit object (NER-138 Phase 7 slice 2), returning its
     /// content-addressed id. Inherits `write_object`'s store-before-DB durability
     /// (temp + fsync + atomic rename + parent-dir fsync) verbatim.
-    fn write_commit(&self, commit: &CommitObject) -> Result<ObjectId> {
+    pub fn write_commit(&self, commit: &CommitObject) -> Result<ObjectId> {
         let payload = serde_json::to_vec(commit)?;
         self.write_object(ObjectKind::Commit, &payload)
     }
 
     /// Read and validate a native commit object. S1: never interpolates a filesystem
     /// path — `read_object`'s context carries only the opaque object id.
-    fn read_commit(&self, id: &ObjectId) -> Result<CommitObject> {
+    pub fn read_commit(&self, id: &ObjectId) -> Result<CommitObject> {
         if id.kind()? != ObjectKind::Commit {
             bail!("native object is not a commit");
         }
@@ -485,32 +489,78 @@ struct TreeObject {
     entries: Vec<TreeEntry>,
 }
 
-/// A native commit/Change object (NER-138 Phase 7 slice 2). Content-addressed and
-/// domain-separated via `ObjectId::new(ObjectKind::Commit, ..)`, it makes history
-/// intent-aware: it references its root `tree`, zero-or-more parent commit ids, and
-/// (nullable) the intent / proposal-revision / decision that justified it plus an
-/// evidence digest. Slice 2 writes only the genesis shape (empty `parents`, all-`None`
-/// justification); slice 3 writes justified commits at `accept`.
-///
-/// `evidence_digest`, when present, MUST be an opaque lowercase-hex digest (e.g. the
-/// ledger's evidence `content_hash`) — never an excerpt or any free text. The commit
-/// payload is written via `write_object` and never passes through
-/// `redact_evidence_excerpt`, so admitting excerpt text here would be a secret-leaking
-/// egress: the field stays a hash by contract.
+/// An opaque lowercase 64-hex digest (e.g. an evidence `content_hash`). Constructing one
+/// validates the shape, so the commit-build path (slice 3's `accept`) can only assign a
+/// real digest — excerpt text is structurally unrepresentable in
+/// [`CommitObject::evidence_digest`] (the commit payload is written via `write_object` and
+/// never passes through `redact_evidence_excerpt`, so this newtype is the secret-hygiene
+/// guard). `#[serde(transparent)]` so it serializes/deserializes as the bare hex string —
+/// byte-identical to the prior `Option<String>` field, preserving genesis-hash stability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CommitObject {
-    schema_version: u32,
-    tree: String,
+#[serde(transparent)]
+pub struct Hex64(String);
+
+impl Hex64 {
+    /// Validate and wrap a lowercase 64-hex digest. Errors (path-free) on any other shape,
+    /// so a non-digest (e.g. excerpt text) can never reach the commit payload.
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            bail!("evidence digest must be exactly 64 lowercase hex characters");
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Hex64 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A native commit/Change object (NER-138 Phase 7 slice 2; justified commits land in
+/// slice 3). Content-addressed and domain-separated via `ObjectId::new(ObjectKind::Commit,
+/// ..)`. `pub` (with `pub` fields) so `forge_store` can build justified commits at `accept`
+/// and walk them for `log`/checkout/`doctor` (slice 3).
+///
+/// **Genesis-hash stability (slice 3, critical):** the two slice-3 fields `actor` and
+/// `authored_time` carry `#[serde(skip_serializing_if = "Option::is_none")]`, so a genesis
+/// commit (all-`None`) serializes byte-identically to slice 2 — its `ObjectId` is unchanged
+/// and existing repos' `base_head` does not desync into spurious `STALE_BASE`. Justified
+/// commits (slice 3) populate `actor` + `authored_time` in the HASHED bytes so Phase 9
+/// signing attests who/when (a later registry bump cannot retroactively bring earlier
+/// justified commits under signed/decider-bound provenance).
+///
+/// `evidence_digest`, when present, is a [`Hex64`] (an opaque lowercase-hex digest such as
+/// the ledger's evidence `content_hash`) — never an excerpt or any free text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitObject {
+    pub schema_version: u32,
+    pub tree: String,
     #[serde(default)]
-    parents: Vec<String>,
+    pub parents: Vec<String>,
     #[serde(default)]
-    intent_id: Option<String>,
+    pub intent_id: Option<String>,
     #[serde(default)]
-    proposal_revision_id: Option<String>,
+    pub proposal_revision_id: Option<String>,
     #[serde(default)]
-    decision_id: Option<String>,
+    pub decision_id: Option<String>,
     #[serde(default)]
-    evidence_digest: Option<String>,
+    pub evidence_digest: Option<Hex64>,
+    /// The decider (`decisions.actor`). `None` for genesis. Hashed for justified commits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// Wall-clock authored time (ms). `None` for genesis. Hashed for justified commits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_time: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1660,13 +1710,15 @@ mod tests {
             proposal_revision_id: None,
             decision_id: None,
             evidence_digest: None,
+            actor: None,
+            authored_time: None,
         };
         let gid = store.write_commit(&genesis).unwrap();
         assert!(gid.to_string().starts_with("f1:commit:sha256:"));
         assert_eq!(store.read_commit(&gid).unwrap(), genesis);
-        // Fully-populated (justified) shape — exercises every field even though slice 2
-        // only writes genesis (slice 3 writes justified commits). evidence_digest is an
-        // opaque lowercase-hex digest, never excerpt text.
+        // Fully-populated (justified) shape — exercises every field including the slice-3
+        // actor + authored_time in the hashed bytes. evidence_digest is a Hex64, so excerpt
+        // text is structurally unrepresentable.
         let justified = CommitObject {
             schema_version: SCHEMA_VERSION,
             tree: format!("f1:tree:sha256:{}", "b".repeat(64)),
@@ -1674,15 +1726,18 @@ mod tests {
             intent_id: Some("intent_x".to_string()),
             proposal_revision_id: Some("revision_x".to_string()),
             decision_id: Some("decision_x".to_string()),
-            evidence_digest: Some("c".repeat(64)),
+            evidence_digest: Some(Hex64::new("c".repeat(64)).unwrap()),
+            actor: Some("agent:tester".to_string()),
+            authored_time: Some(1_700_000_000_000),
         };
         let jid = store.write_commit(&justified).unwrap();
         assert_eq!(store.read_commit(&jid).unwrap(), justified);
         assert!(
             justified
                 .evidence_digest
-                .as_deref()
+                .as_ref()
                 .unwrap()
+                .as_str()
                 .chars()
                 .all(|c| c.is_ascii_hexdigit()),
             "evidence_digest is an opaque hex digest, never excerpt text"
@@ -1690,6 +1745,87 @@ mod tests {
         // The triple-kind all_object_ids scan recovers both commit ids.
         let ids = store.all_object_ids().unwrap();
         assert!(ids.contains(&gid) && ids.contains(&jid));
+    }
+
+    /// GENESIS-HASH STABILITY (slice 3, critical): adding `actor`/`authored_time`
+    /// (skip_serializing_if) and retyping `evidence_digest` to `Hex64` must NOT change the
+    /// bytes a genesis commit serializes to — otherwise every existing native repo's
+    /// `base_head` desyncs into spurious `STALE_BASE`. The expected JSON is a hard-coded
+    /// literal of what slice 2 wrote (NOT recomputed from the struct), per the adversarial
+    /// doc-review finding. Because the `ObjectId` is `hash(preimage(these bytes))`, equal
+    /// bytes ⇒ equal id — so byte-equality is the genesis-stability proof.
+    #[test]
+    fn genesis_commit_serialization_is_byte_identical_to_slice_2() {
+        let tree = format!("f1:tree:sha256:{}", "0".repeat(64));
+        // EXACTLY what a slice-2 genesis serialized to: 7 fields, the 4 justification
+        // Options as null, no actor/authored_time keys.
+        let expected = format!(
+            r#"{{"schema_version":1,"tree":"{tree}","parents":[],"intent_id":null,"proposal_revision_id":null,"decision_id":null,"evidence_digest":null}}"#
+        );
+        let genesis = CommitObject {
+            schema_version: SCHEMA_VERSION,
+            tree: tree.clone(),
+            parents: Vec::new(),
+            intent_id: None,
+            proposal_revision_id: None,
+            decision_id: None,
+            evidence_digest: None,
+            actor: None,
+            authored_time: None,
+        };
+        let serialized = serde_json::to_string(&genesis).unwrap();
+        assert_eq!(
+            serialized, expected,
+            "genesis serialization drifted — existing repos' base_head would desync"
+        );
+        // And the id derived from those exact bytes is stable (illustrates the implication).
+        let id = ObjectId::new(ObjectKind::Commit, serialized.as_bytes());
+        assert!(id.to_string().starts_with("f1:commit:sha256:"));
+    }
+
+    /// The slice-3 `actor`/`authored_time` are in the HASHED bytes (Phase 9 signs who/when):
+    /// two justified commits identical except `actor` MUST have distinct ids, and a
+    /// justified commit MUST differ from the genesis-shaped commit over the same tree.
+    #[test]
+    fn justified_commit_fields_are_hashed() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let base = CommitObject {
+            schema_version: SCHEMA_VERSION,
+            tree: format!("f1:tree:sha256:{}", "a".repeat(64)),
+            parents: vec![format!("f1:commit:sha256:{}", "b".repeat(64))],
+            intent_id: Some("intent_x".to_string()),
+            proposal_revision_id: Some("revision_x".to_string()),
+            decision_id: Some("decision_x".to_string()),
+            evidence_digest: Some(Hex64::new("c".repeat(64)).unwrap()),
+            actor: Some("agent:alice".to_string()),
+            authored_time: Some(1_700_000_000_000),
+        };
+        let mut other_actor = base.clone();
+        other_actor.actor = Some("agent:bob".to_string());
+        let mut other_time = base.clone();
+        other_time.authored_time = Some(1_700_000_000_001);
+        let id_base = store.write_commit(&base).unwrap();
+        let id_actor = store.write_commit(&other_actor).unwrap();
+        let id_time = store.write_commit(&other_time).unwrap();
+        assert_ne!(id_base, id_actor, "actor must be in the hashed bytes");
+        assert_ne!(
+            id_base, id_time,
+            "authored_time must be in the hashed bytes"
+        );
+    }
+
+    /// `Hex64` rejects anything that is not exactly 64 lowercase-hex chars, so excerpt text
+    /// can never reach `CommitObject::evidence_digest` (the secret-hygiene guard).
+    #[test]
+    fn hex64_rejects_non_digest() {
+        assert!(Hex64::new("c".repeat(64)).is_ok());
+        assert!(Hex64::new("not a real digest, this is excerpt text").is_err());
+        assert!(Hex64::new("C".repeat(64)).is_err(), "uppercase rejected");
+        assert!(Hex64::new("c".repeat(63)).is_err(), "wrong length rejected");
+        // Error is path-free (S1): no separators leak from the validation message.
+        let err = Hex64::new("zz").unwrap_err().to_string();
+        assert!(!err.contains('/') && !err.contains('\\'));
     }
 
     #[test]
@@ -1717,6 +1853,8 @@ mod tests {
             proposal_revision_id: None,
             decision_id: None,
             evidence_digest: None,
+            actor: None,
+            authored_time: None,
         };
         let payload = serde_json::to_vec(&future).unwrap();
         let future_id = store.write_object(ObjectKind::Commit, &payload).unwrap();
