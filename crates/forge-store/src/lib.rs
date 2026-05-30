@@ -2801,6 +2801,20 @@ fn rank_compare_rows(rows: &mut Vec<AttemptCompareRow>) {
     *rows = ranked;
 }
 
+/// The latest proposal's `content_ref` for an attempt — the diffable tree the pairwise
+/// `compare --diff` path feeds to the git adapter (NER-137). Errors `UnknownAttempt`
+/// when the attempt does not exist, `NoProposal` when it has no proposal yet.
+pub fn attempt_proposal_content_ref(cwd: &Path, attempt_id: &str) -> Result<String> {
+    let context = open_repository(cwd)?;
+    let attempt =
+        attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+            selector: attempt_id.to_string(),
+        })?;
+    let proposal = latest_proposal_for_attempt(&context, &attempt.attempt_id)?
+        .ok_or(ForgeError::NoProposal)?;
+    Ok(proposal.content_ref)
+}
+
 pub fn show_attempt(cwd: &Path, attempt_id: &str) -> Result<AttemptShowRecord> {
     let context = open_repository(cwd)?;
     let attempt =

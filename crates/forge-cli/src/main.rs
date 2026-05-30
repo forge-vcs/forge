@@ -35,11 +35,28 @@ enum Command {
     Reject(ProposalScopedArgs),
     Show(AttemptScopedArgs),
     Proposal(ProposalArgs),
+    /// Compare competing attempts (per intent) on verified evidence + rank them.
+    Compare(CompareArgs),
     Doctor,
     Gc(GcArgs),
     Export(ExportArgs),
     /// Emit the versioned machine contract (schema_version, command + error registry).
     Schema,
+}
+
+#[derive(Debug, Args)]
+struct CompareArgs {
+    /// Compare attempts under this intent only. Omit to compare every intent that has
+    /// an attempt (each as its own ranked group).
+    #[arg(long)]
+    intent: Option<String>,
+    /// Compare attempts under this attempt's intent.
+    #[arg(long)]
+    attempt: Option<String>,
+    /// Two attempt ids to additionally produce a file/hunk content diff between their
+    /// proposals (via the git adapter): `--diff <attempt_a> <attempt_b>`.
+    #[arg(long, num_args = 2, value_names = ["ATTEMPT_A", "ATTEMPT_B"])]
+    diff: Option<Vec<String>>,
 }
 
 #[derive(Debug, Args)]
@@ -109,8 +126,14 @@ struct AttemptArgs {
 enum AttemptCommand {
     Start(AttemptStartArgs),
     List,
-    Show { attempt_id: String },
-    Attach { attempt_id: String },
+    Show {
+        attempt_id: String,
+    },
+    Attach {
+        attempt_id: String,
+    },
+    /// Compare competing attempts (per intent) on verified evidence + rank them.
+    Compare(CompareArgs),
 }
 
 #[derive(Debug, Args)]
@@ -218,6 +241,7 @@ fn main() -> ExitCode {
         Command::Reject(args) => reject_response(request_id, args),
         Command::Show(args) => show_response(request_id, args),
         Command::Proposal(args) => proposal_response(request_id, args),
+        Command::Compare(args) => compare_response(request_id, "compare", args),
         Command::Doctor => doctor_response(request_id),
         Command::Gc(args) => gc_response(request_id, args),
         Command::Export(args) => export_response(request_id, args),
@@ -402,7 +426,39 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
                 ))
             })
         }
+        AttemptCommand::Compare(args) => compare_response(request_id, "attempt compare", args),
     }
+}
+
+/// `forge compare` / `forge attempt compare` — the read-only compare/rank surface
+/// (NER-137). Both forms share this handler. Returns the per-intent grouped, ranked
+/// comparison; with `--diff <a> <b>` it additionally attaches the file/hunk content
+/// diff between the two attempts' proposals (via the git adapter). Read-only: no
+/// operation_id, no lock. Secret-risk changed paths are already dropped by the store;
+/// any dropped paths in the pairwise diff surface as warnings.
+fn compare_response(
+    request_id: Option<String>,
+    command: &'static str,
+    args: CompareArgs,
+) -> ResponseEnvelope {
+    command_result(command, request_id, |cwd, _| {
+        let selector = forge_store::CompareSelector {
+            intent_id: args.intent.clone(),
+            attempt_id: args.attempt.clone(),
+        };
+        let comparison = forge_store::compare_attempts(&cwd, selector)?;
+        let mut data = serde_json::to_value(&comparison)?;
+        let mut warnings = Vec::new();
+        if let Some(pair) = &args.diff {
+            // clap enforces exactly two values for --diff.
+            let ref_a = forge_store::attempt_proposal_content_ref(&cwd, &pair[0])?;
+            let ref_b = forge_store::attempt_proposal_content_ref(&cwd, &pair[1])?;
+            let tree_diff = forge_export_git::diff_trees(&cwd, &ref_a, &ref_b, true)?;
+            warnings.extend(secret_export_warnings(&tree_diff.dropped_secret_paths));
+            data["diff"] = serde_json::to_value(&tree_diff)?;
+        }
+        Ok((None, data, warnings))
+    })
 }
 
 fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> ResponseEnvelope {

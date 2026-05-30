@@ -68,6 +68,8 @@ fn command_shapes() -> Value {
         ("reject", "Rejects a proposal; data carries the decision + operation_id."),
         ("show", "Shows the active attempt's current state; data carries the attempt view."),
         ("proposal list", "Lists proposals; data carries { proposals: [...] }."),
+        ("compare", "Compares competing attempts on verified evidence and ranks them; data carries { intents: [{ intent_id, intent, attempts: [{ attempt_id, gates, metrics, integrity, decision_status, publication_status, rank, rank_reason, ... }] }] }. Read-only and advisory; a cheap-check-tampered attempt is integrity=tampered with rank=null. With --diff <a> <b>, data also carries the file/hunk diff between the two attempts' proposals (via the git adapter)."),
+        ("attempt compare", "Alias of `compare` scoped to attempts; same data shape."),
         ("doctor", "Reports repository health; data carries the diagnostic checks."),
         ("gc", "Garbage-collection (--dry-run only in v0); data carries the dry-run plan."),
         ("export branch", "Exports an accepted proposal to a new git branch; secret-risk paths are dropped with a warning."),
