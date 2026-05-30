@@ -899,28 +899,6 @@ fn flatten_tree_into(
     Ok(())
 }
 
-/// Retained ONLY for the `#[cfg(test)]` differential harness (`git_based_scan` and the
-/// index-vs-filesystem divergence tests), which prove the slice-1 native walker's snapshot
-/// set still equals the prior git-based set. NER-138 Phase 7 slice 2 removed the last
-/// production caller: native `current_base`/`base_content_ref`/`changed_paths` are now
-/// git-binary-free, so this helper is compiled only in test builds.
-#[cfg(test)]
-fn git(repo_root: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo_root)
-        .output()
-        .with_context(|| format!("failed to run git {args:?}"))?;
-    if !output.status.success() {
-        bail!(
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8(output.stdout)?)
-}
-
 fn validate_tree_entry(entry: &TreeEntry) -> Result<()> {
     if entry.name.is_empty()
         || entry.name == "."
@@ -1172,6 +1150,28 @@ mod tests {
                 .success(),
             "git {args:?} failed"
         );
+    }
+
+    /// Run a git command and capture its stdout. Lives ONLY in the test module: the
+    /// `git_based_scan` differential harness shells git to reproduce the prior git-based
+    /// set, but NER-138 Phase 7 slice 2 removed the last production caller — native
+    /// snapshot/base/changed_paths are git-binary-free (pinned by
+    /// `native_production_paths_shell_no_git`).
+    #[cfg(test)]
+    fn git(repo_root: &Path, args: &[&str]) -> Result<String> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo_root)
+            .output()
+            .with_context(|| format!("failed to run git {args:?}"))?;
+        if !output.status.success() {
+            bail!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8(output.stdout)?)
     }
 
     #[cfg(test)]
@@ -1815,6 +1815,30 @@ mod tests {
             !snap.changed_paths.iter().any(|p| p.contains(".env")),
             "secret must never surface in changed_paths: {:?}",
             snap.changed_paths
+        );
+    }
+
+    #[test]
+    fn native_production_paths_shell_no_git() {
+        // NER-138 exit criterion: no git binary in the native snapshot/base/changed-paths
+        // production paths. The differential harness in THIS test module still shells git
+        // for the slice-1 parity proofs, so scope the scan to the production prefix —
+        // everything before the test module. The invariant is strong and false-positive-
+        // free: production native code spawns NO subprocess at all (`Command::new`). The
+        // `ignore`-crate walker, the object/ref stores, and the tree diff are all
+        // in-process, so any `Command::new` outside #[cfg(test)] is a git-dependency
+        // regression. (Substring-matching `ls-files`/`rev-parse` would false-positive on
+        // doc comments that reference the removed git calls, so we gate on the spawn.)
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"))
+            .expect("read forge-content-native/src/lib.rs");
+        let production = src
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("source has a production prefix before the test module");
+        assert!(
+            !production.contains("Command::new"),
+            "native production code must spawn no subprocess (found `Command::new` outside \
+             #[cfg(test)]); slice 2 made base_head + changed_paths git-binary-free"
         );
     }
 }
