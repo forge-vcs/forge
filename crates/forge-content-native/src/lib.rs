@@ -51,20 +51,62 @@ pub struct ObjectId {
     digest: String,
 }
 
+/// The domain-separated, length-prefixed preimage an object id hashes over:
+/// `b"forge-object\n" + kind + "\n" + SCHEMA_VERSION + "\n" + payload.len() + "\n" + payload`.
+///
+/// NER-138 Phase 7 slice 3 stores this preimage *as the object file* (rather than the raw
+/// payload), so the file is self-verifying (`hash(file) == id`) and self-describing (the
+/// kind is a parsed header field) — letting `all_object_ids` read each object's kind instead
+/// of re-hashing under every kind. `ObjectId::new` hashes exactly these bytes, so the id is
+/// unchanged from slice 1/2 (no re-addressing). Single source of truth for the framing so
+/// the write/read/hash paths can never disagree.
+const OBJECT_MAGIC: &[u8] = b"forge-object\n";
+
+fn object_preimage(kind: ObjectKind, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(OBJECT_MAGIC.len() + payload.len() + 24);
+    buf.extend_from_slice(OBJECT_MAGIC);
+    buf.extend_from_slice(kind.as_str().as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(SCHEMA_VERSION.to_string().as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(payload.len().to_string().as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Parse a stored object file as a slice-3 self-describing preimage, returning its kind and
+/// payload slice. Returns `None` when the bytes are not a well-formed preimage (a slice-1/2
+/// legacy raw-payload object, or — astronomically — a blob whose raw content coincidentally
+/// starts with the magic but does not parse). Callers MUST still verify `hash(file) == id`
+/// before trusting the parsed kind, so the headered-vs-legacy decision is hash-resolved, not
+/// format-guessed (a legacy blob starting with the magic fails that check and falls back).
+fn parse_object_preimage(bytes: &[u8]) -> Option<(ObjectKind, &[u8])> {
+    let rest = bytes.strip_prefix(OBJECT_MAGIC)?;
+    let nl1 = rest.iter().position(|&b| b == b'\n')?;
+    let kind = match std::str::from_utf8(&rest[..nl1]).ok()? {
+        "blob" => ObjectKind::Blob,
+        "tree" => ObjectKind::Tree,
+        "commit" => ObjectKind::Commit,
+        _ => return None,
+    };
+    let rest = &rest[nl1 + 1..];
+    let nl2 = rest.iter().position(|&b| b == b'\n')?;
+    let rest = &rest[nl2 + 1..]; // skip the schema_version line
+    let nl3 = rest.iter().position(|&b| b == b'\n')?;
+    let len: usize = std::str::from_utf8(&rest[..nl3]).ok()?.parse().ok()?;
+    let payload = &rest[nl3 + 1..];
+    if payload.len() != len {
+        return None;
+    }
+    Some((kind, payload))
+}
+
 impl ObjectId {
     pub fn new(kind: ObjectKind, payload: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(b"forge-object\n");
-        hasher.update(kind.as_str().as_bytes());
-        hasher.update(b"\n");
-        hasher.update(SCHEMA_VERSION.to_string().as_bytes());
-        hasher.update(b"\n");
-        hasher.update(payload.len().to_string().as_bytes());
-        hasher.update(b"\n");
-        hasher.update(payload);
         Self {
             kind: kind.as_str().to_string(),
-            digest: hex_lower(&hasher.finalize()),
+            digest: hex_lower(&Sha256::digest(object_preimage(kind, payload))),
         }
     }
 
@@ -247,10 +289,17 @@ impl NativeObjectStore {
         let id = ObjectId::new(kind, payload);
         let path = self.object_path(&id);
         if path.exists() {
+            // Dedup: the object is already on disk. `read_object` re-verifies it (headered
+            // OR legacy raw-payload — both valid for this id), so a slice-3 write over an
+            // existing slice-1/2 legacy file is a verified no-op, never a "hash mismatch".
             self.read_object(&id)?;
             return Ok(id);
         }
 
+        // Slice 3: store the self-describing domain-separated preimage (kind in a header),
+        // not the raw payload. `hash(file) == id`, so the file is self-verifying and
+        // `all_object_ids` reads its kind instead of re-hashing under every kind.
+        let framed = object_preimage(kind, payload);
         let parent = path.parent().context("object path has no parent")?;
         // Record which ancestor directories do not yet exist so their creation can be
         // made durable after the object is written: a freshly created shard directory's
@@ -259,7 +308,7 @@ impl NativeObjectStore {
         fs::create_dir_all(parent)?;
         fs::create_dir_all(self.tmp_dir())?;
         let mut temp = tempfile::NamedTempFile::new_in(self.tmp_dir())?;
-        temp.write_all(payload)?;
+        temp.write_all(&framed)?;
         temp.as_file_mut().sync_all()?;
         temp.persist(&path).map_err(|error| error.error)?;
         // The object's directory entry must reach disk before any DB row references it.
@@ -277,13 +326,27 @@ impl NativeObjectStore {
 
     pub fn read_object(&self, id: &ObjectId) -> Result<Vec<u8>> {
         let path = self.object_path(id);
-        let payload =
+        let bytes =
             fs::read(&path).with_context(|| format!("missing native content object {}", id))?;
-        let actual = ObjectId::new(id.kind()?, &payload);
+        // Slice-3 headered object: the file IS the preimage, so `hash(file) == id` and its
+        // kind is a parsed header field. The hash check disambiguates from a legacy blob
+        // that merely starts with the magic (its hash will not match) — hash-resolved, not
+        // format-guessed. A header kind that disagrees with the id's kind is corruption.
+        if let Some((kind, payload)) = parse_object_preimage(&bytes) {
+            if hex_lower(&Sha256::digest(&bytes)) == id.digest {
+                if kind != id.kind()? {
+                    bail!("native object kind header mismatch for {}", id);
+                }
+                return Ok(payload.to_vec());
+            }
+        }
+        // Legacy slice-1/2 raw-payload fallback: the id hashes the framed preimage of the
+        // raw bytes. Kept alive (prove-before-delete) so existing repos stay readable.
+        let actual = ObjectId::new(id.kind()?, &bytes);
         if &actual != id {
             bail!("hash mismatch for native content object {}", id);
         }
-        Ok(payload)
+        Ok(bytes)
     }
 
     /// Write a native commit object (NER-138 Phase 7 slice 2), returning its
@@ -361,11 +424,22 @@ impl NativeObjectStore {
                 }
                 let digest = entry.file_name().to_string_lossy().into_owned();
                 let bytes = fs::read(entry.path())?;
-                // Recover each loose object's kind by re-hashing its bytes under every
-                // kind and matching the digest; domain separation guarantees at most one
-                // match. NER-138 Phase 7 slice 2 adds `Commit` to the scan. Slice 3's
-                // object-kind headers replace this multi-hash scan (kill the double/triple
-                // hash; see lib.rs object-kind-header work).
+                // Slice-3 headered object: read its kind from the preimage header, verified
+                // by `hash(file) == digest` — a single hash, no multi-kind re-hash. This is
+                // the primary path that kills the triple-hash scan.
+                if let Some((kind, _payload)) = parse_object_preimage(&bytes) {
+                    if hex_lower(&Sha256::digest(&bytes)) == digest {
+                        ids.insert(ObjectId {
+                            kind: kind.as_str().to_string(),
+                            digest,
+                        });
+                        continue;
+                    }
+                }
+                // Legacy slice-1/2 raw-payload fallback (prove-before-delete; kept alive so a
+                // mixed store still enumerates fully): recover the kind by re-hashing the raw
+                // bytes under every kind and matching the digest — domain separation
+                // guarantees at most one match.
                 for kind in [ObjectKind::Blob, ObjectKind::Tree, ObjectKind::Commit] {
                     let id = ObjectId::new(kind, &bytes);
                     if id.digest == digest {
@@ -1826,6 +1900,58 @@ mod tests {
         // Error is path-free (S1): no separators leak from the validation message.
         let err = Hex64::new("zz").unwrap_err().to_string();
         assert!(!err.contains('/') && !err.contains('\\'));
+    }
+
+    /// NER-138 slice 3 U4: object-kind headers coexist with legacy raw-payload objects, and
+    /// the headered-vs-legacy decision is hash-resolved (prove-before-delete: the header path
+    /// enumerates/reads the same id set the triple-hash scan would, across a mixed store).
+    #[test]
+    fn object_kind_headers_coexist_with_legacy_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+
+        // (1) A slice-3 headered object via write_object: the file IS the preimage.
+        let headered_id = store
+            .write_object(ObjectKind::Blob, b"headered payload")
+            .unwrap();
+        let on_disk = fs::read(store.object_path(&headered_id)).unwrap();
+        assert!(
+            on_disk.starts_with(OBJECT_MAGIC),
+            "new writes store the self-describing preimage"
+        );
+        assert_eq!(
+            store.read_object(&headered_id).unwrap(),
+            b"headered payload"
+        );
+
+        // (2) A legacy slice-1/2 object: same id (over the framed preimage), but the FILE is
+        // the RAW payload — planted directly to simulate what slice 1/2 wrote.
+        let legacy_payload = b"legacy raw payload".to_vec();
+        let legacy_id = ObjectId::new(ObjectKind::Blob, &legacy_payload);
+        let legacy_path = store.object_path(&legacy_id);
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_path, &legacy_payload).unwrap();
+        assert_eq!(
+            store.read_object(&legacy_id).unwrap(),
+            legacy_payload,
+            "legacy raw-payload object reads via the fallback, never a hash mismatch"
+        );
+
+        // (3) Differential: the header-aware all_object_ids recovers BOTH.
+        let ids = store.all_object_ids().unwrap();
+        assert!(ids.contains(&headered_id), "headered object enumerated");
+        assert!(ids.contains(&legacy_id), "legacy object enumerated");
+
+        // (4) Hash-resolved disambiguation (adversarial finding): a legacy blob whose RAW
+        // content starts with the magic and even parses as a preimage still reads correctly,
+        // because hash(file) != a headered id, so it falls back to the legacy branch.
+        let tricky_payload = b"forge-object\nblob\n1\n0\n".to_vec();
+        let tricky_id = ObjectId::new(ObjectKind::Blob, &tricky_payload);
+        let tricky_path = store.object_path(&tricky_id);
+        fs::create_dir_all(tricky_path.parent().unwrap()).unwrap();
+        fs::write(&tricky_path, &tricky_payload).unwrap();
+        assert_eq!(store.read_object(&tricky_id).unwrap(), tricky_payload);
+        assert!(store.all_object_ids().unwrap().contains(&tricky_id));
     }
 
     #[test]
