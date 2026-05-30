@@ -27,7 +27,8 @@ pub fn contract() -> Value {
             "retryable": "advisory; the client bounds retries (server sets after_ms only)",
             "retry_side_effects": "retrying a CONFLICT re-executes the command; for 'run' this re-executes the child process",
             "secret_protection": "captured 'run' output is hardened before persistence (NER-136): line-oriented key=value secrets, bare high-entropy tokens, JSON-embedded secrets, PEM private-key blocks, and scheme://user:pass@host credential-URL passwords are redacted, each surfaced as a warnings[] entry. KNOWN RESIDUALS: a bare 7/8/40/64-char pure-hex token or a UUID is exempted (to avoid redacting Forge's own git SHAs and content hashes), so a secret of exactly that shape is a false negative; secret-alphabet tokens shorter than 20 chars are below the entropy gate. Command argv strings (--require gate specs, CHECK_NOT_PASSED.unmet) are still redacted only for key=value patterns. Export secret-deny is path-name-level (.forge/.env/keys).",
-            "integrity": "evidence and decision rows carry a SHA-256 content hash chained into the append-only operations spine; check/accept refuse a tampered deciding evidence row (EVIDENCE_TAMPERED, fail-closed, NOT bypassable by --allow-unverified), export refuses a tampered decision before creating the branch, and 'doctor' re-walks the chain. This is tamper-EVIDENT, not tamper-PROOF: an actor with full DB write access can recompute the whole chain; cryptographic signing is Phase 9."
+            "integrity": "evidence and decision rows carry a SHA-256 content hash chained into the append-only operations spine; check/accept refuse a tampered deciding evidence row (EVIDENCE_TAMPERED, fail-closed, NOT bypassable by --allow-unverified), export refuses a tampered decision before creating the branch, and 'doctor' re-walks the chain. This is tamper-EVIDENT, not tamper-PROOF: an actor with full DB write access can recompute the whole chain; cryptographic signing is Phase 9.",
+            "provenance": "an exported commit carries a structured Forge-* trailer including a content-addressed Forge-Provenance-Digest folding the deciding evidence content_hashes + decision digest. 'export verify-branch' recomputes that digest from the LOCAL ledger and confirms the published trailer matches (fail-closed PROVENANCE_MISMATCH). A PASS proves the published trailer is consistent with the current local ledger — it catches a rewritten commit message or a naively-edited ledger row — but it is NOT an authenticity proof: an attacker who rewrites the ledger rows AND re-exports still matches, and the deciding-row check is the cheap per-row check (a fully re-hashed row is caught only by 'doctor'). This is a self-verifying LOCAL trailer; cross-machine provenance/transport and signing are Phase 9."
         }
     })
 }
@@ -68,10 +69,13 @@ fn command_shapes() -> Value {
         ("reject", "Rejects a proposal; data carries the decision + operation_id."),
         ("show", "Shows the active attempt's current state; data carries the attempt view."),
         ("proposal list", "Lists proposals; data carries { proposals: [...] }."),
+        ("compare", "Compares competing attempts on verified evidence and ranks them; data carries { intents: [{ intent_id, intent, attempts: [{ attempt_id, gates, metrics, integrity, decision_status, publication_status, rank, rank_reason, ... }] }] }. Read-only and advisory; a cheap-check-tampered attempt is integrity=tampered with rank=null. With --diff <a> <b>, data also carries the file/hunk diff between the two attempts' proposals (via the git adapter)."),
+        ("attempt compare", "Alias of `compare` scoped to attempts; same data shape."),
         ("doctor", "Reports repository health; data carries the diagnostic checks."),
         ("gc", "Garbage-collection (--dry-run only in v0); data carries the dry-run plan."),
-        ("export branch", "Exports an accepted proposal to a new git branch; secret-risk paths are dropped with a warning."),
-        ("export pr-body", "Renders PR-body markdown for an accepted proposal; secret-risk paths are omitted with a warning."),
+        ("export branch", "Exports an accepted proposal to a new git branch with a structured Forge-* provenance trailer (incl. a content-addressed Forge-Provenance-Digest); secret-risk paths are dropped with a warning."),
+        ("export pr-body", "Renders PR-body markdown for an accepted proposal citing the competing attempts against the declared intent; secret-risk paths are omitted with a warning."),
+        ("export verify-branch", "Recomputes a published branch's provenance digest from the local ledger and confirms the trailer matches (fail-closed PROVENANCE_MISMATCH); data carries { verified, proposal_id, provenance_digest }. Local consistency, not cross-machine authenticity (see notes.provenance)."),
         ("schema", "Emits this versioned machine contract; needs no repository."),
     ];
     Value::Array(

@@ -94,6 +94,13 @@ pub struct GateResult {
     pub verdict: GateVerdict,
     pub evidence_id: Option<String>,
     pub exit_code: Option<i64>,
+    /// The parsed test-failure count of the deciding evidence (the latest matching
+    /// row on the proposed snapshot), or `None` when the gate is `missing`/`stale` or
+    /// the deciding row produced no parsed count (NER-137 D6). Lets a consumer
+    /// distinguish "failed on exit code" from "failed on parsed count" from
+    /// `check --json` and the compare output. Carried for *every* gate (not only
+    /// structured ones) for observability; the verdict logic is unchanged.
+    pub structured_failures: Option<u64>,
 }
 
 /// The aggregate check outcome: an overall `status` string
@@ -257,35 +264,38 @@ fn verdict_for(
             .filter(|fact| fact.snapshot_id.as_deref() == Some(proposed_snapshot_id)),
     );
 
-    let (verdict, evidence_id, exit_code) = if let Some(fact) = latest_on_snapshot {
-        let verdict = if fact.exit_code != 0 {
-            GateVerdict::Failed
-        } else if require_structured {
-            match fact.structured_failures {
-                Some(0) => GateVerdict::Passed,
-                Some(_) => GateVerdict::Failed,
-                None => GateVerdict::Missing,
-            }
+    let (verdict, evidence_id, exit_code, structured_failures) =
+        if let Some(fact) = latest_on_snapshot {
+            let verdict = if fact.exit_code != 0 {
+                GateVerdict::Failed
+            } else if require_structured {
+                match fact.structured_failures {
+                    Some(0) => GateVerdict::Passed,
+                    Some(_) => GateVerdict::Failed,
+                    None => GateVerdict::Missing,
+                }
+            } else {
+                GateVerdict::Passed
+            };
+            (
+                verdict,
+                Some(fact.evidence_id.clone()),
+                Some(fact.exit_code),
+                fact.structured_failures,
+            )
+        } else if !matching.is_empty() {
+            // Ran, but only on a different tree: carry the latest off-snapshot evidence id
+            // for context. No on-snapshot deciding row, so no structured count to report.
+            let latest_any = latest(matching.iter().copied());
+            (
+                GateVerdict::Stale,
+                latest_any.map(|fact| fact.evidence_id.clone()),
+                None,
+                None,
+            )
         } else {
-            GateVerdict::Passed
+            (GateVerdict::Missing, None, None, None)
         };
-        (
-            verdict,
-            Some(fact.evidence_id.clone()),
-            Some(fact.exit_code),
-        )
-    } else if !matching.is_empty() {
-        // Ran, but only on a different tree: carry the latest off-snapshot evidence id
-        // for context.
-        let latest_any = latest(matching.iter().copied());
-        (
-            GateVerdict::Stale,
-            latest_any.map(|fact| fact.evidence_id.clone()),
-            None,
-        )
-    } else {
-        (GateVerdict::Missing, None, None)
-    };
 
     GateResult {
         program: program.to_string(),
@@ -293,6 +303,7 @@ fn verdict_for(
         verdict,
         evidence_id,
         exit_code,
+        structured_failures,
     }
 }
 
@@ -319,7 +330,10 @@ fn latest<'a>(facts: impl Iterator<Item = &'a EvidenceFact>) -> Option<&'a Evide
     })
 }
 
-fn identity_string(program: &str, args: &[String]) -> String {
+/// The canonical `"program arg…"` identity string for a `(program, args)` gate.
+/// Public so the store can render the same identity into a provenance trailer without
+/// duplicating the format (NER-137 code-review).
+pub fn identity_string(program: &str, args: &[String]) -> String {
     if args.is_empty() {
         program.to_string()
     } else {
@@ -627,5 +641,63 @@ mod tests {
         let unmet = outcome.unmet_identities();
         assert!(unmet.contains(&"cargo test".to_string()));
         assert!(unmet.contains(&"cargo clippy".to_string()));
+    }
+
+    #[test]
+    fn gate_result_carries_structured_failures_of_deciding_row() {
+        // D6 (NER-137): the parsed failure count of the deciding row is surfaced on the
+        // GateResult — even for a plain exit-code gate — so compare/`check --json` can
+        // tell "failed on exit code" from "failed on parsed count".
+        let pass = vec![fact_with_failures(
+            "e1",
+            "cargo",
+            &["test"],
+            0,
+            Some(SNAP),
+            1,
+            Some(0),
+        )];
+        let outcome = evaluate(
+            &spec(vec![structured_gate("cargo", &["test"])]),
+            SNAP,
+            &pass,
+        );
+        assert_eq!(outcome.gates[0].structured_failures, Some(0));
+
+        let fail = vec![fact_with_failures(
+            "e1",
+            "cargo",
+            &["test"],
+            0,
+            Some(SNAP),
+            1,
+            Some(2),
+        )];
+        // A plain (non-structured) gate still reports the parsed count for observability.
+        let outcome = evaluate(&spec(vec![gate("cargo", &["test"])]), SNAP, &fail);
+        assert_eq!(outcome.gates[0].verdict, GateVerdict::Passed); // exit 0, plain gate
+        assert_eq!(outcome.gates[0].structured_failures, Some(2));
+    }
+
+    #[test]
+    fn gate_result_structured_failures_is_none_when_missing_or_stale() {
+        // missing: no matching evidence on the snapshot.
+        let outcome = evaluate(&spec(vec![gate("cargo", &["test"])]), SNAP, &[]);
+        assert_eq!(outcome.gates[0].verdict, GateVerdict::Missing);
+        assert_eq!(outcome.gates[0].structured_failures, None);
+
+        // stale: matching evidence only on another snapshot.
+        let facts = vec![fact_with_failures(
+            "e1",
+            "cargo",
+            &["test"],
+            0,
+            Some(OTHER),
+            1,
+            Some(0),
+        )];
+        let outcome = evaluate(&spec(vec![gate("cargo", &["test"])]), SNAP, &facts);
+        assert_eq!(outcome.gates[0].verdict, GateVerdict::Stale);
+        assert_eq!(outcome.gates[0].structured_failures, None);
     }
 }

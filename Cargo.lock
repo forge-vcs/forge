@@ -363,6 +363,7 @@ dependencies = [
  "forge-content-git",
  "forge-content-native",
  "forge-store",
+ "serde",
  "tempfile",
 ]
 

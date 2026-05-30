@@ -35,11 +35,28 @@ enum Command {
     Reject(ProposalScopedArgs),
     Show(AttemptScopedArgs),
     Proposal(ProposalArgs),
+    /// Compare competing attempts (per intent) on verified evidence + rank them.
+    Compare(CompareArgs),
     Doctor,
     Gc(GcArgs),
     Export(ExportArgs),
     /// Emit the versioned machine contract (schema_version, command + error registry).
     Schema,
+}
+
+#[derive(Debug, Args)]
+struct CompareArgs {
+    /// Compare attempts under this intent only. Omit to compare every intent that has
+    /// an attempt (each as its own ranked group).
+    #[arg(long)]
+    intent: Option<String>,
+    /// Compare attempts under this attempt's intent.
+    #[arg(long)]
+    attempt: Option<String>,
+    /// Two attempt ids to additionally produce a file/hunk content diff between their
+    /// proposals (via the git adapter): `--diff <attempt_a> <attempt_b>`.
+    #[arg(long, num_args = 2, value_names = ["ATTEMPT_A", "ATTEMPT_B"])]
+    diff: Option<Vec<String>>,
 }
 
 #[derive(Debug, Args)]
@@ -109,8 +126,14 @@ struct AttemptArgs {
 enum AttemptCommand {
     Start(AttemptStartArgs),
     List,
-    Show { attempt_id: String },
-    Attach { attempt_id: String },
+    Show {
+        attempt_id: String,
+    },
+    Attach {
+        attempt_id: String,
+    },
+    /// Compare competing attempts (per intent) on verified evidence + rank them.
+    Compare(CompareArgs),
 }
 
 #[derive(Debug, Args)]
@@ -167,6 +190,13 @@ struct ExportArgs {
 enum ExportCommand {
     Branch(ExportBranchArgs),
     PrBody(ProposalScopedArgs),
+    /// Verify a published branch's provenance trailer recomputes from the local ledger.
+    VerifyBranch(VerifyBranchArgs),
+}
+
+#[derive(Debug, Args)]
+struct VerifyBranchArgs {
+    name: String,
 }
 
 #[derive(Debug, Args)]
@@ -218,6 +248,7 @@ fn main() -> ExitCode {
         Command::Reject(args) => reject_response(request_id, args),
         Command::Show(args) => show_response(request_id, args),
         Command::Proposal(args) => proposal_response(request_id, args),
+        Command::Compare(args) => compare_response(request_id, "compare", args),
         Command::Doctor => doctor_response(request_id),
         Command::Gc(args) => gc_response(request_id, args),
         Command::Export(args) => export_response(request_id, args),
@@ -402,7 +433,49 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
                 ))
             })
         }
+        AttemptCommand::Compare(args) => compare_response(request_id, "attempt compare", args),
     }
+}
+
+/// `forge compare` / `forge attempt compare` — the read-only compare/rank surface
+/// (NER-137). Both forms share this handler. Returns the per-intent grouped, ranked
+/// comparison; with `--diff <a> <b>` it additionally attaches the file/hunk content
+/// diff between the two attempts' proposals (via the git adapter). Read-only: no
+/// operation_id, no lock. Secret-risk changed paths are already dropped by the store;
+/// any dropped paths in the pairwise diff surface as warnings.
+fn compare_response(
+    request_id: Option<String>,
+    command: &'static str,
+    args: CompareArgs,
+) -> ResponseEnvelope {
+    command_result(command, request_id, |cwd, _| {
+        let selector = forge_store::CompareSelector {
+            intent_id: args.intent.clone(),
+            attempt_id: args.attempt.clone(),
+        };
+        let comparison = forge_store::compare_attempts(&cwd, selector)?;
+        let mut data = serde_json::to_value(&comparison)?;
+        let mut warnings = Vec::new();
+        if let Some(pair) = &args.diff {
+            // clap enforces exactly two values for --diff.
+            let ref_a = forge_store::attempt_proposal_content_ref(&cwd, &pair[0])?;
+            let ref_b = forge_store::attempt_proposal_content_ref(&cwd, &pair[1])?;
+            let tree_diff = forge_export_git::diff_trees(&cwd, &ref_a, &ref_b, true)?;
+            warnings.extend(secret_export_warnings(&tree_diff.dropped_secret_paths));
+            // Surface hunk truncation at the envelope level so an agent that only reads
+            // warnings[] (not data.diff.files[].truncated) knows the diff is incomplete.
+            for file in &tree_diff.files {
+                if file.truncated {
+                    warnings.push(format!(
+                        "diff hunk truncated for {} (body exceeded the per-file cap)",
+                        file.path
+                    ));
+                }
+            }
+            data["diff"] = serde_json::to_value(&tree_diff)?;
+        }
+        Ok((None, data, warnings))
+    })
 }
 
 fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> ResponseEnvelope {
@@ -664,6 +737,16 @@ fn gc_response(request_id: Option<String>, args: GcArgs) -> ResponseEnvelope {
 
 fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnvelope {
     match args.command {
+        ExportCommand::VerifyBranch(args) => {
+            command_result("export verify-branch", request_id, |cwd, _| {
+                // Read-only: recompute the provenance digest from the local ledger and
+                // confirm the published trailer matches (fail-closed PROVENANCE_MISMATCH /
+                // EVIDENCE_TAMPERED). A PASS is trailer↔current-ledger consistency, not
+                // cross-machine authenticity (NER-137 R7; see schema notes.provenance).
+                let verification = forge_export_git::verify_publication_trailer(&cwd, &args.name)?;
+                Ok((None, serde_json::to_value(verification)?, Vec::new()))
+            })
+        }
         ExportCommand::PrBody(args) => command_result("export pr-body", request_id, |cwd, _| {
             let (body, excluded) =
                 forge_store::pr_body_for(&cwd, args.attempt.as_deref(), args.proposal.as_deref())?;
@@ -731,13 +814,21 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                     }
                     .into());
                 }
+                // Assemble the provenance trailer from the local ledger (NER-137):
+                // this re-verifies the deciding evidence (R8 — EVIDENCE_TAMPERED fails
+                // closed here, before the branch) and folds the deciding evidence
+                // content_hashes + decision digest into a content-addressed digest the
+                // published commit carries and `verify-branch` recomputes.
+                let trailer =
+                    forge_store::build_publication_trailer(&cwd, &proposal.proposal_revision_id)?;
+                let message = forge_store::render_trailer_message(&trailer);
                 let (commit_id, excluded) = forge_export_git::export_branch(
                     &cwd,
                     &args.name,
                     &proposal.base_head,
                     &current_head,
                     &proposal.content_ref,
-                    "Forge accepted proposal",
+                    &message,
                 )?;
                 let actor = resolve_actor(args.actor.as_deref());
                 let publication = forge_store::record_publication(
