@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 6 — Evidence-based attempt compare/rank + provenance-carrying publication"
 type: feat
-status: active
+status: completed
 date: 2026-05-30
 origin: docs/ROADMAP.md  # Phase 6 section; ticket NER-137. Wedge requirements: docs/brainstorms/2026-05-28-competing-local-attempts-requirements.md (F4 / R18–R20). No dedicated *-requirements.md — the ROADMAP Phase 6 entry + the competing-attempts brainstorm are the source.
 ---
