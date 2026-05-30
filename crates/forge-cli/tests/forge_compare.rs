@@ -4,6 +4,7 @@
 mod common;
 
 use common::TestRepo;
+use rusqlite::Connection;
 use serde_json::Value;
 
 fn json_output(assert: assert_cmd::assert::Assert) -> Value {
@@ -148,6 +149,91 @@ fn compare_unknown_intent_is_typed_error() {
             .failure(),
     );
     assert_eq!(out["errors"][0]["code"], "UNKNOWN_INTENT");
+}
+
+#[test]
+fn exit_criterion_compare_export_winner_and_verify_trailer() {
+    // NER-137 exit criterion end-to-end: 2 rival attempts (each verified), compare
+    // asserts per-attempt diffs + per-gate results + metrics + a deterministic
+    // ranking; the ranked winner exports headlessly; verify-branch recomputes the
+    // trailer from the ledger.
+    let repo = TestRepo::new_git();
+    // Attempt A fails its evidence (exit 5); attempt B passes — B is the winner.
+    let (_intent, attempt_a, attempt_b, _pa, proposal_b) =
+        two_competing_attempts(&repo, &["sh", "-c", "exit 5"], &["sh", "-c", "true"]);
+
+    let out = forge_ok(&repo, &["compare"]);
+    let attempts = out["data"]["intents"][0]["attempts"].as_array().unwrap();
+    let winner = attempts.iter().find(|a| a["rank"] == 1).unwrap();
+    assert_eq!(winner["attempt_id"], attempt_b);
+    // Per-attempt diff (changed paths) + per-gate results + metrics are present.
+    assert!(winner["changed_paths"].is_array());
+    assert!(!winner["gates"].as_array().unwrap().is_empty());
+    assert!(winner["metrics"].is_object());
+    // The loser is verified-but-failing and ranks second.
+    let loser = attempts.iter().find(|a| a["rank"] == 2).unwrap();
+    assert_eq!(loser["attempt_id"], attempt_a);
+
+    // Pairwise file/hunk diff between the two competing proposals (via the git adapter).
+    let diffed = forge_ok(&repo, &["compare", "--diff", &attempt_a, &attempt_b]);
+    assert!(!diffed["data"]["diff"]["files"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // The ranked winner exports headlessly using the echoed ids, then verify-branch
+    // recomputes the trailer.
+    forge_ok(
+        &repo,
+        &["accept", "--attempt", &attempt_b, "--proposal", &proposal_b],
+    );
+    forge_ok(
+        &repo,
+        &[
+            "export",
+            "branch",
+            "--attempt",
+            &attempt_b,
+            "--proposal",
+            &proposal_b,
+            "forge/winner",
+        ],
+    );
+    let verified = forge_ok(&repo, &["export", "verify-branch", "forge/winner"]);
+    assert_eq!(verified["data"]["verified"], true);
+}
+
+#[test]
+fn compare_flags_a_tampered_winner_and_promotes_the_honest_attempt() {
+    // Load-bearing (NER-137 R4): tamper the would-be winner's deciding evidence row;
+    // compare must surface it as tampered/unranked and make the honest attempt rank 1.
+    let repo = TestRepo::new_git();
+    let (_intent, attempt_a, attempt_b, _pa, _pb) =
+        two_competing_attempts(&repo, &["sh", "-c", "true"], &["sh", "-c", "true"]);
+
+    // Tamper attempt A's deciding evidence row (flip its exit_code without rehashing).
+    // Find attempt A's snapshot's evidence row and mutate it.
+    let connection = Connection::open(repo.path().join(".forge/forge.db")).expect("open db");
+    let changed = connection
+        .execute(
+            "UPDATE evidence SET exit_code = 1 WHERE attempt_id = ?1",
+            [&attempt_a],
+        )
+        .expect("tamper attempt A evidence");
+    assert!(changed >= 1, "a deciding evidence row was tampered");
+
+    let out = forge_ok(&repo, &["compare"]);
+    let attempts = out["data"]["intents"][0]["attempts"].as_array().unwrap();
+    let tampered = attempts
+        .iter()
+        .find(|a| a["attempt_id"] == attempt_a)
+        .unwrap();
+    assert_eq!(tampered["integrity"], "tampered");
+    assert!(tampered["rank"].is_null(), "tampered attempt is unranked");
+    // The honest attempt is the rank-1 winner.
+    let winner = attempts.iter().find(|a| a["rank"] == 1).unwrap();
+    assert_eq!(winner["attempt_id"], attempt_b);
+    assert_eq!(winner["integrity"], "verified");
 }
 
 #[test]

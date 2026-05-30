@@ -2349,6 +2349,42 @@ pub fn pr_body_for(
         body.push_str(&format!("- {path}\n"));
     }
     body.push('\n');
+    // Cite the competing attempts against the declared intent (NER-137 R9): the
+    // ranked comparison replaces the single-latest-evidence under-report. Uses the
+    // same verify-then-rank engine, so a cheap-check-tampered rival shows as
+    // `integrity: tampered` / unranked rather than as a silent passing row.
+    let comparison = compare_attempts(
+        cwd,
+        CompareSelector {
+            intent_id: Some(attempt.intent_id.clone()),
+            attempt_id: None,
+        },
+    )?;
+    if let Some(group) = comparison.intents.first() {
+        body.push_str("## Competing Attempts\n");
+        for row in &group.attempts {
+            let rank = row
+                .rank
+                .map(|rank| format!("rank {rank}"))
+                .unwrap_or_else(|| "unranked".to_string());
+            let check = row.check_status.as_deref().unwrap_or("n/a");
+            let marker = if row
+                .proposal
+                .as_ref()
+                .map(|candidate| candidate.proposal_id.as_str())
+                == Some(proposal.proposal_id.as_str())
+            {
+                " ← this proposal"
+            } else {
+                ""
+            };
+            body.push_str(&format!(
+                "- {rank}: attempt `{}` — check {check}, integrity {}{}\n",
+                row.attempt_id, row.integrity, marker
+            ));
+        }
+        body.push('\n');
+    }
     if let Some(evidence) = evidence {
         body.push_str("## Evidence\n");
         body.push_str(&format!(

@@ -83,6 +83,39 @@ ck "check JSON reports a per-gate verdict" "$(pg "d['data']['gates'][0]['verdict
 F accept; ck "accept requires a passing check by default" "$(pg "d['errors'][0]['code']")" "CHECK_NOT_PASSED"
 F accept --allow-unverified; ck "accept --allow-unverified bypasses the gate" "$(pg "d['status']")" "success"
 
+echo; echo "=== ATTEMPT COMPARE/RANK + PROVENANCE (NER-137) ==="
+mkrepo cmp >/dev/null
+F init >/dev/null
+F start "compete"; intent="$(pg "d['data']['intent_id']")"; a1="$(pg "d['data']['attempt_id']")"
+echo "alpha" > README.md
+F save --attempt "$a1" >/dev/null
+F run --attempt "$a1" -- sh -c "exit 5" >/dev/null    # attempt A's evidence fails
+F propose --attempt "$a1" >/dev/null
+F attempt start --intent "$intent"; a2="$(pg "d['data']['attempt_id']")"
+F attempt attach "$a2" >/dev/null
+echo "beta" > README.md
+F save --attempt "$a2" >/dev/null
+F run --attempt "$a2" -- sh -c true >/dev/null        # attempt B's evidence passes
+F propose --attempt "$a2"; p2="$(pg "d['data']['proposal_id']")"
+F compare; ck "compare returns one intent group" "$(pg "len(d['data']['intents'])")" "1"
+ck "compare lists both competing attempts" "$(pg "len(d['data']['intents'][0]['attempts'])")" "2"
+ck "ranked winner is the passing attempt" "$(pg "next(x['attempt_id'] for x in d['data']['intents'][0]['attempts'] if x['rank']==1)")" "$a2"
+ck "ranked winner check is passed" "$(pg "next(x['check_status'] for x in d['data']['intents'][0]['attempts'] if x['rank']==1)")" "passed"
+ck "each attempt carries per-gate results" "$(pg "all(len(x['gates'])>0 for x in d['data']['intents'][0]['attempts'])")" "True"
+ck "each attempt carries a metrics object" "$(pg "all(isinstance(x['metrics'],dict) for x in d['data']['intents'][0]['attempts'])")" "True"
+F compare --diff "$a1" "$a2"; ckc "pairwise diff lists the changed file" "$(pg "[f['path'] for f in d['data']['diff']['files']]")" "README.md"
+F accept --attempt "$a2" --proposal "$p2" >/dev/null
+F export branch --attempt "$a2" --proposal "$p2" forge/winner; ck "ranked winner exports headlessly" "$(pg "d['status']")" "success"
+ckc "published commit carries the provenance trailer" "$(git show -s --format=%B forge/winner)" "Forge-Provenance-Digest:"
+F export verify-branch forge/winner; ck "verify-branch confirms the trailer recomputes from the ledger" "$(pg "d['data']['verified']")" "True"
+if [ "$have_sqlite" = 1 ]; then
+  db "$TMP/cmp" "UPDATE evidence SET exit_code=1 WHERE attempt_id='$a1';"   # tamper attempt A's deciding row
+  F compare; ck "compare flags a cheap-check-tampered attempt" "$(pg "next(x['integrity'] for x in d['data']['intents'][0]['attempts'] if x['attempt_id']=='$a1')")" "tampered"
+  ck "a tampered attempt is unranked (rank null)" "$(pg "next(x['rank'] for x in d['data']['intents'][0]['attempts'] if x['attempt_id']=='$a1')")" "None"
+else
+  echo "  (compare tamper check skipped: sqlite3 unavailable)"
+fi
+
 echo; echo "=== MIGRATION state (live binary) ==="
 if [ "$have_sqlite" = 1 ]; then
   vers="$(db "$TMP/life" "SELECT group_concat(version) FROM schema_migrations ORDER BY version;")"
