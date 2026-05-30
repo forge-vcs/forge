@@ -18,11 +18,38 @@
 //! backoff hint, and a structured (secret-redacted) `details()` payload.
 
 use forge_protocol::RETRY_BACKOFF_MS;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 /// Placeholder substituted for a secret-risk path in any machine-visible payload,
 /// so a secret filename never reaches `errors[].details` or the persisted ledger.
 const REDACTED_PATH_PLACEHOLDER: &str = "[secret-risk path redacted]";
+
+/// The class of integrity break `doctor`/the gate detected on a hashed row (NER-136).
+/// A closed enum so [`ForgeError::EvidenceTampered`]'s `details` can never carry a
+/// free-form string (e.g. an excerpt) into a machine-visible payload. Serializes as
+/// snake_case (`content_edit`/`broken_link`/`missing_hash`) — kept in lockstep with
+/// [`TamperKind::as_str`] by the `serde`-vs-`as_str` parity test in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TamperKind {
+    /// The row's recomputed content hash does not match its stored `content_hash`.
+    ContentEdit,
+    /// An operation's chain link does not match its predecessor (deletion/reorder).
+    BrokenLink,
+    /// A hash is NULL on a row created after the migration high-water mark.
+    MissingHash,
+}
+
+impl TamperKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TamperKind::ContentEdit => "content_edit",
+            TamperKind::BrokenLink => "broken_link",
+            TamperKind::MissingHash => "missing_hash",
+        }
+    }
+}
 
 /// Typed Forge error taxonomy. Constructed at the failure site, carried inside an
 /// `anyhow::Error`, recovered at the CLI by `downcast_ref`.
@@ -91,6 +118,13 @@ pub enum ForgeError {
     /// `unmet` entries are redacted for secret-like `key=value` argv in
     /// [`ForgeError::details`]; [`std::fmt::Display`] never prints them.
     CheckNotPassed { status: String, unmet: Vec<String> },
+    /// A hashed evidence or decision row failed integrity verification (NER-136): its
+    /// recomputed content hash does not match what was chained into the op-log spine,
+    /// a chain link is broken, or a post-watermark hash is missing. **Fail-closed and
+    /// never bypassable** — unlike a policy verdict, `accept --allow-unverified` does
+    /// NOT skip it. Deterministic — re-record honest evidence. `id` is an opaque row
+    /// id and `kind` a closed enum, so `details` carries no excerpt/command text.
+    EvidenceTampered { id: String, kind: TamperKind },
 }
 
 impl ForgeError {
@@ -118,6 +152,7 @@ impl ForgeError {
             ForgeError::MigrationFailed { .. } => "MIGRATION_FAILED",
             ForgeError::AttemptWorktreeMismatch { .. } => "ATTEMPT_WORKTREE_MISMATCH",
             ForgeError::CheckNotPassed { .. } => "CHECK_NOT_PASSED",
+            ForgeError::EvidenceTampered { .. } => "EVIDENCE_TAMPERED",
         }
     }
 
@@ -191,6 +226,11 @@ impl ForgeError {
                     })
                     .collect();
                 json!({ "status": status, "unmet": redacted })
+            }
+            ForgeError::EvidenceTampered { id, kind } => {
+                // Only an opaque row id and a closed-enum kind — never an excerpt or
+                // command string (details is a machine-visible egress).
+                json!({ "id": id, "kind": kind.as_str() })
             }
             _ => Value::Object(Default::default()),
         }
@@ -283,6 +323,11 @@ impl std::fmt::Display for ForgeError {
                 f,
                 "check did not pass (status: {status}); {} required gate(s) unmet",
                 unmet.len()
+            ),
+            ForgeError::EvidenceTampered { id, kind } => write!(
+                f,
+                "integrity check failed for row {id} ({}); the recorded evidence/decision was tampered with",
+                kind.as_str()
             ),
         }
     }
@@ -432,6 +477,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             after_ms: None,
             details_keys: &["status", "unmet"],
         },
+        ErrorCodeSpec {
+            code: "EVIDENCE_TAMPERED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["id", "kind"],
+        },
     ]
 }
 
@@ -541,6 +592,14 @@ mod tests {
             .code(),
             "CHECK_NOT_PASSED"
         );
+        assert_eq!(
+            ForgeError::EvidenceTampered {
+                id: "evidence_x".into(),
+                kind: TamperKind::ContentEdit,
+            }
+            .code(),
+            "EVIDENCE_TAMPERED"
+        );
     }
 
     #[test]
@@ -599,6 +658,39 @@ mod tests {
             2,
             "details must carry exactly the two id keys"
         );
+    }
+
+    /// NER-136 security invariant: the tamper payload carries exactly an opaque row
+    /// id and a closed-enum break kind — never an excerpt or command string, which
+    /// would be a secret-leaking egress. Mirrors `attempt_worktree_mismatch_…`.
+    #[test]
+    fn evidence_tampered_details_carry_only_ids() {
+        let details = ForgeError::EvidenceTampered {
+            id: "evidence_abc".into(),
+            kind: TamperKind::ContentEdit,
+        }
+        .details();
+        assert_eq!(details["id"], "evidence_abc");
+        assert_eq!(details["kind"], "content_edit");
+        let object = details.as_object().expect("details object");
+        assert_eq!(object.len(), 2, "details must carry exactly id + kind");
+    }
+
+    /// `TamperKind`'s serde representation (used by `DoctorReport.tampered_rows`) must
+    /// match its `as_str()` (used by `EvidenceTampered.details`), so the two
+    /// machine-visible surfaces never disagree on the break-kind string.
+    #[test]
+    fn tamper_kind_serde_matches_as_str() {
+        for kind in [
+            TamperKind::ContentEdit,
+            TamperKind::BrokenLink,
+            TamperKind::MissingHash,
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialize"),
+                kind.as_str()
+            );
+        }
     }
 
     /// NER-135: the `CHECK_NOT_PASSED` details carry exactly `status` + `unmet`, and
@@ -729,6 +821,10 @@ mod tests {
                 status: "failed".into(),
                 unmet: vec!["cargo test".into()],
             },
+            ForgeError::EvidenceTampered {
+                id: "evidence_x".into(),
+                kind: TamperKind::BrokenLink,
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -754,7 +850,8 @@ mod tests {
                 | ForgeError::UnknownSchemaVersion { .. }
                 | ForgeError::MigrationFailed { .. }
                 | ForgeError::AttemptWorktreeMismatch { .. }
-                | ForgeError::CheckNotPassed { .. } => {}
+                | ForgeError::CheckNotPassed { .. }
+                | ForgeError::EvidenceTampered { .. } => {}
             }
         }
 

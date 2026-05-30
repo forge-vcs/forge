@@ -309,6 +309,7 @@ name = "forge-content"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "regex",
  "serde",
 ]
 
@@ -347,7 +348,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "forge-content",
+ "regex",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 

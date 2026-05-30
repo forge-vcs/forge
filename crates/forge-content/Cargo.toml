@@ -6,4 +6,5 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+regex.workspace = true
 serde.workspace = true
