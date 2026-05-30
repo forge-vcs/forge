@@ -421,6 +421,51 @@ fn undo_then_gc_dry_run_does_not_flag_an_accepted_commit() {
 }
 
 #[test]
+fn doctor_reports_a_healthy_native_dag() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    repo.forge().args(["--json", "accept"]).assert().success();
+
+    let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(report["data"]["ok"], true);
+    assert!(
+        report["data"]["native_history_issues"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a healthy native DAG has no integrity breaks"
+    );
+}
+
+#[test]
+fn doctor_detects_a_dangling_commit_object() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    let commit_id = accepted["data"]["commit_id"].as_str().unwrap().to_string();
+
+    // Delete the accepted commit's object file: the ledger still references it, so doctor's
+    // DAG walk + decisions cross-check must REPORT a dangling commit_id (not panic, not raise).
+    let digest = commit_id.rsplit(':').next().unwrap();
+    let object = repo
+        .path()
+        .join(format!(".forge/objects/sha256/{}/{}", &digest[..2], digest));
+    std::fs::remove_file(&object).expect("delete commit object");
+
+    let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(report["data"]["ok"], false);
+    let issues = report["data"]["native_history_issues"]
+        .as_array()
+        .expect("native_history_issues array");
+    assert!(
+        issues
+            .iter()
+            .any(|i| i["kind"] == "dangling_commit_id" && i["commit_id"] == commit_id),
+        "doctor must report the dangling commit_id: {issues:?}"
+    );
+}
+
+#[test]
 fn dangling_ledger_commit_id_surfaces_native_history_corrupt() {
     let repo = TestRepo::new_git();
     prepare_native_proposal(&repo);

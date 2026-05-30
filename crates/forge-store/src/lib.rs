@@ -315,6 +315,11 @@ pub struct DoctorReport {
     /// hash. Empty in a healthy repo. A head-truncated chain (a lost latest op) is
     /// NOT a tamper — it verifies as a legitimately-shorter chain.
     pub tampered_rows: Vec<TamperedRow>,
+    /// Native commit-DAG integrity breaks (NER-138 Phase 7 slice 3): a parent cycle, a
+    /// dangling parent/tree object, or a `decisions.commit_id` whose commit object is absent.
+    /// Empty in a healthy repo. This is the "DAG has no cycles/dangling parents (doctor
+    /// verifies)" whole-phase exit criterion.
+    pub native_history_issues: Vec<NativeHistoryFinding>,
 }
 
 /// One row that failed integrity verification in `doctor`'s chain pass. Carries only
@@ -326,6 +331,19 @@ pub struct TamperedRow {
     pub id: String,
     pub table: String,
     pub kind: TamperKind,
+}
+
+/// One native-history integrity break found by `doctor`'s commit-DAG walk (NER-138 Phase 7
+/// slice 3). Carries only the closed-enum `kind` and opaque `f1:` commit ids — never a path or
+/// excerpt. `kind` serializes the SAME way as [`ForgeError::NativeHistoryCorrupt`]'s `details`
+/// (the shared [`NativeHistoryCorruptKind`]), so the error payload and the doctor report can
+/// never disagree on the break-kind string. Empty in a healthy repo.
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeHistoryFinding {
+    pub kind: NativeHistoryCorruptKind,
+    pub commit_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2514,6 +2532,18 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         issues.push(format!("{} tampered row(s) detected", tampered_rows.len()));
     }
 
+    // Native commit-DAG integrity pass (NER-138 Phase 7 slice 3): walk the DAG from the
+    // authoritative tip and cross-check the ledger, REPORTING (not raising) cycles / dangling
+    // parents / dangling trees / dangling commit_ids. The raising counterpart lives in
+    // reconcile/checkout; doctor is the offline health report.
+    let native_history_issues = verify_native_history(&context, &connection, &native_store)?;
+    if !native_history_issues.is_empty() {
+        issues.push(format!(
+            "{} native-history integrity break(s) detected",
+            native_history_issues.len()
+        ));
+    }
+
     Ok(DoctorReport {
         ok: issues.is_empty(),
         issues,
@@ -2522,7 +2552,95 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         dangling_content_refs,
         half_applied_worktrees,
         tampered_rows,
+        native_history_issues,
     })
+}
+
+/// `doctor`'s native commit-DAG integrity pass (NER-138 Phase 7 slice 3): walk the DAG from
+/// the authoritative tip detecting cycles (visited set), dangling parents, and dangling trees,
+/// then cross-check every `decisions.commit_id` resolves to an existing commit object. Reports
+/// findings (does not raise) — fail-closed at the call sites that raise. Findings are deduped
+/// by (kind, commit_id, related_id).
+fn verify_native_history(
+    context: &RepositoryContext,
+    connection: &Connection,
+    store: &forge_content_native::NativeObjectStore,
+) -> Result<Vec<NativeHistoryFinding>> {
+    let mut findings: Vec<NativeHistoryFinding> = Vec::new();
+    let mut push = |finding: NativeHistoryFinding| {
+        if !findings.iter().any(|existing| {
+            existing.kind.as_str() == finding.kind.as_str()
+                && existing.commit_id == finding.commit_id
+                && existing.related_id == finding.related_id
+        }) {
+            findings.push(finding);
+        }
+    };
+
+    if let Some(tip) = native_tip(context, connection)? {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut stack = vec![tip];
+        while let Some(commit_id) = stack.pop() {
+            if !seen.insert(commit_id.clone()) {
+                push(NativeHistoryFinding {
+                    kind: NativeHistoryCorruptKind::Cycle,
+                    commit_id: commit_id.to_string(),
+                    related_id: None,
+                });
+                continue;
+            }
+            let commit = match store.read_commit(&commit_id) {
+                Ok(commit) => commit,
+                Err(_) => {
+                    push(NativeHistoryFinding {
+                        kind: NativeHistoryCorruptKind::DanglingCommitId,
+                        commit_id: commit_id.to_string(),
+                        related_id: None,
+                    });
+                    continue;
+                }
+            };
+            let tree_ref = format!("{}{}", forge_content::FORGE_TREE_PREFIX, commit.tree);
+            if store.verify_content_ref(&tree_ref).is_err() {
+                push(NativeHistoryFinding {
+                    kind: NativeHistoryCorruptKind::DanglingTree,
+                    commit_id: commit_id.to_string(),
+                    related_id: Some(commit.tree.clone()),
+                });
+            }
+            for parent in &commit.parents {
+                match forge_content_native::ObjectId::parse(parent) {
+                    Ok(parent_id) if store.read_commit(&parent_id).is_ok() => {
+                        stack.push(parent_id);
+                    }
+                    _ => push(NativeHistoryFinding {
+                        kind: NativeHistoryCorruptKind::DanglingParent,
+                        commit_id: commit_id.to_string(),
+                        related_id: Some(parent.clone()),
+                    }),
+                }
+            }
+        }
+    }
+
+    // Cross-check every accepted decisions.commit_id resolves to a commit object — catches a
+    // dangling commit_id even if it is off the tip's ancestry (the store-before-DB violation).
+    let mut statement = connection
+        .prepare("SELECT commit_id FROM decisions WHERE repo_id = ?1 AND commit_id IS NOT NULL")?;
+    let rows = statement.query_map(params![context.repo_id], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let commit_id = row?;
+        match forge_content_native::ObjectId::parse(&commit_id) {
+            Ok(id) if store.read_commit(&id).is_ok() => {}
+            _ => push(NativeHistoryFinding {
+                kind: NativeHistoryCorruptKind::DanglingCommitId,
+                commit_id,
+                related_id: None,
+            }),
+        }
+    }
+
+    Ok(findings)
 }
 
 /// Re-verify the full tamper-evident chain offline (NER-136 §U8): every evidence and
@@ -2881,12 +2999,36 @@ pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
             }
         }
     }
-    // NER-138 Phase 7 slice 2: native commit objects now exist and enter `all_object_ids`,
-    // so seed the reachable set from the ref-store HEAD's commit DAG (the tip commit, its
-    // ancestry, and each commit's tree). Without this the live base anchor that every
-    // attempt's `base_head` points at would be reported as unreachable garbage. No-op for
-    // git-backend repos (no native HEAD). Empty set if no HEAD yet.
-    reachable.extend(native_store.reachable_from_head()?);
+    // NER-138 Phase 7 slice 3: seed reachability from the AUTHORITATIVE ledger tip (not only
+    // the ref-store HEAD, which a lock-free, never-reconciled gc could read stale), plus every
+    // accepted `decisions.commit_id` and every op-log-referenced commit (a `checkout` target
+    // writes NO decision row, so its commit is reachable only through the op-log). Each is
+    // walked as a DAG root (commit → ancestry → trees). Best-effort: a dangling root is
+    // surfaced by `doctor`, not fatal to this dry-run report. No-op for git-backend repos.
+    let mut roots: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Some(tip) = native_tip(&context, &connection)? {
+        roots.insert(tip.to_string());
+    }
+    let mut decision_stmt = connection
+        .prepare("SELECT commit_id FROM decisions WHERE repo_id = ?1 AND commit_id IS NOT NULL")?;
+    for row in decision_stmt.query_map(params![context.repo_id], |row| row.get::<_, String>(0))? {
+        roots.insert(row?);
+    }
+    let mut view_stmt = connection.prepare("SELECT state_json FROM views WHERE repo_id = ?1")?;
+    for row in view_stmt.query_map(params![context.repo_id], |row| row.get::<_, String>(0))? {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&row?) {
+            if let Some(commit_id) = value.get("commit_id").and_then(|v| v.as_str()) {
+                roots.insert(commit_id.to_string());
+            }
+        }
+    }
+    for root in &roots {
+        if let Ok(id) = forge_content_native::ObjectId::parse(root) {
+            if let Ok(ids) = native_store.reachable_from(&id) {
+                reachable.extend(ids);
+            }
+        }
+    }
     let all = native_store.all_object_ids()?;
     let unreachable_native_objects = all
         .difference(&reachable)

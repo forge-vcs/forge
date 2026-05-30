@@ -392,11 +392,21 @@ impl NativeObjectStore {
     /// `base_head` points at are never reported as unreachable garbage. A `seen` set guards
     /// against revisiting a commit (diamond/merge ancestry).
     pub fn reachable_from_head(&self) -> Result<BTreeSet<ObjectId>> {
+        match NativeRefStore::new(&self.root).read_head()? {
+            Some(head) => self.reachable_from(&head),
+            None => Ok(BTreeSet::new()),
+        }
+    }
+
+    /// All native objects reachable from a given commit (NER-138 Phase 7 slice 3): the commit,
+    /// its ancestry (commit → parents), each commit's tree, and every blob/subtree those trees
+    /// reach. Generalizes `reachable_from_head` so gc can seed reachability from the
+    /// authoritative ledger tip (and every accepted / checkout-target commit), not only the
+    /// ref-store HEAD — which a lock-free, never-reconciled gc could otherwise read stale. A
+    /// `seen` set guards against revisiting a commit (diamond/merge ancestry).
+    pub fn reachable_from(&self, tip: &ObjectId) -> Result<BTreeSet<ObjectId>> {
         let mut reachable = BTreeSet::new();
-        let Some(head) = NativeRefStore::new(&self.root).read_head()? else {
-            return Ok(reachable);
-        };
-        let mut stack = vec![head];
+        let mut stack = vec![tip.clone()];
         while let Some(commit_id) = stack.pop() {
             if !reachable.insert(commit_id.clone()) {
                 continue; // already visited
