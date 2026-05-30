@@ -57,6 +57,11 @@ struct IntentArgs {
     /// whitespace-tokenized into program + args.
     #[arg(long)]
     require: Vec<String>,
+    /// A structured required gate (NER-136): like --require, but the command's parsed
+    /// outcome must also report zero failures (e.g. --require-tests-pass "cargo test"
+    /// fails the gate if the parsed test-failure count is non-zero, even on exit 0).
+    #[arg(long)]
+    require_tests_pass: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -71,6 +76,10 @@ struct ProposalScopedArgs {
     attempt: Option<String>,
     #[arg(long)]
     proposal: Option<String>,
+    /// Who is making this decision (NER-136 actor model). Falls back to `FORGE_ACTOR`,
+    /// then `"unknown"`.
+    #[arg(long)]
+    actor: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -80,9 +89,14 @@ struct AcceptArgs {
     #[arg(long)]
     proposal: Option<String>,
     /// Accept even when the proposal's check is not passing (NER-135). Default is to
-    /// require a passing check; this bypass emits a warnings[] entry.
+    /// require a passing check; this bypass emits a warnings[] entry. NOTE: this is a
+    /// policy bypass only — it never bypasses an `EVIDENCE_TAMPERED` integrity failure.
     #[arg(long)]
     allow_unverified: bool,
+    /// Who is accepting (NER-136 actor model). Falls back to `FORGE_ACTOR`, then
+    /// `"unknown"`.
+    #[arg(long)]
+    actor: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -127,6 +141,10 @@ struct RestoreArgs {
 struct RunArgs {
     #[arg(long)]
     attempt: Option<String>,
+    /// Who is running this command (NER-136 actor model). Falls back to the
+    /// `FORGE_ACTOR` env var, then `"unknown"`. Attribution, not authentication.
+    #[arg(long)]
+    actor: Option<String>,
     #[arg(long, default_value_t = forge_evidence::DEFAULT_TIMEOUT_MS)]
     timeout_ms: u64,
     #[arg(last = true)]
@@ -157,6 +175,10 @@ struct ExportBranchArgs {
     attempt: Option<String>,
     #[arg(long)]
     proposal: Option<String>,
+    /// Who is publishing (NER-136 actor model). Falls back to `FORGE_ACTOR`, then
+    /// `"unknown"`.
+    #[arg(long)]
+    actor: Option<String>,
     name: String,
 }
 
@@ -277,7 +299,8 @@ fn start_response(request_id: Option<String>, args: IntentArgs) -> ResponseEnvel
         let base_head = selected_backend(&cwd)?.current_base(&cwd)?;
         // Persist declared check gates on the intent (NER-135); competing attempts
         // under this intent inherit the same bar. None => default mode.
-        let check_spec_json = forge_store::check_spec_json_from_requires(&args.require);
+        let check_spec_json =
+            forge_store::check_spec_json_from_requires(&args.require, &args.require_tests_pass);
         let started = forge_store::start_attempt(
             &cwd,
             request_id,
@@ -461,6 +484,9 @@ fn run_response(request_id: Option<String>, args: RunArgs) -> ResponseEnvelope {
             anyhow::bail!("missing command after --");
         }
         let captured = forge_evidence::capture_with_timeout(&cwd, &args.command, args.timeout_ms)?;
+        // Surface each secret redaction the capture applied as a warnings[] entry
+        // (NER-136 §U4), grouped by detector kind with a count.
+        let warnings = redaction_warnings(&captured.redactions);
         let recorded = forge_store::record_evidence(
             &cwd,
             request_id,
@@ -480,12 +506,14 @@ fn run_response(request_id: Option<String>, args: RunArgs) -> ResponseEnvelope {
                 sensitivity: captured.sensitivity,
                 visibility: captured.visibility,
                 trust: captured.trust,
+                actor: resolve_actor(args.actor.as_deref()),
+                structured_json: captured.structured_json,
             },
         )?;
         Ok((
             Some(recorded.operation_id.clone()),
             serde_json::to_value(recorded)?,
-            Vec::new(),
+            warnings,
         ))
     })
 }
@@ -558,6 +586,7 @@ fn accept_response(request_id: Option<String>, args: AcceptArgs) -> ResponseEnve
             args.proposal.as_deref(),
             "accepted",
             !args.allow_unverified,
+            &resolve_actor(args.actor.as_deref()),
         )?;
         let mut warnings = Vec::new();
         if args.allow_unverified {
@@ -587,6 +616,7 @@ fn reject_response(request_id: Option<String>, args: ProposalScopedArgs) -> Resp
             args.proposal.as_deref(),
             "rejected",
             false,
+            &resolve_actor(args.actor.as_deref()),
         )?;
         Ok((
             Some(record.operation_id.clone()),
@@ -660,6 +690,10 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                     Some("rejected") => return Err(ForgeError::Rejected.into()),
                     _ => return Err(ForgeError::NotAccepted.into()),
                 }
+                // Verify the accepted decision's integrity BEFORE creating the git
+                // branch (NER-136 R4): a tampered decision row that forged `accepted`
+                // is refused here, under the held repo lock, so no branch is created.
+                forge_store::verify_decision_integrity(&cwd, &proposal.proposal_revision_id)?;
                 let current_head = selected_backend(&cwd)?.current_base(&cwd)?;
                 // CLI-layer stale-base pre-check mirroring `accept`: persist the
                 // divergence to `conflict_sets` under the held lock BEFORE bailing
@@ -705,12 +739,14 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                     &proposal.content_ref,
                     "Forge accepted proposal",
                 )?;
+                let actor = resolve_actor(args.actor.as_deref());
                 let publication = forge_store::record_publication(
                     &cwd,
                     request_id,
                     &proposal.proposal_id,
                     args.name,
                     commit_id,
+                    &actor,
                 )?;
                 Ok((
                     Some(publication.operation_id.clone()),
@@ -945,6 +981,42 @@ fn init_response(request_id: Option<String>, args: InitArgs) -> ResponseEnvelope
 /// repository (no `migrate`, no lock, no cwd dependency).
 fn schema_response(request_id: Option<String>) -> ResponseEnvelope {
     ResponseEnvelope::success("schema", request_id, None, schema::contract())
+}
+
+/// Summarize the hardened redactor's per-occurrence kinds into one `warnings[]`
+/// entry per detector class with a count (NER-136 §U4), so a leak that was redacted
+/// before persistence is visible to the caller without re-emitting the secret.
+fn redaction_warnings(redactions: &[forge_content::RedactionKind]) -> Vec<String> {
+    use forge_content::RedactionKind;
+    let mut counts: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for kind in redactions {
+        let label = match kind {
+            RedactionKind::KeyValue => "key=value secret",
+            RedactionKind::HighEntropyToken => "high-entropy token",
+            RedactionKind::JsonSecret => "JSON-embedded secret",
+            RedactionKind::PemPrivateKey => "PEM private key",
+            RedactionKind::CredentialUrl => "credential URL password",
+        };
+        *counts.entry(label).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(label, count)| {
+            format!("redacted {count} {label}(s) from captured output before persistence")
+        })
+        .collect()
+}
+
+/// Resolve the acting identity for the NER-136 actor model: the `--actor` flag, else
+/// the `FORGE_ACTOR` environment variable, else `"unknown"`. This is *attribution*,
+/// not authentication — the string is whatever the caller declares; Phase 5 protects
+/// its integrity (it is folded into the tamper-evident digest), not its authenticity.
+fn resolve_actor(flag: Option<&str>) -> String {
+    flag.map(str::to_string)
+        .or_else(|| env::var("FORGE_ACTOR").ok())
+        .filter(|actor| !actor.trim().is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn selected_backend(cwd: &std::path::Path) -> anyhow::Result<Box<dyn ContentBackend>> {

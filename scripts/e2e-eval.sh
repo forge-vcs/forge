@@ -58,7 +58,7 @@ echo; echo "=== LIFECYCLE (init→start→save→run→propose→check→accept�
 mkrepo life >/dev/null
 F init;    ck "init success" "$(pg "d['status']")" "success"
 F doctor;  ck "doctor ok" "$(pg "d['data']['ok']")" "True"
-ck "doctor schema_version=3" "$(pg "d['data']['schema_version']")" "3"
+ck "doctor schema_version=4" "$(pg "d['data']['schema_version']")" "4"
 F start "build a feature"; ck "start success" "$(pg "d['status']")" "success"
 echo "hello" > feature.txt
 F save;    ck "save success" "$(pg "d['status']")" "success"
@@ -86,12 +86,12 @@ F accept --allow-unverified; ck "accept --allow-unverified bypasses the gate" "$
 echo; echo "=== MIGRATION state (live binary) ==="
 if [ "$have_sqlite" = 1 ]; then
   vers="$(db "$TMP/life" "SELECT group_concat(version) FROM schema_migrations ORDER BY version;")"
-  ck "schema_migrations has versions 1,2,3" "$vers" "1,2,3"
+  ck "schema_migrations has versions 1,2,3,4" "$vers" "1,2,3,4"
   nullck="$(db "$TMP/life" "SELECT count(*) FROM schema_migrations WHERE checksum IS NULL;")"
   ck "all migration rows carry a checksum" "$nullck" "0"
   # HEAD+1 read-only refuse on a separate repo
   mkrepo headplus1 >/dev/null; F init >/dev/null
-  db "$TMP/headplus1" "INSERT OR REPLACE INTO schema_migrations(version,name,applied_at_ms,checksum) VALUES (4,'future',0,NULL);"
+  db "$TMP/headplus1" "INSERT OR REPLACE INTO schema_migrations(version,name,applied_at_ms,checksum) VALUES (5,'future',0,NULL);"
   F show; ck "DB ahead of binary refuses read-only" "$(pg "d['errors'][0]['code']")" "SCHEMA_VERSION_UNSUPPORTED"
 else
   echo "  (skipped: sqlite3 unavailable)"
@@ -128,6 +128,21 @@ if [ "$have_sqlite" = 1 ]; then
   ck "a conflict_sets row was persisted" "$(db "$TMP/conflict" "SELECT count(*) FROM conflict_sets WHERE context='stale_base_accept';")" "1"
   ckc "conflict_sets row records the head pair" "$(db "$TMP/conflict" "SELECT paths_json FROM conflict_sets LIMIT 1;")" "expected_head"
 else echo "  (conflict_sets row check skipped: sqlite3 unavailable)"; fi
+
+echo; echo "=== TAMPER-EVIDENCE (NER-136) ==="
+mkrepo tamper >/dev/null; F init >/dev/null; F start "tamper test" >/dev/null
+echo "work" > t.txt; F save >/dev/null; F run -- sh -c true >/dev/null; F propose >/dev/null
+F check; ck "untampered check passes" "$(pg "d['data']['status']")" "passed"
+if [ "$have_sqlite" = 1 ]; then
+  # Edit the persisted excerpt WITHOUT recomputing the content hash.
+  db "$TMP/tamper" "UPDATE evidence SET stdout_excerpt='FORGED';"
+  F doctor; ck "doctor flags a tampered evidence row" "$(pg "d['data']['ok']")" "False"
+  ckc "doctor names the content_edit kind" "$(pg "[r['kind'] for r in d['data']['tampered_rows']]")" "content_edit"
+  F check; ck "check refuses tampered evidence" "$(pg "d['errors'][0]['code']")" "EVIDENCE_TAMPERED"
+  F accept --allow-unverified; ck "--allow-unverified never bypasses tamper" "$(pg "d['errors'][0]['code']")" "EVIDENCE_TAMPERED"
+else
+  echo "  (tamper checks skipped: sqlite3 unavailable)"
+fi
 
 echo; echo "=== RESULT ==="
 echo "PASS=$PASS  FAIL=$FAIL"

@@ -39,6 +39,12 @@ use serde::{Deserialize, Serialize};
 pub struct Gate {
     pub program: String,
     pub args: Vec<String>,
+    /// When `true`, this is a structured gate (NER-136 §U6): in addition to a zero
+    /// exit code, the deciding evidence's *parsed* failure count must be exactly zero
+    /// ("0 failing tests"). `#[serde(default)]` keeps Phase 4 (exit-code-only) specs
+    /// readable on an upgraded DB.
+    #[serde(default)]
+    pub require_structured_pass: bool,
 }
 
 /// The per-intent check spec: a flat, ANDed list of command gates. An empty list
@@ -60,11 +66,17 @@ pub struct EvidenceFact {
     pub snapshot_id: Option<String>,
     pub created_at_ms: i64,
     pub seq: i64,
+    /// The parsed test-failure count from the row's structured outcome (NER-136 §U5),
+    /// or `None` when no parser matched. A structured gate reads this; an exit-code
+    /// gate ignores it.
+    pub structured_failures: Option<u64>,
 }
 
 /// The per-gate verdict. `passed`/`failed` from the latest matching evidence on the
 /// proposed snapshot; `stale` when matching evidence exists only on another
-/// snapshot; `missing` when none matches at all.
+/// snapshot; `missing` when no matching evidence exists on the snapshot, OR (for a
+/// structured gate, NER-136) when the deciding evidence has a zero exit code but
+/// produced no parseable failure count — the declared count was never produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GateVerdict {
@@ -144,7 +156,15 @@ fn evaluate_declared(
 ) -> CheckOutcome {
     let results: Vec<GateResult> = gates
         .iter()
-        .map(|gate| verdict_for(&gate.program, &gate.args, proposed_snapshot_id, facts))
+        .map(|gate| {
+            verdict_for(
+                &gate.program,
+                &gate.args,
+                gate.require_structured_pass,
+                proposed_snapshot_id,
+                facts,
+            )
+        })
         .collect();
     let status = rollup(&results);
     let reason = summarize(status, &results);
@@ -196,7 +216,7 @@ fn evaluate_default(proposed_snapshot_id: &str, facts: &[EvidenceFact]) -> Check
     }
     let results: Vec<GateResult> = identities
         .iter()
-        .map(|(program, args)| verdict_for(program, args, proposed_snapshot_id, facts))
+        .map(|(program, args)| verdict_for(program, args, false, proposed_snapshot_id, facts))
         .collect();
     // Synthesized gates are all passed/failed (each exists on the snapshot), so the
     // status is passed unless any failed.
@@ -213,10 +233,15 @@ fn evaluate_default(proposed_snapshot_id: &str, facts: &[EvidenceFact]) -> Check
     }
 }
 
-/// The verdict for a single `(program, args)` identity against the proposed snapshot.
+/// The verdict for a single gate identity against the proposed snapshot. When
+/// `require_structured` is set, a zero exit code is necessary but not sufficient: the
+/// deciding evidence's parsed failure count must also be exactly zero (conjunctive —
+/// the stronger claim wins, so any disagreement is `Failed`); an absent parsed count
+/// is `Missing` (the gate asked for a count that was never produced).
 fn verdict_for(
     program: &str,
     args: &[String],
+    require_structured: bool,
     proposed_snapshot_id: &str,
     facts: &[EvidenceFact],
 ) -> GateResult {
@@ -233,10 +258,16 @@ fn verdict_for(
     );
 
     let (verdict, evidence_id, exit_code) = if let Some(fact) = latest_on_snapshot {
-        let verdict = if fact.exit_code == 0 {
-            GateVerdict::Passed
-        } else {
+        let verdict = if fact.exit_code != 0 {
             GateVerdict::Failed
+        } else if require_structured {
+            match fact.structured_failures {
+                Some(0) => GateVerdict::Passed,
+                Some(_) => GateVerdict::Failed,
+                None => GateVerdict::Missing,
+            }
+        } else {
+            GateVerdict::Passed
         };
         (
             verdict,
@@ -335,6 +366,7 @@ mod tests {
             snapshot_id: snapshot.map(str::to_string),
             created_at_ms: seq, // monotonic with seq for these tests
             seq,
+            structured_failures: None,
         }
     }
 
@@ -342,7 +374,110 @@ mod tests {
         Gate {
             program: program.to_string(),
             args: args.iter().map(|a| a.to_string()).collect(),
+            require_structured_pass: false,
         }
+    }
+
+    fn structured_gate(program: &str, args: &[&str]) -> Gate {
+        Gate {
+            require_structured_pass: true,
+            ..gate(program, args)
+        }
+    }
+
+    fn fact_with_failures(
+        id: &str,
+        program: &str,
+        args: &[&str],
+        exit_code: i64,
+        snapshot: Option<&str>,
+        seq: i64,
+        structured_failures: Option<u64>,
+    ) -> EvidenceFact {
+        EvidenceFact {
+            structured_failures,
+            ..fact(id, program, args, exit_code, snapshot, seq)
+        }
+    }
+
+    #[test]
+    fn structured_gate_passes_on_zero_parsed_failures() {
+        let facts = vec![fact_with_failures(
+            "e1",
+            "cargo",
+            &["test"],
+            0,
+            Some(SNAP),
+            1,
+            Some(0),
+        )];
+        let outcome = evaluate(
+            &spec(vec![structured_gate("cargo", &["test"])]),
+            SNAP,
+            &facts,
+        );
+        assert_eq!(outcome.status, "passed");
+    }
+
+    #[test]
+    fn structured_gate_fails_on_parsed_failures_despite_zero_exit() {
+        // exit_code == 0 but the parser found failures — the stronger claim wins.
+        let facts = vec![fact_with_failures(
+            "e1",
+            "cargo",
+            &["test"],
+            0,
+            Some(SNAP),
+            1,
+            Some(2),
+        )];
+        let outcome = evaluate(
+            &spec(vec![structured_gate("cargo", &["test"])]),
+            SNAP,
+            &facts,
+        );
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.gates[0].verdict, GateVerdict::Failed);
+    }
+
+    #[test]
+    fn structured_gate_fails_on_nonzero_exit_even_if_zero_failures() {
+        let facts = vec![fact_with_failures(
+            "e1",
+            "cargo",
+            &["test"],
+            101,
+            Some(SNAP),
+            1,
+            Some(0),
+        )];
+        let outcome = evaluate(
+            &spec(vec![structured_gate("cargo", &["test"])]),
+            SNAP,
+            &facts,
+        );
+        assert_eq!(outcome.status, "failed");
+    }
+
+    #[test]
+    fn structured_gate_is_missing_when_count_unparsed() {
+        // Zero exit, but no parsed count for a declared structured gate -> missing.
+        let facts = vec![fact_with_failures(
+            "e1",
+            "cargo",
+            &["test"],
+            0,
+            Some(SNAP),
+            1,
+            None,
+        )];
+        let outcome = evaluate(
+            &spec(vec![structured_gate("cargo", &["test"])]),
+            SNAP,
+            &facts,
+        );
+        assert_eq!(outcome.status, "missing");
+        assert_eq!(outcome.gates[0].verdict, GateVerdict::Missing);
     }
 
     fn spec(gates: Vec<Gate>) -> CheckSpec {

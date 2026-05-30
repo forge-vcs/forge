@@ -27,6 +27,7 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "MIGRATION_FAILED",
     "ATTEMPT_WORKTREE_MISMATCH",
     "CHECK_NOT_PASSED",
+    "EVIDENCE_TAMPERED",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.

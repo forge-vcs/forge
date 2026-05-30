@@ -11,9 +11,10 @@ use std::process::Command;
 use std::time::Duration;
 
 mod error;
+mod integrity;
 mod migrations;
 mod repo_lock;
-pub use error::{error_registry, ErrorCodeSpec, ForgeError};
+pub use error::{error_registry, ErrorCodeSpec, ForgeError, TamperKind};
 pub use repo_lock::{LockTimeout, RepoLock};
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +128,14 @@ pub struct EvidenceInput {
     pub sensitivity: String,
     pub visibility: String,
     pub trust: String,
+    /// Who ran the command (NER-136 actor model): `--actor`, else `FORGE_ACTOR`,
+    /// else `"unknown"`. Folded into the evidence digest so attribution is itself
+    /// tamper-evident.
+    pub actor: String,
+    /// Machine-readable outcome parsed from the full captured output (NER-136 §U5),
+    /// e.g. `{"tool":"cargo-test","passed":12,"failed":0}`. `None` when no parser
+    /// matched. Persisted alongside the excerpt and folded into the digest.
+    pub structured_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,7 +152,18 @@ pub struct EvidenceRecord {
     pub timed_out: bool,
     pub sensitivity: String,
     pub visibility: String,
+    /// The trust-ladder rung. In Phase 5 this is a *verifiable* claim: it is emitted
+    /// alongside `hash_alg` + `content_hash`, so a reviewer can recompute the digest
+    /// rather than taking a bare string on faith (replacing the historic hardcoded
+    /// `locally_observed` literal that asserted nothing). Higher rungs (signed,
+    /// attested) are Phase 9.
     pub trust: String,
+    /// The hash algorithm backing the trust claim (`sha256`).
+    pub hash_alg: String,
+    /// The evidence row's tamper-evident content hash (NER-136).
+    pub content_hash: String,
+    /// Who ran the command (attribution, not auth).
+    pub actor: String,
     pub operation_id: String,
 }
 
@@ -283,6 +303,23 @@ pub struct DoctorReport {
     /// (`.forge-restore-*`), the signature of a restore killed mid-flight. Empty
     /// in a healthy repo.
     pub half_applied_worktrees: Vec<String>,
+    /// Rows whose tamper-evident hash failed verification (NER-136): an evidence or
+    /// decision row whose content no longer matches its stored hash, an operation
+    /// whose chain link is broken (a deletion/reorder), or a post-watermark missing
+    /// hash. Empty in a healthy repo. A head-truncated chain (a lost latest op) is
+    /// NOT a tamper — it verifies as a legitimately-shorter chain.
+    pub tampered_rows: Vec<TamperedRow>,
+}
+
+/// One row that failed integrity verification in `doctor`'s chain pass. Carries only
+/// an opaque id, the table, and a closed-enum break kind — never an excerpt or
+/// command string (this is a machine-visible egress). `kind` serializes as snake_case
+/// (`content_edit`/`broken_link`/`missing_hash`).
+#[derive(Debug, Clone, Serialize)]
+pub struct TamperedRow {
+    pub id: String,
+    pub table: String,
+    pub kind: TamperKind,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -349,17 +386,31 @@ pub fn init_repository(
             "INSERT INTO repositories (id, root_path, git_head, content_backend, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![repo_id, root.to_string_lossy(), git_head, content_backend, now],
         )?;
+        // The genesis link: parent is the documented genesis sentinel, no domain
+        // digest. Stored so `doctor`'s re-walk starts from a verifiable anchor and a
+        // fresh repo is never mis-flagged as a NULL-hash (tampered) op (NER-136).
+        let genesis_hash = integrity::operation_link_hash(
+            integrity::GENESIS_PARENT_HASH,
+            &integrity::OperationDigestInput {
+                operation_id: &operation_id,
+                command: "init",
+                kind: "repository_initialized",
+                created_at_ms: now,
+            },
+            None,
+        );
         tx.execute(
             "INSERT INTO operations (
                 id, repo_id, request_id, command, status, kind, parent_operation_id,
-                resulting_view_id, error_json, created_at_ms
-            ) VALUES (?1, ?2, ?3, 'init', ?4, 'repository_initialized', NULL, ?5, NULL, ?6)",
+                resulting_view_id, error_json, content_hash, created_at_ms
+            ) VALUES (?1, ?2, ?3, 'init', ?4, 'repository_initialized', NULL, ?5, NULL, ?6, ?7)",
             params![
                 operation_id,
                 repo_id,
                 request_id,
                 format!("{:?}", OperationStatus::Succeeded).to_lowercase(),
                 view_id,
+                genesis_hash,
                 now
             ],
         )?;
@@ -540,16 +591,29 @@ pub fn operation_for_request(cwd: &Path, request_id: &str) -> Result<Option<Requ
 /// documented v0 limitation (deferred). Lives in the store (which already depends on
 /// `forge-policy`) so the CLI need not name `forge_policy` types directly to build a
 /// spec — though it still transitively serializes them via `CheckRecord.gates`.
-pub fn check_spec_json_from_requires(requires: &[String]) -> Option<String> {
-    let gates: Vec<forge_policy::Gate> = requires
-        .iter()
-        .filter_map(|raw| {
-            let mut tokens = raw.split_whitespace();
-            let program = tokens.next()?.to_string();
-            let args = tokens.map(str::to_string).collect();
-            Some(forge_policy::Gate { program, args })
+pub fn check_spec_json_from_requires(
+    requires: &[String],
+    structured_requires: &[String],
+) -> Option<String> {
+    let parse_gate = |raw: &str, require_structured_pass: bool| -> Option<forge_policy::Gate> {
+        let mut tokens = raw.split_whitespace();
+        let program = tokens.next()?.to_string();
+        let args = tokens.map(str::to_string).collect();
+        Some(forge_policy::Gate {
+            program,
+            args,
+            require_structured_pass,
         })
+    };
+    let mut gates: Vec<forge_policy::Gate> = requires
+        .iter()
+        .filter_map(|raw| parse_gate(raw, false))
         .collect();
+    gates.extend(
+        structured_requires
+            .iter()
+            .filter_map(|raw| parse_gate(raw, true)),
+    );
     if gates.is_empty() {
         return None;
     }
@@ -860,23 +924,48 @@ pub fn record_evidence(
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
     let mut connection = open_connection(&context.database_path)?;
-    let (evidence_id, op) = with_immediate_retry(&mut connection, |tx| {
+    let (evidence_id, content_hash, op) = with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
         // Determining read inside the IMMEDIATE txn: the snapshot the evidence is
         // attributed to is read on the same connection that writes it (U4).
         let snapshot = latest_snapshot_on(tx, &attempt.attempt_id)?;
+        let snapshot_id = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.snapshot_id.clone());
         let evidence_id = new_id("evidence");
+        // Recomputed per busy-retry (the body is FnMut): `created` is captured here so
+        // the digest is over exactly the bytes the INSERT below persists (NER-136).
+        let created = now_ms();
+        let content_hash = integrity::evidence_digest(&integrity::EvidenceDigestInput {
+            attempt_id: &attempt.attempt_id,
+            snapshot_id: snapshot_id.as_deref(),
+            command: &input.command,
+            args: &input.args,
+            cwd: &input.cwd,
+            exit_code: input.exit_code as i64,
+            started_at_ms: input.started_at_ms,
+            ended_at_ms: input.ended_at_ms,
+            timed_out: input.timed_out,
+            stdout_excerpt: &input.stdout_excerpt,
+            stderr_excerpt: &input.stderr_excerpt,
+            stdout_truncated: input.stdout_truncated,
+            stderr_truncated: input.stderr_truncated,
+            sensitivity: &input.sensitivity,
+            actor: &input.actor,
+            structured_json: input.structured_json.as_deref(),
+            created_at_ms: created,
+        });
         tx.execute(
             "INSERT INTO evidence (
                 id, repo_id, attempt_id, snapshot_id, command, args_json, cwd, exit_code, started_at_ms, ended_at_ms,
                 stdout_excerpt, stderr_excerpt, stdout_truncated, stderr_truncated, timed_out,
-                sensitivity, visibility, trust, created_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                sensitivity, visibility, trust, actor, structured_json, content_hash, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 evidence_id,
                 context.repo_id,
                 attempt.attempt_id,
-                snapshot.as_ref().map(|snapshot| snapshot.snapshot_id.clone()),
+                snapshot_id,
                 input.command,
                 serde_json::to_string(&input.args)?,
                 input.cwd,
@@ -891,10 +980,15 @@ pub fn record_evidence(
                 input.sensitivity,
                 input.visibility,
                 input.trust,
-                now_ms()
+                input.actor,
+                input.structured_json,
+                content_hash,
+                created
             ],
         )?;
-        let op = insert_operation_view(
+        // Fold the evidence digest into the op-log spine so a later swap of
+        // evidence.content_hash (to cover a tamper) is caught by doctor's re-walk.
+        let op = insert_operation_view_chained(
             tx,
             &context.repo_id,
             Some(&context.current_operation_id),
@@ -905,8 +999,9 @@ pub fn record_evidence(
                 view_kind: ViewKind::Initialized,
                 state: json!({ "lifecycle": "evidence_captured", "evidence_id": evidence_id }),
             },
+            Some(&content_hash),
         )?;
-        Ok((evidence_id, op))
+        Ok((evidence_id, content_hash, op))
     })?;
     // The record echoes the inputs that were just written; reading the row back
     // on a fresh connection could observe a concurrently-written newer row, so we
@@ -925,6 +1020,9 @@ pub fn record_evidence(
         sensitivity: input.sensitivity,
         visibility: input.visibility,
         trust: input.trust,
+        hash_alg: "sha256".to_string(),
+        content_hash,
+        actor: input.actor,
         operation_id: op.operation_id,
     })
 }
@@ -1135,11 +1233,17 @@ fn evidence_facts_on(
     attempt_id: &str,
 ) -> Result<Vec<forge_policy::EvidenceFact>> {
     let mut statement = conn.prepare(
-        "SELECT id, command, args_json, exit_code, snapshot_id, created_at_ms, rowid FROM evidence
+        "SELECT id, command, args_json, exit_code, snapshot_id, created_at_ms, rowid, structured_json FROM evidence
          WHERE attempt_id = ?1 ORDER BY created_at_ms DESC, rowid DESC",
     )?;
     let rows = statement.query_map(params![attempt_id], |row| {
         let args_json: String = row.get(2)?;
+        let structured_json: Option<String> = row.get(7)?;
+        // Project the parsed test-failure count for a structured gate (NER-136 §U6).
+        let structured_failures = structured_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .and_then(|value| value.get("failed").and_then(serde_json::Value::as_u64));
         Ok(forge_policy::EvidenceFact {
             evidence_id: row.get(0)?,
             program: row.get(1)?,
@@ -1148,6 +1252,7 @@ fn evidence_facts_on(
             snapshot_id: row.get(4)?,
             created_at_ms: row.get(5)?,
             seq: row.get(6)?,
+            structured_failures,
         })
     })?;
     let mut facts = Vec::new();
@@ -1169,7 +1274,160 @@ fn evaluate_check_on(
 ) -> Result<forge_policy::CheckOutcome> {
     let spec = intent_check_spec(conn, &attempt.intent_id)?;
     let facts = evidence_facts_on(conn, &attempt.attempt_id)?;
-    Ok(forge_policy::evaluate(&spec, &proposal.snapshot_id, &facts))
+    let outcome = forge_policy::evaluate(&spec, &proposal.snapshot_id, &facts);
+    // Integrity gate (NER-136 R4), fail-CLOSED: if any evidence row that DECIDES a
+    // gate was tampered with (its stored content_hash no longer matches a recompute,
+    // or a post-watermark hash is missing), refuse. Runs on `&tx` at BOTH
+    // `record_check` and `decide`, and — being raised here, before the enforce_check
+    // branch — it refuses even under `accept --allow-unverified` (a policy bypass is
+    // never an integrity bypass). The deeper full-chain re-walk lives in `doctor`.
+    let marker = evidence_high_water(conn)?;
+    for gate in &outcome.gates {
+        if let Some(evidence_id) = &gate.evidence_id {
+            if let IntegrityStatus::Tampered(kind) =
+                verify_evidence_integrity(conn, evidence_id, marker)?
+            {
+                return Err(ForgeError::EvidenceTampered {
+                    id: evidence_id.clone(),
+                    kind,
+                }
+                .into());
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// The verdict of re-verifying a hashed row against its stored `content_hash`.
+enum IntegrityStatus {
+    /// Recomputed hash matches the stored one.
+    Verified,
+    /// A NULL hash on a pre-watermark row — predates Phase 5, grandfathered.
+    LegacyUnverified,
+    /// The row was tampered with.
+    Tampered(TamperKind),
+}
+
+/// The recorded `evidence` rowid high-water mark from migration 004 — the boundary
+/// that distinguishes a legacy NULL hash (rowid ≤ mark) from a deleted one (rowid >
+/// mark). Keyed on the immutable rowid, never a per-row timestamp the attacker can
+/// backdate (NER-136). A fresh post-Phase-5 repo records 0, so any NULL hash is a
+/// deletion.
+fn evidence_high_water(conn: &Connection) -> Result<i64> {
+    let mark: Option<i64> = conn
+        .query_row(
+            "SELECT evidence_high_water FROM integrity_marker WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(mark.unwrap_or(0))
+}
+
+/// Recompute an evidence row's content hash from its stored columns and compare to
+/// the persisted `content_hash` (NER-136). Reads the full row on the caller's `&tx`
+/// so the determining read stays inside the writer's transaction. This is the cheap
+/// per-row gate-path check; it catches the naive "edit a field, leave the hash stale"
+/// tamper (the literal Phase 4 honesty-note hole). Catching a *recomputed* row hash
+/// requires the op-log re-walk that `doctor` performs.
+fn verify_evidence_integrity(
+    conn: &Connection,
+    evidence_id: &str,
+    marker: i64,
+) -> Result<IntegrityStatus> {
+    let row = conn
+        .query_row(
+            "SELECT attempt_id, snapshot_id, command, args_json, cwd, exit_code,
+                    started_at_ms, ended_at_ms, timed_out, stdout_excerpt, stderr_excerpt,
+                    stdout_truncated, stderr_truncated, sensitivity, actor, structured_json,
+                    created_at_ms, content_hash, rowid
+             FROM evidence WHERE id = ?1",
+            params![evidence_id],
+            |row| {
+                Ok(StoredEvidence {
+                    attempt_id: row.get(0)?,
+                    snapshot_id: row.get(1)?,
+                    command: row.get(2)?,
+                    args_json: row.get(3)?,
+                    cwd: row.get(4)?,
+                    exit_code: row.get(5)?,
+                    started_at_ms: row.get(6)?,
+                    ended_at_ms: row.get(7)?,
+                    timed_out: row.get::<_, i64>(8)? != 0,
+                    stdout_excerpt: row.get(9)?,
+                    stderr_excerpt: row.get(10)?,
+                    stdout_truncated: row.get::<_, i64>(11)? != 0,
+                    stderr_truncated: row.get::<_, i64>(12)? != 0,
+                    sensitivity: row.get(13)?,
+                    actor: row.get(14)?,
+                    structured_json: row.get(15)?,
+                    created_at_ms: row.get(16)?,
+                    content_hash: row.get(17)?,
+                    rowid: row.get(18)?,
+                })
+            },
+        )
+        .optional()?;
+    // No row to verify (e.g. a default-mode gate with no deciding evidence) is not a
+    // tamper signal.
+    let Some(row) = row else {
+        return Ok(IntegrityStatus::Verified);
+    };
+    let Some(stored_hash) = row.content_hash else {
+        return Ok(if row.rowid <= marker {
+            IntegrityStatus::LegacyUnverified
+        } else {
+            IntegrityStatus::Tampered(TamperKind::MissingHash)
+        });
+    };
+    let args: Vec<String> = serde_json::from_str(&row.args_json).unwrap_or_default();
+    let recomputed = integrity::evidence_digest(&integrity::EvidenceDigestInput {
+        attempt_id: &row.attempt_id,
+        snapshot_id: row.snapshot_id.as_deref(),
+        command: &row.command,
+        args: &args,
+        cwd: &row.cwd,
+        exit_code: row.exit_code,
+        started_at_ms: row.started_at_ms,
+        ended_at_ms: row.ended_at_ms,
+        timed_out: row.timed_out,
+        stdout_excerpt: &row.stdout_excerpt,
+        stderr_excerpt: &row.stderr_excerpt,
+        stdout_truncated: row.stdout_truncated,
+        stderr_truncated: row.stderr_truncated,
+        sensitivity: &row.sensitivity,
+        actor: &row.actor,
+        structured_json: row.structured_json.as_deref(),
+        created_at_ms: row.created_at_ms,
+    });
+    Ok(if recomputed == stored_hash {
+        IntegrityStatus::Verified
+    } else {
+        IntegrityStatus::Tampered(TamperKind::ContentEdit)
+    })
+}
+
+/// The full evidence row read back for integrity verification.
+struct StoredEvidence {
+    attempt_id: String,
+    snapshot_id: Option<String>,
+    command: String,
+    args_json: String,
+    cwd: String,
+    exit_code: i64,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    timed_out: bool,
+    stdout_excerpt: String,
+    stderr_excerpt: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    sensitivity: String,
+    actor: String,
+    structured_json: Option<String>,
+    created_at_ms: i64,
+    content_hash: Option<String>,
+    rowid: i64,
 }
 
 pub fn decide(
@@ -1179,6 +1437,7 @@ pub fn decide(
     proposal_id: Option<&str>,
     decision: &str,
     enforce_check: bool,
+    actor: &str,
 ) -> Result<DecisionRecord> {
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
@@ -1190,9 +1449,9 @@ pub fn decide(
         // check IN this IMMEDIATE txn (not on a separate connection), so the verdict
         // that gates the decision is computed from the same facts the decision
         // commits against — closing the TOCTOU against the lock-free `run` writer
-        // (NER-132 U2). `accept` re-evaluates rather than trusting a stored
-        // check_results row, so a green decision is bound to the current evidence on
-        // the proposal's snapshot. Still not tamper-proof (Phase 5).
+        // (NER-132 U2). `evaluate_check_on` ALSO fails closed on a tampered deciding
+        // row (NER-136), and — being raised before the enforce_check branch — that
+        // refusal holds even under `--allow-unverified`.
         let check_status = if decision == "accepted" {
             let outcome = evaluate_check_on(tx, &attempt, &proposal)?;
             if enforce_check && !outcome.passed() {
@@ -1207,23 +1466,36 @@ pub fn decide(
             None
         };
         let decision_id = new_id("decision");
+        // Recomputed per busy-retry: the decision digest covers proposal/revision +
+        // decision + actor + timestamp, and is both stored on the row and folded into
+        // the op-log spine so editing a decision row is detectable (NER-136 R3/R4).
+        let created = now_ms();
+        let content_hash = integrity::decision_digest(&integrity::DecisionDigestInput {
+            proposal_id: &proposal.proposal_id,
+            proposal_revision_id: &proposal.proposal_revision_id,
+            decision,
+            actor,
+            created_at_ms: created,
+        });
         tx.execute(
-            "INSERT INTO decisions (id, repo_id, proposal_id, proposal_revision_id, decision, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO decisions (id, repo_id, proposal_id, proposal_revision_id, decision, actor, content_hash, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 decision_id,
                 context.repo_id,
                 proposal.proposal_id,
                 proposal.proposal_revision_id,
                 decision,
-                now_ms()
+                actor,
+                content_hash,
+                created
             ],
         )?;
         tx.execute(
             "UPDATE proposals SET status = ?1 WHERE id = ?2",
             params![decision, proposal.proposal_id],
         )?;
-        let op = insert_operation_view(
+        let op = insert_operation_view_chained(
             tx,
             &context.repo_id,
             Some(&context.current_operation_id),
@@ -1234,6 +1506,7 @@ pub fn decide(
                 view_kind: ViewKind::Initialized,
                 state: json!({ "lifecycle": decision, "decision_id": decision_id }),
             },
+            Some(&content_hash),
         )?;
         Ok((decision_id, check_status, op))
     })?;
@@ -1245,6 +1518,81 @@ pub fn decide(
         check_status,
         operation_id: op.operation_id,
     })
+}
+
+/// Verify an accepted proposal's decision row integrity before trusting `accepted`
+/// at `export branch` (NER-136 R4). There is no in-txn site on the export path (the
+/// git branch is created before `record_publication`'s txn opens), so this is a
+/// verifying read under the held repo lock, before the branch. A mismatch means the
+/// decision row was tampered with → refuse with `EVIDENCE_TAMPERED`.
+pub fn verify_decision_integrity(cwd: &Path, proposal_revision_id: &str) -> Result<()> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let row = connection
+        .query_row(
+            "SELECT id, proposal_id, decision, actor, content_hash, created_at_ms, rowid
+             FROM decisions
+             WHERE repo_id = ?1 AND proposal_revision_id = ?2
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            params![context.repo_id, proposal_revision_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, proposal_id, decision, actor, content_hash, created_at_ms, rowid)) = row else {
+        return Ok(());
+    };
+    let Some(stored_hash) = content_hash else {
+        // A decision predating Phase 5 (legacy) is grandfathered; a post-watermark
+        // NULL is a deletion.
+        let marker = decision_high_water(&connection)?;
+        if rowid <= marker {
+            return Ok(());
+        }
+        return Err(ForgeError::EvidenceTampered {
+            id,
+            kind: TamperKind::MissingHash,
+        }
+        .into());
+    };
+    let recomputed = integrity::decision_digest(&integrity::DecisionDigestInput {
+        proposal_id: &proposal_id,
+        proposal_revision_id,
+        decision: &decision,
+        actor: &actor,
+        created_at_ms,
+    });
+    if recomputed != stored_hash {
+        return Err(ForgeError::EvidenceTampered {
+            id,
+            kind: TamperKind::ContentEdit,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The recorded `decisions` rowid high-water mark — the legacy/tampered boundary for
+/// decision rows (rowid ≤ mark predates Phase 5; rowid > mark with a NULL hash is a
+/// deletion).
+fn decision_high_water(conn: &Connection) -> Result<i64> {
+    let mark: Option<i64> = conn
+        .query_row(
+            "SELECT decision_high_water FROM integrity_marker WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(mark.unwrap_or(0))
 }
 
 pub fn exportable_proposal(
@@ -1297,6 +1645,7 @@ pub fn record_publication(
     proposal_id: &str,
     branch_name: String,
     commit_id: String,
+    actor: &str,
 ) -> Result<PublicationRecord> {
     let context = open_repository(cwd)?;
     let proposal = proposal_by_id(&context, proposal_id)?.ok_or(ForgeError::NoProposal)?;
@@ -1309,8 +1658,8 @@ pub fn record_publication(
         let publication_id = new_id("publication");
         tx.execute(
             "INSERT INTO publications (
-                id, repo_id, proposal_id, proposal_revision_id, branch_name, commit_id, created_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                id, repo_id, proposal_id, proposal_revision_id, branch_name, commit_id, actor, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 publication_id,
                 context.repo_id,
@@ -1318,6 +1667,7 @@ pub fn record_publication(
                 proposal.proposal_revision_id,
                 branch_name,
                 commit_id,
+                actor,
                 now_ms()
             ],
         )?;
@@ -1522,6 +1872,12 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         issues.push("half-applied worktree (leftover restore temp files)".to_string());
     }
 
+    // Tamper-evidence chain pass (NER-136): re-verify every hashed row offline.
+    let tampered_rows = verify_integrity_chain(&connection)?;
+    if !tampered_rows.is_empty() {
+        issues.push(format!("{} tampered row(s) detected", tampered_rows.len()));
+    }
+
     Ok(DoctorReport {
         ok: issues.is_empty(),
         issues,
@@ -1529,7 +1885,220 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         dangling_temp_files,
         dangling_content_refs,
         half_applied_worktrees,
+        tampered_rows,
     })
+}
+
+/// Re-verify the full tamper-evident chain offline (NER-136 §U8): every evidence and
+/// decision row's own content hash, plus every operation's chain link (which folds
+/// the domain digest, so a *recomputed* row hash that slipped past the cheap gate
+/// check is caught here at the operation that chained the old digest). Reads a
+/// consistent ordered snapshot; a head-truncated chain (a lost latest op) is reported
+/// as clean, NOT a tamper, because there is no expected-count check.
+fn verify_integrity_chain(conn: &Connection) -> Result<Vec<TamperedRow>> {
+    let mut tampered = Vec::new();
+    let evidence_marker = evidence_high_water(conn)?;
+    let op_marker = op_high_water(conn)?;
+    let decision_marker = decision_high_water(conn)?;
+
+    // (a) Every evidence row's own digest.
+    let mut evidence_ids = conn.prepare("SELECT id FROM evidence ORDER BY rowid")?;
+    let ids: Vec<String> = evidence_ids
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in ids {
+        if let IntegrityStatus::Tampered(kind) =
+            verify_evidence_integrity(conn, &id, evidence_marker)?
+        {
+            tampered.push(TamperedRow {
+                id,
+                table: "evidence".to_string(),
+                kind,
+            });
+        }
+    }
+
+    // (b) Every decision row's own digest.
+    let mut decision_rows = conn.prepare(
+        "SELECT id, proposal_id, proposal_revision_id, decision, actor, content_hash, created_at_ms, rowid
+         FROM decisions ORDER BY rowid",
+    )?;
+    let decisions: Vec<StoredDecision> = decision_rows
+        .query_map([], |row| {
+            Ok(StoredDecision {
+                id: row.get(0)?,
+                proposal_id: row.get(1)?,
+                proposal_revision_id: row.get(2)?,
+                decision: row.get(3)?,
+                actor: row.get(4)?,
+                content_hash: row.get(5)?,
+                created_at_ms: row.get(6)?,
+                rowid: row.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for row in decisions {
+        match row.content_hash {
+            None if row.rowid > decision_marker => tampered.push(TamperedRow {
+                id: row.id,
+                table: "decisions".to_string(),
+                kind: TamperKind::MissingHash,
+            }),
+            None => {}
+            Some(stored) => {
+                let recomputed = integrity::decision_digest(&integrity::DecisionDigestInput {
+                    proposal_id: &row.proposal_id,
+                    proposal_revision_id: &row.proposal_revision_id,
+                    decision: &row.decision,
+                    actor: &row.actor,
+                    created_at_ms: row.created_at_ms,
+                });
+                if recomputed != stored {
+                    tampered.push(TamperedRow {
+                        id: row.id,
+                        table: "decisions".to_string(),
+                        kind: TamperKind::ContentEdit,
+                    });
+                }
+            }
+        }
+    }
+
+    // (c) Every operation's chain link (folding its domain digest), in chain order.
+    let mut op_rows = conn.prepare(
+        "SELECT id, parent_operation_id, command, kind, resulting_view_id, content_hash, created_at_ms, rowid
+         FROM operations ORDER BY created_at_ms, rowid",
+    )?;
+    let ops: Vec<StoredOp> = op_rows
+        .query_map([], |row| {
+            Ok(StoredOp {
+                id: row.get(0)?,
+                parent_operation_id: row.get(1)?,
+                command: row.get(2)?,
+                kind: row.get(3)?,
+                resulting_view_id: row.get(4)?,
+                content_hash: row.get(5)?,
+                created_at_ms: row.get(6)?,
+                rowid: row.get(7)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for row in ops {
+        let Some(stored) = row.content_hash else {
+            if row.rowid > op_marker {
+                tampered.push(TamperedRow {
+                    id: row.id,
+                    table: "operations".to_string(),
+                    kind: TamperKind::MissingHash,
+                });
+            }
+            continue;
+        };
+        let parent_hash = op_content_hash(conn, row.parent_operation_id.as_deref())?;
+        let domain_digest = op_domain_digest(conn, row.resulting_view_id.as_deref())?;
+        let recomputed = integrity::operation_link_hash(
+            &parent_hash,
+            &integrity::OperationDigestInput {
+                operation_id: &row.id,
+                command: &row.command,
+                kind: &row.kind,
+                created_at_ms: row.created_at_ms,
+            },
+            domain_digest.as_deref(),
+        );
+        if recomputed != stored {
+            tampered.push(TamperedRow {
+                id: row.id,
+                table: "operations".to_string(),
+                kind: TamperKind::BrokenLink,
+            });
+        }
+    }
+
+    Ok(tampered)
+}
+
+/// A decision row read back for `doctor`'s chain pass.
+struct StoredDecision {
+    id: String,
+    proposal_id: String,
+    proposal_revision_id: String,
+    decision: String,
+    actor: String,
+    content_hash: Option<String>,
+    created_at_ms: i64,
+    rowid: i64,
+}
+
+/// An operation row read back for `doctor`'s chain re-walk.
+struct StoredOp {
+    id: String,
+    parent_operation_id: Option<String>,
+    command: String,
+    kind: String,
+    resulting_view_id: Option<String>,
+    content_hash: Option<String>,
+    created_at_ms: i64,
+    rowid: i64,
+}
+
+/// The recorded `operations` rowid high-water mark (the legacy/tampered boundary for
+/// operation rows).
+fn op_high_water(conn: &Connection) -> Result<i64> {
+    let mark: Option<i64> = conn
+        .query_row(
+            "SELECT op_high_water FROM integrity_marker WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(mark.unwrap_or(0))
+}
+
+/// The domain-row digest an operation folded into its chain link, recovered for the
+/// `doctor` re-walk by reading the operation's view `state_json` for an `evidence_id`
+/// or `decision_id` and returning that row's stored `content_hash`. `None` for
+/// operations with no domain row (init, propose, attach, …).
+fn op_domain_digest(conn: &Connection, view_id: Option<&str>) -> Result<Option<String>> {
+    let Some(view_id) = view_id else {
+        return Ok(None);
+    };
+    let state_json: Option<String> = conn
+        .query_row(
+            "SELECT state_json FROM views WHERE id = ?1",
+            params![view_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(state_json) = state_json else {
+        return Ok(None);
+    };
+    let Ok(state) = serde_json::from_str::<Value>(&state_json) else {
+        return Ok(None);
+    };
+    if let Some(evidence_id) = state.get("evidence_id").and_then(Value::as_str) {
+        return conn
+            .query_row(
+                "SELECT content_hash FROM evidence WHERE id = ?1",
+                params![evidence_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(Into::into);
+    }
+    if let Some(decision_id) = state.get("decision_id").and_then(Value::as_str) {
+        return conn
+            .query_row(
+                "SELECT content_hash FROM decisions WHERE id = ?1",
+                params![decision_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(Into::into);
+    }
+    Ok(None)
 }
 
 /// Recursively scan a work tree for leftover crash-atomic-restore temp files
@@ -1672,11 +2241,26 @@ pub fn record_failed_operation(
     // distinct attempt and the unique index (caught as a non-busy error by the
     // caller's `.ok()`) is the correct backstop. IMMEDIATE + retry only (R3).
     with_immediate_retry(&mut connection, |tx| {
+        // A failed op is a third chain-write site (it bypasses insert_operation_view
+        // with its own INSERT + CAS). It must carry a content_hash too, or it leaves a
+        // NULL-hash op on the spine that `doctor`/the gate would mis-flag as tampered
+        // (NER-136). No domain row, so the digest is None.
+        let parent_hash = op_content_hash(tx, Some(&context.current_operation_id))?;
+        let content_hash = integrity::operation_link_hash(
+            &parent_hash,
+            &integrity::OperationDigestInput {
+                operation_id: &operation_id,
+                command,
+                kind: "recoverable_failure",
+                created_at_ms: now,
+            },
+            None,
+        );
         tx.execute(
             "INSERT INTO operations (
                 id, repo_id, request_id, command, status, kind, parent_operation_id,
-                resulting_view_id, error_json, created_at_ms
-            ) VALUES (?1, ?2, ?3, ?4, 'failed', 'recoverable_failure', ?5, ?6, ?7, ?8)",
+                resulting_view_id, error_json, content_hash, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, 'failed', 'recoverable_failure', ?5, ?6, ?7, ?8, ?9)",
             params![
                 operation_id,
                 context.repo_id,
@@ -1689,6 +2273,7 @@ pub fn record_failed_operation(
                 // response carried (FIX C). Old rows lacking `details` fall back to
                 // an empty object at replay time.
                 json!({ "message": message, "code": code, "details": details }).to_string(),
+                content_hash,
                 now
             ],
         )?;
@@ -2223,23 +2808,68 @@ fn latest_publication_for_proposal_revision(
         .map_err(Into::into)
 }
 
+/// The stored chain hash of an operation, or the genesis sentinel when the parent
+/// is absent (the `init` genesis op) or predates Phase 5 (a legacy NULL hash). It is
+/// the `parent_hash` input to the next link, so a chain always anchors on one
+/// canonical value (NER-136). Read on the writer's `&tx` so the folded parent and
+/// the singleton CAS pointer are the same row.
+fn op_content_hash(conn: &Connection, operation_id: Option<&str>) -> Result<String> {
+    let Some(operation_id) = operation_id else {
+        return Ok(integrity::GENESIS_PARENT_HASH.to_string());
+    };
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT content_hash FROM operations WHERE id = ?1",
+            params![operation_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(stored.unwrap_or_else(|| integrity::GENESIS_PARENT_HASH.to_string()))
+}
+
 fn insert_operation_view(
     tx: &Transaction<'_>,
     repo_id: &str,
     parent_operation_id: Option<&str>,
     input: OperationViewInput,
 ) -> Result<OperationViewResult> {
+    insert_operation_view_chained(tx, repo_id, parent_operation_id, input, None)
+}
+
+/// Append an operation/view, folding `domain_digest` (the evidence/decision row's
+/// own `content_hash`, or `None` for ops with no domain row) plus the parent op's
+/// hash into `operations.content_hash` — the tamper-evident chain spine (NER-136).
+/// Computed inside the writer's IMMEDIATE txn; the parent read is on the same `&tx`.
+fn insert_operation_view_chained(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    parent_operation_id: Option<&str>,
+    input: OperationViewInput,
+    domain_digest: Option<&str>,
+) -> Result<OperationViewResult> {
     let operation_id = OperationId::new().to_string();
     let view_id = ViewId::new().to_string();
     let now = now_ms();
     let status = format!("{:?}", OperationStatus::Succeeded).to_lowercase();
     let view_kind = format!("{:?}", input.view_kind).to_lowercase();
+    let parent_hash = op_content_hash(tx, parent_operation_id)?;
+    let content_hash = integrity::operation_link_hash(
+        &parent_hash,
+        &integrity::OperationDigestInput {
+            operation_id: &operation_id,
+            command: &input.command,
+            kind: &input.kind,
+            created_at_ms: now,
+        },
+        domain_digest,
+    );
 
     tx.execute(
         "INSERT INTO operations (
             id, repo_id, request_id, command, status, kind, parent_operation_id,
-            resulting_view_id, error_json, created_at_ms
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
+            resulting_view_id, error_json, content_hash, created_at_ms
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
         params![
             operation_id,
             repo_id,
@@ -2249,6 +2879,7 @@ fn insert_operation_view(
             input.kind,
             parent_operation_id,
             view_id,
+            content_hash,
             now
         ],
     )?;
@@ -2640,6 +3271,10 @@ mod tests {
         connection
             .execute_batch(include_str!("../migrations/001_init.sql"))
             .expect("baseline schema");
+        // Phase 5 adds operations.content_hash, which insert_operation_view now writes.
+        connection
+            .execute_batch(include_str!("../migrations/004_integrity_and_actor.sql"))
+            .expect("phase 5 integrity columns");
 
         // Seed: a repo, a genesis operation+view that `current_state` points at, and
         // a SECOND operation row (`op_stale`) that does NOT match current_state.

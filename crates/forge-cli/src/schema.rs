@@ -26,7 +26,8 @@ pub fn contract() -> Value {
         "notes": {
             "retryable": "advisory; the client bounds retries (server sets after_ms only)",
             "retry_side_effects": "retrying a CONFLICT re-executes the command; for 'run' this re-executes the child process",
-            "secret_protection": "export secret-deny is path-name-level only in this version; secret values inside non-secret-named files, and command argv strings (including --require gate specs and CHECK_NOT_PASSED.unmet), are redacted only for known key=value secret patterns, not otherwise scanned until Phase 5"
+            "secret_protection": "captured 'run' output is hardened before persistence (NER-136): line-oriented key=value secrets, bare high-entropy tokens, JSON-embedded secrets, PEM private-key blocks, and scheme://user:pass@host credential-URL passwords are redacted, each surfaced as a warnings[] entry. KNOWN RESIDUALS: a bare 7/8/40/64-char pure-hex token or a UUID is exempted (to avoid redacting Forge's own git SHAs and content hashes), so a secret of exactly that shape is a false negative; secret-alphabet tokens shorter than 20 chars are below the entropy gate. Command argv strings (--require gate specs, CHECK_NOT_PASSED.unmet) are still redacted only for key=value patterns. Export secret-deny is path-name-level (.forge/.env/keys).",
+            "integrity": "evidence and decision rows carry a SHA-256 content hash chained into the append-only operations spine; check/accept refuse a tampered deciding evidence row (EVIDENCE_TAMPERED, fail-closed, NOT bypassable by --allow-unverified), export refuses a tampered decision before creating the branch, and 'doctor' re-walks the chain. This is tamper-EVIDENT, not tamper-PROOF: an actor with full DB write access can recompute the whole chain; cryptographic signing is Phase 9."
         }
     })
 }
@@ -53,7 +54,7 @@ fn envelope_shape() -> Value {
 fn command_shapes() -> Value {
     let commands = [
         ("init", "Initializes a .forge repository; data carries root_path and the genesis operation."),
-        ("start", "Starts an intent + its first attempt; accepts repeatable --require <command> gates persisted on the intent; data carries the started attempt + operation_id."),
+        ("start", "Starts an intent + its first attempt; accepts repeatable --require <command> gates and --require-tests-pass <command> structured gates (which also require zero parsed failures) persisted on the intent, and an optional --actor; data carries the started attempt + operation_id."),
         ("attempt start", "Starts a new attempt for an existing intent; data carries the attempt + operation_id."),
         ("attempt list", "Lists attempts; data carries { attempts: [...] }."),
         ("attempt show", "Shows one attempt; data carries the attempt detail."),
