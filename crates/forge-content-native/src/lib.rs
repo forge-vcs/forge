@@ -2102,9 +2102,16 @@ mod tests {
             serialized, expected,
             "genesis serialization drifted — existing repos' base_head would desync"
         );
-        // And the id derived from those exact bytes is stable (illustrates the implication).
-        let id = ObjectId::new(ObjectKind::Commit, serialized.as_bytes());
-        assert!(id.to_string().starts_with("f1:commit:sha256:"));
+        // Pin the FULL content-addressed id against a hard-coded literal (not just a prefix),
+        // so a change to the preimage framing (object_preimage / ObjectId::new) — not only the
+        // CommitObject shape — also fails loudly. This literal is the deterministic genesis id
+        // for the all-zeros tree above; it must never change, or existing repos' base_head
+        // desyncs into spurious STALE_BASE.
+        let id = ObjectId::new(ObjectKind::Commit, serialized.as_bytes()).to_string();
+        assert_eq!(
+            id, "f1:commit:sha256:cf31029e040659af09e1dd6f323b3dcd76db2bf9a2d5c639b2a588d8a9fa809e",
+            "genesis commit id changed — preimage framing or commit shape drifted"
+        );
     }
 
     /// The slice-3 `actor`/`authored_time` are in the HASHED bytes (Phase 9 signs who/when):

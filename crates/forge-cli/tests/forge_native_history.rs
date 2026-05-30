@@ -322,6 +322,9 @@ fn checkout_unknown_commit_is_not_corruption() {
             .assert()
             .failure(),
     );
+    // A never-written commit id is a USER error (COMMAND_FAILED), NOT corruption — pin the
+    // actual code positively, not just "anything but NATIVE_HISTORY_CORRUPT".
+    assert_eq!(out["errors"][0]["code"], "COMMAND_FAILED");
     assert_ne!(
         out["errors"][0]["code"], "NATIVE_HISTORY_CORRUPT",
         "a typo'd commit id must not inflate the corruption rate"
@@ -557,6 +560,111 @@ fn doctor_detects_a_dangling_commit_object() {
             .iter()
             .any(|i| i["kind"] == "dangling_commit_id" && i["commit_id"] == commit_id),
         "doctor must report the dangling commit_id: {issues:?}"
+    );
+}
+
+#[test]
+fn accept_populates_evidence_digest_from_the_deciding_evidence() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    // A required gate so the accepted check has a DECIDING evidence row.
+    repo.forge()
+        .args(["--json", "start", "ev digest", "--require", "sh -c true"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("f.txt"), "x\n").unwrap();
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    repo.forge().args(["--json", "propose"]).assert().success();
+    repo.forge().args(["--json", "check"]).assert().success();
+    repo.forge().args(["--json", "accept"]).assert().success();
+
+    // The justified commit's evidence_digest is the deciding evidence's content_hash (opaque
+    // 64-hex), not None — proving R4 is wired, not just the Hex64 type unit-tested.
+    let logged = json_output(repo.forge().args(["--json", "log"]).assert().success());
+    let digest = logged["data"]["commits"][0]["evidence_digest"]
+        .as_str()
+        .expect("evidence_digest populated from the deciding gate");
+    assert_eq!(digest.len(), 64);
+    assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    let matches: i64 = db(repo.path())
+        .query_row(
+            "SELECT COUNT(*) FROM evidence WHERE content_hash = ?1",
+            [digest],
+            |row| row.get(0),
+        )
+        .expect("count evidence");
+    assert!(
+        matches >= 1,
+        "evidence_digest must equal a real evidence row's content_hash"
+    );
+}
+
+#[test]
+fn doctor_detects_a_dangling_parent() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let genesis = head(repo.path()).expect("genesis HEAD"); // the accepted commit's parent
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    let commit_id = accepted["data"]["commit_id"].as_str().unwrap().to_string();
+
+    // Delete the genesis (parent) commit object: doctor's DAG walk from the tip reads the tip
+    // ok, then finds its parent object missing -> DanglingParent (commit_id=tip, related=genesis).
+    let g_digest = genesis.rsplit(':').next().unwrap();
+    let g_obj = repo.path().join(format!(
+        ".forge/objects/sha256/{}/{}",
+        &g_digest[..2],
+        g_digest
+    ));
+    std::fs::remove_file(&g_obj).expect("delete genesis object");
+
+    let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(report["data"]["ok"], false);
+    let issues = report["data"]["native_history_issues"].as_array().unwrap();
+    assert!(
+        issues.iter().any(|i| i["kind"] == "dangling_parent"
+            && i["commit_id"] == commit_id
+            && i["related_id"] == genesis),
+        "doctor must report the dangling parent: {issues:?}"
+    );
+}
+
+#[test]
+fn doctor_detects_a_dangling_tree() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    let commit_id = accepted["data"]["commit_id"].as_str().unwrap().to_string();
+    let logged = json_output(repo.forge().args(["--json", "log"]).assert().success());
+    let tree = logged["data"]["commits"][0]["tree"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Delete the tip commit's tree object: doctor's DAG walk verifies the tree is reachable
+    // and reports DanglingTree when it is not.
+    let t_digest = tree.rsplit(':').next().unwrap();
+    let t_obj = repo.path().join(format!(
+        ".forge/objects/sha256/{}/{}",
+        &t_digest[..2],
+        t_digest
+    ));
+    std::fs::remove_file(&t_obj).expect("delete tree object");
+
+    let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(report["data"]["ok"], false);
+    let issues = report["data"]["native_history_issues"].as_array().unwrap();
+    assert!(
+        issues
+            .iter()
+            .any(|i| i["kind"] == "dangling_tree" && i["commit_id"] == commit_id),
+        "doctor must report the dangling tree: {issues:?}"
     );
 }
 
