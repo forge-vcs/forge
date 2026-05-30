@@ -83,7 +83,9 @@ pub fn diff_trees(
         let mut parts = line.split('\t');
         let Some(status) = parts.next() else { continue };
         // For rename/copy the final field is the new path; for the rest it is the path.
-        let Some(path) = parts.last() else { continue };
+        let Some(path) = parts.next_back() else {
+            continue;
+        };
         if forge_content::is_secret_risk_path(path) {
             dropped_secret_paths.push(path.to_string());
             continue;
