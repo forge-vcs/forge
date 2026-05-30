@@ -780,21 +780,31 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                 let current_head = selected_backend(&cwd)?.current_base(&cwd)?;
                 // CLI-layer stale-base pre-check mirroring `accept`: persist the
                 // divergence to `conflict_sets` under the held lock BEFORE bailing
-                // (NER-133 U7). `export_branch` keeps its own internal stale-base
-                // check as defense-in-depth; it just won't be reached on this path.
-                if current_head != proposal.base_head {
+                // (NER-133 U7). NER-138 slice 3: after commit-on-accept the ref-store HEAD
+                // advances to the accepted proposal's OWN commit, so the expected current
+                // head is that `commit_id` — not the proposal's `base_head`, which the accept
+                // progressed past. Falls back to `base_head` for git repos / pre-006 accepts
+                // (NULL commit_id), where the forge HEAD never moves. This CLI check is
+                // authoritative; `export_branch`'s internal check is fed equal anchors below
+                // so it never double-fires on the legitimate post-accept divergence.
+                let expected_head = forge_store::accepted_commit_id_for_revision(
+                    &cwd,
+                    &proposal.proposal_revision_id,
+                )?
+                .unwrap_or_else(|| proposal.base_head.clone());
+                if current_head != expected_head {
                     // Best-effort metadata (FIX B): conflict-set persistence must
                     // never mask the domain error, so discard the Result and always
                     // surface STALE_BASE.
                     let _ = forge_store::record_conflict_set(
                         &cwd,
                         "stale_base_export",
-                        &proposal.base_head,
+                        &expected_head,
                         &current_head,
                         &proposal.changed_paths,
                     );
                     return Err(ForgeError::StaleBase {
-                        expected_head: proposal.base_head.clone(),
+                        expected_head,
                         actual_head: current_head,
                     }
                     .into());
@@ -822,11 +832,15 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                 let trailer =
                     forge_store::build_publication_trailer(&cwd, &proposal.proposal_revision_id)?;
                 let message = forge_store::render_trailer_message(&trailer);
+                // `base_head` is BOTH the synthesis source (the git parent is built from the
+                // proposal's base tree) AND, passed again as `current_target`, makes
+                // `export_branch`'s internal stale check a confirmed no-op — the CLI check
+                // above is authoritative now that commit-on-accept advances HEAD off the base.
                 let (commit_id, excluded) = forge_export_git::export_branch(
                     &cwd,
                     &args.name,
                     &proposal.base_head,
-                    &current_head,
+                    &proposal.base_head,
                     &proposal.content_ref,
                     &message,
                 )?;
@@ -974,6 +988,20 @@ where
     } else {
         None
     };
+
+    // NER-138 slice 3: heal a torn commit-on-accept (a committed decision whose ref-store
+    // HEAD advance was lost to a crash) BEFORE the base anchor is read this command, and
+    // BEFORE the preflight-replay short-circuit — so a same-`request_id` replay of a torn
+    // accept still advances HEAD. Runs only for lock-holding commands (serialized, never
+    // racing `run`); a no-op on git repos and before any justified commit. A dangling
+    // ledger `commit_id` (the store-before-DB violation) surfaces here as
+    // `NATIVE_HISTORY_CORRUPT`.
+    if requires_repo_lock(command) {
+        if let Err(error) = forge_store::reconcile_native_head(&cwd) {
+            let (error_object, retry) = error_to_object(command, &error);
+            return ResponseEnvelope::error_with(command, request_id, None, error_object, retry);
+        }
+    }
 
     // Pre-flight replay check: a sequential same-`request_id` retry replays the
     // original result without opening a write transaction. The concurrent race

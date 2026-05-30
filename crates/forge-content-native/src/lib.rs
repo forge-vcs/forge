@@ -17,6 +17,11 @@ use std::process::Command;
 
 const SCHEMA_VERSION: u32 = 1;
 
+/// The on-object `CommitObject::schema_version` value to stamp when building a commit in
+/// another crate (slice 3's `forge_store::decide`). Exposed so callers need not hard-code
+/// the version; it stays 1 (genesis-hash stability — see `CommitObject`).
+pub const COMMIT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
+
 /// Re-exported from `forge_content` so `forge_store::doctor` keeps referencing
 /// `forge_content_native::RESTORE_TEMP_PREFIX`, while the canonical definition and
 /// its matching `is_restore_temp_path` exclusion predicate live in the shared base

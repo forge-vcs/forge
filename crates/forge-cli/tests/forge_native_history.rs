@@ -1,0 +1,232 @@
+//! NER-138 Phase 7 slice 3: navigable native history end-to-end through the CLI —
+//! justified commit-on-accept, HEAD advancement, base progression, the HEAD-from-ledger
+//! reconcile, and (later units) log / checkout / undo / doctor.
+
+mod common;
+
+use common::TestRepo;
+use rusqlite::Connection;
+use serde_json::Value;
+use std::path::Path;
+
+fn json_output(assert: assert_cmd::assert::Assert) -> Value {
+    serde_json::from_slice(&assert.get_output().stdout).expect("valid json")
+}
+
+fn head(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path.join(".forge/refs/HEAD"))
+        .ok()
+        .map(|raw| raw.trim().to_string())
+}
+
+fn db(path: &Path) -> Connection {
+    Connection::open(path.join(".forge/forge.db")).expect("open forge db")
+}
+
+/// Drive a native repo through `init → start → save → run → propose → check`, leaving a
+/// checked proposal ready to accept. Returns nothing; the caller reads HEAD / the ledger.
+fn prepare_native_proposal(repo: &TestRepo) {
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "native history"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("feature.txt"), "native\n").expect("write feature");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    repo.forge().args(["--json", "propose"]).assert().success();
+    repo.forge().args(["--json", "check"]).assert().success();
+}
+
+#[test]
+fn native_accept_writes_a_justified_commit_and_advances_head() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+
+    // Genesis HEAD is set at `start`, before any accept.
+    let genesis = head(repo.path()).expect("genesis HEAD exists after start");
+    assert!(genesis.starts_with("f1:commit:sha256:"));
+
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    let commit_id = accepted["data"]["commit_id"]
+        .as_str()
+        .expect("native accept surfaces commit_id in JSON data")
+        .to_string();
+    assert!(commit_id.starts_with("f1:commit:sha256:"));
+    assert_ne!(
+        commit_id, genesis,
+        "accept advances HEAD off the genesis base"
+    );
+
+    // HEAD advanced to the new commit, and the ledger records it.
+    assert_eq!(head(repo.path()).as_deref(), Some(commit_id.as_str()));
+    let ledger_commit: Option<String> = db(repo.path())
+        .query_row(
+            "SELECT commit_id FROM decisions WHERE decision = 'accepted' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("decision row");
+    assert_eq!(ledger_commit.as_deref(), Some(commit_id.as_str()));
+}
+
+#[test]
+fn git_accept_leaves_commit_id_null_and_no_ref_store() {
+    let repo = TestRepo::new_git();
+    // Default (git) backend.
+    repo.forge().args(["--json", "init"]).assert().success();
+    repo.forge()
+        .args(["--json", "start", "git history"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("feature.txt"), "git\n").expect("write feature");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    repo.forge().args(["--json", "propose"]).assert().success();
+    repo.forge().args(["--json", "check"]).assert().success();
+
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    // commit_id is omitted entirely (skip_serializing_if) for a git-backend accept.
+    assert!(accepted["data"].get("commit_id").is_none());
+    assert!(
+        head(repo.path()).is_none(),
+        "git repos have no native ref store"
+    );
+    let ledger_commit: Option<String> = db(repo.path())
+        .query_row(
+            "SELECT commit_id FROM decisions WHERE decision = 'accepted' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("decision row");
+    assert_eq!(ledger_commit, None);
+}
+
+#[test]
+fn native_accept_replay_same_request_id_writes_no_second_commit() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+
+    let first = json_output(
+        repo.forge()
+            .args(["--json", "accept", "--request-id", "accept-once"])
+            .assert()
+            .success(),
+    );
+    let commit_id = first["data"]["commit_id"].as_str().unwrap().to_string();
+
+    // Replaying the SAME request id does NOT run a second `decide` transaction — so no
+    // second commit is written and HEAD is unchanged (the load-bearing slice-3 property).
+    // Accept records its op-log entry under the decision verb ("accepted"), so the
+    // sequential replay surfaces the pre-existing REQUEST_ID_CONFLICT (op command
+    // "accepted" vs CLI command "accept") rather than an idempotent stub; either way the
+    // decision/commit side effects do not repeat.
+    let replay = json_output(
+        repo.forge()
+            .args(["--json", "accept", "--request-id", "accept-once"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(replay["errors"][0]["code"], "REQUEST_ID_CONFLICT");
+    assert_eq!(
+        head(repo.path()).as_deref(),
+        Some(commit_id.as_str()),
+        "replay must not advance HEAD"
+    );
+    let decision_count: i64 = db(repo.path())
+        .query_row("SELECT COUNT(*) FROM decisions", [], |row| row.get(0))
+        .expect("count decisions");
+    assert_eq!(decision_count, 1, "replay must not write a second decision");
+}
+
+#[test]
+fn native_reaccept_with_new_request_id_is_stale_after_head_advanced() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    repo.forge()
+        .args(["--json", "accept", "--request-id", "first"])
+        .assert()
+        .success();
+
+    // A fresh accept of the same (now-accepted) proposal: HEAD advanced past the proposal's
+    // base, so the stale-base check fires — never a double-commit.
+    let second = json_output(
+        repo.forge()
+            .args(["--json", "accept", "--request-id", "second"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(second["errors"][0]["code"], "STALE_BASE");
+}
+
+#[test]
+fn reconcile_advances_head_from_a_torn_accept() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let genesis = head(repo.path()).expect("genesis HEAD");
+
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    let commit_id = accepted["data"]["commit_id"].as_str().unwrap().to_string();
+    assert_eq!(head(repo.path()).as_deref(), Some(commit_id.as_str()));
+
+    // Simulate a crash AFTER the decision committed but BEFORE set_head ran: rewind the
+    // ref-store HEAD to the genesis while the ledger still records the accepted commit_id.
+    std::fs::write(repo.path().join(".forge/refs/HEAD"), &genesis).expect("rewind HEAD");
+    assert_eq!(head(repo.path()).as_deref(), Some(genesis.as_str()));
+
+    // The next lock-holding command runs reconcile_native_head first, healing HEAD forward
+    // to the ledger's latest commit_id before the command's own logic runs.
+    repo.forge()
+        .args(["--json", "start", "after the crash"])
+        .assert()
+        .success();
+    assert_eq!(
+        head(repo.path()).as_deref(),
+        Some(commit_id.as_str()),
+        "reconcile advances HEAD to the ledger tip after a torn accept"
+    );
+}
+
+#[test]
+fn dangling_ledger_commit_id_surfaces_native_history_corrupt() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let genesis = head(repo.path()).expect("genesis HEAD");
+    repo.forge().args(["--json", "accept"]).assert().success();
+
+    // Corrupt the store: point the ledger tip at a commit whose object does not exist, and
+    // rewind HEAD so reconcile must walk to it. This is the store-before-DB violation the
+    // typed NativeHistoryCorrupt error makes agent-distinguishable from transient IO.
+    let missing = format!("f1:commit:sha256:{}", "f".repeat(64));
+    db(repo.path())
+        .execute(
+            "UPDATE decisions SET commit_id = ?1 WHERE decision = 'accepted'",
+            [&missing],
+        )
+        .expect("plant dangling commit_id");
+    std::fs::write(repo.path().join(".forge/refs/HEAD"), &genesis).expect("rewind HEAD");
+
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "start", "after corruption"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(output["errors"][0]["code"], "NATIVE_HISTORY_CORRUPT");
+    assert_eq!(output["errors"][0]["details"]["kind"], "dangling_commit_id");
+    // S1: the error carries only the opaque commit id, no filesystem path.
+    let message = output["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        !message.contains('/'),
+        "error message leaked a path: {message}"
+    );
+}
