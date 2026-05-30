@@ -48,6 +48,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "004_integrity_and_actor",
         include_str!("../migrations/004_integrity_and_actor.sql"),
     ),
+    (
+        5,
+        "005_native_history",
+        include_str!("../migrations/005_native_history.sql"),
+    ),
 ];
 
 /// The highest migration version this binary knows how to apply.
@@ -397,7 +402,7 @@ mod tests {
 
     #[test]
     fn schema_head_is_max_version() {
-        assert_eq!(schema_head(), 4);
+        assert_eq!(schema_head(), 5);
     }
 
     #[test]
@@ -408,22 +413,40 @@ mod tests {
         assert_eq!(checksum, checksum_of("ALTER TABLE x ADD COLUMN y TEXT;"));
     }
 
-    /// Fresh apply reaches HEAD=4 with non-NULL checksums for every row.
+    /// Fresh apply reaches HEAD=5 with non-NULL checksums for every row.
     #[test]
     fn fresh_apply_reaches_head_with_checksums() {
         let mut conn = mem_conn();
         apply_pending_migrations(&mut conn).expect("apply migrations");
 
         let versions = applied_versions(&conn);
-        assert_eq!(versions.len(), 4);
+        assert_eq!(versions.len(), 5);
         assert_eq!(versions[0].0, 1);
         assert_eq!(versions[1].0, 2);
         assert_eq!(versions[2].0, 3);
         assert_eq!(versions[3].0, 4);
+        assert_eq!(versions[4].0, 5);
         assert!(versions[0].1.is_some(), "001 checksum must be non-NULL");
         assert!(versions[1].1.is_some(), "002 checksum must be non-NULL");
         assert!(versions[2].1.is_some(), "003 checksum must be non-NULL");
         assert!(versions[3].1.is_some(), "004 checksum must be non-NULL");
+        assert!(versions[4].1.is_some(), "005 checksum must be non-NULL");
+
+        // 005 seeds exactly one native_object_format row (f1/sha256/commit-schema 1).
+        let format_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM native_object_format", [], |row| {
+                row.get(0)
+            })
+            .expect("native_object_format exists");
+        assert_eq!(format_rows, 1, "exactly one seeded format row");
+        let (tag, algo, commit_v): (String, String, i64) = conn
+            .query_row(
+                "SELECT format_tag, hash_algo, commit_schema_version FROM native_object_format WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("seeded format row");
+        assert_eq!((tag.as_str(), algo.as_str(), commit_v), ("f1", "sha256", 1));
     }
 
     /// Build genesis case B — a GENUINE old v1 DB — by running the reverted-001
@@ -486,7 +509,15 @@ mod tests {
         // `intents` is included so migration 003's `check_spec_json` column is part of
         // the by-name convergence guard (code-review F4): case C (merged-binary v2)
         // is stamped only at version 2, so the runner must apply 003 to it.
-        for table in ["repositories", "current_state", "intents"] {
+        // `native_object_format` (005, NER-138 Phase 7 slice 2) is a new table created in
+        // all three genesis paths — cases B and C are stamped below version 5, so the
+        // runner must apply 005 to them — so its column set must converge too.
+        for table in [
+            "repositories",
+            "current_state",
+            "intents",
+            "native_object_format",
+        ] {
             let set_a = column_set(&a, table);
             let set_b = column_set(&b, table);
             let set_c = column_set(&c, table);
@@ -627,7 +658,7 @@ mod tests {
 
         apply_pending_migrations(&mut conn).expect("cd1bb3b v1 must converge, not brick");
 
-        // Both columns now present; version advanced to HEAD (4).
+        // Both columns now present; version advanced to HEAD (5).
         assert!(
             column_set(&conn, "repositories")
                 .iter()
@@ -641,8 +672,8 @@ mod tests {
             "attached_attempt_id added by the reconciling 002"
         );
         let versions = applied_versions(&conn);
-        assert_eq!(versions.last().expect("at least one version").0, 4);
-        assert_eq!(current_schema_version(&conn).expect("version probe"), 4);
+        assert_eq!(versions.last().expect("at least one version").0, 5);
+        assert_eq!(current_schema_version(&conn).expect("version probe"), 5);
     }
 
     /// FIX A: a genuinely-failing migration statement (a malformed `ALTER`, not a

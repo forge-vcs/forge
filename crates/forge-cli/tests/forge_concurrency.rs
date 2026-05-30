@@ -465,7 +465,7 @@ fn concurrent_commands_against_behind_db_both_upgrade_and_succeed() {
     // transient `migrate()` lock (acquired BEFORE each command's per-command lock,
     // never nested) serializes the upgrade against an in-flight unrelated mutating
     // command on the same `.forge/forge.lock`: both upgrade transparently and
-    // succeed, the schema lands at HEAD=4 with exactly one set of version rows, and
+    // succeed, the schema lands at HEAD=5 with exactly one set of version rows, and
     // no SQLITE_BUSY-class error surfaces — proving migrate-vs-locked-writer does
     // not deadlock.
     let repo = TestRepo::new_git();
@@ -501,14 +501,14 @@ fn concurrent_commands_against_behind_db_both_upgrade_and_succeed() {
 
     let connection = open_db(repo.path());
     // Exactly one set of version rows: the second upgrader's `INSERT OR IGNORE`
-    // is a no-op once the first commits version 4 (probe HEAD=4, the migration whose
+    // is a no-op once the first commits version 5 (probe the HEAD migration, whose
     // dedup the race actually exercises — code-review F5).
     let version_rows = count(
         &connection,
         "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
-        "4",
+        "5",
     );
-    assert_eq!(version_rows, 1, "exactly one version-4 row after the race");
+    assert_eq!(version_rows, 1, "exactly one version-5 row after the race");
     let head: i64 = connection
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -516,7 +516,7 @@ fn concurrent_commands_against_behind_db_both_upgrade_and_succeed() {
             |row| row.get(0),
         )
         .expect("max version");
-    assert_eq!(head, 4, "schema reached HEAD after the concurrent upgrade");
+    assert_eq!(head, 5, "schema reached HEAD after the concurrent upgrade");
     // The upgrade actually applied: 002's columns are present.
     let has_backend: i64 = connection
         .query_row(
