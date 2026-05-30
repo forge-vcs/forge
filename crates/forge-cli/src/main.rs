@@ -190,6 +190,13 @@ struct ExportArgs {
 enum ExportCommand {
     Branch(ExportBranchArgs),
     PrBody(ProposalScopedArgs),
+    /// Verify a published branch's provenance trailer recomputes from the local ledger.
+    VerifyBranch(VerifyBranchArgs),
+}
+
+#[derive(Debug, Args)]
+struct VerifyBranchArgs {
+    name: String,
 }
 
 #[derive(Debug, Args)]
@@ -720,6 +727,16 @@ fn gc_response(request_id: Option<String>, args: GcArgs) -> ResponseEnvelope {
 
 fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnvelope {
     match args.command {
+        ExportCommand::VerifyBranch(args) => {
+            command_result("export verify-branch", request_id, |cwd, _| {
+                // Read-only: recompute the provenance digest from the local ledger and
+                // confirm the published trailer matches (fail-closed PROVENANCE_MISMATCH /
+                // EVIDENCE_TAMPERED). A PASS is trailer↔current-ledger consistency, not
+                // cross-machine authenticity (NER-137 R7; see schema notes.provenance).
+                let verification = forge_export_git::verify_publication_trailer(&cwd, &args.name)?;
+                Ok((None, serde_json::to_value(verification)?, Vec::new()))
+            })
+        }
         ExportCommand::PrBody(args) => command_result("export pr-body", request_id, |cwd, _| {
             let (body, excluded) =
                 forge_store::pr_body_for(&cwd, args.attempt.as_deref(), args.proposal.as_deref())?;

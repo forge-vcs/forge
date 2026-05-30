@@ -28,6 +28,7 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "ATTEMPT_WORKTREE_MISMATCH",
     "CHECK_NOT_PASSED",
     "EVIDENCE_TAMPERED",
+    "PROVENANCE_MISMATCH",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.

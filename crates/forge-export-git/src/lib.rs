@@ -144,6 +144,93 @@ fn read_hunk(
     Ok((Some(bounded), truncated))
 }
 
+/// The `Forge-*` provenance trailers parsed from a published commit message (NER-137).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForgeTrailers {
+    pub proposal_id: Option<String>,
+    pub proposal_revision_id: Option<String>,
+    pub provenance_digest: Option<String>,
+    pub decision_actor: Option<String>,
+    pub gates: Option<String>,
+}
+
+/// The result of a successful `verify-branch` (NER-137 U6). A clean verification means
+/// the published `Forge-Provenance-Digest` matches the digest recomputed from the local
+/// ledger — trailer↔current-ledger consistency, NOT cross-machine authenticity.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TrailerVerification {
+    pub verified: bool,
+    pub proposal_id: String,
+    pub provenance_digest: String,
+}
+
+/// Read a commit's full message body via `git show -s --format=%B` (NER-137).
+pub fn read_commit_message(repo_root: &Path, branch_or_commit: &str) -> Result<String> {
+    git(repo_root, &["show", "-s", "--format=%B", branch_or_commit])
+}
+
+/// Parse the `Forge-*` provenance trailer lines out of a commit message. A single-pass
+/// line scan (not git's trailer canonicalization) so it is robust to the human prose
+/// preceding the trailer block.
+pub fn parse_forge_trailers(message: &str) -> ForgeTrailers {
+    let mut trailers = ForgeTrailers::default();
+    for line in message.lines() {
+        if let Some(value) = line.strip_prefix("Forge-Proposal-Id:") {
+            trailers.proposal_id = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("Forge-Proposal-Revision-Id:") {
+            trailers.proposal_revision_id = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("Forge-Provenance-Digest:") {
+            trailers.provenance_digest = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("Forge-Decision-Actor:") {
+            trailers.decision_actor = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("Forge-Gates:") {
+            trailers.gates = Some(value.trim().to_string());
+        }
+    }
+    trailers
+}
+
+/// Verify a published branch's provenance trailer against the local ledger (NER-137 U6,
+/// R7). Reads the commit's `Forge-*` trailers, recomputes the provenance digest from the
+/// deciding evidence/decision rows (`forge_store::build_publication_trailer`, which also
+/// re-verifies the deciding evidence and raises `EVIDENCE_TAMPERED` on a tampered row),
+/// and **fails closed** with `PROVENANCE_MISMATCH` when the published digest differs.
+///
+/// A PASS confirms the published trailer is consistent with the **current local ledger**
+/// — it detects a rewritten commit message or a naively-edited ledger row. It is NOT an
+/// authenticity proof: an attacker who rewrites the ledger rows AND re-exports still
+/// matches (the cheap-check boundary; cross-machine authenticity is Phase 9 signing).
+pub fn verify_publication_trailer(
+    repo_root: &Path,
+    branch_or_commit: &str,
+) -> Result<TrailerVerification> {
+    let message = read_commit_message(repo_root, branch_or_commit)?;
+    let trailers = parse_forge_trailers(&message);
+    let revision_id = trailers.proposal_revision_id.ok_or_else(|| {
+        anyhow!("commit {branch_or_commit} carries no Forge-Proposal-Revision-Id trailer")
+    })?;
+    let published = trailers.provenance_digest.ok_or_else(|| {
+        anyhow!("commit {branch_or_commit} carries no Forge-Provenance-Digest trailer")
+    })?;
+
+    let recomputed = forge_store::build_publication_trailer(repo_root, &revision_id)?;
+    if recomputed.provenance_digest != published {
+        return Err(ForgeError::ProvenanceMismatch {
+            proposal_id: trailers
+                .proposal_id
+                .unwrap_or_else(|| recomputed.proposal_id.clone()),
+            published_digest: published,
+            recomputed_digest: recomputed.provenance_digest,
+        }
+        .into());
+    }
+    Ok(TrailerVerification {
+        verified: true,
+        proposal_id: recomputed.proposal_id,
+        provenance_digest: recomputed.provenance_digest,
+    })
+}
+
 /// Export the accepted proposal as a new branch, returning `(commit_id, excluded)`.
 ///
 /// `excluded` is the list of secret-risk-named paths dropped from the resulting git

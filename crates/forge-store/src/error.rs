@@ -125,6 +125,19 @@ pub enum ForgeError {
     /// NOT skip it. Deterministic — re-record honest evidence. `id` is an opaque row
     /// id and `kind` a closed enum, so `details` carries no excerpt/command text.
     EvidenceTampered { id: String, kind: TamperKind },
+    /// A published commit's provenance trailer does not match the local ledger
+    /// (NER-137): `verify-branch` recomputed the content-addressed digest from the
+    /// deciding evidence/decision rows and it differs from the `Forge-Provenance-Digest`
+    /// the commit carries — the commit was rewritten, or a ledger row was edited without
+    /// re-export. Fail-closed and non-retryable. A PASS proves trailer↔current-ledger
+    /// consistency, NOT authenticity (an attacker who rewrites the ledger AND re-exports
+    /// still matches — cross-machine authenticity is Phase 9 signing). `details` carries
+    /// only the opaque proposal id and the two digests (no excerpt/path).
+    ProvenanceMismatch {
+        proposal_id: String,
+        published_digest: String,
+        recomputed_digest: String,
+    },
 }
 
 impl ForgeError {
@@ -153,6 +166,7 @@ impl ForgeError {
             ForgeError::AttemptWorktreeMismatch { .. } => "ATTEMPT_WORKTREE_MISMATCH",
             ForgeError::CheckNotPassed { .. } => "CHECK_NOT_PASSED",
             ForgeError::EvidenceTampered { .. } => "EVIDENCE_TAMPERED",
+            ForgeError::ProvenanceMismatch { .. } => "PROVENANCE_MISMATCH",
         }
     }
 
@@ -232,6 +246,15 @@ impl ForgeError {
                 // command string (details is a machine-visible egress).
                 json!({ "id": id, "kind": kind.as_str() })
             }
+            ForgeError::ProvenanceMismatch {
+                proposal_id,
+                published_digest,
+                recomputed_digest,
+            } => json!({
+                "proposal_id": proposal_id,
+                "published_digest": published_digest,
+                "recomputed_digest": recomputed_digest,
+            }),
             _ => Value::Object(Default::default()),
         }
     }
@@ -328,6 +351,14 @@ impl std::fmt::Display for ForgeError {
                 f,
                 "integrity check failed for row {id} ({}); the recorded evidence/decision was tampered with",
                 kind.as_str()
+            ),
+            ForgeError::ProvenanceMismatch {
+                proposal_id,
+                published_digest,
+                recomputed_digest,
+            } => write!(
+                f,
+                "provenance mismatch for proposal {proposal_id}: published trailer digest {published_digest} does not match the digest recomputed from the local ledger ({recomputed_digest})"
             ),
         }
     }
@@ -483,6 +514,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             after_ms: None,
             details_keys: &["id", "kind"],
         },
+        ErrorCodeSpec {
+            code: "PROVENANCE_MISMATCH",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["proposal_id", "published_digest", "recomputed_digest"],
+        },
     ]
 }
 
@@ -600,6 +637,15 @@ mod tests {
             .code(),
             "EVIDENCE_TAMPERED"
         );
+        assert_eq!(
+            ForgeError::ProvenanceMismatch {
+                proposal_id: "proposal_x".into(),
+                published_digest: "aaa".into(),
+                recomputed_digest: "bbb".into(),
+            }
+            .code(),
+            "PROVENANCE_MISMATCH"
+        );
     }
 
     #[test]
@@ -674,6 +720,28 @@ mod tests {
         assert_eq!(details["kind"], "content_edit");
         let object = details.as_object().expect("details object");
         assert_eq!(object.len(), 2, "details must carry exactly id + kind");
+    }
+
+    /// NER-137 security invariant: the provenance-mismatch payload carries only the
+    /// opaque proposal id and the two digests — no excerpt or path. Mirrors the other
+    /// `*_details_carry_only_ids` guards.
+    #[test]
+    fn provenance_mismatch_details_carry_only_ids() {
+        let details = ForgeError::ProvenanceMismatch {
+            proposal_id: "proposal_abc".into(),
+            published_digest: "deadbeef".into(),
+            recomputed_digest: "feedface".into(),
+        }
+        .details();
+        assert_eq!(details["proposal_id"], "proposal_abc");
+        assert_eq!(details["published_digest"], "deadbeef");
+        assert_eq!(details["recomputed_digest"], "feedface");
+        let object = details.as_object().expect("details object");
+        assert_eq!(
+            object.len(),
+            3,
+            "details must carry exactly proposal_id + the two digests"
+        );
     }
 
     /// `TamperKind`'s serde representation (used by `DoctorReport.tampered_rows`) must
@@ -825,6 +893,11 @@ mod tests {
                 id: "evidence_x".into(),
                 kind: TamperKind::BrokenLink,
             },
+            ForgeError::ProvenanceMismatch {
+                proposal_id: "proposal_x".into(),
+                published_digest: "aaa".into(),
+                recomputed_digest: "bbb".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -851,7 +924,8 @@ mod tests {
                 | ForgeError::MigrationFailed { .. }
                 | ForgeError::AttemptWorktreeMismatch { .. }
                 | ForgeError::CheckNotPassed { .. }
-                | ForgeError::EvidenceTampered { .. } => {}
+                | ForgeError::EvidenceTampered { .. }
+                | ForgeError::ProvenanceMismatch { .. } => {}
             }
         }
 
