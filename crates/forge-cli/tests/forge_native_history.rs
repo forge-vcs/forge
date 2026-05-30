@@ -420,6 +420,101 @@ fn undo_then_gc_dry_run_does_not_flag_an_accepted_commit() {
     );
 }
 
+/// A `forge` command builder whose child PATH contains ONLY `sh` (for `run`) and NO git —
+/// so any internal `git` spawn fails. The native lifecycle must complete anyway.
+#[cfg(unix)]
+fn forge_without_git(repo: &TestRepo, git_free_bin: &std::path::Path) -> assert_cmd::Command {
+    let mut command = repo.forge();
+    command.env("PATH", git_free_bin);
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn native_lifecycle_runs_with_git_removed_from_path() {
+    // NER-138 Phase 7 WHOLE-PHASE exit criterion: a native-backend repo completes
+    // init → start → save → run → propose → check → accept → restore, walks its history (log),
+    // checks out a past commit, and reports healthy (doctor) — ALL with git removed from PATH.
+    let repo = TestRepo::new_git(); // setup uses the test's own git; forge runs git-free below
+    let bin = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("/bin/sh", bin.path().join("sh")).unwrap();
+    let no_git = || forge_without_git(&repo, bin.path());
+
+    no_git()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    no_git()
+        .args(["--json", "start", "git-free lifecycle"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("feature.txt"), "git-free\n").unwrap();
+    let saved = json_output(no_git().args(["--json", "save"]).assert().success());
+    let snapshot_id = saved["data"]["snapshot_id"].as_str().unwrap().to_string();
+    no_git()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    no_git().args(["--json", "propose"]).assert().success();
+    no_git().args(["--json", "check"]).assert().success();
+    let accepted = json_output(no_git().args(["--json", "accept"]).assert().success());
+    let commit_id = accepted["data"]["commit_id"].as_str().unwrap().to_string();
+    assert!(commit_id.starts_with("f1:commit:sha256:"));
+    // restore the just-saved snapshot (worktree is clean / equals it) — git-free.
+    no_git()
+        .args(["--json", "restore", &snapshot_id, "--yes"])
+        .assert()
+        .success();
+    // walk history, check out the genesis (worktree clean == latest snapshot), report health.
+    let logged = json_output(no_git().args(["--json", "log"]).assert().success());
+    assert!(!logged["data"]["commits"].as_array().unwrap().is_empty());
+    let genesis = head(repo.path()).map(|_| ()); // HEAD file exists (no git needed to read it)
+    assert!(genesis.is_some());
+    // checkout the accepted commit's parent (genesis) — find it from log's last entry.
+    let genesis_commit = logged["data"]["commits"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    no_git()
+        .args(["--json", "checkout", &genesis_commit])
+        .assert()
+        .success();
+    let doctor = json_output(no_git().args(["--json", "doctor"]).assert().success());
+    assert_eq!(doctor["data"]["ok"], true, "healthy native repo, git-free");
+}
+
+#[cfg(unix)]
+#[test]
+fn native_undo_runs_with_git_removed_from_path() {
+    let repo = TestRepo::new_git();
+    let bin = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink("/bin/sh", bin.path().join("sh")).unwrap();
+    let no_git = || forge_without_git(&repo, bin.path());
+
+    no_git()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    no_git()
+        .args(["--json", "start", "git-free undo"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("f.txt"), "A\n").unwrap();
+    no_git().args(["--json", "save"]).assert().success();
+    std::fs::write(repo.path().join("f.txt"), "B\n").unwrap();
+    no_git().args(["--json", "save"]).assert().success();
+    no_git().args(["--json", "undo"]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+        "A\n",
+        "undo restored the prior snapshot — git-free"
+    );
+}
+
 #[test]
 fn doctor_reports_a_healthy_native_dag() {
     let repo = TestRepo::new_git();

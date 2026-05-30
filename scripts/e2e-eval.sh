@@ -149,6 +149,30 @@ else
   echo "  (compare tamper check skipped: sqlite3 unavailable)"
 fi
 
+echo; echo "=== NATIVE lifecycle with git REMOVED from PATH (NER-138 Phase 7 exit criterion) ==="
+# A PATH with only `sh` (needed by `run`) and NO git, proving the native lifecycle never
+# shells the git binary. Setup (mkrepo) uses the real git; the NG-prefixed forge commands run
+# with the stripped PATH. Skipped if /bin/sh is unavailable (non-POSIX host).
+if [ -x /bin/sh ]; then
+  NOGIT_BIN="$TMP/nogit-bin"; mkdir -p "$NOGIT_BIN"; ln -sf /bin/sh "$NOGIT_BIN/sh"
+  mkrepo nativelife >/dev/null
+  NG() { PATH="$NOGIT_BIN" "$FORGE" --json "$@" >"$OUT" 2>"$ERR"; }   # forge with git-free PATH
+  NG init --content-backend native; ck "native init (git removed)" "$(pg "d['status']")" "success"
+  NG start "git-free"; ck "native start (git removed)" "$(pg "d['status']")" "success"
+  echo "feature" > feature.txt
+  NG save; ck "native save (git removed)" "$(pg "d['status']")" "success"
+  NG run -- sh -c true; ck "native run (git removed)" "$(pg "d['status']")" "success"
+  NG propose; ck "native propose (git removed)" "$(pg "d['status']")" "success"
+  NG check; ck "native check (git removed)" "$(pg "d['status']")" "success"
+  NG accept; ck "native accept (git removed)" "$(pg "d['status']")" "success"
+  ckc "accept writes a native commit (git removed)" "$(pg "d['data']['commit_id']")" "f1:commit:sha256:"
+  NG log; ckc "native log walks history (git removed)" "$(pg "len(d['data']['commits'])>=1")" "True"
+  NG doctor; ck "native doctor healthy (git removed)" "$(pg "d['data']['ok']")" "True"
+  cd "$TMP"
+else
+  echo "  (skipped: /bin/sh unavailable)"
+fi
+
 echo; echo "=== MIGRATION state (live binary) ==="
 if [ "$have_sqlite" = 1 ]; then
   vers="$(db "$TMP/life" "SELECT group_concat(version) FROM schema_migrations ORDER BY version;")"

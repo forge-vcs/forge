@@ -363,7 +363,15 @@ pub fn init_repository(
     if !matches!(content_backend.as_str(), "git" | "native") {
         bail!("unsupported content backend");
     }
-    let root = git_root(cwd)?;
+    // A NATIVE repo earns real git independence: it does not require the git binary at init —
+    // its root is `cwd` (canonicalized). A GIT-backed repo still anchors on the git toplevel
+    // (Forge layers on an existing git repo). This is what lets the full native lifecycle —
+    // init included — run with git removed from PATH (NER-138 Phase 7 exit criterion).
+    let root = if content_backend == "native" {
+        cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
+    } else {
+        git_root(cwd)?
+    };
     let forge_dir = root.join(".forge");
     fs::create_dir_all(&forge_dir)
         .with_context(|| format!("failed to create {}", forge_dir.display()))?;
@@ -389,7 +397,13 @@ pub fn init_repository(
         });
     }
 
-    let git_head = git_head(&root);
+    // A native repo records no git_head (it has its own ref store and never shells git);
+    // recording it would reintroduce a git dependency at init.
+    let git_head = if content_backend == "native" {
+        None
+    } else {
+        git_head(&root)
+    };
     let repo_id = RepositoryId::new().to_string();
     let operation_id = OperationId::new().to_string();
     let view_id = ViewId::new().to_string();
@@ -466,7 +480,9 @@ pub fn init_repository(
 }
 
 pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
-    let root = git_root(cwd)?;
+    // Git-free root resolution (slice 3): walk up for `.forge/forge.db` rather than shelling
+    // `git rev-parse`, so every post-init command works with git removed from PATH.
+    let root = forge_root(cwd)?;
     let database_path = root.join(".forge/forge.db");
     if !database_path.exists() {
         return Err(ForgeError::NotInitialized.into());
@@ -514,7 +530,8 @@ pub fn repository_content_backend(cwd: &Path) -> Result<String> {
 /// surfaces the canonical "not initialized" error instead of a lock-file error.
 /// A genuine contention timeout surfaces as a [`LockTimeout`] (`Err`).
 pub fn acquire_repo_lock(cwd: &Path) -> Result<Option<RepoLock>> {
-    let root = match git_root(cwd) {
+    // Git-free root resolution (slice 3): a `.forge`-walk, so locking works without git.
+    let root = match forge_root(cwd) {
         Ok(root) => root,
         Err(_) => return Ok(None),
     };
@@ -546,7 +563,8 @@ pub fn acquire_repo_lock(cwd: &Path) -> Result<Option<RepoLock>> {
 ///   pending migrations (idempotent + version-gated, so a concurrent migrator that
 ///   won the race is handled), then release the lock (Drop) before returning.
 pub fn migrate(cwd: &Path) -> Result<()> {
-    let root = match git_root(cwd) {
+    // Git-free root resolution (slice 3): a `.forge`-walk, so migration works without git.
+    let root = match forge_root(cwd) {
         Ok(root) => root,
         Err(_) => return Ok(()),
     };
@@ -4338,6 +4356,27 @@ fn read_init_repository(
             }
         },
     ))
+}
+
+/// Find the Forge repository root by walking up from `cwd` for the nearest ancestor that
+/// contains the `.forge/forge.db` repo marker. GIT-FREE (NER-138 Phase 7 slice 3): post-`init`
+/// commands resolve the root without the git binary, so the native lifecycle
+/// (start→save→…→accept→restore→log→checkout→undo) runs with git removed from PATH. `init`
+/// still anchors a *git-backed* repo on the git toplevel (Forge layers on an existing git
+/// repo); a *native* repo's root is established at init without git. Returns
+/// `NotInitialized` when no `.forge/forge.db` is found up the tree.
+fn forge_root(cwd: &Path) -> Result<PathBuf> {
+    let start = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut current: &Path = &start;
+    loop {
+        if current.join(".forge/forge.db").exists() {
+            return Ok(current.to_path_buf());
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return Err(ForgeError::NotInitialized.into()),
+        }
+    }
 }
 
 fn git_root(cwd: &Path) -> Result<PathBuf> {
