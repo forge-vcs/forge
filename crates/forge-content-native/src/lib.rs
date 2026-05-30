@@ -661,7 +661,18 @@ enum TreeEntryKind {
 struct FileEntry {
     path: String,
     executable: bool,
+    /// `Some(target)` when this entry is a symlink (NER-138 Phase 7 slice 3): the blob stores
+    /// the link target bytes under mode `0o120000`, matching git's symlink representation, so
+    /// a symlink round-trips as a link (not a regular file whose content is the target text).
+    /// `None` for a regular file. Captured via `read_link` (never followed), so the link's
+    /// pointed-at content is never read into a snapshot.
+    symlink_target: Option<String>,
 }
+
+/// The tree-entry mode for a symlink: git's `120000`. A symlink leaf is a `TreeEntryKind::File`
+/// whose blob is the target bytes and whose mode is this; folding mode into the diff key
+/// (`FileFingerprint`) keeps a symlink distinct from a regular file with identical bytes.
+const SYMLINK_MODE: u32 = 0o120000;
 
 fn object_id_from_content_ref(content_ref: &str) -> Result<ObjectId> {
     ObjectId::parse(
@@ -701,7 +712,15 @@ fn write_tree(
 
     let mut entries = Vec::new();
     for file in direct_files {
-        let bytes = fs::read(repo_root.join(&file.path))?;
+        // A symlink stores its target bytes under mode 120000 (git's representation); a
+        // regular file stores its content under 100644/100755.
+        let (bytes, mode) = match &file.symlink_target {
+            Some(target) => (target.clone().into_bytes(), SYMLINK_MODE),
+            None => {
+                let bytes = fs::read(repo_root.join(&file.path))?;
+                (bytes, if file.executable { 0o100755 } else { 0o100644 })
+            }
+        };
         let blob = store.write_object(ObjectKind::Blob, &bytes)?;
         let name = file
             .path
@@ -712,7 +731,7 @@ fn write_tree(
         entries.push(TreeEntry {
             name,
             kind: TreeEntryKind::File,
-            mode: if file.executable { 0o100755 } else { 0o100644 },
+            mode,
             object: blob.to_string(),
         });
     }
@@ -773,6 +792,24 @@ fn materialize_tree(
             TreeEntryKind::File => {
                 let bytes = store.read_object(&child)?;
                 let full = repo_root.join(&rel);
+                if entry.mode == SYMLINK_MODE {
+                    // A symlink entry: the blob is the link target bytes. On Unix, recreate a
+                    // symlink (R15: reject an absolute / worktree-escaping target before
+                    // creating it). On non-Unix, fall through and write the target bytes as a
+                    // regular file (documented platform divergence).
+                    #[cfg(unix)]
+                    {
+                        materialize_symlink(
+                            repo_root,
+                            &rel,
+                            &full,
+                            &bytes,
+                            target_paths,
+                            synced_dirs,
+                        )?;
+                        continue;
+                    }
+                }
                 if full.is_dir() {
                     fs::remove_dir_all(&full)
                         .with_context(|| format!("remove directory {}", full.display()))?;
@@ -837,6 +874,99 @@ fn materialize_tree(
     Ok(())
 }
 
+/// Lexically normalize a path — resolve `.`/`..` WITHOUT touching the filesystem (a symlink
+/// target need not exist). `..` pops the last kept component; `.` is dropped.
+#[cfg(unix)]
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// R15 (NER-138 Phase 7 slice 3): a materialized symlink must not escape the worktree. Reject
+/// an absolute target, or a relative target whose lexical resolution (from the link's own
+/// parent) leaves the worktree root. Errors are PATH-FREE (S1) — neither the link path nor the
+/// target is interpolated into the message.
+#[cfg(unix)]
+fn validate_symlink_target(repo_root: &Path, link_rel: &str, target: &str) -> Result<()> {
+    if Path::new(target).is_absolute() {
+        bail!("symlink target escapes the worktree (absolute target rejected)");
+    }
+    let link_parent = Path::new(link_rel)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let combined = lexical_normalize(&repo_root.join(link_parent).join(target));
+    if !combined.starts_with(lexical_normalize(repo_root)) {
+        bail!("symlink target escapes the worktree");
+    }
+    Ok(())
+}
+
+/// Crash-atomically materialize a symlink (NER-138 Phase 7 slice 3): validate the target
+/// (R15), remove any existing entry at the path (without following it), create the symlink
+/// under a `.forge-restore-` temp name in the destination's own parent (so a crash
+/// mid-materialize leaves a doctor-reclaimable temp, not a torn entry), atomically rename it
+/// into place, and fsync the parent directory. `bytes` are the link target.
+#[cfg(unix)]
+fn materialize_symlink(
+    repo_root: &Path,
+    rel: &str,
+    full: &Path,
+    bytes: &[u8],
+    target_paths: &mut BTreeSet<String>,
+    synced_dirs: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let target =
+        std::str::from_utf8(bytes).map_err(|_| anyhow!("symlink target is not valid utf-8"))?;
+    validate_symlink_target(repo_root, rel, target)?;
+    let parent = full
+        .parent()
+        .ok_or_else(|| anyhow!("symlink target has no parent"))?;
+    let newly_created = missing_dirs(parent);
+    fs::create_dir_all(parent)?;
+    // Remove any existing entry WITHOUT following a symlink (symlink_metadata): a stale
+    // symlink is removed as a file, a real directory via remove_dir_all.
+    if let Ok(meta) = fs::symlink_metadata(full) {
+        if meta.file_type().is_dir() {
+            fs::remove_dir_all(full)?;
+        } else {
+            fs::remove_file(full)?;
+        }
+    }
+    let name = full
+        .file_name()
+        .ok_or_else(|| anyhow!("symlink target has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let temp = parent.join(format!("{RESTORE_TEMP_PREFIX}{name}"));
+    let _ = fs::remove_file(&temp); // clear a crash-orphaned temp from a prior run
+    std::os::unix::fs::symlink(target, &temp)
+        .map_err(|error| anyhow!("create symlink: {}", error.kind()))?;
+    fs::rename(&temp, full).map_err(|error| anyhow!("persist symlink: {}", error.kind()))?;
+    // A symlink cannot be fsynced portably; fsyncing the parent dir (which gained the new
+    // entry) is the durability boundary, mirroring the regular-file restore.
+    if synced_dirs.insert(parent.to_path_buf()) {
+        sync_dir(parent)?;
+    }
+    for dir in &newly_created {
+        if let Some(grandparent) = dir.parent() {
+            if synced_dirs.insert(grandparent.to_path_buf()) {
+                sync_dir(grandparent)?;
+            }
+        }
+    }
+    target_paths.insert(rel.to_string());
+    Ok(())
+}
+
 fn scan_worktree(repo_root: &Path) -> Result<Vec<FileEntry>> {
     let mut files = Vec::new();
     for path in walk_worktree(repo_root)? {
@@ -844,14 +974,52 @@ fn scan_worktree(repo_root: &Path) -> Result<Vec<FileEntry>> {
             continue;
         }
         let full = repo_root.join(&path);
-        let metadata = match fs::metadata(&full) {
-            Ok(metadata) if metadata.is_file() => metadata,
-            _ => continue,
+        // `symlink_metadata` does NOT follow links: a symlink reports as a symlink (so we can
+        // capture it as a `120000` entry via `read_link`, never reading its pointed-at
+        // content). A non-symlink file is captured as before.
+        let metadata = match fs::symlink_metadata(&full) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
         };
-        files.push(FileEntry {
-            path,
-            executable: is_executable(&metadata),
-        });
+        if metadata.file_type().is_symlink() {
+            #[cfg(unix)]
+            {
+                // Capture the link target bytes as a `120000` blob (matching git). The link is
+                // never followed, so a symlink pointing at a secret/out-of-tree path leaks no
+                // content into the snapshot — only the target string is stored.
+                let target = match fs::read_link(&full) {
+                    Ok(target) => target.to_string_lossy().into_owned(),
+                    Err(_) => continue,
+                };
+                files.push(FileEntry {
+                    path,
+                    executable: false,
+                    symlink_target: Some(target),
+                });
+            }
+            #[cfg(not(unix))]
+            {
+                // Non-Unix: preserve the pre-slice-3 behavior (follow the link, capture
+                // resolved file content) — documented platform divergence.
+                if let Ok(resolved) = fs::metadata(&full) {
+                    if resolved.is_file() {
+                        files.push(FileEntry {
+                            path,
+                            executable: is_executable(&resolved),
+                            symlink_target: None,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+        if metadata.is_file() {
+            files.push(FileEntry {
+                path,
+                executable: is_executable(&metadata),
+                symlink_target: None,
+            });
+        }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     // Defensive: the serial `ignore` Walk yields each path once, so this dedup is a no-op
@@ -911,9 +1079,9 @@ fn walk_worktree(repo_root: &Path) -> Result<Vec<String>> {
                 None => continue,
             },
         };
-        // Skip directories; yield regular files AND symlinks so the downstream
-        // `fs::metadata`/`is_file` gate (which follows links) decides symlink-to-file
-        // capture — preserving today's behavior (Phase 7 does not add symlink content).
+        // Skip directories; yield regular files AND symlinks. `scan_worktree`'s
+        // `symlink_metadata` gate then captures a symlink as a `120000` entry (its target,
+        // via `read_link` — never followed) and a regular file as content (NER-138 slice 3).
         match entry.file_type() {
             Some(file_type) if file_type.is_dir() => continue,
             None => continue, // no file type (e.g. the stdin sentinel) — never a worktree file
@@ -1645,9 +1813,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tracked_symlink_to_file_is_captured() {
-        // Regression guard for the file_type trap: a symlink's own file_type is is_symlink,
-        // so a walk-layer is_file() filter would drop a tracked symlink-to-file that today's
-        // fs::metadata (which follows the link) captures. The walker must yield symlinks.
+        // The walker yields symlinks (a symlink's own file_type is is_symlink, so a walk-layer
+        // is_file() filter would drop it); scan_worktree's symlink_metadata gate then captures
+        // it as a 120000 entry. Path-set parity with git holds: git ls-files lists the link and
+        // git_based_scan's is_file() (which follows) keeps a symlink-to-file.
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
@@ -1664,6 +1833,72 @@ mod tests {
         );
         assert!(native.contains(&"target.txt".to_string()));
         assert_eq!(native, git_based_scan(repo));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_round_trips_as_a_link_not_a_regular_file() {
+        // NER-138 slice 3: a symlink snapshots as a 120000 object (its target) and restores as
+        // a SYMLINK with the identical target — not a regular file whose content is the target
+        // text. A regular file containing the same bytes is a DISTINCT object + diff entry.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("target.txt"), b"hello").unwrap();
+        symlink("target.txt", repo.join("link.txt")).unwrap();
+        // A regular file whose CONTENT equals the symlink's target string.
+        fs::write(repo.join("decoy.txt"), b"target.txt").unwrap();
+
+        let content = NativeContentBackend
+            .snapshot_worktree(repo)
+            .expect("snapshot with a symlink");
+
+        let dest = tempfile::tempdir().unwrap();
+        // Objects live under `repo`; files materialize into `dest` (which is also the worktree
+        // root the R15 target validation resolves against).
+        materialize_content_ref(repo, dest.path(), &content.content_ref)
+            .expect("materialize symlink");
+        let restored = dest.path().join("link.txt");
+        let meta = fs::symlink_metadata(&restored).expect("restored link exists");
+        assert!(
+            meta.file_type().is_symlink(),
+            "must restore as a symlink, not a regular file"
+        );
+        assert_eq!(fs::read_link(&restored).unwrap(), Path::new("target.txt"));
+
+        // The symlink and the same-bytes regular file are distinct (mode in the diff key):
+        // their tree entries carry different modes (120000 vs 100644) even though one's blob
+        // content equals the other's target string.
+        let root = object_id_from_content_ref(&content.content_ref).unwrap();
+        let store = NativeObjectStore::new(repo);
+        let flat = flatten_tree(&store, &root).unwrap();
+        let (_, link_mode) = flat.get("link.txt").expect("link.txt in tree");
+        let (_, decoy_mode) = flat.get("decoy.txt").expect("decoy.txt in tree");
+        assert_eq!(*link_mode, 0o120000, "symlink entry is mode 120000");
+        assert_eq!(*decoy_mode, 0o100644, "regular file entry is mode 100644");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materializing_an_escaping_symlink_is_rejected() {
+        // R15 (security P0): a materialized symlink must not escape the worktree. A captured
+        // target of `../../etc/passwd` or an absolute `/etc/passwd` is rejected at materialize
+        // (path-free error); a safe relative target within the worktree materializes.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        // Escaping (relative) and absolute targets are rejected.
+        for bad in ["../../etc/passwd", "/etc/passwd"] {
+            let error = validate_symlink_target(repo, "sub/link", bad).unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(
+                !rendered.contains("etc/passwd") && !rendered.contains(repo.to_str().unwrap()),
+                "S1: rejection must be path-free: {rendered}"
+            );
+        }
+        // A safe relative target within the worktree is accepted.
+        validate_symlink_target(repo, "sub/link", "../README.md").expect("safe relative target");
+        validate_symlink_target(repo, "link", "target.txt").expect("sibling target");
     }
 
     #[test]
