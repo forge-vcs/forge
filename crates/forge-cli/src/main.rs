@@ -39,6 +39,8 @@ enum Command {
     Compare(CompareArgs),
     /// Walk the native commit history (tip→genesis) and the evidence that justified it.
     Log(LogArgs),
+    /// Materialize a past commit's tree into the worktree (does not move the base anchor).
+    Checkout(CheckoutArgs),
     Doctor,
     Gc(GcArgs),
     Export(ExportArgs),
@@ -66,6 +68,12 @@ struct LogArgs {
     /// Show only commits recorded under this intent ("show every change under this intent").
     #[arg(long)]
     intent: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CheckoutArgs {
+    /// The native commit id (`f1:commit:sha256:...`) whose tree to materialize.
+    commit_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -259,6 +267,7 @@ fn main() -> ExitCode {
         Command::Proposal(args) => proposal_response(request_id, args),
         Command::Compare(args) => compare_response(request_id, "compare", args),
         Command::Log(args) => log_response(request_id, args),
+        Command::Checkout(args) => checkout_response(request_id, args),
         Command::Doctor => doctor_response(request_id),
         Command::Gc(args) => gc_response(request_id, args),
         Command::Export(args) => export_response(request_id, args),
@@ -726,6 +735,40 @@ fn proposal_response(request_id: Option<String>, args: ProposalArgs) -> Response
             ))
         }),
     }
+}
+
+fn checkout_response(request_id: Option<String>, args: CheckoutArgs) -> ResponseEnvelope {
+    command_result("checkout", request_id, |cwd, request_id| {
+        // Resolve + validate the target FIRST (NOT_FOUND for a typo vs NATIVE_HISTORY_CORRUPT
+        // for a ledger-referenced-but-missing commit), before touching the worktree.
+        let content_ref = forge_store::checkout_target_content_ref(&cwd, &args.commit_id)?;
+        // Refuse a dirty worktree BEFORE materializing (mirrors restore): the irreversible
+        // clobber must not run if there are unsaved changes to lose.
+        let current_content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
+        let latest_content_ref = forge_store::latest_snapshot_content_ref(&cwd, None)?;
+        if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
+            return Err(ForgeError::DirtyWorktree {
+                paths: current_content.changed_paths.clone(),
+            }
+            .into());
+        }
+        // Materialize the historical tree (policy-excluded; symlink-aware + R15 via U9).
+        backend_for_content_ref(&content_ref)?.restore_snapshot(&cwd, &content_ref)?;
+        // Record the checkout in the op-log (so `undo` can reverse it and gc keeps the target
+        // reachable). Checkout does NOT move the base anchor — surfaced as base_unchanged so an
+        // agent is not misled into expecting git's HEAD-moving checkout semantics.
+        let record = forge_store::record_checkout(&cwd, request_id, &args.commit_id)?;
+        Ok((
+            Some(record.operation_id.clone()),
+            json!({
+                "commit_id": args.commit_id,
+                "content_ref": content_ref,
+                "base_unchanged": true,
+                "current_view_id": record.view_id
+            }),
+            Vec::new(),
+        ))
+    })
 }
 
 fn log_response(request_id: Option<String>, args: LogArgs) -> ResponseEnvelope {
@@ -1278,6 +1321,8 @@ fn is_mutating_command(command: &str) -> bool {
             | "accept"
             | "reject"
             | "export branch"
+            | "checkout"
+            | "undo"
     )
 }
 

@@ -261,6 +261,74 @@ fn native_log_filters_by_intent() {
 }
 
 #[test]
+fn checkout_materializes_a_past_commit_without_moving_the_base() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let genesis = head(repo.path()).expect("genesis HEAD");
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    let tip = accepted["data"]["commit_id"].as_str().unwrap().to_string();
+
+    // The accepted state has feature.txt; the genesis (pre-save) does not.
+    assert!(repo.path().join("feature.txt").exists());
+
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "checkout", &genesis])
+            .assert()
+            .success(),
+    );
+    assert_eq!(out["data"]["commit_id"], genesis);
+    assert_eq!(out["data"]["base_unchanged"], true);
+    // The genesis tree (README.md only) is materialized; feature.txt is gone.
+    assert!(!repo.path().join("feature.txt").exists());
+    // Checkout did NOT move the base anchor: HEAD is still the accepted tip.
+    assert_eq!(head(repo.path()).as_deref(), Some(tip.as_str()));
+}
+
+#[test]
+fn checkout_refuses_a_dirty_worktree() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let genesis = head(repo.path()).expect("genesis HEAD");
+    repo.forge().args(["--json", "accept"]).assert().success();
+
+    // Dirty the worktree with an unsaved edit.
+    std::fs::write(repo.path().join("feature.txt"), "uncommitted edit\n").unwrap();
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "checkout", &genesis])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(out["errors"][0]["code"], "DIRTY_WORKTREE");
+    // The worktree was not clobbered.
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("feature.txt")).unwrap(),
+        "uncommitted edit\n"
+    );
+}
+
+#[test]
+fn checkout_unknown_commit_is_not_corruption() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    repo.forge().args(["--json", "accept"]).assert().success();
+
+    // A syntactically-valid but never-written commit id is a user error, NOT corruption.
+    let unknown = format!("f1:commit:sha256:{}", "a".repeat(64));
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "checkout", &unknown])
+            .assert()
+            .failure(),
+    );
+    assert_ne!(
+        out["errors"][0]["code"], "NATIVE_HISTORY_CORRUPT",
+        "a typo'd commit id must not inflate the corruption rate"
+    );
+}
+
+#[test]
 fn dangling_ledger_commit_id_surfaces_native_history_corrupt() {
     let repo = TestRepo::new_git();
     prepare_native_proposal(&repo);

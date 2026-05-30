@@ -921,6 +921,84 @@ pub fn record_restore(
     Ok(op)
 }
 
+/// Resolve a historical commit id to the `forge-tree:` content ref of its tree, for
+/// `forge checkout` (NER-138 Phase 7 slice 3). Fail-closed BEFORE any materialization:
+/// - a non-parseable / non-commit id, or a never-written id the ledger does not reference,
+///   is a USER error → a path-free `anyhow` ("unknown commit", mapped to COMMAND_FAILED),
+///   NOT corruption (so a typo never inflates the perceived corruption rate);
+/// - a commit/tree the ledger references but whose object is missing is genuine corruption
+///   → typed `NativeHistoryCorrupt` (DanglingCommitId / DanglingTree).
+pub fn checkout_target_content_ref(cwd: &Path, commit_id: &str) -> Result<String> {
+    let context = open_repository(cwd)?;
+    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let id = match forge_content_native::ObjectId::parse(commit_id) {
+        Ok(id) if matches!(id.kind(), Ok(forge_content_native::ObjectKind::Commit)) => id,
+        _ => bail!("unknown commit: not a native commit id in this repository"),
+    };
+    let connection = open_connection(&context.database_path)?;
+    let commit = match store.read_commit(&id) {
+        Ok(commit) => commit,
+        Err(_) => {
+            let referenced: bool = connection
+                .query_row(
+                    "SELECT 1 FROM decisions WHERE repo_id = ?1 AND commit_id = ?2 LIMIT 1",
+                    params![context.repo_id, commit_id],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if referenced {
+                return Err(ForgeError::NativeHistoryCorrupt {
+                    kind: NativeHistoryCorruptKind::DanglingCommitId,
+                    commit_id: commit_id.to_string(),
+                    related_id: None,
+                }
+                .into());
+            }
+            bail!("unknown commit: not in this repository's native history");
+        }
+    };
+    let content_ref = format!("{}{}", forge_content::FORGE_TREE_PREFIX, commit.tree);
+    // The tree (and everything it reaches) must exist before we clobber the worktree.
+    store
+        .verify_content_ref(&content_ref)
+        .map_err(|_| ForgeError::NativeHistoryCorrupt {
+            kind: NativeHistoryCorruptKind::DanglingTree,
+            commit_id: commit_id.to_string(),
+            related_id: Some(commit.tree.clone()),
+        })?;
+    Ok(content_ref)
+}
+
+/// Record a `forge checkout` in the op-log (NER-138 Phase 7 slice 3) so `undo` can reverse
+/// it and gc treats the materialized commit as a reachability root. The target `commit_id`
+/// is in the view `state_json`. Does NOT advance the base anchor (checkout is materialize-only
+/// — a `save` afterward still diffs against the unchanged base HEAD; see the slice-3 plan).
+pub fn record_checkout(
+    cwd: &Path,
+    request_id: Option<String>,
+    commit_id: &str,
+) -> Result<OperationViewResult> {
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    let op = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "checkout".to_string(),
+                kind: "commit_checked_out".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({ "lifecycle": "commit_checked_out", "commit_id": commit_id }),
+            },
+        )
+    })?;
+    Ok(op)
+}
+
 pub fn record_evidence(
     cwd: &Path,
     request_id: Option<String>,
