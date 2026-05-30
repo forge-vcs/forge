@@ -58,7 +58,7 @@ echo; echo "=== LIFECYCLE (init→start→save→run→propose→check→accept�
 mkrepo life >/dev/null
 F init;    ck "init success" "$(pg "d['status']")" "success"
 F doctor;  ck "doctor ok" "$(pg "d['data']['ok']")" "True"
-ck "doctor schema_version=4" "$(pg "d['data']['schema_version']")" "4"
+ck "doctor schema_version=5" "$(pg "d['data']['schema_version']")" "5"
 F start "build a feature"; ck "start success" "$(pg "d['status']")" "success"
 echo "hello" > feature.txt
 F save;    ck "save success" "$(pg "d['status']")" "success"
@@ -70,15 +70,16 @@ F export branch eval-branch; ck "export branch success" "$(pg "d['status']")" "s
 git rev-parse --verify eval-branch >/dev/null 2>&1 && b=yes || b=no
 ck "exported git branch exists" "$b" "yes"
 
-echo; echo "=== LIFECYCLE (native backend, NER-138 Phase 7 walker) ==="
-# Drives the native ignore-crate walker through the real binary. Git stays in PATH: native
-# changed_paths/base_head still shell git until slice 2, so this is NOT a full git-independence
-# check (that lands in slice 3). Snapshot-level secret exclusion is proven rigorously by the
-# Rust differential harness; here we smoke the lifecycle, assert the forge-tree content ref
-# (proving the native walker produced the snapshot), and check observable ignore/secret hygiene.
+echo; echo "=== LIFECYCLE (native backend, NER-138 Phase 7 slices 1+2) ==="
+# Drives the native backend end-to-end. Slice 1 made the snapshot enumerator native
+# (ignore-crate walker); slice 2 made base_head + changed_paths native too — base_head is
+# now a native f1:commit: id (not a git commit), and changed_paths is a native tree diff.
+# Git stays in PATH only for export INTEROP (a native base resolves to a deterministic
+# synthesized git parent). Full git-removed-from-PATH is slice 3.
 mkrepo life-native >/dev/null
 F init --content-backend native; ck "native init success" "$(pg "d['status']")" "success"
 F start "native feature"; ck "native start success" "$(pg "d['status']")" "success"
+ckc "native base_head is a native commit id (not a git SHA)" "$(pg "d['data']['base_head']")" "f1:commit:sha256:"
 printf '*.log\n' > .gitignore
 echo "feature" > feature.txt
 echo "noise" > debug.log
@@ -86,13 +87,20 @@ printf 'API_TOKEN=supersecret\n' > .env
 F save; ck "native save success" "$(pg "d['status']")" "success"
 ckc "native save content_ref is forge-tree" "$(pg "d['data']['content_ref']")" "forge-tree:"
 nsnap="$(pg "d['data']['snapshot_id']")"
-ck "native walker keeps feature.txt" "$(pg "'feature.txt' in d['data']['changed_paths']")" "True"
-ck "native walker drops gitignored debug.log" "$(pg "'debug.log' in d['data']['changed_paths']")" "False"
-ck "native walker drops secret .env" "$(pg "'.env' in d['data']['changed_paths']")" "False"
+ck "native changed_paths keeps feature.txt" "$(pg "'feature.txt' in d['data']['changed_paths']")" "True"
+ck "native changed_paths drops gitignored debug.log" "$(pg "'debug.log' in d['data']['changed_paths']")" "False"
+ck "native changed_paths drops secret .env" "$(pg "'.env' in d['data']['changed_paths']")" "False"
 F run -- true; ck "native run success" "$(pg "d['status']")" "success"
 F propose; ck "native propose success" "$(pg "d['status']")" "success"
 F check; ck "native check success" "$(pg "d['status']")" "success"
 F accept; ck "native accept success" "$(pg "d['status']")" "success"
+# Export interop: a native f1:commit: base resolves to a synthesized git parent (slice 2).
+F export branch native-pub; ck "native export branch success (git interop on a native base)" "$(pg "d['status']")" "success"
+git rev-parse --verify native-pub >/dev/null 2>&1 && nb=yes || nb=no
+ck "native export produced a git branch" "$nb" "yes"
+ntree="$(git ls-tree -r native-pub --name-only 2>/dev/null)"
+ckc "native export tree keeps feature.txt" "$ntree" "feature.txt"
+case "$ntree" in *".env"*) FAIL=$((FAIL+1)); FAILS+=(".env LEAKED into native exported tree"); printf '  \033[31m✗\033[0m .env must NOT be in the native exported branch tree\n';; *) PASS=$((PASS+1)); printf '  \033[32m✓\033[0m .env is absent from the native exported branch tree\n';; esac
 F restore "$nsnap" --yes; ck "native restore round-trips" "$(pg "d['status']")" "success"
 
 echo; echo "=== DECLARATIVE CHECK GATES (NER-135) ==="
@@ -144,12 +152,12 @@ fi
 echo; echo "=== MIGRATION state (live binary) ==="
 if [ "$have_sqlite" = 1 ]; then
   vers="$(db "$TMP/life" "SELECT group_concat(version) FROM schema_migrations ORDER BY version;")"
-  ck "schema_migrations has versions 1,2,3,4" "$vers" "1,2,3,4"
+  ck "schema_migrations has versions 1,2,3,4,5" "$vers" "1,2,3,4,5"
   nullck="$(db "$TMP/life" "SELECT count(*) FROM schema_migrations WHERE checksum IS NULL;")"
   ck "all migration rows carry a checksum" "$nullck" "0"
   # HEAD+1 read-only refuse on a separate repo
   mkrepo headplus1 >/dev/null; F init >/dev/null
-  db "$TMP/headplus1" "INSERT OR REPLACE INTO schema_migrations(version,name,applied_at_ms,checksum) VALUES (5,'future',0,NULL);"
+  db "$TMP/headplus1" "INSERT OR REPLACE INTO schema_migrations(version,name,applied_at_ms,checksum) VALUES (6,'future',0,NULL);"
   F show; ck "DB ahead of binary refuses read-only" "$(pg "d['errors'][0]['code']")" "SCHEMA_VERSION_UNSUPPORTED"
 else
   echo "  (skipped: sqlite3 unavailable)"

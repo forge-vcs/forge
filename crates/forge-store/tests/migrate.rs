@@ -26,6 +26,9 @@ const COLUMNS_002: &str = include_str!("../migrations/002_columns.sql");
 const CHECK_SPEC_003: &str = include_str!("../migrations/003_check_spec.sql");
 /// The 004 integrity/actor migration — used to build an at-head fixture.
 const INTEGRITY_004: &str = include_str!("../migrations/004_integrity_and_actor.sql");
+/// The 005 native-history migration (NER-138 Phase 7 slice 2) — used to build an
+/// at-head fixture now that HEAD is 5.
+const NATIVE_HISTORY_005: &str = include_str!("../migrations/005_native_history.sql");
 
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
@@ -140,7 +143,11 @@ fn behind_db_upgrades_to_head() {
         has_column(&conn, "evidence", "content_hash"),
         "004 added evidence.content_hash"
     );
-    assert_eq!(max_version(&conn), 4, "reached HEAD=4");
+    assert!(
+        has_column(&conn, "native_object_format", "format_tag"),
+        "005 created native_object_format"
+    );
+    assert_eq!(max_version(&conn), 5, "reached HEAD=5");
 }
 
 #[test]
@@ -153,6 +160,8 @@ fn at_head_db_is_a_noop() {
         conn.execute_batch(COLUMNS_002).expect("apply 002 ALTERs");
         conn.execute_batch(CHECK_SPEC_003).expect("apply 003 ALTER");
         conn.execute_batch(INTEGRITY_004).expect("apply 004 ALTERs");
+        conn.execute_batch(NATIVE_HISTORY_005)
+            .expect("apply 005 native-history");
         stamp_versions(
             &conn,
             &[
@@ -160,15 +169,16 @@ fn at_head_db_is_a_noop() {
                 (2, "002_columns"),
                 (3, "003_check_spec"),
                 (4, "004_integrity_and_actor"),
+                (5, "005_native_history"),
             ],
         );
-        assert_eq!(max_version(&conn), 4);
+        assert_eq!(max_version(&conn), 5);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 4, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 5, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -181,6 +191,9 @@ fn head_plus_one_is_refused() {
         conn.execute_batch(COLUMNS_002).expect("apply 002 ALTERs");
         conn.execute_batch(CHECK_SPEC_003).expect("apply 003 ALTER");
         conn.execute_batch(INTEGRITY_004).expect("apply 004 ALTERs");
+        conn.execute_batch(NATIVE_HISTORY_005)
+            .expect("apply 005 native-history");
+        // HEAD is now 5, so the genuinely-ahead stamp is 6.
         stamp_versions(
             &conn,
             &[
@@ -188,10 +201,11 @@ fn head_plus_one_is_refused() {
                 (2, "002_columns"),
                 (3, "003_check_spec"),
                 (4, "004_integrity_and_actor"),
-                (5, "future"),
+                (5, "005_native_history"),
+                (6, "future"),
             ],
         );
-        assert_eq!(max_version(&conn), 5);
+        assert_eq!(max_version(&conn), 6);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -200,8 +214,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 5);
-            assert_eq!(*supported_head, 4);
+            assert_eq!(*db_version, 6);
+            assert_eq!(*supported_head, 5);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }

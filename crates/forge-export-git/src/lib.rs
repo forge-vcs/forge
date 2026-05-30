@@ -1,9 +1,18 @@
 use anyhow::{anyhow, Result};
-use forge_content::{classify_content_ref, ContentRefKind};
+use forge_content::{classify_content_ref, ContentBackend, ContentRefKind};
 use forge_store::ForgeError;
 use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
+
+/// Fixed identity/date/message for the synthesized git parent of a NATIVE base
+/// (NER-138 Phase 7 slice 2). Pinning every commit input keeps the synthesized parent
+/// SHA deterministic for a given base tree, so idempotent re-export reconciles instead
+/// of erroring `BRANCH_EXISTS`. These are git-interop scaffolding, not user identity.
+const FORGE_SYNTH_IDENTITY: &str = "Forge";
+const FORGE_SYNTH_EMAIL: &str = "forge@localhost";
+const FORGE_SYNTH_DATE: &str = "@0 +0000";
+const FORGE_SYNTH_BASE_MESSAGE: &str = "Forge native base";
 
 /// Per-file hunk-body byte cap, mirroring `forge_evidence::EXCERPT_LIMIT` (4096). A
 /// local const so the diff adapter does not depend on `forge-evidence`; the value is
@@ -282,6 +291,12 @@ pub fn export_branch(
         }
         .into());
     }
+    // NER-138 Phase 7 slice 2: a native repo's `base_commit` is now an `f1:commit:` id,
+    // not a git commit SHA, so it cannot be a `git commit-tree` parent directly. Resolve
+    // it to a deterministic synthesized git commit; a git-backend base passes through
+    // unchanged. The stale-base re-check above stays on the original anchors (both native
+    // or both git); only the git-interop parent uses the resolved SHA.
+    let parent = resolve_git_base_commit(repo_root, base_commit)?;
     let raw_tree = git_tree_for_content_ref(repo_root, content_ref)?;
     let (tree, excluded) = filter_secret_paths_from_tree(repo_root, &raw_tree)?;
     if forge_content_git::branch_exists(repo_root, branch_name) {
@@ -296,7 +311,7 @@ pub fn export_branch(
             .next()
             .unwrap_or_default()
             .to_string();
-        if existing_tree == tree && existing_parent == base_commit {
+        if existing_tree == tree && existing_parent == parent {
             return Ok((existing_commit, Vec::new()));
         }
         return Err(ForgeError::BranchExists {
@@ -307,11 +322,73 @@ pub fn export_branch(
     let commit_id = forge_content_git::create_branch_from_git_tree(
         repo_root,
         branch_name,
-        base_commit,
+        &parent,
         &tree,
         message,
     )?;
     Ok((commit_id, excluded))
+}
+
+/// Resolve a base anchor to a git commit SHA usable as a `git commit-tree` parent
+/// (NER-138 Phase 7 slice 2). A git-backend base is already a git commit SHA → returned
+/// unchanged. A native-backend base is an `f1:commit:` id → its tree is synthesized into a
+/// git tree (reusing the export path's `synthesize_git_tree`) and committed as a
+/// **deterministic parentless** git commit, so idempotent re-export reconciles to the same
+/// parent SHA. The native base tree was built by the policy-filtered walker, so the
+/// synthesized git tree already excludes `is_ignored_by_policy` paths (.env/keys); S2 is
+/// preserved end-to-end. S1: a missing/corrupt native base surfaces a path-free error
+/// (`base_content_ref` and the git invocations carry no filesystem path).
+fn resolve_git_base_commit(repo_root: &Path, base_anchor: &str) -> Result<String> {
+    // A git-backend base is a git commit SHA (it does not parse as a native ObjectId); a
+    // native base is an `f1:commit:` id. Route the discriminator through `ObjectId::parse`
+    // so the wire-format knowledge lives in forge-content-native (the canonical parser),
+    // not a string literal here that a future format bump (slice 3 object-kind headers)
+    // could silently desync.
+    let is_native_commit = forge_content_native::ObjectId::parse(base_anchor)
+        .map(|id| matches!(id.kind(), Ok(forge_content_native::ObjectKind::Commit)))
+        .unwrap_or(false);
+    if !is_native_commit {
+        return Ok(base_anchor.to_string());
+    }
+    let base_ref =
+        forge_content_native::NativeContentBackend.base_content_ref(repo_root, base_anchor)?;
+    let base_tree = synthesize_git_tree(repo_root, &base_ref)?;
+    synthesize_deterministic_commit(repo_root, &base_tree)
+}
+
+/// `git commit-tree <tree>` (no parent) with a fully fixed environment (identity, epoch
+/// date, message) and `core.autocrlf=false`, so the resulting commit SHA is deterministic
+/// for a given tree. Determinism is load-bearing: idempotent re-export compares this
+/// synthesized parent against the existing branch's parent. (Cross-machine determinism
+/// additionally depends on the synthesized tree's blob bytes being identical; within one
+/// environment — the re-export reconciliation case — this is fully deterministic.)
+fn synthesize_deterministic_commit(repo_root: &Path, tree: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "core.autocrlf=false",
+            "commit-tree",
+            tree,
+            "-m",
+            FORGE_SYNTH_BASE_MESSAGE,
+        ])
+        .current_dir(repo_root)
+        .env("GIT_AUTHOR_NAME", FORGE_SYNTH_IDENTITY)
+        .env("GIT_AUTHOR_EMAIL", FORGE_SYNTH_EMAIL)
+        .env("GIT_COMMITTER_NAME", FORGE_SYNTH_IDENTITY)
+        .env("GIT_COMMITTER_EMAIL", FORGE_SYNTH_EMAIL)
+        .env("GIT_AUTHOR_DATE", FORGE_SYNTH_DATE)
+        .env("GIT_COMMITTER_DATE", FORGE_SYNTH_DATE)
+        .output()?;
+    if !output.status.success() {
+        // S1: stderr from commit-tree (e.g. "fatal: not a valid object name") carries no
+        // filesystem path; do not interpolate any path here.
+        return Err(anyhow!(
+            "git commit-tree failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
 }
 
 /// Rewrite `tree` to drop every secret-risk-named entry, returning the (possibly
@@ -365,12 +442,24 @@ fn synthesize_git_tree(repo_root: &Path, content_ref: &str) -> Result<String> {
     remove_secret_risk_files(worktree.path(), worktree.path())?;
     let index_dir = tempfile::tempdir()?;
     let index_path = index_dir.path().join("index");
-    git_with_index_and_worktree(repo_root, worktree.path(), &index_path, &["add", "-A", "."])?;
-    Ok(
-        git_with_index_and_worktree(repo_root, worktree.path(), &index_path, &["write-tree"])?
-            .trim()
-            .to_string(),
-    )
+    // `-c core.autocrlf=false`: store the materialized native bytes verbatim (no line-ending
+    // normalization) so the synthesized git tree SHA is content-faithful to the native tree
+    // and reproducible regardless of the operator's global git config. This matches the same
+    // pin on `synthesize_deterministic_commit` and hardens cross-machine export determinism.
+    git_with_index_and_worktree(
+        repo_root,
+        worktree.path(),
+        &index_path,
+        &["-c", "core.autocrlf=false", "add", "-A", "."],
+    )?;
+    Ok(git_with_index_and_worktree(
+        repo_root,
+        worktree.path(),
+        &index_path,
+        &["-c", "core.autocrlf=false", "write-tree"],
+    )?
+    .trim()
+    .to_string())
 }
 
 /// Recursively delete files whose path (relative to `root`) is secret-risk by name
@@ -715,5 +804,144 @@ mod tests {
         let file = diff.files.iter().find(|f| f.path == "big.txt").unwrap();
         assert!(file.truncated, "hunk should be marked truncated");
         assert!(file.hunk.as_deref().unwrap().len() <= HUNK_LIMIT);
+    }
+
+    // --- NER-138 Phase 7 slice 2: native-base git-export interop ---
+
+    #[test]
+    fn resolve_git_base_commit_passes_through_a_git_sha() {
+        // A git-backend base (a real git commit SHA, no f1:commit: prefix) is returned
+        // unchanged, so git-repo export behavior is byte-identical to before.
+        let repo = init_repo();
+        std::fs::write(repo.path().join("seed.txt"), "s\n").unwrap();
+        git(repo.path(), &["add", "."]).unwrap();
+        git(repo.path(), &["commit", "-m", "base"]).unwrap();
+        let sha = git(repo.path(), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(resolve_git_base_commit(repo.path(), &sha).unwrap(), sha);
+    }
+
+    #[test]
+    fn export_branch_with_native_base_reconciles_idempotently() {
+        // A native repo's base is an f1:commit: id; export must synthesize a git parent,
+        // produce a reviewable branch, and re-export idempotently (deterministic parent).
+        let repo = init_repo();
+        std::fs::write(repo.path().join("app.txt"), "v1\n").unwrap();
+        let backend = forge_content_native::NativeContentBackend;
+        let base = backend.current_base(repo.path()).unwrap();
+        assert!(base.starts_with("f1:commit:"), "native base: {base}");
+        std::fs::write(repo.path().join("app.txt"), "v2\n").unwrap();
+        let content_ref = backend.snapshot_worktree(repo.path()).unwrap().content_ref;
+
+        let (commit, _excluded) = export_branch(
+            repo.path(),
+            "forge/native-x",
+            &base,
+            &base,
+            &content_ref,
+            "msg",
+        )
+        .expect("native export");
+        let listing = git(
+            repo.path(),
+            &["ls-tree", "-r", "--name-only", "forge/native-x"],
+        )
+        .unwrap();
+        assert!(listing.lines().any(|l| l == "app.txt"));
+        // Re-export the same proposal to the same branch: deterministic parent + matching
+        // tree → idempotent reconcile to the same commit (not BRANCH_EXISTS).
+        let (commit2, _) = export_branch(
+            repo.path(),
+            "forge/native-x",
+            &base,
+            &base,
+            &content_ref,
+            "msg",
+        )
+        .expect("idempotent re-export");
+        assert_eq!(
+            commit, commit2,
+            "re-export must reconcile to the same commit"
+        );
+    }
+
+    #[test]
+    fn synthesized_native_base_parent_is_deterministic_across_repos() {
+        // Same base tree in two fresh git repos → identical synthesized parent SHA (the
+        // cross-environment determinism reconciliation depends on).
+        let mk = || {
+            let repo = init_repo();
+            std::fs::write(repo.path().join("same.txt"), "identical\n").unwrap();
+            let base = forge_content_native::NativeContentBackend
+                .current_base(repo.path())
+                .unwrap();
+            let parent = resolve_git_base_commit(repo.path(), &base).unwrap();
+            (repo, parent)
+        };
+        let (_r1, p1) = mk();
+        let (_r2, p2) = mk();
+        assert_eq!(
+            p1, p2,
+            "identical base tree must synthesize the same parent SHA"
+        );
+    }
+
+    #[test]
+    fn export_branch_with_empty_native_base_does_not_error() {
+        // Genesis over an empty worktree → an empty base tree; synthesis + commit-tree
+        // must handle the empty-tree case.
+        let repo = init_repo();
+        let backend = forge_content_native::NativeContentBackend;
+        let base = backend.current_base(repo.path()).unwrap(); // empty genesis
+        std::fs::write(repo.path().join("a.txt"), "hi\n").unwrap();
+        let content_ref = backend.snapshot_worktree(repo.path()).unwrap().content_ref;
+        export_branch(
+            repo.path(),
+            "forge/empty-base",
+            &base,
+            &base,
+            &content_ref,
+            "msg",
+        )
+        .expect("empty-base export must not error");
+    }
+
+    #[test]
+    fn resolve_git_base_commit_missing_native_commit_is_path_free() {
+        // S1: a base pointing at a missing native commit object surfaces a path-free error.
+        let repo = init_repo();
+        let missing = format!("f1:commit:sha256:{}", "0".repeat(64));
+        let error = resolve_git_base_commit(repo.path(), &missing).unwrap_err();
+        let repo_str = repo.path().to_string_lossy();
+        assert!(
+            !error.to_string().contains(&*repo_str) && !format!("{error:#}").contains(&*repo_str),
+            "S1: resolve_git_base_commit leaked a path: {error:#}"
+        );
+    }
+
+    #[test]
+    fn native_base_synthesis_excludes_non_ascii_secret() {
+        // NER-142 class: a non-ASCII secret-named path must not reach the synthesized base
+        // git tree. The native walker already excludes it before the base tree is built, so
+        // it never enters the f1:commit: tree the parent is synthesized from.
+        let repo = init_repo();
+        std::fs::write(repo.path().join("keep.txt"), "ok\n").unwrap();
+        std::fs::write(repo.path().join(".env.café"), "SECRET=1\n").unwrap();
+        let base = forge_content_native::NativeContentBackend
+            .current_base(repo.path())
+            .unwrap();
+        let parent = resolve_git_base_commit(repo.path(), &base).unwrap();
+        let tree = git(repo.path(), &["show", "-s", "--format=%T", &parent])
+            .unwrap()
+            .trim()
+            .to_string();
+        let listing = git(repo.path(), &["ls-tree", "-r", "--name-only", &tree]).unwrap();
+        assert!(listing.lines().any(|l| l == "keep.txt"));
+        assert!(
+            !listing.lines().any(|l| l.contains(".env.caf")),
+            "secret must not appear in the synthesized base tree: {listing}"
+        );
     }
 }

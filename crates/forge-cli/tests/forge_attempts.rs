@@ -205,6 +205,56 @@ fn attach_materializes_snapshot_and_refuses_dirty_work() {
 }
 
 #[test]
+fn attach_materializes_native_base_via_forge_tree_ref() {
+    // NER-138 Phase 7 slice 2: a native repo's base_head is an f1:commit: id (not a git
+    // SHA). Attaching a fresh competing attempt materializes its base through
+    // base_content_ref -> forge-tree: -> the native backend (prefix dispatch), with no git
+    // — proving native base anchoring round-trips through `attempt attach`.
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let first = json_output(
+        repo.forge()
+            .args(["--json", "start", "compete"])
+            .assert()
+            .success(),
+    );
+    let intent_id = first["data"]["intent_id"].as_str().unwrap();
+    assert!(
+        first["data"]["base_head"]
+            .as_str()
+            .unwrap()
+            .starts_with("f1:commit:sha256:"),
+        "native base_head must be a commit id: {}",
+        first["data"]["base_head"]
+    );
+    // Modify + save under the first attempt; the genesis base remains README = "hello".
+    std::fs::write(repo.path().join("README.md"), "attempt one\n").expect("write first");
+    repo.forge().args(["--json", "save"]).assert().success();
+
+    // A competing attempt under the same intent; attaching it (no snapshot yet)
+    // materializes the native BASE tree via the forge-tree: ref.
+    let second = json_output(
+        repo.forge()
+            .args(["--json", "attempt", "start", "--intent", intent_id])
+            .assert()
+            .success(),
+    );
+    let second_attempt = second["data"]["attempt_id"].as_str().unwrap();
+    repo.forge()
+        .args(["--json", "attempt", "attach", second_attempt])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        "hello\n",
+        "attach must materialize the native base via the forge-tree: ref"
+    );
+}
+
+#[test]
 fn attach_base_revision_preserves_tracked_secret_risk_paths() {
     let repo = TestRepo::new_git();
     std::fs::write(repo.path().join(".env"), "TOKEN=committed\n").expect("write env");
