@@ -53,6 +53,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "005_native_history",
         include_str!("../migrations/005_native_history.sql"),
     ),
+    (
+        6,
+        "006_native_history_commit_id",
+        include_str!("../migrations/006_native_history_commit_id.sql"),
+    ),
 ];
 
 /// The highest migration version this binary knows how to apply.
@@ -402,7 +407,7 @@ mod tests {
 
     #[test]
     fn schema_head_is_max_version() {
-        assert_eq!(schema_head(), 5);
+        assert_eq!(schema_head(), 6);
     }
 
     #[test]
@@ -413,40 +418,47 @@ mod tests {
         assert_eq!(checksum, checksum_of("ALTER TABLE x ADD COLUMN y TEXT;"));
     }
 
-    /// Fresh apply reaches HEAD=5 with non-NULL checksums for every row.
+    /// Fresh apply reaches HEAD=6 with non-NULL checksums for every row.
     #[test]
     fn fresh_apply_reaches_head_with_checksums() {
         let mut conn = mem_conn();
         apply_pending_migrations(&mut conn).expect("apply migrations");
 
         let versions = applied_versions(&conn);
-        assert_eq!(versions.len(), 5);
+        assert_eq!(versions.len(), 6);
         assert_eq!(versions[0].0, 1);
         assert_eq!(versions[1].0, 2);
         assert_eq!(versions[2].0, 3);
         assert_eq!(versions[3].0, 4);
         assert_eq!(versions[4].0, 5);
+        assert_eq!(versions[5].0, 6);
         assert!(versions[0].1.is_some(), "001 checksum must be non-NULL");
         assert!(versions[1].1.is_some(), "002 checksum must be non-NULL");
         assert!(versions[2].1.is_some(), "003 checksum must be non-NULL");
         assert!(versions[3].1.is_some(), "004 checksum must be non-NULL");
         assert!(versions[4].1.is_some(), "005 checksum must be non-NULL");
+        assert!(versions[5].1.is_some(), "006 checksum must be non-NULL");
 
-        // 005 seeds exactly one native_object_format row (f1/sha256/commit-schema 1).
+        // 005 seeds one native_object_format row; 006 bumps commit_schema_version -> 2
+        // (justified-commit payload epoch) and adds object_format_version = 2 (kind-header
+        // framing epoch). The per-object CommitObject.schema_version field stays 1.
         let format_rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM native_object_format", [], |row| {
                 row.get(0)
             })
             .expect("native_object_format exists");
         assert_eq!(format_rows, 1, "exactly one seeded format row");
-        let (tag, algo, commit_v): (String, String, i64) = conn
+        let (tag, algo, commit_v, object_v): (String, String, i64, i64) = conn
             .query_row(
-                "SELECT format_tag, hash_algo, commit_schema_version FROM native_object_format WHERE singleton = 1",
+                "SELECT format_tag, hash_algo, commit_schema_version, object_format_version FROM native_object_format WHERE singleton = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("seeded format row");
-        assert_eq!((tag.as_str(), algo.as_str(), commit_v), ("f1", "sha256", 1));
+        assert_eq!(
+            (tag.as_str(), algo.as_str(), commit_v, object_v),
+            ("f1", "sha256", 2, 2)
+        );
     }
 
     /// Build genesis case B — a GENUINE old v1 DB — by running the reverted-001
@@ -525,18 +537,19 @@ mod tests {
             assert_eq!(set_a, set_c, "fresh vs merged-v2 diverge on {table}");
         }
 
-        // 005's INSERT OR IGNORE must seed the SAME format row on every upgrade path, not
-        // just the fresh apply (which fresh_apply_reaches_head_with_checksums covers) —
-        // column-set convergence proves the table exists, this proves the seed data matches.
-        let seed = |conn: &Connection| -> (String, String, i64) {
+        // 005's INSERT OR IGNORE seeds the format row and 006's UPDATE bumps it on every
+        // upgrade path, not just the fresh apply (which fresh_apply_reaches_head_with_checksums
+        // covers) — column-set convergence proves the table exists, this proves the seed +
+        // 006-bumped values match. object_format_version (006) is part of the convergence too.
+        let seed = |conn: &Connection| -> (String, String, i64, i64) {
             conn.query_row(
-                "SELECT format_tag, hash_algo, commit_schema_version FROM native_object_format WHERE singleton = 1",
+                "SELECT format_tag, hash_algo, commit_schema_version, object_format_version FROM native_object_format WHERE singleton = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .expect("seeded native_object_format row")
         };
-        assert_eq!(seed(&a), ("f1".to_string(), "sha256".to_string(), 1));
+        assert_eq!(seed(&a), ("f1".to_string(), "sha256".to_string(), 2, 2));
         assert_eq!(seed(&b), seed(&a), "genuine-v1 seed diverges");
         assert_eq!(seed(&c), seed(&a), "merged-v2 seed diverges");
     }
@@ -673,7 +686,7 @@ mod tests {
 
         apply_pending_migrations(&mut conn).expect("cd1bb3b v1 must converge, not brick");
 
-        // Both columns now present; version advanced to HEAD (5).
+        // Both columns now present; version advanced to HEAD (6).
         assert!(
             column_set(&conn, "repositories")
                 .iter()
@@ -687,8 +700,8 @@ mod tests {
             "attached_attempt_id added by the reconciling 002"
         );
         let versions = applied_versions(&conn);
-        assert_eq!(versions.last().expect("at least one version").0, 5);
-        assert_eq!(current_schema_version(&conn).expect("version probe"), 5);
+        assert_eq!(versions.last().expect("at least one version").0, 6);
+        assert_eq!(current_schema_version(&conn).expect("version probe"), 6);
     }
 
     /// FIX A: a genuinely-failing migration statement (a malformed `ALTER`, not a
