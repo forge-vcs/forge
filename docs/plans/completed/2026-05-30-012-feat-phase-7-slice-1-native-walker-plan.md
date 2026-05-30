@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 7 Slice 1 — Native worktree walker + ignore engine + differential harness"
 type: feat
-status: active
+status: completed
 date: 2026-05-30
 deepened: 2026-05-30
 origin: docs/ROADMAP.md  # Phase 7 section; ticket NER-138. Slice 1 of 3 (XL phase, staged internally). No dedicated *-requirements.md — the ROADMAP Phase 7 entry + the NER-134 Phase-3 boundary solution doc are the source.
