@@ -329,6 +329,98 @@ fn checkout_unknown_commit_is_not_corruption() {
 }
 
 #[test]
+fn undo_restores_the_prior_snapshot() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "undo flow"])
+        .assert()
+        .success();
+    // save A
+    std::fs::write(repo.path().join("file.txt"), "state A\n").unwrap();
+    repo.forge().args(["--json", "save"]).assert().success();
+    // save B
+    std::fs::write(repo.path().join("file.txt"), "state B\n").unwrap();
+    repo.forge().args(["--json", "save"]).assert().success();
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+        "state B\n"
+    );
+
+    // undo restores the worktree to state A and records the undo as an op.
+    let out = json_output(repo.forge().args(["--json", "undo"]).assert().success());
+    assert!(out["data"]["restored_snapshot_id"].is_string());
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+        "state A\n",
+        "undo restores the prior snapshot's content"
+    );
+    // The decisions ledger is untouched by undo (no accepts here, but the invariant holds):
+    // undo is append-only — it added an "undo" op, not deleted anything.
+    let ops: i64 = db(repo.path())
+        .query_row(
+            "SELECT COUNT(*) FROM operations WHERE command = 'undo'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count undo ops");
+    assert_eq!(ops, 1, "undo is recorded as a forward op-log operation");
+}
+
+#[test]
+fn undo_with_nothing_to_undo_is_a_clear_error_not_a_crash() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "nothing yet"])
+        .assert()
+        .success();
+    // No save yet → nothing to undo. Clear error, not a panic.
+    let out = json_output(repo.forge().args(["--json", "undo"]).assert().failure());
+    let message = out["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("nothing to undo"),
+        "clear message: {message}"
+    );
+    assert!(!message.contains('/'), "path-free: {message}");
+}
+
+#[test]
+fn undo_then_gc_dry_run_does_not_flag_an_accepted_commit() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    let commit_id = accepted["data"]["commit_id"].as_str().unwrap().to_string();
+
+    // A second save so there is a prior snapshot to undo to.
+    std::fs::write(repo.path().join("feature.txt"), "more\n").unwrap();
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge().args(["--json", "undo"]).assert().success();
+
+    // The accepted commit (referenced by decisions.commit_id, which undo never deletes) is
+    // NOT reported as unreachable garbage by gc.
+    let gc = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--dry-run"])
+            .assert()
+            .success(),
+    );
+    let unreachable = gc["data"]["unreachable_native_objects"]
+        .as_array()
+        .expect("unreachable array");
+    assert!(
+        !unreachable.iter().any(|u| u == &commit_id),
+        "an accepted commit must stay reachable after undo"
+    );
+}
+
+#[test]
 fn dangling_ledger_commit_id_surfaces_native_history_corrupt() {
     let repo = TestRepo::new_git();
     prepare_native_proposal(&repo);

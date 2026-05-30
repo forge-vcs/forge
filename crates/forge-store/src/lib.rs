@@ -999,6 +999,84 @@ pub fn record_checkout(
     Ok(op)
 }
 
+/// What a `forge undo` will restore (NER-138 Phase 7 slice 3): the operation being undone and
+/// the prior snapshot to materialize. v0 undo reverses the last save by restoring the latest
+/// snapshot's parent (the snapshots table's own `parent_snapshot_id` chain — robust, no
+/// cross-table timestamp comparison).
+#[derive(Debug, Clone, Serialize)]
+pub struct UndoTarget {
+    pub undone_operation_id: String,
+    pub content_ref: String,
+    pub restored_snapshot_id: String,
+}
+
+/// Resolve what `forge undo` will restore: the parent of the latest snapshot. Read-only and
+/// fail-closed with a clear, path-free "nothing to undo" when there is no snapshot, or the
+/// latest snapshot is the first (no earlier state to restore). Restoring past the first
+/// snapshot (to the base) is future work.
+pub fn undo_target(cwd: &Path) -> Result<UndoTarget> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let latest: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT id, parent_snapshot_id FROM snapshots \
+             WHERE repo_id = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            params![context.repo_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((_latest_id, parent_snapshot_id)) = latest else {
+        bail!("nothing to undo: this repository has no snapshots");
+    };
+    let Some(parent_id) = parent_snapshot_id else {
+        bail!("nothing to undo: already at the first saved snapshot");
+    };
+    let content_ref: String = connection.query_row(
+        "SELECT content_ref FROM snapshots WHERE id = ?1",
+        params![parent_id],
+        |row| row.get(0),
+    )?;
+    Ok(UndoTarget {
+        undone_operation_id: context.current_operation_id,
+        content_ref,
+        restored_snapshot_id: parent_id,
+    })
+}
+
+/// Record a `forge undo` in the op-log (NER-138 Phase 7 slice 3). Append-only: undo is a
+/// FORWARD operation that restores prior content — it NEVER deletes a `decisions` row (so an
+/// undone accept's `commit_id` stays a permanent gc reachability root) or any op-log row. The
+/// undone operation + restored snapshot are in the view `state_json` for auditability.
+pub fn record_undo(
+    cwd: &Path,
+    request_id: Option<String>,
+    undone_operation_id: &str,
+    restored_snapshot_id: &str,
+) -> Result<OperationViewResult> {
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    let op = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "undo".to_string(),
+                kind: "operation_undone".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({
+                    "lifecycle": "undone",
+                    "undone_operation_id": undone_operation_id,
+                    "restored_snapshot_id": restored_snapshot_id,
+                }),
+            },
+        )
+    })?;
+    Ok(op)
+}
+
 pub fn record_evidence(
     cwd: &Path,
     request_id: Option<String>,

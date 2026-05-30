@@ -41,6 +41,8 @@ enum Command {
     Log(LogArgs),
     /// Materialize a past commit's tree into the worktree (does not move the base anchor).
     Checkout(CheckoutArgs),
+    /// Undo the last save, restoring the prior snapshot (recorded in the op-log).
+    Undo,
     Doctor,
     Gc(GcArgs),
     Export(ExportArgs),
@@ -268,6 +270,7 @@ fn main() -> ExitCode {
         Command::Compare(args) => compare_response(request_id, "compare", args),
         Command::Log(args) => log_response(request_id, args),
         Command::Checkout(args) => checkout_response(request_id, args),
+        Command::Undo => undo_response(request_id),
         Command::Doctor => doctor_response(request_id),
         Command::Gc(args) => gc_response(request_id, args),
         Command::Export(args) => export_response(request_id, args),
@@ -764,6 +767,43 @@ fn checkout_response(request_id: Option<String>, args: CheckoutArgs) -> Response
                 "commit_id": args.commit_id,
                 "content_ref": content_ref,
                 "base_unchanged": true,
+                "current_view_id": record.view_id
+            }),
+            Vec::new(),
+        ))
+    })
+}
+
+fn undo_response(request_id: Option<String>) -> ResponseEnvelope {
+    command_result("undo", request_id, |cwd, request_id| {
+        // Resolve the prior snapshot to restore (clear "nothing to undo" if none).
+        let target = forge_store::undo_target(&cwd)?;
+        // Refuse a dirty worktree BEFORE materializing (mirrors restore/checkout): undo must
+        // not clobber unsaved edits.
+        let current_content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
+        let latest_content_ref = forge_store::latest_snapshot_content_ref(&cwd, None)?;
+        if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
+            return Err(ForgeError::DirtyWorktree {
+                paths: current_content.changed_paths.clone(),
+            }
+            .into());
+        }
+        // Restore the prior snapshot (policy-excluded, crash-atomic, symlink-aware + R15).
+        backend_for_content_ref(&target.content_ref)?
+            .restore_snapshot(&cwd, &target.content_ref)?;
+        // Record the undo as a forward op-log operation (never deletes a decisions/op row).
+        let record = forge_store::record_undo(
+            &cwd,
+            request_id,
+            &target.undone_operation_id,
+            &target.restored_snapshot_id,
+        )?;
+        Ok((
+            Some(record.operation_id.clone()),
+            json!({
+                "undone_operation_id": target.undone_operation_id,
+                "restored_snapshot_id": target.restored_snapshot_id,
+                "content_ref": target.content_ref,
                 "current_view_id": record.view_id
             }),
             Vec::new(),
