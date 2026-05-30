@@ -14,7 +14,7 @@ mod error;
 mod integrity;
 mod migrations;
 mod repo_lock;
-pub use error::{error_registry, ErrorCodeSpec, ForgeError, TamperKind};
+pub use error::{error_registry, ErrorCodeSpec, ForgeError, NativeHistoryCorruptKind, TamperKind};
 pub use repo_lock::{LockTimeout, RepoLock};
 
 #[derive(Debug, Clone, Serialize)]

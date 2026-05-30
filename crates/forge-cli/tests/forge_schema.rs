@@ -30,6 +30,7 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "EVIDENCE_TAMPERED",
     "PROVENANCE_MISMATCH",
     "MISSING_PROVENANCE_TRAILER",
+    "NATIVE_HISTORY_CORRUPT",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.
