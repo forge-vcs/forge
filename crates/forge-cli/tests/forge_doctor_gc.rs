@@ -84,6 +84,49 @@ fn gc_dry_run_reports_without_deleting() {
 }
 
 #[test]
+fn gc_dry_run_does_not_flag_native_base_commit_as_unreachable() {
+    // NER-138 Phase 7 slice 2: native commit objects now enter all_object_ids, so gc
+    // reachability must seed from the ref-store HEAD. Otherwise the genesis commit — which
+    // every attempt's base_head points at — is reported as garbage (a misleading report
+    // today and a latent data-loss trap before slice-3 gc deletion).
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let started = json_output(
+        repo.forge()
+            .args(["--json", "start", "native gc"])
+            .assert()
+            .success(),
+    );
+    let base_head = started["data"]["base_head"].as_str().unwrap().to_string();
+    assert!(
+        base_head.starts_with("f1:commit:"),
+        "native base: {base_head}"
+    );
+    std::fs::write(repo.path().join("a.txt"), "x\n").expect("write file");
+    repo.forge().args(["--json", "save"]).assert().success();
+
+    let gc = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--dry-run"])
+            .assert()
+            .success(),
+    );
+    let unreachable: Vec<String> = gc["data"]["unreachable_native_objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !unreachable.contains(&base_head),
+        "the live base commit must not be reported as unreachable: {unreachable:?}"
+    );
+}
+
+#[test]
 fn doctor_reports_corrupt_native_content_and_gc_reports_unreachable_objects() {
     let repo = TestRepo::new_git();
     repo.forge()

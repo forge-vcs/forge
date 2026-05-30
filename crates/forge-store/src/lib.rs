@@ -2435,6 +2435,12 @@ pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
             }
         }
     }
+    // NER-138 Phase 7 slice 2: native commit objects now exist and enter `all_object_ids`,
+    // so seed the reachable set from the ref-store HEAD's commit DAG (the tip commit, its
+    // ancestry, and each commit's tree). Without this the live base anchor that every
+    // attempt's `base_head` points at would be reported as unreachable garbage. No-op for
+    // git-backend repos (no native HEAD). Empty set if no HEAD yet.
+    reachable.extend(native_store.reachable_from_head()?);
     let all = native_store.all_object_ids()?;
     let unreachable_native_objects = all
         .difference(&reachable)

@@ -312,6 +312,33 @@ impl NativeObjectStore {
         Ok(seen)
     }
 
+    /// All native objects reachable from the ref-store `HEAD` (NER-138 Phase 7 slice 2):
+    /// every commit on HEAD's ancestry (commit → parents), each commit's tree, and every
+    /// blob/subtree those trees reach. Returns an empty set when no `HEAD` exists yet (a
+    /// git-backend repo, or a native repo before its first base anchoring). Used by gc
+    /// reachability so the live history tip and the base anchor that every attempt's
+    /// `base_head` points at are never reported as unreachable garbage. A `seen` set guards
+    /// against revisiting a commit (diamond/merge ancestry).
+    pub fn reachable_from_head(&self) -> Result<BTreeSet<ObjectId>> {
+        let mut reachable = BTreeSet::new();
+        let Some(head) = NativeRefStore::new(&self.root).read_head()? else {
+            return Ok(reachable);
+        };
+        let mut stack = vec![head];
+        while let Some(commit_id) = stack.pop() {
+            if !reachable.insert(commit_id.clone()) {
+                continue; // already visited
+            }
+            let commit = self.read_commit(&commit_id)?;
+            // Mark the commit's tree and everything it reaches.
+            self.verify_reachable(&ObjectId::parse(&commit.tree)?, &mut reachable)?;
+            for parent in &commit.parents {
+                stack.push(ObjectId::parse(parent)?);
+            }
+        }
+        Ok(reachable)
+    }
+
     pub fn all_object_ids(&self) -> Result<BTreeSet<ObjectId>> {
         let mut ids = BTreeSet::new();
         let dir = self.root.join(".forge/objects/sha256");
@@ -820,10 +847,12 @@ fn materialized_paths(repo_root: &Path) -> Result<BTreeSet<String>> {
 
 /// Name-level diff of the base commit's tree against the freshly-built worktree tree
 /// (NER-138 Phase 7 slice 2), replacing the prior `git diff --name-only HEAD` +
-/// `git ls-files --others` shell-out. A path is reported when its file blob id differs
+/// `git ls-files --others` shell-out. A path is reported when its `(blob id, mode)` differs
 /// between the two trees: added (worktree-only), removed (base-only), or modified (same
-/// path, different blob). **Name granularity only — hunk-level diff is Phase 8.** This is
-/// reproducibility-over-parity: it does not chase exact `git diff` output.
+/// path, different blob **or** a changed executable bit). Mode is part of the key so a
+/// `chmod +x` with unchanged content still surfaces — matching `git diff --name-only HEAD`,
+/// which lists a mode-only change. **Name granularity only — hunk-level diff is Phase 8.**
+/// This is reproducibility-over-parity: it does not chase exact `git diff` output.
 ///
 /// The base tree is `ensure_head`'s commit tree (the genesis, established at `start`); by
 /// `save` time it is the start-time anchor, so the diff reflects edits since `start`. If
@@ -843,9 +872,9 @@ fn changed_paths(
     let base = flatten_tree(store, &base_tree)?;
     let worktree = flatten_tree(store, worktree_root)?;
     let mut changed = BTreeSet::new();
-    for (path, blob) in &worktree {
-        if base.get(path) != Some(blob) {
-            changed.insert(path.clone()); // added or modified
+    for (path, fingerprint) in &worktree {
+        if base.get(path) != Some(fingerprint) {
+            changed.insert(path.clone()); // added, or content/mode modified
         }
     }
     for path in base.keys() {
@@ -859,9 +888,18 @@ fn changed_paths(
         .collect())
 }
 
-/// Flatten a native tree into a map of repo-relative file path → blob object id, recursing
-/// into directory entries. Used by `changed_paths` for the name-level base-vs-worktree diff.
-fn flatten_tree(store: &NativeObjectStore, tree_id: &ObjectId) -> Result<BTreeMap<String, String>> {
+/// A file leaf's change-detection fingerprint: its blob object id AND its mode, so a
+/// mode-only change (e.g. `chmod +x`) is detected even though the blob content (hence the
+/// blob id) is unchanged.
+type FileFingerprint = (String, u32);
+
+/// Flatten a native tree into a map of repo-relative file path → `(blob id, mode)`,
+/// recursing into directory entries. Used by `changed_paths` for the name-level
+/// base-vs-worktree diff.
+fn flatten_tree(
+    store: &NativeObjectStore,
+    tree_id: &ObjectId,
+) -> Result<BTreeMap<String, FileFingerprint>> {
     let mut out = BTreeMap::new();
     flatten_tree_into(store, tree_id, "", &mut out)?;
     Ok(out)
@@ -871,7 +909,7 @@ fn flatten_tree_into(
     store: &NativeObjectStore,
     tree_id: &ObjectId,
     prefix: &str,
-    out: &mut BTreeMap<String, String>,
+    out: &mut BTreeMap<String, FileFingerprint>,
 ) -> Result<()> {
     let payload = store.read_object(tree_id)?;
     let tree: TreeObject = serde_json::from_slice(&payload)
@@ -888,10 +926,14 @@ fn flatten_tree_into(
         };
         match entry.kind {
             TreeEntryKind::File => {
-                out.insert(path, entry.object);
+                out.insert(path, (entry.object, entry.mode));
             }
             TreeEntryKind::Dir => {
                 let child = ObjectId::parse(&entry.object)?;
+                // Mirror verify_reachable/materialize_tree: a Dir entry must point at a
+                // Tree, so a corrupt entry surfaces a typed "wrong object type" error
+                // rather than a downstream serde failure.
+                ensure_child_kind(&entry, &child)?;
                 flatten_tree_into(store, &child, &path, out)?;
             }
         }
@@ -1152,12 +1194,11 @@ mod tests {
         );
     }
 
-    /// Run a git command and capture its stdout. Lives ONLY in the test module: the
-    /// `git_based_scan` differential harness shells git to reproduce the prior git-based
-    /// set, but NER-138 Phase 7 slice 2 removed the last production caller — native
-    /// snapshot/base/changed_paths are git-binary-free (pinned by
+    /// Run a git command and capture its stdout. Lives ONLY in the test module (already
+    /// `#[cfg(test)]`): the `git_based_scan` differential harness shells git to reproduce
+    /// the prior git-based set, but NER-138 Phase 7 slice 2 removed the last production
+    /// caller — native snapshot/base/changed_paths are git-binary-free (pinned by
     /// `native_production_paths_shell_no_git`).
-    #[cfg(test)]
     fn git(repo_root: &Path, args: &[&str]) -> Result<String> {
         let output = Command::new("git")
             .args(args)
@@ -1657,6 +1698,7 @@ mod tests {
         assert_eq!(id.kind().unwrap(), ObjectKind::Commit);
         let temp = tempfile::tempdir().unwrap();
         let store = NativeObjectStore::new(temp.path());
+        // Wrong kind: a blob id is not a commit.
         let blob = store
             .write_object(ObjectKind::Blob, b"not a commit")
             .unwrap();
@@ -1665,6 +1707,110 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not a commit"));
+        // Bad schema: a commit whose schema_version is newer than this binary supports must
+        // be refused, not silently ingested (forward-compat guard).
+        let future = CommitObject {
+            schema_version: SCHEMA_VERSION + 1,
+            tree: format!("f1:tree:sha256:{}", "e".repeat(64)),
+            parents: Vec::new(),
+            intent_id: None,
+            proposal_revision_id: None,
+            decision_id: None,
+            evidence_digest: None,
+        };
+        let payload = serde_json::to_vec(&future).unwrap();
+        let future_id = store.write_object(ObjectKind::Commit, &payload).unwrap();
+        assert!(store
+            .read_commit(&future_id)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported native commit schema version"));
+    }
+
+    #[test]
+    fn read_head_rejects_non_commit_kind() {
+        // HEAD must name a commit. A valid-but-wrong-kind id (a blob/tree id written
+        // directly) is rejected — distinct from the unparseable-garbage case.
+        let temp = tempfile::tempdir().unwrap();
+        let refs = NativeRefStore::new(temp.path());
+        fs::create_dir_all(temp.path().join(".forge/refs")).unwrap();
+        let tree_id = ObjectId::new(ObjectKind::Tree, b"a tree, not a commit");
+        fs::write(
+            temp.path().join(".forge/refs/HEAD"),
+            tree_id.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert!(refs
+            .read_head()
+            .unwrap_err()
+            .to_string()
+            .contains("does not name a commit"));
+    }
+
+    #[test]
+    fn reachable_from_head_covers_genesis_commit_and_its_tree() {
+        // gc reachability must include the live history tip: the genesis commit AND the
+        // objects its tree reaches (the gc-flags-base-as-garbage fix).
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("a.txt"), b"hello").unwrap();
+        let base = NativeContentBackend.current_base(repo).unwrap(); // creates genesis + HEAD
+        let store = NativeObjectStore::new(repo);
+        let reachable = store.reachable_from_head().unwrap();
+        let genesis = ObjectId::parse(&base).unwrap();
+        assert!(
+            reachable.contains(&genesis),
+            "genesis commit must be reachable from HEAD"
+        );
+        let tree = ObjectId::parse(&store.read_commit(&genesis).unwrap().tree).unwrap();
+        assert!(reachable.contains(&tree), "genesis tree must be reachable");
+        // A repo with no HEAD (git backend / pre-anchoring) yields an empty set.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(NativeObjectStore::new(empty.path())
+            .reachable_from_head()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_changed_paths_reports_executable_bit_change() {
+        // A chmod with unchanged content must surface in changed_paths (the blob id is
+        // unchanged but the mode is part of the diff key) — parity with git diff.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("script.sh"), b"#!/bin/sh\n").unwrap();
+        let backend = NativeContentBackend;
+        let first = backend.snapshot_worktree(repo).unwrap(); // genesis @ mode 644
+        assert!(first.changed_paths.is_empty());
+        fs::set_permissions(repo.join("script.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        let snap = backend.snapshot_worktree(repo).unwrap();
+        assert!(
+            snap.changed_paths.contains(&"script.sh".to_string()),
+            "executable-bit-only change must be reported: {:?}",
+            snap.changed_paths
+        );
+    }
+
+    #[test]
+    fn native_changed_paths_handles_nested_subdirectories() {
+        // Exercises flatten_tree's recursive Dir branch in the changed_paths path: a
+        // modified file and an added file in a subdirectory both surface with /-joined paths.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/main.rs"), b"v1").unwrap();
+        let backend = NativeContentBackend;
+        backend.snapshot_worktree(repo).unwrap(); // genesis
+        fs::write(repo.join("src/main.rs"), b"v2").unwrap();
+        fs::write(repo.join("src/util.rs"), b"new").unwrap();
+        let mut changed = backend.snapshot_worktree(repo).unwrap().changed_paths;
+        changed.sort();
+        assert_eq!(
+            changed,
+            vec!["src/main.rs".to_string(), "src/util.rs".to_string()]
+        );
     }
 
     #[test]

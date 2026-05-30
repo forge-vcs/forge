@@ -339,7 +339,15 @@ pub fn export_branch(
 /// preserved end-to-end. S1: a missing/corrupt native base surfaces a path-free error
 /// (`base_content_ref` and the git invocations carry no filesystem path).
 fn resolve_git_base_commit(repo_root: &Path, base_anchor: &str) -> Result<String> {
-    if !base_anchor.starts_with("f1:commit:") {
+    // A git-backend base is a git commit SHA (it does not parse as a native ObjectId); a
+    // native base is an `f1:commit:` id. Route the discriminator through `ObjectId::parse`
+    // so the wire-format knowledge lives in forge-content-native (the canonical parser),
+    // not a string literal here that a future format bump (slice 3 object-kind headers)
+    // could silently desync.
+    let is_native_commit = forge_content_native::ObjectId::parse(base_anchor)
+        .map(|id| matches!(id.kind(), Ok(forge_content_native::ObjectKind::Commit)))
+        .unwrap_or(false);
+    if !is_native_commit {
         return Ok(base_anchor.to_string());
     }
     let base_ref =
@@ -434,12 +442,24 @@ fn synthesize_git_tree(repo_root: &Path, content_ref: &str) -> Result<String> {
     remove_secret_risk_files(worktree.path(), worktree.path())?;
     let index_dir = tempfile::tempdir()?;
     let index_path = index_dir.path().join("index");
-    git_with_index_and_worktree(repo_root, worktree.path(), &index_path, &["add", "-A", "."])?;
-    Ok(
-        git_with_index_and_worktree(repo_root, worktree.path(), &index_path, &["write-tree"])?
-            .trim()
-            .to_string(),
-    )
+    // `-c core.autocrlf=false`: store the materialized native bytes verbatim (no line-ending
+    // normalization) so the synthesized git tree SHA is content-faithful to the native tree
+    // and reproducible regardless of the operator's global git config. This matches the same
+    // pin on `synthesize_deterministic_commit` and hardens cross-machine export determinism.
+    git_with_index_and_worktree(
+        repo_root,
+        worktree.path(),
+        &index_path,
+        &["-c", "core.autocrlf=false", "add", "-A", "."],
+    )?;
+    Ok(git_with_index_and_worktree(
+        repo_root,
+        worktree.path(),
+        &index_path,
+        &["-c", "core.autocrlf=false", "write-tree"],
+    )?
+    .trim()
+    .to_string())
 }
 
 /// Recursively delete files whose path (relative to `root`) is secret-risk by name

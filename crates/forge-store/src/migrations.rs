@@ -524,6 +524,21 @@ mod tests {
             assert_eq!(set_a, set_b, "fresh vs genuine-v1 diverge on {table}");
             assert_eq!(set_a, set_c, "fresh vs merged-v2 diverge on {table}");
         }
+
+        // 005's INSERT OR IGNORE must seed the SAME format row on every upgrade path, not
+        // just the fresh apply (which fresh_apply_reaches_head_with_checksums covers) —
+        // column-set convergence proves the table exists, this proves the seed data matches.
+        let seed = |conn: &Connection| -> (String, String, i64) {
+            conn.query_row(
+                "SELECT format_tag, hash_algo, commit_schema_version FROM native_object_format WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("seeded native_object_format row")
+        };
+        assert_eq!(seed(&a), ("f1".to_string(), "sha256".to_string(), 1));
+        assert_eq!(seed(&b), seed(&a), "genuine-v1 seed diverges");
+        assert_eq!(seed(&c), seed(&a), "merged-v2 seed diverges");
     }
 
     /// Re-running on a head DB is a no-op (no new rows, no error).
