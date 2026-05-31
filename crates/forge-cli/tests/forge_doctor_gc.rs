@@ -279,6 +279,54 @@ fn object_path_containing(repo_path: &std::path::Path, needle: &str) -> Option<s
     None
 }
 
+/// NER-143 R6: `gc --dry-run` must FAIL CLOSED when a ledger row that determines a
+/// reachability root is corrupt — a malformed `views.state_json` could hide a live
+/// `checkout`-target commit (reachable only through the op-log), and silently
+/// under-counting roots would mark a live object for deletion once Phase 8 grants
+/// real mark-sweep deletion. The failure must be path-free (S1).
+#[test]
+fn gc_fails_closed_on_a_corrupt_ledger_view_row() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "gc fail closed"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("README.md"), "native\n").expect("write readme");
+    repo.forge().args(["--json", "save"]).assert().success();
+
+    // A clean gc dry-run succeeds before the corruption.
+    repo.forge()
+        .args(["--json", "gc", "--dry-run"])
+        .assert()
+        .success();
+
+    // Corrupt a view row's state_json so the root-enumeration scan cannot parse it.
+    let connection = Connection::open(repo.path().join(".forge/forge.db")).expect("open db");
+    connection
+        .execute("UPDATE views SET state_json = ?1", ["{ not json"])
+        .expect("corrupt a view state_json");
+
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--dry-run"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(output["status"], "error");
+    assert_eq!(output["errors"][0]["code"], "COMMAND_FAILED");
+    // S1: the failure must not leak a filesystem path in any envelope string.
+    let needle = repo.path().to_string_lossy();
+    let rendered = serde_json::to_string(&output).expect("re-serialize envelope");
+    assert!(
+        !rendered.contains(&*needle),
+        "gc fail-closed leaked a path: {rendered}"
+    );
+}
+
 #[test]
 fn doctor_reports_mismatched_current_view() {
     let repo = TestRepo::new_git();
