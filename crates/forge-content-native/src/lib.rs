@@ -189,7 +189,8 @@ impl ContentBackend for NativeContentBackend {
             if !target_paths.contains(&path) {
                 let full = repo_root.join(&path);
                 if full.is_file() || full.is_symlink() {
-                    fs::remove_file(&full).with_context(|| format!("remove {}", full.display()))?;
+                    fs::remove_file(&full)
+                        .map_err(|error| anyhow!("remove worktree entry: {}", error.kind()))?;
                 }
             }
         }
@@ -822,11 +823,11 @@ fn materialize_tree(
                 }
                 if full.is_dir() {
                     fs::remove_dir_all(&full)
-                        .with_context(|| format!("remove directory {}", full.display()))?;
+                        .map_err(|error| anyhow!("remove directory: {}", error.kind()))?;
                 }
                 let parent = full
                     .parent()
-                    .ok_or_else(|| anyhow!("restore target {} has no parent", full.display()))?;
+                    .ok_or_else(|| anyhow!("restore target has no parent"))?;
                 // Record which ancestor directories are newly created so their own
                 // entries can be made durable below (mirrors write_object) — a freshly
                 // created dir's entry is not durable until the dir it lives in is fsynced.
@@ -841,13 +842,12 @@ fn materialize_tree(
                 let mut temp = tempfile::Builder::new()
                     .prefix(RESTORE_TEMP_PREFIX)
                     .tempfile_in(parent)
-                    .with_context(|| format!("create restore temp file in {}", parent.display()))?;
+                    .map_err(|error| anyhow!("create restore temp file: {}", error.kind()))?;
                 temp.write_all(&bytes)?;
                 set_file_mode(temp.path(), entry.mode)?;
                 temp.as_file().sync_all()?;
                 temp.persist(&full)
-                    .map_err(|error| error.error)
-                    .with_context(|| format!("persist restored file {}", full.display()))?;
+                    .map_err(|error| anyhow!("persist restored file: {}", error.error.kind()))?;
                 // The renamed file's directory entry must reach disk for the
                 // restore to be durable; fsync each parent directory once per
                 // restore to bound the fsync cost on large worktrees.
@@ -874,7 +874,7 @@ fn materialize_tree(
                 let full = repo_root.join(&rel);
                 if full.is_file() || full.is_symlink() {
                     fs::remove_file(&full)
-                        .with_context(|| format!("remove file {}", full.display()))?;
+                        .map_err(|error| anyhow!("remove file: {}", error.kind()))?;
                 }
                 fs::create_dir_all(full)?;
                 materialize_tree(store, repo_root, &child, &rel, target_paths, synced_dirs)?;
@@ -1278,10 +1278,10 @@ fn ensure_child_kind(entry: &TreeEntry, child: &ObjectId) -> Result<()> {
 /// local filesystem (Phase 1b's WAL work makes that constraint explicit), so tolerating
 /// those errnos as a degraded no-op is deferred rather than guessed at here.
 fn sync_dir(path: &Path) -> Result<()> {
-    let dir = File::open(path)
-        .with_context(|| format!("open directory for fsync: {}", path.display()))?;
+    let dir =
+        File::open(path).map_err(|error| anyhow!("open directory for fsync: {}", error.kind()))?;
     dir.sync_all()
-        .with_context(|| format!("fsync directory: {}", path.display()))?;
+        .map_err(|error| anyhow!("fsync directory: {}", error.kind()))?;
     Ok(())
 }
 
