@@ -730,17 +730,20 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_drops_a_secret_path_with_pathspec_glob_metacharacters() {
-        // NER-142 (write side): a secret-risk name containing a pathspec metacharacter
-        // (`[`) is collected into `dropped` by `is_secret_risk_path`, but a plain
-        // `rm --cached '.env[prod]'` reads `[prod]` as a glob character class that never
-        // matches the literal file — and `--ignore-unmatch` hides the miss, leaving the
-        // secret in the tree. The `:(literal)` pathspec forces a verbatim match so it is
-        // actually removed. `.env[prod]` matches `.env.*`/`.env*` secret-risk naming.
+    fn rewrite_drops_a_secret_path_with_a_pathspec_magic_prefix() {
+        // NER-142 (write side): a secret-risk name beginning with `:` (e.g. `:secret.txt`)
+        // is collected into `dropped` by `is_secret_risk_path` (it contains "secret"), but a
+        // plain `rm --cached ':secret.txt'` reads the leading `:` as a PATHSPEC MAGIC prefix
+        // that matches nothing — and `--ignore-unmatch` hides the miss, leaving the secret in
+        // the published tree while it is REPORTED as excluded. The `:(literal)` pathspec forces
+        // a verbatim byte match so it is actually removed. (A glob metacharacter like `[` in a
+        // name is NOT a useful fixture here because `.env[prod]` etc. are not secret-risk by
+        // name — only a name that genuinely matches `is_secret_risk_path` AND carries pathspec
+        // magic exercises the leak; a leading `:` is the canonical case.)
         let repo = init_repo();
         let tree = build_tree(
             repo.path(),
-            &[("README.md", "hello\n"), (".env[prod]", "SECRET=1\n")],
+            &[("README.md", "hello\n"), (":secret.txt", "SECRET=1\n")],
         );
 
         let (new_tree, dropped) =
@@ -748,8 +751,8 @@ mod tests {
 
         assert_eq!(
             dropped,
-            vec![".env[prod]".to_string()],
-            "the glob-metacharacter secret path must be reported as dropped"
+            vec![":secret.txt".to_string()],
+            "the pathspec-magic secret path must be reported as dropped"
         );
         // The report is only honest if the file is ACTUALLY gone from the tree.
         let listing = git(
@@ -761,7 +764,7 @@ mod tests {
         assert_eq!(
             entries,
             vec!["README.md"],
-            "the glob-metacharacter secret must be physically removed, not just reported"
+            "the pathspec-magic secret must be physically removed, not just reported"
         );
     }
 
