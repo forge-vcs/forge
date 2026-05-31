@@ -445,7 +445,8 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
                 // materialized by the git backend even in a native repo (intentional
                 // until the Phase 7 native walker; see ContentBackend::base_content_ref).
                 backend_for_content_ref(&content_ref)?.restore_snapshot(&cwd, &content_ref)?;
-                let attached = forge_store::attach_attempt(&cwd, request_id, &attempt_id)?;
+                let attached =
+                    forge_store::attach_attempt(&cwd, request_id, &attempt_id, &content_ref)?;
                 Ok((
                     Some(attached.operation_id.clone()),
                     json!({
@@ -536,7 +537,10 @@ fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> Respons
 }
 
 /// Refuse a dirty worktree BEFORE a materializing nav command (restore/checkout/undo) clobbers
-/// it (NER-143 R1/R2). The single definition of the refuse-before-materialize safety invariant.
+/// it (NER-143 R1/R2): the single definition shared by those three chained-nav commands. (Note
+/// `attempt attach` also materializes but uses its OWN switching-baseline dirty-check — it
+/// compares against the attempt being switched *to*, not the expected/target model here — so it
+/// deliberately does not route through this helper.)
 ///
 /// Passes iff the worktree holds the content it is EXPECTED to hold
 /// (`current_state.expected_content_ref`, set by the last materializing op; fallback to the

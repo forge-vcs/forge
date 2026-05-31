@@ -793,43 +793,67 @@ fn nav_then_unsaved_edit_still_refuses_dirty_worktree() {
 #[test]
 fn interrupted_nav_self_heals_via_target_match() {
     let repo = TestRepo::new_git();
-    prepare_native_proposal(&repo);
-    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
-    let commit_id = accepted["data"]["commit_id"].as_str().unwrap().to_string();
-
-    // Capture the current expected ref (the accepted state), then check out the commit so the
-    // worktree holds its tree and expected == that tree.
-    let prior_expected: String = db(repo.path())
-        .query_row(
-            "SELECT expected_content_ref FROM current_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("expected ref after accept");
     repo.forge()
-        .args(["--json", "checkout", &commit_id])
+        .args(["--json", "init", "--content-backend", "native"])
         .assert()
         .success();
+    repo.forge()
+        .args(["--json", "start", "crash heal"])
+        .assert()
+        .success();
+    // Two DISTINCT snapshots so the target differs from both `expected` and the latest SAVED
+    // snapshot — making `matches_target` the ONLY clause that can heal (and making this test
+    // fail on the pre-fix latest-snapshot baseline, which has no target clause).
+    std::fs::write(repo.path().join("file.txt"), "state A\n").unwrap();
+    let save_a = json_output(repo.forge().args(["--json", "save"]).assert().success());
+    let snapshot_a = save_a["data"]["snapshot_id"].as_str().unwrap().to_string();
+    std::fs::write(repo.path().join("file.txt"), "state B\n").unwrap();
+    repo.forge().args(["--json", "save"]).assert().success();
 
-    // Simulate the crash window: the materialize happened (worktree holds the target) but the
-    // record txn that set expected_content_ref was lost — roll it back to the prior value.
+    // Restore A: worktree now holds A, expected == A's ref (record_restore set it), while the
+    // latest SAVED snapshot is still B.
+    repo.forge()
+        .args(["--json", "restore", &snapshot_a, "--yes"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+        "state A\n"
+    );
+
+    // Simulate the materialize-then-crash window: the worktree holds the target (A) but the
+    // record txn that set expected_content_ref to A was lost. Roll expected back to B's ref (the
+    // pre-restore value), so expected == B != worktree(A) == target(A). Only `matches_target`
+    // can now make the re-run succeed.
+    let b_ref: String = db(repo.path())
+        .query_row(
+            "SELECT content_ref FROM snapshots WHERE id != ?1 ORDER BY created_at_ms DESC LIMIT 1",
+            [&snapshot_a],
+            |row| row.get(0),
+        )
+        .expect("B content ref");
     db(repo.path())
         .execute(
             "UPDATE current_state SET expected_content_ref = ?1 WHERE singleton = 1",
-            [&prior_expected],
+            [&b_ref],
         )
-        .expect("simulate lost record txn");
+        .expect("simulate lost record txn (expected stale at B)");
 
-    // Re-running the same checkout must HEAL (worktree already == target), not fail DIRTY_WORKTREE.
+    // Re-running the SAME restore must HEAL via worktree(A) == target(A), even though expected is
+    // the stale B ref. Pre-fix (compare worktree A vs latest-saved B) this would brick.
     let healed = json_output(
         repo.forge()
-            .args(["--json", "checkout", &commit_id])
+            .args(["--json", "restore", &snapshot_a, "--yes"])
             .assert()
             .success(),
     );
     assert_eq!(
         healed["status"], "success",
         "re-running an interrupted nav must self-heal via the worktree==target clause"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+        "state A\n"
     );
 }
 
@@ -876,12 +900,22 @@ fn undo_does_not_restore_another_attempts_content() {
         .assert()
         .success();
 
-    // Attempt A saves LAST, so A now holds the repo-wide latest snapshot.
+    // Attempt A saves LAST (TWICE), so A holds the repo-wide latest snapshot AND that snapshot
+    // has a non-NULL parent ("A one"). This is load-bearing: with only one A save, A's latest
+    // would have parent=NULL and pre-fix `undo` would bail "nothing to undo" rather than
+    // materialize A's parent into B — masking the genuine cross-attempt CONTENT contamination the
+    // fix prevents. With two A saves, pre-fix `undo` (repo-wide latest = A) would actually restore
+    // "A one" into B's worktree.
     repo.forge()
         .args(["--json", "attempt", "attach", &attempt_a])
         .assert()
         .success();
-    std::fs::write(repo.path().join("file.txt"), "A latest\n").unwrap();
+    std::fs::write(repo.path().join("file.txt"), "A one\n").unwrap();
+    repo.forge()
+        .args(["--json", "save", "--attempt", &attempt_a])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("file.txt"), "A two\n").unwrap();
     repo.forge()
         .args(["--json", "save", "--attempt", &attempt_a])
         .assert()
@@ -957,5 +991,119 @@ fn undo_labels_the_save_operation_not_the_op_log_head() {
     assert_ne!(
         undo["data"]["undone_operation_id"], run_op,
         "undone_operation_id must NOT be the op-log head after a non-save head op"
+    );
+}
+
+/// NER-143 R1 (code-review P1): `attempt attach` is a materializing op — it restores the
+/// attached attempt's tree into the worktree — so it must set `expected_content_ref` like the
+/// other recorders. Otherwise an attach IMMEDIATELY followed by a nav command (no intervening
+/// restore) spuriously fails `DIRTY_WORKTREE` on a clean worktree, because `expected` still
+/// points at the prior attempt's tree. This is the exact masked gap: every existing attach test
+/// inserts a `restore` between attach and undo, which repairs `expected` and hides the bug.
+#[test]
+fn attach_then_undo_without_intervening_restore_succeeds() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let started = json_output(
+        repo.forge()
+            .args(["--json", "start", "attempt A"])
+            .assert()
+            .success(),
+    );
+    let intent = started["data"]["intent_id"].as_str().unwrap().to_string();
+    let attempt_a = started["data"]["attempt_id"].as_str().unwrap().to_string();
+
+    // Attempt B with two saves (so B has a parent chain to undo into).
+    let b = json_output(
+        repo.forge()
+            .args(["--json", "attempt", "start", "--intent", &intent])
+            .assert()
+            .success(),
+    );
+    let attempt_b = b["data"]["attempt_id"].as_str().unwrap().to_string();
+    repo.forge()
+        .args(["--json", "attempt", "attach", &attempt_b])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("file.txt"), "B one\n").unwrap();
+    repo.forge()
+        .args(["--json", "save", "--attempt", &attempt_b])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("file.txt"), "B two\n").unwrap();
+    repo.forge()
+        .args(["--json", "save", "--attempt", &attempt_b])
+        .assert()
+        .success();
+
+    // Switch to A (materializes A's tree) and back to B (materializes B's tree). The second
+    // attach leaves the worktree holding B's content; expected_content_ref must track it.
+    repo.forge()
+        .args(["--json", "attempt", "attach", &attempt_a])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "attempt", "attach", &attempt_b])
+        .assert()
+        .success();
+
+    // undo IMMEDIATELY after attach, NO intervening restore. Pre-fix this fails DIRTY_WORKTREE
+    // (expected still == A's tree while the worktree cleanly holds B's). Post-fix it succeeds.
+    let undo = json_output(repo.forge().args(["--json", "undo"]).assert().success());
+    assert_eq!(
+        undo["status"], "success",
+        "undo immediately after attach must not spuriously fail DIRTY_WORKTREE"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+        "B one\n",
+        "undo restores attempt B's prior save"
+    );
+}
+
+/// NER-143 R4 (code-review): a `restore` of the latest snapshot records a view that ALSO carries
+/// `$.snapshot_id`, so without the `snapshot_saved` lifecycle filter the `undone_operation_id`
+/// resolution would pick the restore op (more recent) instead of the save op. This pins the
+/// filter: after `save A; save B; restore B; undo`, the label must be B's SAVE op.
+#[test]
+fn undo_labels_the_save_op_even_after_restoring_the_latest_snapshot() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "restore then undo label"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("file.txt"), "one\n").unwrap();
+    repo.forge().args(["--json", "save"]).assert().success();
+    std::fs::write(repo.path().join("file.txt"), "two\n").unwrap();
+    let save_b = json_output(repo.forge().args(["--json", "save"]).assert().success());
+    let save_b_op = save_b["operation_id"].as_str().unwrap().to_string();
+    let snapshot_b = save_b["data"]["snapshot_id"].as_str().unwrap().to_string();
+
+    // Restore B (the latest snapshot) — a no-op materialize that records a restore view carrying
+    // $.snapshot_id == B and becomes the op-log head.
+    let restore = json_output(
+        repo.forge()
+            .args(["--json", "restore", &snapshot_b, "--yes"])
+            .assert()
+            .success(),
+    );
+    let restore_op = restore["operation_id"].as_str().unwrap().to_string();
+    assert_ne!(save_b_op, restore_op);
+
+    let undo = json_output(repo.forge().args(["--json", "undo"]).assert().success());
+    assert_eq!(
+        undo["data"]["undone_operation_id"], save_b_op,
+        "undone_operation_id must be B's SAVE op, not the later restore op for the same snapshot"
+    );
+    assert_ne!(
+        undo["data"]["undone_operation_id"], restore_op,
+        "the restore-of-latest view must not win the undone_operation_id resolution"
     );
 }

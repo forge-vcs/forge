@@ -1133,13 +1133,17 @@ pub fn undo_target(cwd: &Path) -> Result<UndoTarget> {
         |row| row.get(0),
     )?;
     // NER-143 R4: the undone operation is the SAVE that produced the latest snapshot (the one
-    // being reversed) — found via that save view's `snapshot_id` — not the op-log head. Falls
-    // back to the op-log head only if no such view is found (defensive; a save always records
-    // one). `json_extract` is exact (no LIKE false-matches); SQLite's JSON1 is bundled.
+    // being reversed) — found via that save view's `snapshot_id` — not the op-log head. Scoped
+    // to `snapshot_saved` views: a later `restore`/checkout of the same snapshot ALSO carries
+    // `$.snapshot_id`, so without the lifecycle filter the ORDER BY would pick that restore op
+    // and mislabel the audit field (code-review finding). Falls back to the op-log head only if
+    // no save view is found (defensive; a save always records one). `json_extract` is exact (no
+    // LIKE false-matches); SQLite's JSON1 is bundled.
     let undone_operation_id: String = connection
         .query_row(
             "SELECT operation_id FROM views \
              WHERE repo_id = ?1 AND json_extract(state_json, '$.snapshot_id') = ?2 \
+             AND json_extract(state_json, '$.lifecycle') = 'snapshot_saved' \
              ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
             params![context.repo_id, latest_id],
             |row| row.get(0),
@@ -3765,6 +3769,7 @@ pub fn attach_attempt(
     cwd: &Path,
     request_id: Option<String>,
     attempt_id: &str,
+    content_ref: &str,
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
     let attempt =
@@ -3793,6 +3798,12 @@ pub fn attach_attempt(
             "UPDATE current_state SET attached_attempt_id = ?1 WHERE singleton = 1",
             params![attempt.attempt_id],
         )?;
+        // NER-143 R1: `attempt attach` is the FIFTH materializing op — the CLI restores the
+        // attached attempt's tree into the worktree before calling this. Set the expected
+        // baseline atomically with the attach (code-review P1: without this, an attach-then-nav
+        // spuriously fails DIRTY_WORKTREE because `expected` still points at the prior attempt's
+        // tree). Same dedicated-UPDATE discipline as the other recorders (DR-F2).
+        set_expected_content_ref(tx, content_ref)?;
         Ok(op)
     })?;
     Ok(op)
