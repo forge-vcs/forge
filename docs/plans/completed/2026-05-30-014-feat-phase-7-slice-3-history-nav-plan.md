@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 7 Slice 3 — Justified commit-on-accept + native log/checkout/undo + symlink content + object-kind headers + DAG doctor + git-export demotion"
 type: feat
-status: active
+status: completed
 date: 2026-05-30
 origin: docs/handoffs/2026-05-30-ner-138-phase-7-slice-3-kickoff.md  # NER-138 Phase 7, slice 3 of 3 (final, XL phase). Source requirements = the slice-3 kickoff handoff + slice-2 completed plan + slice-2 code-review "Defer-able" + ROADMAP Phase 7. No dedicated *-requirements.md.
 ---
