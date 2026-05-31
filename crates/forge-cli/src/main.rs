@@ -37,6 +37,12 @@ enum Command {
     Proposal(ProposalArgs),
     /// Compare competing attempts (per intent) on verified evidence + rank them.
     Compare(CompareArgs),
+    /// Walk the native commit history (tip→genesis) and the evidence that justified it.
+    Log(LogArgs),
+    /// Materialize a past commit's tree into the worktree (does not move the base anchor).
+    Checkout(CheckoutArgs),
+    /// Undo the last save, restoring the prior snapshot (recorded in the op-log).
+    Undo,
     Doctor,
     Gc(GcArgs),
     Export(ExportArgs),
@@ -57,6 +63,19 @@ struct CompareArgs {
     /// proposals (via the git adapter): `--diff <attempt_a> <attempt_b>`.
     #[arg(long, num_args = 2, value_names = ["ATTEMPT_A", "ATTEMPT_B"])]
     diff: Option<Vec<String>>,
+}
+
+#[derive(Debug, Args)]
+struct LogArgs {
+    /// Show only commits recorded under this intent ("show every change under this intent").
+    #[arg(long)]
+    intent: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct CheckoutArgs {
+    /// The native commit id (`f1:commit:sha256:...`) whose tree to materialize.
+    commit_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -249,6 +268,9 @@ fn main() -> ExitCode {
         Command::Show(args) => show_response(request_id, args),
         Command::Proposal(args) => proposal_response(request_id, args),
         Command::Compare(args) => compare_response(request_id, "compare", args),
+        Command::Log(args) => log_response(request_id, args),
+        Command::Checkout(args) => checkout_response(request_id, args),
+        Command::Undo => undo_response(request_id),
         Command::Doctor => doctor_response(request_id),
         Command::Gc(args) => gc_response(request_id, args),
         Command::Export(args) => export_response(request_id, args),
@@ -718,6 +740,87 @@ fn proposal_response(request_id: Option<String>, args: ProposalArgs) -> Response
     }
 }
 
+fn checkout_response(request_id: Option<String>, args: CheckoutArgs) -> ResponseEnvelope {
+    command_result("checkout", request_id, |cwd, request_id| {
+        // Resolve + validate the target FIRST (NOT_FOUND for a typo vs NATIVE_HISTORY_CORRUPT
+        // for a ledger-referenced-but-missing commit), before touching the worktree.
+        let content_ref = forge_store::checkout_target_content_ref(&cwd, &args.commit_id)?;
+        // Refuse a dirty worktree BEFORE materializing (mirrors restore): the irreversible
+        // clobber must not run if there are unsaved changes to lose.
+        let current_content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
+        let latest_content_ref = forge_store::latest_snapshot_content_ref(&cwd, None)?;
+        if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
+            return Err(ForgeError::DirtyWorktree {
+                paths: current_content.changed_paths.clone(),
+            }
+            .into());
+        }
+        // Materialize the historical tree (policy-excluded; symlink-aware + R15 via U9).
+        backend_for_content_ref(&content_ref)?.restore_snapshot(&cwd, &content_ref)?;
+        // Record the checkout in the op-log (so `undo` can reverse it and gc keeps the target
+        // reachable). Checkout does NOT move the base anchor — surfaced as base_unchanged so an
+        // agent is not misled into expecting git's HEAD-moving checkout semantics.
+        let record = forge_store::record_checkout(&cwd, request_id, &args.commit_id)?;
+        Ok((
+            Some(record.operation_id.clone()),
+            json!({
+                "commit_id": args.commit_id,
+                "content_ref": content_ref,
+                "base_unchanged": true,
+                "current_view_id": record.view_id
+            }),
+            Vec::new(),
+        ))
+    })
+}
+
+fn undo_response(request_id: Option<String>) -> ResponseEnvelope {
+    command_result("undo", request_id, |cwd, request_id| {
+        // Resolve the prior snapshot to restore (clear "nothing to undo" if none).
+        let target = forge_store::undo_target(&cwd)?;
+        // Refuse a dirty worktree BEFORE materializing (mirrors restore/checkout): undo must
+        // not clobber unsaved edits.
+        let current_content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
+        let latest_content_ref = forge_store::latest_snapshot_content_ref(&cwd, None)?;
+        if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
+            return Err(ForgeError::DirtyWorktree {
+                paths: current_content.changed_paths.clone(),
+            }
+            .into());
+        }
+        // Restore the prior snapshot (policy-excluded, crash-atomic, symlink-aware + R15).
+        backend_for_content_ref(&target.content_ref)?
+            .restore_snapshot(&cwd, &target.content_ref)?;
+        // Record the undo as a forward op-log operation (never deletes a decisions/op row).
+        let record = forge_store::record_undo(
+            &cwd,
+            request_id,
+            &target.undone_operation_id,
+            &target.restored_snapshot_id,
+        )?;
+        Ok((
+            Some(record.operation_id.clone()),
+            json!({
+                "undone_operation_id": target.undone_operation_id,
+                "restored_snapshot_id": target.restored_snapshot_id,
+                "content_ref": target.content_ref,
+                "current_view_id": record.view_id
+            }),
+            Vec::new(),
+        ))
+    })
+}
+
+fn log_response(request_id: Option<String>, args: LogArgs) -> ResponseEnvelope {
+    // Read-only: "log" is not a mutating command, so command_result takes no lock and runs
+    // no reconcile — `native_log` resolves the authoritative tip from the ledger directly,
+    // tolerating a not-yet-reconciled HEAD.
+    command_result("log", request_id, |cwd, _request_id| {
+        let commits = forge_store::native_log(&cwd, args.intent.as_deref())?;
+        Ok((None, json!({ "commits": commits }), Vec::new()))
+    })
+}
+
 fn doctor_response(request_id: Option<String>) -> ResponseEnvelope {
     command_result("doctor", request_id, |cwd, _request_id| {
         let report = forge_store::doctor(&cwd)?;
@@ -780,21 +883,31 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                 let current_head = selected_backend(&cwd)?.current_base(&cwd)?;
                 // CLI-layer stale-base pre-check mirroring `accept`: persist the
                 // divergence to `conflict_sets` under the held lock BEFORE bailing
-                // (NER-133 U7). `export_branch` keeps its own internal stale-base
-                // check as defense-in-depth; it just won't be reached on this path.
-                if current_head != proposal.base_head {
+                // (NER-133 U7). NER-138 slice 3: after commit-on-accept the ref-store HEAD
+                // advances to the accepted proposal's OWN commit, so the expected current
+                // head is that `commit_id` — not the proposal's `base_head`, which the accept
+                // progressed past. Falls back to `base_head` for git repos / pre-006 accepts
+                // (NULL commit_id), where the forge HEAD never moves. This CLI check is
+                // authoritative; `export_branch`'s internal check is fed equal anchors below
+                // so it never double-fires on the legitimate post-accept divergence.
+                let expected_head = forge_store::accepted_commit_id_for_revision(
+                    &cwd,
+                    &proposal.proposal_revision_id,
+                )?
+                .unwrap_or_else(|| proposal.base_head.clone());
+                if current_head != expected_head {
                     // Best-effort metadata (FIX B): conflict-set persistence must
                     // never mask the domain error, so discard the Result and always
                     // surface STALE_BASE.
                     let _ = forge_store::record_conflict_set(
                         &cwd,
                         "stale_base_export",
-                        &proposal.base_head,
+                        &expected_head,
                         &current_head,
                         &proposal.changed_paths,
                     );
                     return Err(ForgeError::StaleBase {
-                        expected_head: proposal.base_head.clone(),
+                        expected_head,
                         actual_head: current_head,
                     }
                     .into());
@@ -822,11 +935,15 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                 let trailer =
                     forge_store::build_publication_trailer(&cwd, &proposal.proposal_revision_id)?;
                 let message = forge_store::render_trailer_message(&trailer);
+                // `base_head` is BOTH the synthesis source (the git parent is built from the
+                // proposal's base tree) AND, passed again as `current_target`, makes
+                // `export_branch`'s internal stale check a confirmed no-op — the CLI check
+                // above is authoritative now that commit-on-accept advances HEAD off the base.
                 let (commit_id, excluded) = forge_export_git::export_branch(
                     &cwd,
                     &args.name,
                     &proposal.base_head,
-                    &current_head,
+                    &proposal.base_head,
                     &proposal.content_ref,
                     &message,
                 )?;
@@ -974,6 +1091,20 @@ where
     } else {
         None
     };
+
+    // NER-138 slice 3: heal a torn commit-on-accept (a committed decision whose ref-store
+    // HEAD advance was lost to a crash) BEFORE the base anchor is read this command, and
+    // BEFORE the preflight-replay short-circuit — so a same-`request_id` replay of a torn
+    // accept still advances HEAD. Runs only for lock-holding commands (serialized, never
+    // racing `run`); a no-op on git repos and before any justified commit. A dangling
+    // ledger `commit_id` (the store-before-DB violation) surfaces here as
+    // `NATIVE_HISTORY_CORRUPT`.
+    if requires_repo_lock(command) {
+        if let Err(error) = forge_store::reconcile_native_head(&cwd) {
+            let (error_object, retry) = error_to_object(command, &error);
+            return ResponseEnvelope::error_with(command, request_id, None, error_object, retry);
+        }
+    }
 
     // Pre-flight replay check: a sequential same-`request_id` retry replays the
     // original result without opening a write transaction. The concurrent race
@@ -1230,6 +1361,8 @@ fn is_mutating_command(command: &str) -> bool {
             | "accept"
             | "reject"
             | "export branch"
+            | "checkout"
+            | "undo"
     )
 }
 

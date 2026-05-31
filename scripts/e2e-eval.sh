@@ -58,7 +58,7 @@ echo; echo "=== LIFECYCLE (init→start→save→run→propose→check→accept�
 mkrepo life >/dev/null
 F init;    ck "init success" "$(pg "d['status']")" "success"
 F doctor;  ck "doctor ok" "$(pg "d['data']['ok']")" "True"
-ck "doctor schema_version=5" "$(pg "d['data']['schema_version']")" "5"
+ck "doctor schema_version=6" "$(pg "d['data']['schema_version']")" "6"
 F start "build a feature"; ck "start success" "$(pg "d['status']")" "success"
 echo "hello" > feature.txt
 F save;    ck "save success" "$(pg "d['status']")" "success"
@@ -149,15 +149,39 @@ else
   echo "  (compare tamper check skipped: sqlite3 unavailable)"
 fi
 
+echo; echo "=== NATIVE lifecycle with git REMOVED from PATH (NER-138 Phase 7 exit criterion) ==="
+# A PATH with only `sh` (needed by `run`) and NO git, proving the native lifecycle never
+# shells the git binary. Setup (mkrepo) uses the real git; the NG-prefixed forge commands run
+# with the stripped PATH. Skipped if /bin/sh is unavailable (non-POSIX host).
+if [ -x /bin/sh ]; then
+  NOGIT_BIN="$TMP/nogit-bin"; mkdir -p "$NOGIT_BIN"; ln -sf /bin/sh "$NOGIT_BIN/sh"
+  mkrepo nativelife >/dev/null
+  NG() { PATH="$NOGIT_BIN" "$FORGE" --json "$@" >"$OUT" 2>"$ERR"; }   # forge with git-free PATH
+  NG init --content-backend native; ck "native init (git removed)" "$(pg "d['status']")" "success"
+  NG start "git-free"; ck "native start (git removed)" "$(pg "d['status']")" "success"
+  echo "feature" > feature.txt
+  NG save; ck "native save (git removed)" "$(pg "d['status']")" "success"
+  NG run -- sh -c true; ck "native run (git removed)" "$(pg "d['status']")" "success"
+  NG propose; ck "native propose (git removed)" "$(pg "d['status']")" "success"
+  NG check; ck "native check (git removed)" "$(pg "d['status']")" "success"
+  NG accept; ck "native accept (git removed)" "$(pg "d['status']")" "success"
+  ckc "accept writes a native commit (git removed)" "$(pg "d['data']['commit_id']")" "f1:commit:sha256:"
+  NG log; ckc "native log walks history (git removed)" "$(pg "len(d['data']['commits'])>=1")" "True"
+  NG doctor; ck "native doctor healthy (git removed)" "$(pg "d['data']['ok']")" "True"
+  cd "$TMP"
+else
+  echo "  (skipped: /bin/sh unavailable)"
+fi
+
 echo; echo "=== MIGRATION state (live binary) ==="
 if [ "$have_sqlite" = 1 ]; then
   vers="$(db "$TMP/life" "SELECT group_concat(version) FROM schema_migrations ORDER BY version;")"
-  ck "schema_migrations has versions 1,2,3,4,5" "$vers" "1,2,3,4,5"
+  ck "schema_migrations has versions 1,2,3,4,5,6" "$vers" "1,2,3,4,5,6"
   nullck="$(db "$TMP/life" "SELECT count(*) FROM schema_migrations WHERE checksum IS NULL;")"
   ck "all migration rows carry a checksum" "$nullck" "0"
   # HEAD+1 read-only refuse on a separate repo
   mkrepo headplus1 >/dev/null; F init >/dev/null
-  db "$TMP/headplus1" "INSERT OR REPLACE INTO schema_migrations(version,name,applied_at_ms,checksum) VALUES (6,'future',0,NULL);"
+  db "$TMP/headplus1" "INSERT OR REPLACE INTO schema_migrations(version,name,applied_at_ms,checksum) VALUES (7,'future',0,NULL);"
   F show; ck "DB ahead of binary refuses read-only" "$(pg "d['errors'][0]['code']")" "SCHEMA_VERSION_UNSUPPORTED"
 else
   echo "  (skipped: sqlite3 unavailable)"

@@ -14,7 +14,7 @@ mod error;
 mod integrity;
 mod migrations;
 mod repo_lock;
-pub use error::{error_registry, ErrorCodeSpec, ForgeError, TamperKind};
+pub use error::{error_registry, ErrorCodeSpec, ForgeError, NativeHistoryCorruptKind, TamperKind};
 pub use repo_lock::{LockTimeout, RepoLock};
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,6 +206,12 @@ pub struct DecisionRecord {
     /// gate, which the CLI surfaces as a `warnings[]` entry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub check_status: Option<String>,
+    /// The native `Commit` written when a proposal is accepted in a native repo (NER-138
+    /// Phase 7 slice 3). `None` for git-backend repos and for `reject` (no commit). The
+    /// ref-store HEAD is advanced to this id after the decision row commits; it is recorded
+    /// in `decisions.commit_id` so a torn HEAD advance is reconcilable from the ledger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
     pub operation_id: String,
 }
 
@@ -309,6 +315,11 @@ pub struct DoctorReport {
     /// hash. Empty in a healthy repo. A head-truncated chain (a lost latest op) is
     /// NOT a tamper — it verifies as a legitimately-shorter chain.
     pub tampered_rows: Vec<TamperedRow>,
+    /// Native commit-DAG integrity breaks (NER-138 Phase 7 slice 3): a parent cycle, a
+    /// dangling parent/tree object, or a `decisions.commit_id` whose commit object is absent.
+    /// Empty in a healthy repo. This is the "DAG has no cycles/dangling parents (doctor
+    /// verifies)" whole-phase exit criterion.
+    pub native_history_issues: Vec<NativeHistoryFinding>,
 }
 
 /// One row that failed integrity verification in `doctor`'s chain pass. Carries only
@@ -320,6 +331,19 @@ pub struct TamperedRow {
     pub id: String,
     pub table: String,
     pub kind: TamperKind,
+}
+
+/// One native-history integrity break found by `doctor`'s commit-DAG walk (NER-138 Phase 7
+/// slice 3). Carries only the closed-enum `kind` and opaque `f1:` commit ids — never a path or
+/// excerpt. `kind` serializes the SAME way as [`ForgeError::NativeHistoryCorrupt`]'s `details`
+/// (the shared [`NativeHistoryCorruptKind`]), so the error payload and the doctor report can
+/// never disagree on the break-kind string. Empty in a healthy repo.
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeHistoryFinding {
+    pub kind: NativeHistoryCorruptKind,
+    pub commit_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub related_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -339,7 +363,15 @@ pub fn init_repository(
     if !matches!(content_backend.as_str(), "git" | "native") {
         bail!("unsupported content backend");
     }
-    let root = git_root(cwd)?;
+    // A NATIVE repo earns real git independence: it does not require the git binary at init —
+    // its root is `cwd` (canonicalized). A GIT-backed repo still anchors on the git toplevel
+    // (Forge layers on an existing git repo). This is what lets the full native lifecycle —
+    // init included — run with git removed from PATH (NER-138 Phase 7 exit criterion).
+    let root = if content_backend == "native" {
+        cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
+    } else {
+        git_root(cwd)?
+    };
     let forge_dir = root.join(".forge");
     fs::create_dir_all(&forge_dir)
         .with_context(|| format!("failed to create {}", forge_dir.display()))?;
@@ -365,7 +397,13 @@ pub fn init_repository(
         });
     }
 
-    let git_head = git_head(&root);
+    // A native repo records no git_head (it has its own ref store and never shells git);
+    // recording it would reintroduce a git dependency at init.
+    let git_head = if content_backend == "native" {
+        None
+    } else {
+        git_head(&root)
+    };
     let repo_id = RepositoryId::new().to_string();
     let operation_id = OperationId::new().to_string();
     let view_id = ViewId::new().to_string();
@@ -442,7 +480,9 @@ pub fn init_repository(
 }
 
 pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
-    let root = git_root(cwd)?;
+    // Git-free root resolution (slice 3): walk up for `.forge/forge.db` rather than shelling
+    // `git rev-parse`, so every post-init command works with git removed from PATH.
+    let root = forge_root(cwd)?;
     let database_path = root.join(".forge/forge.db");
     if !database_path.exists() {
         return Err(ForgeError::NotInitialized.into());
@@ -490,7 +530,8 @@ pub fn repository_content_backend(cwd: &Path) -> Result<String> {
 /// surfaces the canonical "not initialized" error instead of a lock-file error.
 /// A genuine contention timeout surfaces as a [`LockTimeout`] (`Err`).
 pub fn acquire_repo_lock(cwd: &Path) -> Result<Option<RepoLock>> {
-    let root = match git_root(cwd) {
+    // Git-free root resolution (slice 3): a `.forge`-walk, so locking works without git.
+    let root = match forge_root(cwd) {
         Ok(root) => root,
         Err(_) => return Ok(None),
     };
@@ -522,7 +563,8 @@ pub fn acquire_repo_lock(cwd: &Path) -> Result<Option<RepoLock>> {
 ///   pending migrations (idempotent + version-gated, so a concurrent migrator that
 ///   won the race is handled), then release the lock (Drop) before returning.
 pub fn migrate(cwd: &Path) -> Result<()> {
-    let root = match git_root(cwd) {
+    // Git-free root resolution (slice 3): a `.forge`-walk, so migration works without git.
+    let root = match forge_root(cwd) {
         Ok(root) => root,
         Err(_) => return Ok(()),
     };
@@ -909,6 +951,162 @@ pub fn record_restore(
                 kind: "snapshot_restored".to_string(),
                 view_kind: ViewKind::Initialized,
                 state: json!({ "lifecycle": "snapshot_restored", "snapshot_id": snapshot_id }),
+            },
+        )
+    })?;
+    Ok(op)
+}
+
+/// Resolve a historical commit id to the `forge-tree:` content ref of its tree, for
+/// `forge checkout` (NER-138 Phase 7 slice 3). Fail-closed BEFORE any materialization:
+/// - a non-parseable / non-commit id, or a never-written id the ledger does not reference,
+///   is a USER error → a path-free `anyhow` ("unknown commit", mapped to COMMAND_FAILED),
+///   NOT corruption (so a typo never inflates the perceived corruption rate);
+/// - a commit/tree the ledger references but whose object is missing is genuine corruption
+///   → typed `NativeHistoryCorrupt` (DanglingCommitId / DanglingTree).
+pub fn checkout_target_content_ref(cwd: &Path, commit_id: &str) -> Result<String> {
+    let context = open_repository(cwd)?;
+    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let id = match forge_content_native::ObjectId::parse(commit_id) {
+        Ok(id) if matches!(id.kind(), Ok(forge_content_native::ObjectKind::Commit)) => id,
+        _ => bail!("unknown commit: not a native commit id in this repository"),
+    };
+    let connection = open_connection(&context.database_path)?;
+    let commit = match store.read_commit(&id) {
+        Ok(commit) => commit,
+        Err(_) => {
+            let referenced: bool = connection
+                .query_row(
+                    "SELECT 1 FROM decisions WHERE repo_id = ?1 AND commit_id = ?2 LIMIT 1",
+                    params![context.repo_id, commit_id],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if referenced {
+                return Err(ForgeError::NativeHistoryCorrupt {
+                    kind: NativeHistoryCorruptKind::DanglingCommitId,
+                    commit_id: commit_id.to_string(),
+                    related_id: None,
+                }
+                .into());
+            }
+            bail!("unknown commit: not in this repository's native history");
+        }
+    };
+    let content_ref = format!("{}{}", forge_content::FORGE_TREE_PREFIX, commit.tree);
+    // The tree (and everything it reaches) must exist before we clobber the worktree.
+    store
+        .verify_content_ref(&content_ref)
+        .map_err(|_| ForgeError::NativeHistoryCorrupt {
+            kind: NativeHistoryCorruptKind::DanglingTree,
+            commit_id: commit_id.to_string(),
+            related_id: Some(commit.tree.clone()),
+        })?;
+    Ok(content_ref)
+}
+
+/// Record a `forge checkout` in the op-log (NER-138 Phase 7 slice 3) so `undo` can reverse
+/// it and gc treats the materialized commit as a reachability root. The target `commit_id`
+/// is in the view `state_json`. Does NOT advance the base anchor (checkout is materialize-only
+/// — a `save` afterward still diffs against the unchanged base HEAD; see the slice-3 plan).
+pub fn record_checkout(
+    cwd: &Path,
+    request_id: Option<String>,
+    commit_id: &str,
+) -> Result<OperationViewResult> {
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    let op = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "checkout".to_string(),
+                kind: "commit_checked_out".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({ "lifecycle": "commit_checked_out", "commit_id": commit_id }),
+            },
+        )
+    })?;
+    Ok(op)
+}
+
+/// What a `forge undo` will restore (NER-138 Phase 7 slice 3): the operation being undone and
+/// the prior snapshot to materialize. v0 undo reverses the last save by restoring the latest
+/// snapshot's parent (the snapshots table's own `parent_snapshot_id` chain — robust, no
+/// cross-table timestamp comparison).
+#[derive(Debug, Clone, Serialize)]
+pub struct UndoTarget {
+    pub undone_operation_id: String,
+    pub content_ref: String,
+    pub restored_snapshot_id: String,
+}
+
+/// Resolve what `forge undo` will restore: the parent of the latest snapshot. Read-only and
+/// fail-closed with a clear, path-free "nothing to undo" when there is no snapshot, or the
+/// latest snapshot is the first (no earlier state to restore). Restoring past the first
+/// snapshot (to the base) is future work.
+pub fn undo_target(cwd: &Path) -> Result<UndoTarget> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let latest: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT id, parent_snapshot_id FROM snapshots \
+             WHERE repo_id = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            params![context.repo_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((_latest_id, parent_snapshot_id)) = latest else {
+        bail!("nothing to undo: this repository has no snapshots");
+    };
+    let Some(parent_id) = parent_snapshot_id else {
+        bail!("nothing to undo: already at the first saved snapshot");
+    };
+    let content_ref: String = connection.query_row(
+        "SELECT content_ref FROM snapshots WHERE id = ?1",
+        params![parent_id],
+        |row| row.get(0),
+    )?;
+    Ok(UndoTarget {
+        undone_operation_id: context.current_operation_id,
+        content_ref,
+        restored_snapshot_id: parent_id,
+    })
+}
+
+/// Record a `forge undo` in the op-log (NER-138 Phase 7 slice 3). Append-only: undo is a
+/// FORWARD operation that restores prior content — it NEVER deletes a `decisions` row (so an
+/// undone accept's `commit_id` stays a permanent gc reachability root) or any op-log row. The
+/// undone operation + restored snapshot are in the view `state_json` for auditability.
+pub fn record_undo(
+    cwd: &Path,
+    request_id: Option<String>,
+    undone_operation_id: &str,
+    restored_snapshot_id: &str,
+) -> Result<OperationViewResult> {
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    let op = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "undo".to_string(),
+                kind: "operation_undone".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({
+                    "lifecycle": "undone",
+                    "undone_operation_id": undone_operation_id,
+                    "restored_snapshot_id": restored_snapshot_id,
+                }),
             },
         )
     })?;
@@ -1443,7 +1641,18 @@ pub fn decide(
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
     let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
     let mut connection = open_connection(&context.database_path)?;
-    let (decision_id, check_status, op) = with_immediate_retry(&mut connection, |tx| {
+
+    // NER-138 slice 3: a native repo is detected by routing `base_head` through the canonical
+    // ObjectId parser (a git repo's `base_head` is a 40-hex git SHA, which does not parse as
+    // an `f1:` commit id). When native + accepted, a justified Commit is written and the
+    // ref-store HEAD advanced; git repos and rejects leave `commit_id` NULL and never touch
+    // the ref store.
+    let native_base = forge_content_native::ObjectId::parse(&proposal.base_head)
+        .ok()
+        .filter(|id| matches!(id.kind(), Ok(forge_content_native::ObjectKind::Commit)));
+    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
+
+    let (decision_id, check_status, op, commit_id) = with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
         // Evidence gate (NER-135 R6): for `accept`, re-evaluate the declarative
         // check IN this IMMEDIATE txn (not on a separate connection), so the verdict
@@ -1452,7 +1661,7 @@ pub fn decide(
         // (NER-132 U2). `evaluate_check_on` ALSO fails closed on a tampered deciding
         // row (NER-136), and — being raised before the enforce_check branch — that
         // refusal holds even under `--allow-unverified`.
-        let check_status = if decision == "accepted" {
+        let (check_status, deciding_evidence_id) = if decision == "accepted" {
             let outcome = evaluate_check_on(tx, &attempt, &proposal)?;
             if enforce_check && !outcome.passed() {
                 return Err(ForgeError::CheckNotPassed {
@@ -1461,9 +1670,12 @@ pub fn decide(
                 }
                 .into());
             }
-            Some(outcome.status)
+            // The deciding gate's evidence id (failed gate first, else any with evidence)
+            // — its content_hash becomes the commit's opaque evidence_digest below.
+            let deciding_evidence_id = representative_evidence_id(&outcome);
+            (Some(outcome.status), deciding_evidence_id)
         } else {
-            None
+            (None, None)
         };
         let decision_id = new_id("decision");
         // Recomputed per busy-retry: the decision digest covers proposal/revision +
@@ -1477,9 +1689,56 @@ pub fn decide(
             actor,
             created_at_ms: created,
         });
+        // NER-138 slice 3: for a native accept, build + DURABLY write the justified commit
+        // BEFORE the decision row that references it (store-before-DB). A busy-retry re-runs
+        // this closure, minting a fresh decision_id -> a fresh commit object; the loser is an
+        // unreferenced orphan (gc-collectible). `actor` + `authored_time` (= the decision
+        // timestamp) are in the HASHED bytes so Phase 9 signs who/when. `evidence_digest` is
+        // the deciding gate's evidence content_hash wrapped in `Hex64` (excerpt text is
+        // structurally unrepresentable). HEAD is advanced only AFTER this txn commits.
+        let commit_id = match (decision, &native_base) {
+            ("accepted", Some(parent)) => {
+                let tree = proposal
+                    .content_ref
+                    .strip_prefix(forge_content::FORGE_TREE_PREFIX)
+                    .ok_or_else(|| {
+                        anyhow!("native accepted proposal has a non-forge-tree content ref")
+                    })?
+                    .to_string();
+                let evidence_digest = match &deciding_evidence_id {
+                    Some(evidence_id) => {
+                        let hash: Option<String> = tx
+                            .query_row(
+                                "SELECT content_hash FROM evidence WHERE id = ?1",
+                                params![evidence_id],
+                                |row| row.get(0),
+                            )
+                            .optional()?;
+                        match hash {
+                            Some(hash) => Some(forge_content_native::Hex64::new(hash)?),
+                            None => None,
+                        }
+                    }
+                    None => None,
+                };
+                let commit = forge_content_native::CommitObject {
+                    schema_version: forge_content_native::COMMIT_SCHEMA_VERSION,
+                    tree,
+                    parents: vec![parent.to_string()],
+                    intent_id: Some(attempt.intent_id.clone()),
+                    proposal_revision_id: Some(proposal.proposal_revision_id.clone()),
+                    decision_id: Some(decision_id.clone()),
+                    evidence_digest,
+                    actor: Some(actor.to_string()),
+                    authored_time: Some(created),
+                };
+                Some(store.write_commit(&commit)?.to_string())
+            }
+            _ => None,
+        };
         tx.execute(
-            "INSERT INTO decisions (id, repo_id, proposal_id, proposal_revision_id, decision, actor, content_hash, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO decisions (id, repo_id, proposal_id, proposal_revision_id, decision, actor, content_hash, created_at_ms, commit_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 decision_id,
                 context.repo_id,
@@ -1488,7 +1747,8 @@ pub fn decide(
                 decision,
                 actor,
                 content_hash,
-                created
+                created,
+                commit_id
             ],
         )?;
         tx.execute(
@@ -1508,16 +1768,215 @@ pub fn decide(
             },
             Some(&content_hash),
         )?;
-        Ok((decision_id, check_status, op))
+        Ok((decision_id, check_status, op, commit_id))
     })?;
+
+    // Advance the ref-store HEAD AFTER the decision row durably committed (store-before-DB
+    // + HEAD-lags-never-leads): a crash here leaves HEAD one commit behind the ledger, which
+    // `reconcile_native_head` heals on the next command — never HEAD ahead of an
+    // uncommitted decision. `commit_id` is the COMMITTED attempt's value returned from the
+    // closure (not a closure-captured outer var), so a busy-retry advances HEAD to the winner.
+    if let Some(commit_id) = &commit_id {
+        let refs = forge_content_native::NativeRefStore::new(&context.root_path);
+        refs.set_head(&forge_content_native::ObjectId::parse(commit_id)?)?;
+    }
+
     Ok(DecisionRecord {
         decision_id,
         proposal_id: proposal.proposal_id,
         proposal_revision_id: proposal.proposal_revision_id,
         decision: decision.to_string(),
         check_status,
+        commit_id,
         operation_id: op.operation_id,
     })
+}
+
+/// Heal a torn commit-on-accept (NER-138 Phase 7 slice 3): a crash after the decision row
+/// committed but before the ref-store HEAD advanced leaves HEAD one or more commits behind
+/// the ledger. The SQLite ledger is authoritative and HEAD is a reconcilable cache, so this
+/// advances HEAD to the latest accepted `decisions.commit_id` when it lags. Runs at the
+/// command boundary under the held advisory lock (serialized, cannot race), BEFORE the base
+/// anchor is read and before the preflight-replay short-circuit (so a same-`request_id`
+/// replay of a torn accept still heals HEAD). A no-op on git repos (no native `commit_id`,
+/// no ref store) and before any justified commit. HEAD only ever moves FORWARD: the ledger
+/// tip must descend from the current HEAD (else the store is corrupt → `NativeHistoryCorrupt`),
+/// and a missing tip/parent object (the store-before-DB violation) is surfaced typed.
+pub fn reconcile_native_head(cwd: &Path) -> Result<()> {
+    let context = match open_repository(cwd) {
+        Ok(context) => context,
+        // Not a forge repo / not initialized: nothing to reconcile. The command's own
+        // `open_repository` surfaces the real NOT_INITIALIZED — reconcile is best-effort.
+        Err(_) => return Ok(()),
+    };
+    let refs = forge_content_native::NativeRefStore::new(&context.root_path);
+    let current_head = refs.read_head()?;
+    let connection = open_connection(&context.database_path)?;
+    let Some(tip) = native_tip(&context, &connection)? else {
+        return Ok(()); // genesis-only / git repo — nothing to reconcile
+    };
+    if current_head.as_ref() == Some(&tip) {
+        return Ok(()); // HEAD already current
+    }
+    // Walk the tip's ancestry: every object must exist (a miss is the store-before-DB
+    // violation), there is no cycle, and the current HEAD must be an ancestor of the tip
+    // (HEAD lags, never forks). Linear history → follow the first parent.
+    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let mut cursor = Some(tip.clone());
+    let mut seen = std::collections::BTreeSet::new();
+    let mut head_reached = current_head.is_none();
+    while let Some(cid) = cursor {
+        if current_head.as_ref() == Some(&cid) {
+            head_reached = true;
+            break;
+        }
+        if !seen.insert(cid.clone()) {
+            return Err(ForgeError::NativeHistoryCorrupt {
+                kind: NativeHistoryCorruptKind::Cycle,
+                commit_id: cid.to_string(),
+                related_id: None,
+            }
+            .into());
+        }
+        let commit = store.read_commit(&cid).map_err(|_| {
+            // The tip miss is a dangling commit_id; a deeper miss is a dangling parent.
+            let kind = if cid == tip {
+                NativeHistoryCorruptKind::DanglingCommitId
+            } else {
+                NativeHistoryCorruptKind::DanglingParent
+            };
+            anyhow::Error::from(ForgeError::NativeHistoryCorrupt {
+                kind,
+                commit_id: cid.to_string(),
+                related_id: None,
+            })
+        })?;
+        cursor = match commit.parents.first() {
+            Some(parent) => Some(forge_content_native::ObjectId::parse(parent)?),
+            None => None,
+        };
+    }
+    if !head_reached {
+        // The ledger tip does not descend from the current HEAD — a fork, which lock-
+        // serialized accepts cannot produce: the store is corrupt.
+        return Err(ForgeError::NativeHistoryCorrupt {
+            kind: NativeHistoryCorruptKind::DanglingParent,
+            commit_id: tip.to_string(),
+            related_id: current_head.map(|head| head.to_string()),
+        }
+        .into());
+    }
+    refs.set_head(&tip)?;
+    Ok(())
+}
+
+/// The authoritative native history tip: the latest accepted `decisions.commit_id` (by
+/// op-log chain order, `rowid DESC` tiebreak) if any justified commit exists, else the
+/// ref-store HEAD (the genesis), else `None`. Shared by `reconcile_native_head` (the advance
+/// target) and `native_log` (the walk origin) so the two can never disagree on the tip —
+/// `log` is read-only and never writes HEAD, so it tolerates a not-yet-reconciled HEAD by
+/// resolving the tip from the ledger directly.
+fn native_tip(
+    context: &RepositoryContext,
+    connection: &Connection,
+) -> Result<Option<forge_content_native::ObjectId>> {
+    let latest: Option<String> = connection
+        .query_row(
+            "SELECT commit_id FROM decisions \
+             WHERE repo_id = ?1 AND commit_id IS NOT NULL \
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            params![context.repo_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match latest {
+        Some(commit) => Ok(Some(forge_content_native::ObjectId::parse(&commit)?)),
+        None => forge_content_native::NativeRefStore::new(&context.root_path).read_head(),
+    }
+}
+
+/// One commit in the native history, as surfaced by `forge log` through the JSON contract
+/// ("show every change under this intent and the evidence that justified it"). Optional
+/// justification fields are omitted when absent (genesis), matching the on-object shape.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitView {
+    pub commit_id: String,
+    pub tree: String,
+    pub parents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_revision_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authored_time: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_digest: Option<String>,
+}
+
+/// Walk the native commit DAG from the authoritative tip (NER-138 Phase 7 slice 3),
+/// tip→genesis, returning each commit's justification. Read-only (no lock, no HEAD write).
+/// When `intent` is `Some`, only commits whose `intent_id` matches are returned — the literal
+/// "show every change under this intent" query. A missing tip/parent object surfaces typed
+/// `NativeHistoryCorrupt` (DanglingCommitId for the tip, DanglingParent deeper); a parent
+/// cycle is `Cycle`.
+pub fn native_log(cwd: &Path, intent: Option<&str>) -> Result<Vec<CommitView>> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let tip = native_tip(&context, &connection)?;
+    let mut out = Vec::new();
+    let mut cursor = tip.clone();
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(cid) = cursor {
+        if !seen.insert(cid.clone()) {
+            return Err(ForgeError::NativeHistoryCorrupt {
+                kind: NativeHistoryCorruptKind::Cycle,
+                commit_id: cid.to_string(),
+                related_id: None,
+            }
+            .into());
+        }
+        let commit = store.read_commit(&cid).map_err(|_| {
+            let kind = if Some(&cid) == tip.as_ref() {
+                NativeHistoryCorruptKind::DanglingCommitId
+            } else {
+                NativeHistoryCorruptKind::DanglingParent
+            };
+            anyhow::Error::from(ForgeError::NativeHistoryCorrupt {
+                kind,
+                commit_id: cid.to_string(),
+                related_id: None,
+            })
+        })?;
+        let matches = intent
+            .map(|want| commit.intent_id.as_deref() == Some(want))
+            .unwrap_or(true);
+        if matches {
+            out.push(CommitView {
+                commit_id: cid.to_string(),
+                tree: commit.tree.clone(),
+                parents: commit.parents.clone(),
+                intent_id: commit.intent_id.clone(),
+                proposal_revision_id: commit.proposal_revision_id.clone(),
+                decision_id: commit.decision_id.clone(),
+                actor: commit.actor.clone(),
+                authored_time: commit.authored_time,
+                evidence_digest: commit
+                    .evidence_digest
+                    .as_ref()
+                    .map(|h| h.as_str().to_string()),
+            });
+        }
+        cursor = match commit.parents.first() {
+            Some(parent) => Some(forge_content_native::ObjectId::parse(parent)?),
+            None => None,
+        };
+    }
+    Ok(out)
 }
 
 /// Verify an accepted proposal's decision row integrity before trusting `accepted`
@@ -1818,6 +2277,29 @@ pub fn decision_for_proposal_revision(
         .map_err(Into::into)
 }
 
+/// The native `Commit` id recorded when a proposal revision was accepted (NER-138 Phase 7
+/// slice 3), or `None` for a git-backend repo / a pre-006 accept (NULL `commit_id`) / an
+/// unaccepted revision. After commit-on-accept the ref-store HEAD advances to this id, so it
+/// is the *expected* current head for the accepted proposal — `export branch` compares the
+/// live head against it (not the proposal's `base_head`, which the accept progressed past).
+pub fn accepted_commit_id_for_revision(
+    cwd: &Path,
+    proposal_revision_id: &str,
+) -> Result<Option<String>> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let commit_id: Option<Option<String>> = connection
+        .query_row(
+            "SELECT commit_id FROM decisions
+             WHERE repo_id = ?1 AND proposal_revision_id = ?2 AND decision = 'accepted'
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            params![context.repo_id, proposal_revision_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(commit_id.flatten())
+}
+
 pub fn publication_exists_for_branch(cwd: &Path, branch_name: &str) -> Result<bool> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
@@ -2068,6 +2550,18 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         issues.push(format!("{} tampered row(s) detected", tampered_rows.len()));
     }
 
+    // Native commit-DAG integrity pass (NER-138 Phase 7 slice 3): walk the DAG from the
+    // authoritative tip and cross-check the ledger, REPORTING (not raising) cycles / dangling
+    // parents / dangling trees / dangling commit_ids. The raising counterpart lives in
+    // reconcile/checkout; doctor is the offline health report.
+    let native_history_issues = verify_native_history(&context, &connection, &native_store)?;
+    if !native_history_issues.is_empty() {
+        issues.push(format!(
+            "{} native-history integrity break(s) detected",
+            native_history_issues.len()
+        ));
+    }
+
     Ok(DoctorReport {
         ok: issues.is_empty(),
         issues,
@@ -2076,7 +2570,95 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         dangling_content_refs,
         half_applied_worktrees,
         tampered_rows,
+        native_history_issues,
     })
+}
+
+/// `doctor`'s native commit-DAG integrity pass (NER-138 Phase 7 slice 3): walk the DAG from
+/// the authoritative tip detecting cycles (visited set), dangling parents, and dangling trees,
+/// then cross-check every `decisions.commit_id` resolves to an existing commit object. Reports
+/// findings (does not raise) — fail-closed at the call sites that raise. Findings are deduped
+/// by (kind, commit_id, related_id).
+fn verify_native_history(
+    context: &RepositoryContext,
+    connection: &Connection,
+    store: &forge_content_native::NativeObjectStore,
+) -> Result<Vec<NativeHistoryFinding>> {
+    let mut findings: Vec<NativeHistoryFinding> = Vec::new();
+    let mut push = |finding: NativeHistoryFinding| {
+        if !findings.iter().any(|existing| {
+            existing.kind.as_str() == finding.kind.as_str()
+                && existing.commit_id == finding.commit_id
+                && existing.related_id == finding.related_id
+        }) {
+            findings.push(finding);
+        }
+    };
+
+    if let Some(tip) = native_tip(context, connection)? {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut stack = vec![tip];
+        while let Some(commit_id) = stack.pop() {
+            if !seen.insert(commit_id.clone()) {
+                push(NativeHistoryFinding {
+                    kind: NativeHistoryCorruptKind::Cycle,
+                    commit_id: commit_id.to_string(),
+                    related_id: None,
+                });
+                continue;
+            }
+            let commit = match store.read_commit(&commit_id) {
+                Ok(commit) => commit,
+                Err(_) => {
+                    push(NativeHistoryFinding {
+                        kind: NativeHistoryCorruptKind::DanglingCommitId,
+                        commit_id: commit_id.to_string(),
+                        related_id: None,
+                    });
+                    continue;
+                }
+            };
+            let tree_ref = format!("{}{}", forge_content::FORGE_TREE_PREFIX, commit.tree);
+            if store.verify_content_ref(&tree_ref).is_err() {
+                push(NativeHistoryFinding {
+                    kind: NativeHistoryCorruptKind::DanglingTree,
+                    commit_id: commit_id.to_string(),
+                    related_id: Some(commit.tree.clone()),
+                });
+            }
+            for parent in &commit.parents {
+                match forge_content_native::ObjectId::parse(parent) {
+                    Ok(parent_id) if store.read_commit(&parent_id).is_ok() => {
+                        stack.push(parent_id);
+                    }
+                    _ => push(NativeHistoryFinding {
+                        kind: NativeHistoryCorruptKind::DanglingParent,
+                        commit_id: commit_id.to_string(),
+                        related_id: Some(parent.clone()),
+                    }),
+                }
+            }
+        }
+    }
+
+    // Cross-check every accepted decisions.commit_id resolves to a commit object — catches a
+    // dangling commit_id even if it is off the tip's ancestry (the store-before-DB violation).
+    let mut statement = connection
+        .prepare("SELECT commit_id FROM decisions WHERE repo_id = ?1 AND commit_id IS NOT NULL")?;
+    let rows = statement.query_map(params![context.repo_id], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let commit_id = row?;
+        match forge_content_native::ObjectId::parse(&commit_id) {
+            Ok(id) if store.read_commit(&id).is_ok() => {}
+            _ => push(NativeHistoryFinding {
+                kind: NativeHistoryCorruptKind::DanglingCommitId,
+                commit_id,
+                related_id: None,
+            }),
+        }
+    }
+
+    Ok(findings)
 }
 
 /// Re-verify the full tamper-evident chain offline (NER-136 §U8): every evidence and
@@ -2435,12 +3017,36 @@ pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
             }
         }
     }
-    // NER-138 Phase 7 slice 2: native commit objects now exist and enter `all_object_ids`,
-    // so seed the reachable set from the ref-store HEAD's commit DAG (the tip commit, its
-    // ancestry, and each commit's tree). Without this the live base anchor that every
-    // attempt's `base_head` points at would be reported as unreachable garbage. No-op for
-    // git-backend repos (no native HEAD). Empty set if no HEAD yet.
-    reachable.extend(native_store.reachable_from_head()?);
+    // NER-138 Phase 7 slice 3: seed reachability from the AUTHORITATIVE ledger tip (not only
+    // the ref-store HEAD, which a lock-free, never-reconciled gc could read stale), plus every
+    // accepted `decisions.commit_id` and every op-log-referenced commit (a `checkout` target
+    // writes NO decision row, so its commit is reachable only through the op-log). Each is
+    // walked as a DAG root (commit → ancestry → trees). Best-effort: a dangling root is
+    // surfaced by `doctor`, not fatal to this dry-run report. No-op for git-backend repos.
+    let mut roots: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if let Some(tip) = native_tip(&context, &connection)? {
+        roots.insert(tip.to_string());
+    }
+    let mut decision_stmt = connection
+        .prepare("SELECT commit_id FROM decisions WHERE repo_id = ?1 AND commit_id IS NOT NULL")?;
+    for row in decision_stmt.query_map(params![context.repo_id], |row| row.get::<_, String>(0))? {
+        roots.insert(row?);
+    }
+    let mut view_stmt = connection.prepare("SELECT state_json FROM views WHERE repo_id = ?1")?;
+    for row in view_stmt.query_map(params![context.repo_id], |row| row.get::<_, String>(0))? {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&row?) {
+            if let Some(commit_id) = value.get("commit_id").and_then(|v| v.as_str()) {
+                roots.insert(commit_id.to_string());
+            }
+        }
+    }
+    for root in &roots {
+        if let Ok(id) = forge_content_native::ObjectId::parse(root) {
+            if let Ok(ids) = native_store.reachable_from(&id) {
+                reachable.extend(ids);
+            }
+        }
+    }
     let all = native_store.all_object_ids()?;
     let unreachable_native_objects = all
         .difference(&reachable)
@@ -3750,6 +4356,27 @@ fn read_init_repository(
             }
         },
     ))
+}
+
+/// Find the Forge repository root by walking up from `cwd` for the nearest ancestor that
+/// contains the `.forge/forge.db` repo marker. GIT-FREE (NER-138 Phase 7 slice 3): post-`init`
+/// commands resolve the root without the git binary, so the native lifecycle
+/// (start→save→…→accept→restore→log→checkout→undo) runs with git removed from PATH. `init`
+/// still anchors a *git-backed* repo on the git toplevel (Forge layers on an existing git
+/// repo); a *native* repo's root is established at init without git. Returns
+/// `NotInitialized` when no `.forge/forge.db` is found up the tree.
+fn forge_root(cwd: &Path) -> Result<PathBuf> {
+    let start = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut current: &Path = &start;
+    loop {
+        if current.join(".forge/forge.db").exists() {
+            return Ok(current.to_path_buf());
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return Err(ForgeError::NotInitialized.into()),
+        }
+    }
 }
 
 fn git_root(cwd: &Path) -> Result<PathBuf> {

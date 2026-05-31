@@ -51,6 +51,36 @@ impl TamperKind {
     }
 }
 
+/// The class of native-history corruption `doctor`/`reconcile`/`log`/checkout detected
+/// when walking the commit DAG (NER-138 Phase 7 slice 3). A closed enum so
+/// [`ForgeError::NativeHistoryCorrupt`]'s `details` — and the `DoctorReport` finding it
+/// also feeds — can never carry a free-form string (a path/excerpt) into a machine-visible
+/// payload. Serializes as snake_case, kept in lockstep with [`NativeHistoryCorruptKind::as_str`]
+/// by the `serde`-vs-`as_str` parity test in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeHistoryCorruptKind {
+    /// A commit is reachable from itself through its parent chain (forged/corrupt store).
+    Cycle,
+    /// A commit names a parent commit whose object is absent from the store.
+    DanglingParent,
+    /// A commit names a root tree whose object is absent from the store.
+    DanglingTree,
+    /// A `decisions.commit_id` (or ledger-recorded tip) references a commit with no object.
+    DanglingCommitId,
+}
+
+impl NativeHistoryCorruptKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NativeHistoryCorruptKind::Cycle => "cycle",
+            NativeHistoryCorruptKind::DanglingParent => "dangling_parent",
+            NativeHistoryCorruptKind::DanglingTree => "dangling_tree",
+            NativeHistoryCorruptKind::DanglingCommitId => "dangling_commit_id",
+        }
+    }
+}
+
 /// Typed Forge error taxonomy. Constructed at the failure site, carried inside an
 /// `anyhow::Error`, recovered at the CLI by `downcast_ref`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +178,18 @@ pub enum ForgeError {
         branch: String,
         missing_field: String,
     },
+    /// The native commit DAG failed an integrity walk (NER-138 Phase 7 slice 3): a parent
+    /// cycle, a dangling parent/tree object, or a `decisions.commit_id`/ledger tip whose
+    /// commit object is absent. Distinguishes genuine corruption from transient IO (which
+    /// stays path-free `anyhow`) so an agent can tell "the history is broken" from "a read
+    /// failed". Fail-closed and **non-retryable**. `commit_id` is the subject commit and
+    /// `related_id` the missing parent/tree (or the cycle-closing ancestor) when applicable
+    /// — both opaque `f1:` ids, never paths/excerpts, so `details` emits them un-redacted.
+    NativeHistoryCorrupt {
+        kind: NativeHistoryCorruptKind,
+        commit_id: String,
+        related_id: Option<String>,
+    },
 }
 
 impl ForgeError {
@@ -178,6 +220,7 @@ impl ForgeError {
             ForgeError::EvidenceTampered { .. } => "EVIDENCE_TAMPERED",
             ForgeError::ProvenanceMismatch { .. } => "PROVENANCE_MISMATCH",
             ForgeError::MissingProvenanceTrailer { .. } => "MISSING_PROVENANCE_TRAILER",
+            ForgeError::NativeHistoryCorrupt { .. } => "NATIVE_HISTORY_CORRUPT",
         }
     }
 
@@ -270,6 +313,17 @@ impl ForgeError {
                 branch,
                 missing_field,
             } => json!({ "branch": branch, "missing_field": missing_field }),
+            ForgeError::NativeHistoryCorrupt {
+                kind,
+                commit_id,
+                related_id,
+            } => json!({
+                // Only the closed-enum kind and opaque f1: commit ids — never a path
+                // or excerpt (details is a machine-visible egress).
+                "kind": kind.as_str(),
+                "commit_id": commit_id,
+                "related_id": related_id,
+            }),
             _ => Value::Object(Default::default()),
         }
     }
@@ -382,6 +436,22 @@ impl std::fmt::Display for ForgeError {
                 f,
                 "commit {branch} carries no Forge provenance trailer (missing {missing_field}); it was not produced by `forge export branch`"
             ),
+            ForgeError::NativeHistoryCorrupt {
+                kind,
+                commit_id,
+                related_id,
+            } => match related_id {
+                Some(related) => write!(
+                    f,
+                    "native history corrupt ({}) at commit {commit_id} (related {related})",
+                    kind.as_str()
+                ),
+                None => write!(
+                    f,
+                    "native history corrupt ({}) at commit {commit_id}",
+                    kind.as_str()
+                ),
+            },
         }
     }
 }
@@ -548,6 +618,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             after_ms: None,
             details_keys: &["branch", "missing_field"],
         },
+        ErrorCodeSpec {
+            code: "NATIVE_HISTORY_CORRUPT",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["kind", "commit_id", "related_id"],
+        },
     ]
 }
 
@@ -682,6 +758,15 @@ mod tests {
             .code(),
             "MISSING_PROVENANCE_TRAILER"
         );
+        assert_eq!(
+            ForgeError::NativeHistoryCorrupt {
+                kind: NativeHistoryCorruptKind::DanglingParent,
+                commit_id: "f1:commit:sha256:aa".into(),
+                related_id: Some("f1:commit:sha256:bb".into()),
+            }
+            .code(),
+            "NATIVE_HISTORY_CORRUPT"
+        );
     }
 
     #[test]
@@ -811,6 +896,75 @@ mod tests {
                 serde_json::to_value(kind).expect("serialize"),
                 kind.as_str()
             );
+        }
+    }
+
+    /// NER-138 slice 3: `NativeHistoryCorruptKind`'s serde representation (used by the
+    /// `DoctorReport` corruption finding) must match its `as_str()` (used by
+    /// `NativeHistoryCorrupt.details`), so the error payload and the doctor report never
+    /// disagree on the kind string. Mirrors `tamper_kind_serde_matches_as_str`.
+    #[test]
+    fn native_history_corrupt_kind_serde_matches_as_str() {
+        for kind in [
+            NativeHistoryCorruptKind::Cycle,
+            NativeHistoryCorruptKind::DanglingParent,
+            NativeHistoryCorruptKind::DanglingTree,
+            NativeHistoryCorruptKind::DanglingCommitId,
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).expect("serialize"),
+                kind.as_str()
+            );
+        }
+    }
+
+    /// NER-138 slice 3 security invariant: the native-history-corrupt payload carries only
+    /// the closed-enum kind and opaque `f1:` commit ids — never a path or excerpt. Mirrors
+    /// the other `*_details_carry_only_ids` guards.
+    #[test]
+    fn native_history_corrupt_details_carry_only_ids() {
+        let details = ForgeError::NativeHistoryCorrupt {
+            kind: NativeHistoryCorruptKind::DanglingParent,
+            commit_id: "f1:commit:sha256:aaaa".into(),
+            related_id: Some("f1:commit:sha256:bbbb".into()),
+        }
+        .details();
+        assert_eq!(details["kind"], "dangling_parent");
+        assert_eq!(details["commit_id"], "f1:commit:sha256:aaaa");
+        assert_eq!(details["related_id"], "f1:commit:sha256:bbbb");
+        let object = details.as_object().expect("details object");
+        assert_eq!(
+            object.len(),
+            3,
+            "details must carry exactly kind + commit_id + related_id"
+        );
+    }
+
+    /// S1: `NativeHistoryCorrupt`'s `Display` (which reaches the untyped envelope via
+    /// `{:#}` on the wrapping `anyhow::Error`) must be path-free for every kind — the
+    /// `details_carry_only_ids` guard covers the structured payload, this covers the
+    /// Display egress so a future `write!` cannot smuggle a path into the message.
+    #[test]
+    fn native_history_corrupt_display_is_path_free() {
+        for kind in [
+            NativeHistoryCorruptKind::Cycle,
+            NativeHistoryCorruptKind::DanglingParent,
+            NativeHistoryCorruptKind::DanglingTree,
+            NativeHistoryCorruptKind::DanglingCommitId,
+        ] {
+            let error = ForgeError::NativeHistoryCorrupt {
+                kind,
+                commit_id: "f1:commit:sha256:aaaa".into(),
+                related_id: Some("f1:commit:sha256:bbbb".into()),
+            };
+            let display = format!("{error}");
+            let chained = format!("{:#}", anyhow::Error::new(error));
+            for rendered in [&display, &chained] {
+                assert!(
+                    !rendered.contains('/') && !rendered.contains('\\'),
+                    "NativeHistoryCorrupt Display leaked a path separator: {rendered}"
+                );
+            }
         }
     }
 
@@ -955,6 +1109,11 @@ mod tests {
                 branch: "forge/x".into(),
                 missing_field: "provenance_digest".into(),
             },
+            ForgeError::NativeHistoryCorrupt {
+                kind: NativeHistoryCorruptKind::Cycle,
+                commit_id: "f1:commit:sha256:aa".into(),
+                related_id: None,
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -983,7 +1142,8 @@ mod tests {
                 | ForgeError::CheckNotPassed { .. }
                 | ForgeError::EvidenceTampered { .. }
                 | ForgeError::ProvenanceMismatch { .. }
-                | ForgeError::MissingProvenanceTrailer { .. } => {}
+                | ForgeError::MissingProvenanceTrailer { .. }
+                | ForgeError::NativeHistoryCorrupt { .. } => {}
             }
         }
 

@@ -17,6 +17,11 @@ use std::process::Command;
 
 const SCHEMA_VERSION: u32 = 1;
 
+/// The on-object `CommitObject::schema_version` value to stamp when building a commit in
+/// another crate (slice 3's `forge_store::decide`). Exposed so callers need not hard-code
+/// the version; it stays 1 (genesis-hash stability — see `CommitObject`).
+pub const COMMIT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
+
 /// Re-exported from `forge_content` so `forge_store::doctor` keeps referencing
 /// `forge_content_native::RESTORE_TEMP_PREFIX`, while the canonical definition and
 /// its matching `is_restore_temp_path` exclusion predicate live in the shared base
@@ -51,20 +56,62 @@ pub struct ObjectId {
     digest: String,
 }
 
+/// The domain-separated, length-prefixed preimage an object id hashes over:
+/// `b"forge-object\n" + kind + "\n" + SCHEMA_VERSION + "\n" + payload.len() + "\n" + payload`.
+///
+/// NER-138 Phase 7 slice 3 stores this preimage *as the object file* (rather than the raw
+/// payload), so the file is self-verifying (`hash(file) == id`) and self-describing (the
+/// kind is a parsed header field) — letting `all_object_ids` read each object's kind instead
+/// of re-hashing under every kind. `ObjectId::new` hashes exactly these bytes, so the id is
+/// unchanged from slice 1/2 (no re-addressing). Single source of truth for the framing so
+/// the write/read/hash paths can never disagree.
+const OBJECT_MAGIC: &[u8] = b"forge-object\n";
+
+fn object_preimage(kind: ObjectKind, payload: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(OBJECT_MAGIC.len() + payload.len() + 24);
+    buf.extend_from_slice(OBJECT_MAGIC);
+    buf.extend_from_slice(kind.as_str().as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(SCHEMA_VERSION.to_string().as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(payload.len().to_string().as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Parse a stored object file as a slice-3 self-describing preimage, returning its kind and
+/// payload slice. Returns `None` when the bytes are not a well-formed preimage (a slice-1/2
+/// legacy raw-payload object, or — astronomically — a blob whose raw content coincidentally
+/// starts with the magic but does not parse). Callers MUST still verify `hash(file) == id`
+/// before trusting the parsed kind, so the headered-vs-legacy decision is hash-resolved, not
+/// format-guessed (a legacy blob starting with the magic fails that check and falls back).
+fn parse_object_preimage(bytes: &[u8]) -> Option<(ObjectKind, &[u8])> {
+    let rest = bytes.strip_prefix(OBJECT_MAGIC)?;
+    let nl1 = rest.iter().position(|&b| b == b'\n')?;
+    let kind = match std::str::from_utf8(&rest[..nl1]).ok()? {
+        "blob" => ObjectKind::Blob,
+        "tree" => ObjectKind::Tree,
+        "commit" => ObjectKind::Commit,
+        _ => return None,
+    };
+    let rest = &rest[nl1 + 1..];
+    let nl2 = rest.iter().position(|&b| b == b'\n')?;
+    let rest = &rest[nl2 + 1..]; // skip the schema_version line
+    let nl3 = rest.iter().position(|&b| b == b'\n')?;
+    let len: usize = std::str::from_utf8(&rest[..nl3]).ok()?.parse().ok()?;
+    let payload = &rest[nl3 + 1..];
+    if payload.len() != len {
+        return None;
+    }
+    Some((kind, payload))
+}
+
 impl ObjectId {
     pub fn new(kind: ObjectKind, payload: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(b"forge-object\n");
-        hasher.update(kind.as_str().as_bytes());
-        hasher.update(b"\n");
-        hasher.update(SCHEMA_VERSION.to_string().as_bytes());
-        hasher.update(b"\n");
-        hasher.update(payload.len().to_string().as_bytes());
-        hasher.update(b"\n");
-        hasher.update(payload);
         Self {
             kind: kind.as_str().to_string(),
-            digest: hex_lower(&hasher.finalize()),
+            digest: hex_lower(&Sha256::digest(object_preimage(kind, payload))),
         }
     }
 
@@ -199,6 +246,10 @@ fn ensure_head(repo_root: &Path) -> Result<ObjectId> {
         proposal_revision_id: None,
         decision_id: None,
         evidence_digest: None,
+        // Genesis has no decider; `actor`/`authored_time` stay `None` and (via
+        // skip_serializing_if) are omitted, so the genesis hash is byte-identical to slice 2.
+        actor: None,
+        authored_time: None,
     };
     // Store-before-DB: the genesis object + HEAD are durable before `current_base`
     // returns, so the `attempts.base_head` row that records this id is written only after
@@ -243,10 +294,17 @@ impl NativeObjectStore {
         let id = ObjectId::new(kind, payload);
         let path = self.object_path(&id);
         if path.exists() {
+            // Dedup: the object is already on disk. `read_object` re-verifies it (headered
+            // OR legacy raw-payload — both valid for this id), so a slice-3 write over an
+            // existing slice-1/2 legacy file is a verified no-op, never a "hash mismatch".
             self.read_object(&id)?;
             return Ok(id);
         }
 
+        // Slice 3: store the self-describing domain-separated preimage (kind in a header),
+        // not the raw payload. `hash(file) == id`, so the file is self-verifying and
+        // `all_object_ids` reads its kind instead of re-hashing under every kind.
+        let framed = object_preimage(kind, payload);
         let parent = path.parent().context("object path has no parent")?;
         // Record which ancestor directories do not yet exist so their creation can be
         // made durable after the object is written: a freshly created shard directory's
@@ -255,7 +313,7 @@ impl NativeObjectStore {
         fs::create_dir_all(parent)?;
         fs::create_dir_all(self.tmp_dir())?;
         let mut temp = tempfile::NamedTempFile::new_in(self.tmp_dir())?;
-        temp.write_all(payload)?;
+        temp.write_all(&framed)?;
         temp.as_file_mut().sync_all()?;
         temp.persist(&path).map_err(|error| error.error)?;
         // The object's directory entry must reach disk before any DB row references it.
@@ -273,26 +331,40 @@ impl NativeObjectStore {
 
     pub fn read_object(&self, id: &ObjectId) -> Result<Vec<u8>> {
         let path = self.object_path(id);
-        let payload =
+        let bytes =
             fs::read(&path).with_context(|| format!("missing native content object {}", id))?;
-        let actual = ObjectId::new(id.kind()?, &payload);
+        // Slice-3 headered object: the file IS the preimage, so `hash(file) == id` and its
+        // kind is a parsed header field. The hash check disambiguates from a legacy blob
+        // that merely starts with the magic (its hash will not match) — hash-resolved, not
+        // format-guessed. A header kind that disagrees with the id's kind is corruption.
+        if let Some((kind, payload)) = parse_object_preimage(&bytes) {
+            if hex_lower(&Sha256::digest(&bytes)) == id.digest {
+                if kind != id.kind()? {
+                    bail!("native object kind header mismatch for {}", id);
+                }
+                return Ok(payload.to_vec());
+            }
+        }
+        // Legacy slice-1/2 raw-payload fallback: the id hashes the framed preimage of the
+        // raw bytes. Kept alive (prove-before-delete) so existing repos stay readable.
+        let actual = ObjectId::new(id.kind()?, &bytes);
         if &actual != id {
             bail!("hash mismatch for native content object {}", id);
         }
-        Ok(payload)
+        Ok(bytes)
     }
 
     /// Write a native commit object (NER-138 Phase 7 slice 2), returning its
     /// content-addressed id. Inherits `write_object`'s store-before-DB durability
     /// (temp + fsync + atomic rename + parent-dir fsync) verbatim.
-    fn write_commit(&self, commit: &CommitObject) -> Result<ObjectId> {
+    pub fn write_commit(&self, commit: &CommitObject) -> Result<ObjectId> {
         let payload = serde_json::to_vec(commit)?;
         self.write_object(ObjectKind::Commit, &payload)
     }
 
     /// Read and validate a native commit object. S1: never interpolates a filesystem
     /// path — `read_object`'s context carries only the opaque object id.
-    fn read_commit(&self, id: &ObjectId) -> Result<CommitObject> {
+    pub fn read_commit(&self, id: &ObjectId) -> Result<CommitObject> {
         if id.kind()? != ObjectKind::Commit {
             bail!("native object is not a commit");
         }
@@ -320,11 +392,21 @@ impl NativeObjectStore {
     /// `base_head` points at are never reported as unreachable garbage. A `seen` set guards
     /// against revisiting a commit (diamond/merge ancestry).
     pub fn reachable_from_head(&self) -> Result<BTreeSet<ObjectId>> {
+        match NativeRefStore::new(&self.root).read_head()? {
+            Some(head) => self.reachable_from(&head),
+            None => Ok(BTreeSet::new()),
+        }
+    }
+
+    /// All native objects reachable from a given commit (NER-138 Phase 7 slice 3): the commit,
+    /// its ancestry (commit → parents), each commit's tree, and every blob/subtree those trees
+    /// reach. Generalizes `reachable_from_head` so gc can seed reachability from the
+    /// authoritative ledger tip (and every accepted / checkout-target commit), not only the
+    /// ref-store HEAD — which a lock-free, never-reconciled gc could otherwise read stale. A
+    /// `seen` set guards against revisiting a commit (diamond/merge ancestry).
+    pub fn reachable_from(&self, tip: &ObjectId) -> Result<BTreeSet<ObjectId>> {
         let mut reachable = BTreeSet::new();
-        let Some(head) = NativeRefStore::new(&self.root).read_head()? else {
-            return Ok(reachable);
-        };
-        let mut stack = vec![head];
+        let mut stack = vec![tip.clone()];
         while let Some(commit_id) = stack.pop() {
             if !reachable.insert(commit_id.clone()) {
                 continue; // already visited
@@ -357,11 +439,22 @@ impl NativeObjectStore {
                 }
                 let digest = entry.file_name().to_string_lossy().into_owned();
                 let bytes = fs::read(entry.path())?;
-                // Recover each loose object's kind by re-hashing its bytes under every
-                // kind and matching the digest; domain separation guarantees at most one
-                // match. NER-138 Phase 7 slice 2 adds `Commit` to the scan. Slice 3's
-                // object-kind headers replace this multi-hash scan (kill the double/triple
-                // hash; see lib.rs object-kind-header work).
+                // Slice-3 headered object: read its kind from the preimage header, verified
+                // by `hash(file) == digest` — a single hash, no multi-kind re-hash. This is
+                // the primary path that kills the triple-hash scan.
+                if let Some((kind, _payload)) = parse_object_preimage(&bytes) {
+                    if hex_lower(&Sha256::digest(&bytes)) == digest {
+                        ids.insert(ObjectId {
+                            kind: kind.as_str().to_string(),
+                            digest,
+                        });
+                        continue;
+                    }
+                }
+                // Legacy slice-1/2 raw-payload fallback (prove-before-delete; kept alive so a
+                // mixed store still enumerates fully): recover the kind by re-hashing the raw
+                // bytes under every kind and matching the digest — domain separation
+                // guarantees at most one match.
                 for kind in [ObjectKind::Blob, ObjectKind::Tree, ObjectKind::Commit] {
                     let id = ObjectId::new(kind, &bytes);
                     if id.digest == digest {
@@ -485,32 +578,78 @@ struct TreeObject {
     entries: Vec<TreeEntry>,
 }
 
-/// A native commit/Change object (NER-138 Phase 7 slice 2). Content-addressed and
-/// domain-separated via `ObjectId::new(ObjectKind::Commit, ..)`, it makes history
-/// intent-aware: it references its root `tree`, zero-or-more parent commit ids, and
-/// (nullable) the intent / proposal-revision / decision that justified it plus an
-/// evidence digest. Slice 2 writes only the genesis shape (empty `parents`, all-`None`
-/// justification); slice 3 writes justified commits at `accept`.
-///
-/// `evidence_digest`, when present, MUST be an opaque lowercase-hex digest (e.g. the
-/// ledger's evidence `content_hash`) — never an excerpt or any free text. The commit
-/// payload is written via `write_object` and never passes through
-/// `redact_evidence_excerpt`, so admitting excerpt text here would be a secret-leaking
-/// egress: the field stays a hash by contract.
+/// An opaque lowercase 64-hex digest (e.g. an evidence `content_hash`). Constructing one
+/// validates the shape, so the commit-build path (slice 3's `accept`) can only assign a
+/// real digest — excerpt text is structurally unrepresentable in
+/// [`CommitObject::evidence_digest`] (the commit payload is written via `write_object` and
+/// never passes through `redact_evidence_excerpt`, so this newtype is the secret-hygiene
+/// guard). `#[serde(transparent)]` so it serializes/deserializes as the bare hex string —
+/// byte-identical to the prior `Option<String>` field, preserving genesis-hash stability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CommitObject {
-    schema_version: u32,
-    tree: String,
+#[serde(transparent)]
+pub struct Hex64(String);
+
+impl Hex64 {
+    /// Validate and wrap a lowercase 64-hex digest. Errors (path-free) on any other shape,
+    /// so a non-digest (e.g. excerpt text) can never reach the commit payload.
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            bail!("evidence digest must be exactly 64 lowercase hex characters");
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Hex64 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A native commit/Change object (NER-138 Phase 7 slice 2; justified commits land in
+/// slice 3). Content-addressed and domain-separated via `ObjectId::new(ObjectKind::Commit,
+/// ..)`. `pub` (with `pub` fields) so `forge_store` can build justified commits at `accept`
+/// and walk them for `log`/checkout/`doctor` (slice 3).
+///
+/// **Genesis-hash stability (slice 3, critical):** the two slice-3 fields `actor` and
+/// `authored_time` carry `#[serde(skip_serializing_if = "Option::is_none")]`, so a genesis
+/// commit (all-`None`) serializes byte-identically to slice 2 — its `ObjectId` is unchanged
+/// and existing repos' `base_head` does not desync into spurious `STALE_BASE`. Justified
+/// commits (slice 3) populate `actor` + `authored_time` in the HASHED bytes so Phase 9
+/// signing attests who/when (a later registry bump cannot retroactively bring earlier
+/// justified commits under signed/decider-bound provenance).
+///
+/// `evidence_digest`, when present, is a [`Hex64`] (an opaque lowercase-hex digest such as
+/// the ledger's evidence `content_hash`) — never an excerpt or any free text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitObject {
+    pub schema_version: u32,
+    pub tree: String,
     #[serde(default)]
-    parents: Vec<String>,
+    pub parents: Vec<String>,
     #[serde(default)]
-    intent_id: Option<String>,
+    pub intent_id: Option<String>,
     #[serde(default)]
-    proposal_revision_id: Option<String>,
+    pub proposal_revision_id: Option<String>,
     #[serde(default)]
-    decision_id: Option<String>,
+    pub decision_id: Option<String>,
     #[serde(default)]
-    evidence_digest: Option<String>,
+    pub evidence_digest: Option<Hex64>,
+    /// The decider (`decisions.actor`). `None` for genesis. Hashed for justified commits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// Wall-clock authored time (ms). `None` for genesis. Hashed for justified commits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_time: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,7 +671,18 @@ enum TreeEntryKind {
 struct FileEntry {
     path: String,
     executable: bool,
+    /// `Some(target)` when this entry is a symlink (NER-138 Phase 7 slice 3): the blob stores
+    /// the link target bytes under mode `0o120000`, matching git's symlink representation, so
+    /// a symlink round-trips as a link (not a regular file whose content is the target text).
+    /// `None` for a regular file. Captured via `read_link` (never followed), so the link's
+    /// pointed-at content is never read into a snapshot.
+    symlink_target: Option<String>,
 }
+
+/// The tree-entry mode for a symlink: git's `120000`. A symlink leaf is a `TreeEntryKind::File`
+/// whose blob is the target bytes and whose mode is this; folding mode into the diff key
+/// (`FileFingerprint`) keeps a symlink distinct from a regular file with identical bytes.
+const SYMLINK_MODE: u32 = 0o120000;
 
 fn object_id_from_content_ref(content_ref: &str) -> Result<ObjectId> {
     ObjectId::parse(
@@ -572,7 +722,15 @@ fn write_tree(
 
     let mut entries = Vec::new();
     for file in direct_files {
-        let bytes = fs::read(repo_root.join(&file.path))?;
+        // A symlink stores its target bytes under mode 120000 (git's representation); a
+        // regular file stores its content under 100644/100755.
+        let (bytes, mode) = match &file.symlink_target {
+            Some(target) => (target.clone().into_bytes(), SYMLINK_MODE),
+            None => {
+                let bytes = fs::read(repo_root.join(&file.path))?;
+                (bytes, if file.executable { 0o100755 } else { 0o100644 })
+            }
+        };
         let blob = store.write_object(ObjectKind::Blob, &bytes)?;
         let name = file
             .path
@@ -583,7 +741,7 @@ fn write_tree(
         entries.push(TreeEntry {
             name,
             kind: TreeEntryKind::File,
-            mode: if file.executable { 0o100755 } else { 0o100644 },
+            mode,
             object: blob.to_string(),
         });
     }
@@ -644,6 +802,24 @@ fn materialize_tree(
             TreeEntryKind::File => {
                 let bytes = store.read_object(&child)?;
                 let full = repo_root.join(&rel);
+                if entry.mode == SYMLINK_MODE {
+                    // A symlink entry: the blob is the link target bytes. On Unix, recreate a
+                    // symlink (R15: reject an absolute / worktree-escaping target before
+                    // creating it). On non-Unix, fall through and write the target bytes as a
+                    // regular file (documented platform divergence).
+                    #[cfg(unix)]
+                    {
+                        materialize_symlink(
+                            repo_root,
+                            &rel,
+                            &full,
+                            &bytes,
+                            target_paths,
+                            synced_dirs,
+                        )?;
+                        continue;
+                    }
+                }
                 if full.is_dir() {
                     fs::remove_dir_all(&full)
                         .with_context(|| format!("remove directory {}", full.display()))?;
@@ -708,6 +884,99 @@ fn materialize_tree(
     Ok(())
 }
 
+/// Lexically normalize a path — resolve `.`/`..` WITHOUT touching the filesystem (a symlink
+/// target need not exist). `..` pops the last kept component; `.` is dropped.
+#[cfg(unix)]
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// R15 (NER-138 Phase 7 slice 3): a materialized symlink must not escape the worktree. Reject
+/// an absolute target, or a relative target whose lexical resolution (from the link's own
+/// parent) leaves the worktree root. Errors are PATH-FREE (S1) — neither the link path nor the
+/// target is interpolated into the message.
+#[cfg(unix)]
+fn validate_symlink_target(repo_root: &Path, link_rel: &str, target: &str) -> Result<()> {
+    if Path::new(target).is_absolute() {
+        bail!("symlink target escapes the worktree (absolute target rejected)");
+    }
+    let link_parent = Path::new(link_rel)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let combined = lexical_normalize(&repo_root.join(link_parent).join(target));
+    if !combined.starts_with(lexical_normalize(repo_root)) {
+        bail!("symlink target escapes the worktree");
+    }
+    Ok(())
+}
+
+/// Crash-atomically materialize a symlink (NER-138 Phase 7 slice 3): validate the target
+/// (R15), remove any existing entry at the path (without following it), create the symlink
+/// under a `.forge-restore-` temp name in the destination's own parent (so a crash
+/// mid-materialize leaves a doctor-reclaimable temp, not a torn entry), atomically rename it
+/// into place, and fsync the parent directory. `bytes` are the link target.
+#[cfg(unix)]
+fn materialize_symlink(
+    repo_root: &Path,
+    rel: &str,
+    full: &Path,
+    bytes: &[u8],
+    target_paths: &mut BTreeSet<String>,
+    synced_dirs: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let target =
+        std::str::from_utf8(bytes).map_err(|_| anyhow!("symlink target is not valid utf-8"))?;
+    validate_symlink_target(repo_root, rel, target)?;
+    let parent = full
+        .parent()
+        .ok_or_else(|| anyhow!("symlink target has no parent"))?;
+    let newly_created = missing_dirs(parent);
+    fs::create_dir_all(parent)?;
+    // Remove any existing entry WITHOUT following a symlink (symlink_metadata): a stale
+    // symlink is removed as a file, a real directory via remove_dir_all.
+    if let Ok(meta) = fs::symlink_metadata(full) {
+        if meta.file_type().is_dir() {
+            fs::remove_dir_all(full)?;
+        } else {
+            fs::remove_file(full)?;
+        }
+    }
+    let name = full
+        .file_name()
+        .ok_or_else(|| anyhow!("symlink target has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let temp = parent.join(format!("{RESTORE_TEMP_PREFIX}{name}"));
+    let _ = fs::remove_file(&temp); // clear a crash-orphaned temp from a prior run
+    std::os::unix::fs::symlink(target, &temp)
+        .map_err(|error| anyhow!("create symlink: {}", error.kind()))?;
+    fs::rename(&temp, full).map_err(|error| anyhow!("persist symlink: {}", error.kind()))?;
+    // A symlink cannot be fsynced portably; fsyncing the parent dir (which gained the new
+    // entry) is the durability boundary, mirroring the regular-file restore.
+    if synced_dirs.insert(parent.to_path_buf()) {
+        sync_dir(parent)?;
+    }
+    for dir in &newly_created {
+        if let Some(grandparent) = dir.parent() {
+            if synced_dirs.insert(grandparent.to_path_buf()) {
+                sync_dir(grandparent)?;
+            }
+        }
+    }
+    target_paths.insert(rel.to_string());
+    Ok(())
+}
+
 fn scan_worktree(repo_root: &Path) -> Result<Vec<FileEntry>> {
     let mut files = Vec::new();
     for path in walk_worktree(repo_root)? {
@@ -715,14 +984,52 @@ fn scan_worktree(repo_root: &Path) -> Result<Vec<FileEntry>> {
             continue;
         }
         let full = repo_root.join(&path);
-        let metadata = match fs::metadata(&full) {
-            Ok(metadata) if metadata.is_file() => metadata,
-            _ => continue,
+        // `symlink_metadata` does NOT follow links: a symlink reports as a symlink (so we can
+        // capture it as a `120000` entry via `read_link`, never reading its pointed-at
+        // content). A non-symlink file is captured as before.
+        let metadata = match fs::symlink_metadata(&full) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
         };
-        files.push(FileEntry {
-            path,
-            executable: is_executable(&metadata),
-        });
+        if metadata.file_type().is_symlink() {
+            #[cfg(unix)]
+            {
+                // Capture the link target bytes as a `120000` blob (matching git). The link is
+                // never followed, so a symlink pointing at a secret/out-of-tree path leaks no
+                // content into the snapshot — only the target string is stored.
+                let target = match fs::read_link(&full) {
+                    Ok(target) => target.to_string_lossy().into_owned(),
+                    Err(_) => continue,
+                };
+                files.push(FileEntry {
+                    path,
+                    executable: false,
+                    symlink_target: Some(target),
+                });
+            }
+            #[cfg(not(unix))]
+            {
+                // Non-Unix: preserve the pre-slice-3 behavior (follow the link, capture
+                // resolved file content) — documented platform divergence.
+                if let Ok(resolved) = fs::metadata(&full) {
+                    if resolved.is_file() {
+                        files.push(FileEntry {
+                            path,
+                            executable: is_executable(&resolved),
+                            symlink_target: None,
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+        if metadata.is_file() {
+            files.push(FileEntry {
+                path,
+                executable: is_executable(&metadata),
+                symlink_target: None,
+            });
+        }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     // Defensive: the serial `ignore` Walk yields each path once, so this dedup is a no-op
@@ -782,9 +1089,9 @@ fn walk_worktree(repo_root: &Path) -> Result<Vec<String>> {
                 None => continue,
             },
         };
-        // Skip directories; yield regular files AND symlinks so the downstream
-        // `fs::metadata`/`is_file` gate (which follows links) decides symlink-to-file
-        // capture — preserving today's behavior (Phase 7 does not add symlink content).
+        // Skip directories; yield regular files AND symlinks. `scan_worktree`'s
+        // `symlink_metadata` gate then captures a symlink as a `120000` entry (its target,
+        // via `read_link` — never followed) and a regular file as content (NER-138 slice 3).
         match entry.file_type() {
             Some(file_type) if file_type.is_dir() => continue,
             None => continue, // no file type (e.g. the stdin sentinel) — never a worktree file
@@ -1516,9 +1823,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tracked_symlink_to_file_is_captured() {
-        // Regression guard for the file_type trap: a symlink's own file_type is is_symlink,
-        // so a walk-layer is_file() filter would drop a tracked symlink-to-file that today's
-        // fs::metadata (which follows the link) captures. The walker must yield symlinks.
+        // The walker yields symlinks (a symlink's own file_type is is_symlink, so a walk-layer
+        // is_file() filter would drop it); scan_worktree's symlink_metadata gate then captures
+        // it as a 120000 entry. Path-set parity with git holds: git ls-files lists the link and
+        // git_based_scan's is_file() (which follows) keeps a symlink-to-file.
         use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
@@ -1535,6 +1843,72 @@ mod tests {
         );
         assert!(native.contains(&"target.txt".to_string()));
         assert_eq!(native, git_based_scan(repo));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_round_trips_as_a_link_not_a_regular_file() {
+        // NER-138 slice 3: a symlink snapshots as a 120000 object (its target) and restores as
+        // a SYMLINK with the identical target — not a regular file whose content is the target
+        // text. A regular file containing the same bytes is a DISTINCT object + diff entry.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        fs::write(repo.join("target.txt"), b"hello").unwrap();
+        symlink("target.txt", repo.join("link.txt")).unwrap();
+        // A regular file whose CONTENT equals the symlink's target string.
+        fs::write(repo.join("decoy.txt"), b"target.txt").unwrap();
+
+        let content = NativeContentBackend
+            .snapshot_worktree(repo)
+            .expect("snapshot with a symlink");
+
+        let dest = tempfile::tempdir().unwrap();
+        // Objects live under `repo`; files materialize into `dest` (which is also the worktree
+        // root the R15 target validation resolves against).
+        materialize_content_ref(repo, dest.path(), &content.content_ref)
+            .expect("materialize symlink");
+        let restored = dest.path().join("link.txt");
+        let meta = fs::symlink_metadata(&restored).expect("restored link exists");
+        assert!(
+            meta.file_type().is_symlink(),
+            "must restore as a symlink, not a regular file"
+        );
+        assert_eq!(fs::read_link(&restored).unwrap(), Path::new("target.txt"));
+
+        // The symlink and the same-bytes regular file are distinct (mode in the diff key):
+        // their tree entries carry different modes (120000 vs 100644) even though one's blob
+        // content equals the other's target string.
+        let root = object_id_from_content_ref(&content.content_ref).unwrap();
+        let store = NativeObjectStore::new(repo);
+        let flat = flatten_tree(&store, &root).unwrap();
+        let (_, link_mode) = flat.get("link.txt").expect("link.txt in tree");
+        let (_, decoy_mode) = flat.get("decoy.txt").expect("decoy.txt in tree");
+        assert_eq!(*link_mode, 0o120000, "symlink entry is mode 120000");
+        assert_eq!(*decoy_mode, 0o100644, "regular file entry is mode 100644");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materializing_an_escaping_symlink_is_rejected() {
+        // R15 (security P0): a materialized symlink must not escape the worktree. A captured
+        // target of `../../etc/passwd` or an absolute `/etc/passwd` is rejected at materialize
+        // (path-free error); a safe relative target within the worktree materializes.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        // Escaping (relative) and absolute targets are rejected.
+        for bad in ["../../etc/passwd", "/etc/passwd"] {
+            let error = validate_symlink_target(repo, "sub/link", bad).unwrap_err();
+            let rendered = format!("{error:#}");
+            assert!(
+                !rendered.contains("etc/passwd") && !rendered.contains(repo.to_str().unwrap()),
+                "S1: rejection must be path-free: {rendered}"
+            );
+        }
+        // A safe relative target within the worktree is accepted.
+        validate_symlink_target(repo, "sub/link", "../README.md").expect("safe relative target");
+        validate_symlink_target(repo, "link", "target.txt").expect("sibling target");
     }
 
     #[test]
@@ -1660,13 +2034,15 @@ mod tests {
             proposal_revision_id: None,
             decision_id: None,
             evidence_digest: None,
+            actor: None,
+            authored_time: None,
         };
         let gid = store.write_commit(&genesis).unwrap();
         assert!(gid.to_string().starts_with("f1:commit:sha256:"));
         assert_eq!(store.read_commit(&gid).unwrap(), genesis);
-        // Fully-populated (justified) shape — exercises every field even though slice 2
-        // only writes genesis (slice 3 writes justified commits). evidence_digest is an
-        // opaque lowercase-hex digest, never excerpt text.
+        // Fully-populated (justified) shape — exercises every field including the slice-3
+        // actor + authored_time in the hashed bytes. evidence_digest is a Hex64, so excerpt
+        // text is structurally unrepresentable.
         let justified = CommitObject {
             schema_version: SCHEMA_VERSION,
             tree: format!("f1:tree:sha256:{}", "b".repeat(64)),
@@ -1674,15 +2050,18 @@ mod tests {
             intent_id: Some("intent_x".to_string()),
             proposal_revision_id: Some("revision_x".to_string()),
             decision_id: Some("decision_x".to_string()),
-            evidence_digest: Some("c".repeat(64)),
+            evidence_digest: Some(Hex64::new("c".repeat(64)).unwrap()),
+            actor: Some("agent:tester".to_string()),
+            authored_time: Some(1_700_000_000_000),
         };
         let jid = store.write_commit(&justified).unwrap();
         assert_eq!(store.read_commit(&jid).unwrap(), justified);
         assert!(
             justified
                 .evidence_digest
-                .as_deref()
+                .as_ref()
                 .unwrap()
+                .as_str()
                 .chars()
                 .all(|c| c.is_ascii_hexdigit()),
             "evidence_digest is an opaque hex digest, never excerpt text"
@@ -1690,6 +2069,146 @@ mod tests {
         // The triple-kind all_object_ids scan recovers both commit ids.
         let ids = store.all_object_ids().unwrap();
         assert!(ids.contains(&gid) && ids.contains(&jid));
+    }
+
+    /// GENESIS-HASH STABILITY (slice 3, critical): adding `actor`/`authored_time`
+    /// (skip_serializing_if) and retyping `evidence_digest` to `Hex64` must NOT change the
+    /// bytes a genesis commit serializes to — otherwise every existing native repo's
+    /// `base_head` desyncs into spurious `STALE_BASE`. The expected JSON is a hard-coded
+    /// literal of what slice 2 wrote (NOT recomputed from the struct), per the adversarial
+    /// doc-review finding. Because the `ObjectId` is `hash(preimage(these bytes))`, equal
+    /// bytes ⇒ equal id — so byte-equality is the genesis-stability proof.
+    #[test]
+    fn genesis_commit_serialization_is_byte_identical_to_slice_2() {
+        let tree = format!("f1:tree:sha256:{}", "0".repeat(64));
+        // EXACTLY what a slice-2 genesis serialized to: 7 fields, the 4 justification
+        // Options as null, no actor/authored_time keys.
+        let expected = format!(
+            r#"{{"schema_version":1,"tree":"{tree}","parents":[],"intent_id":null,"proposal_revision_id":null,"decision_id":null,"evidence_digest":null}}"#
+        );
+        let genesis = CommitObject {
+            schema_version: SCHEMA_VERSION,
+            tree: tree.clone(),
+            parents: Vec::new(),
+            intent_id: None,
+            proposal_revision_id: None,
+            decision_id: None,
+            evidence_digest: None,
+            actor: None,
+            authored_time: None,
+        };
+        let serialized = serde_json::to_string(&genesis).unwrap();
+        assert_eq!(
+            serialized, expected,
+            "genesis serialization drifted — existing repos' base_head would desync"
+        );
+        // Pin the FULL content-addressed id against a hard-coded literal (not just a prefix),
+        // so a change to the preimage framing (object_preimage / ObjectId::new) — not only the
+        // CommitObject shape — also fails loudly. This literal is the deterministic genesis id
+        // for the all-zeros tree above; it must never change, or existing repos' base_head
+        // desyncs into spurious STALE_BASE.
+        let id = ObjectId::new(ObjectKind::Commit, serialized.as_bytes()).to_string();
+        assert_eq!(
+            id, "f1:commit:sha256:cf31029e040659af09e1dd6f323b3dcd76db2bf9a2d5c639b2a588d8a9fa809e",
+            "genesis commit id changed — preimage framing or commit shape drifted"
+        );
+    }
+
+    /// The slice-3 `actor`/`authored_time` are in the HASHED bytes (Phase 9 signs who/when):
+    /// two justified commits identical except `actor` MUST have distinct ids, and a
+    /// justified commit MUST differ from the genesis-shaped commit over the same tree.
+    #[test]
+    fn justified_commit_fields_are_hashed() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let base = CommitObject {
+            schema_version: SCHEMA_VERSION,
+            tree: format!("f1:tree:sha256:{}", "a".repeat(64)),
+            parents: vec![format!("f1:commit:sha256:{}", "b".repeat(64))],
+            intent_id: Some("intent_x".to_string()),
+            proposal_revision_id: Some("revision_x".to_string()),
+            decision_id: Some("decision_x".to_string()),
+            evidence_digest: Some(Hex64::new("c".repeat(64)).unwrap()),
+            actor: Some("agent:alice".to_string()),
+            authored_time: Some(1_700_000_000_000),
+        };
+        let mut other_actor = base.clone();
+        other_actor.actor = Some("agent:bob".to_string());
+        let mut other_time = base.clone();
+        other_time.authored_time = Some(1_700_000_000_001);
+        let id_base = store.write_commit(&base).unwrap();
+        let id_actor = store.write_commit(&other_actor).unwrap();
+        let id_time = store.write_commit(&other_time).unwrap();
+        assert_ne!(id_base, id_actor, "actor must be in the hashed bytes");
+        assert_ne!(
+            id_base, id_time,
+            "authored_time must be in the hashed bytes"
+        );
+    }
+
+    /// `Hex64` rejects anything that is not exactly 64 lowercase-hex chars, so excerpt text
+    /// can never reach `CommitObject::evidence_digest` (the secret-hygiene guard).
+    #[test]
+    fn hex64_rejects_non_digest() {
+        assert!(Hex64::new("c".repeat(64)).is_ok());
+        assert!(Hex64::new("not a real digest, this is excerpt text").is_err());
+        assert!(Hex64::new("C".repeat(64)).is_err(), "uppercase rejected");
+        assert!(Hex64::new("c".repeat(63)).is_err(), "wrong length rejected");
+        // Error is path-free (S1): no separators leak from the validation message.
+        let err = Hex64::new("zz").unwrap_err().to_string();
+        assert!(!err.contains('/') && !err.contains('\\'));
+    }
+
+    /// NER-138 slice 3 U4: object-kind headers coexist with legacy raw-payload objects, and
+    /// the headered-vs-legacy decision is hash-resolved (prove-before-delete: the header path
+    /// enumerates/reads the same id set the triple-hash scan would, across a mixed store).
+    #[test]
+    fn object_kind_headers_coexist_with_legacy_objects() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+
+        // (1) A slice-3 headered object via write_object: the file IS the preimage.
+        let headered_id = store
+            .write_object(ObjectKind::Blob, b"headered payload")
+            .unwrap();
+        let on_disk = fs::read(store.object_path(&headered_id)).unwrap();
+        assert!(
+            on_disk.starts_with(OBJECT_MAGIC),
+            "new writes store the self-describing preimage"
+        );
+        assert_eq!(
+            store.read_object(&headered_id).unwrap(),
+            b"headered payload"
+        );
+
+        // (2) A legacy slice-1/2 object: same id (over the framed preimage), but the FILE is
+        // the RAW payload — planted directly to simulate what slice 1/2 wrote.
+        let legacy_payload = b"legacy raw payload".to_vec();
+        let legacy_id = ObjectId::new(ObjectKind::Blob, &legacy_payload);
+        let legacy_path = store.object_path(&legacy_id);
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_path, &legacy_payload).unwrap();
+        assert_eq!(
+            store.read_object(&legacy_id).unwrap(),
+            legacy_payload,
+            "legacy raw-payload object reads via the fallback, never a hash mismatch"
+        );
+
+        // (3) Differential: the header-aware all_object_ids recovers BOTH.
+        let ids = store.all_object_ids().unwrap();
+        assert!(ids.contains(&headered_id), "headered object enumerated");
+        assert!(ids.contains(&legacy_id), "legacy object enumerated");
+
+        // (4) Hash-resolved disambiguation (adversarial finding): a legacy blob whose RAW
+        // content starts with the magic and even parses as a preimage still reads correctly,
+        // because hash(file) != a headered id, so it falls back to the legacy branch.
+        let tricky_payload = b"forge-object\nblob\n1\n0\n".to_vec();
+        let tricky_id = ObjectId::new(ObjectKind::Blob, &tricky_payload);
+        let tricky_path = store.object_path(&tricky_id);
+        fs::create_dir_all(tricky_path.parent().unwrap()).unwrap();
+        fs::write(&tricky_path, &tricky_payload).unwrap();
+        assert_eq!(store.read_object(&tricky_id).unwrap(), tricky_payload);
+        assert!(store.all_object_ids().unwrap().contains(&tricky_id));
     }
 
     #[test]
@@ -1717,6 +2236,8 @@ mod tests {
             proposal_revision_id: None,
             decision_id: None,
             evidence_digest: None,
+            actor: None,
+            authored_time: None,
         };
         let payload = serde_json::to_vec(&future).unwrap();
         let future_id = store.write_object(ObjectKind::Commit, &payload).unwrap();
