@@ -86,6 +86,12 @@ impl NativeHistoryCorruptKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForgeError {
     /// `accept`/`export` ran against a moved HEAD.
+    ///
+    /// Schema-doc note (NER-138 slice 3 / NER-143 R11): for a NATIVE repo, `expected_head`
+    /// now carries the accepted `commit_id` (commit-on-accept advanced the base past the
+    /// pre-accept `base_head`), not `base_head` itself — correct and internally consistent
+    /// post-commit-on-accept. A git-backend repo is unchanged. Both fields stay opaque
+    /// `f1:`/git ids, never paths.
     StaleBase {
         expected_head: String,
         actual_head: String,
