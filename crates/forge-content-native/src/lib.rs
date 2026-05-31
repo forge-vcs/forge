@@ -1406,7 +1406,14 @@ mod tests {
         // cannot be opened must surface an Err rather than being swallowed.
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("does-not-exist");
-        assert!(sync_dir(&missing).is_err());
+        let error = sync_dir(&missing).unwrap_err();
+        // S1 (NER-143 R8): the error must surface the io::ErrorKind, never the filesystem
+        // path, in either the Display or the alternate context-chained `{:#}` form.
+        let needle = missing.to_string_lossy();
+        assert!(
+            !error.to_string().contains(&*needle) && !format!("{error:#}").contains(&*needle),
+            "sync_dir leaked a path: {error:#}"
+        );
     }
 
     #[test]
