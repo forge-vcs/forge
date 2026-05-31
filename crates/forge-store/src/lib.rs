@@ -372,6 +372,28 @@ pub fn init_repository(
     } else {
         git_root(cwd)?
     };
+    // NER-143 R9: refuse to initialize a forge repo nested inside an existing forge repo.
+    // `forge_root`'s nearest-ancestor walk routes a subtree's commands to whichever `.forge`
+    // is closer up-tree, and the nested repo's objects look unreachable to the outer repo's
+    // gc (a Phase-8 deletion hazard). The check is BACKEND-AGNOSTIC because `forge_root` is:
+    // a native inner repo anchors at `cwd` (so it can nest below anything), and a git inner
+    // repo whose own toplevel sits below an outer repo can nest too — both are shadowing
+    // hazards regardless of backend, so the guard must not be gated on `content_backend`
+    // (the code-review adversarial pass flagged the native-only gating as an escape). Message
+    // is path-free (S1). This checks ANCESTORS only (`root.parent()` upward), so re-init of
+    // the same root never trips it and stays the already_initialized path below. (A
+    // deliberately-independent nested repo is not a v0 use case; an --allow-nested opt-out is
+    // future work. A narrow cross-repo-init TOCTOU window — two inits racing in
+    // ancestor/descendant dirs before either's lock — is an accepted v0 limitation.)
+    {
+        let mut ancestor = root.parent();
+        while let Some(dir) = ancestor {
+            if dir.join(".forge/forge.db").exists() {
+                bail!("refusing to initialize a forge repo nested inside an existing forge repo");
+            }
+            ancestor = dir.parent();
+        }
+    }
     let forge_dir = root.join(".forge");
     fs::create_dir_all(&forge_dir)
         .with_context(|| format!("failed to create {}", forge_dir.display()))?;
@@ -3034,17 +3056,41 @@ pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
     }
     let mut view_stmt = connection.prepare("SELECT state_json FROM views WHERE repo_id = ?1")?;
     for row in view_stmt.query_map(params![context.repo_id], |row| row.get::<_, String>(0))? {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&row?) {
-            if let Some(commit_id) = value.get("commit_id").and_then(|v| v.as_str()) {
-                roots.insert(commit_id.to_string());
-            }
+        // NER-143 R6: FAIL CLOSED when a ledger row that DETERMINES a root cannot be read.
+        // A malformed `views.state_json` means we cannot know whether this op-log entry named
+        // a live commit (a `checkout` target is reachable ONLY through the op-log), so silently
+        // skipping it under-counts the root set — harmless for this dry-run report, but a live
+        // commit marked "unreachable" would be deleted once Phase 8 (NER-139) wires real
+        // mark-sweep deletion to this scan. Propagate instead. Path-free (S1): never interpolate
+        // the row. Contrast with a *dangling object* (a determined root/ref whose object is
+        // absent) below, which stays best-effort — that is `doctor`'s domain and the established
+        // gc-tolerance contract (`doctor_reports_corrupt_native_content_and_gc_reports_unreachable_objects`).
+        // Message is honest about the remedy: `doctor` does NOT currently parse every
+        // `views.state_json`, so it would not pinpoint this row — say "the ledger is damaged"
+        // rather than dead-end the user at `forge doctor` (code-review reliability finding).
+        let value: serde_json::Value = serde_json::from_str(&row?).map_err(|_| {
+            anyhow!("gc cannot read a ledger view row (corrupt views.state_json); the ledger is damaged")
+        })?;
+        if let Some(commit_id) = value.get("commit_id").and_then(|v| v.as_str()) {
+            roots.insert(commit_id.to_string());
         }
     }
     for root in &roots {
-        if let Ok(id) = forge_content_native::ObjectId::parse(root) {
-            if let Ok(ids) = native_store.reachable_from(&id) {
-                reachable.extend(ids);
-            }
+        // NER-143 R6: FAIL CLOSED on a corrupt root id string (the ledger names a root we cannot
+        // even parse → the root set is untrustworthy). This covers EVERY root source — the
+        // native_tip, the `decisions.commit_id` set (inserted raw above), and the view-derived
+        // ids — so an unparseable accepted-commit id also fails closed here, not only a corrupt
+        // view row. The reachability WALK from a parseable root stays best-effort: a
+        // determined-but-dangling object is a `doctor` finding, not a root-enumeration failure
+        // (mirrors the `verify_content_ref` snapshot loop above and the existing corrupt-content
+        // gc-tolerance contract). Path-free (S1): never interpolate `root`.
+        let id = forge_content_native::ObjectId::parse(root).map_err(|_| {
+            anyhow!(
+                "gc found an unparseable reachability root in the ledger; the ledger is damaged"
+            )
+        })?;
+        if let Ok(ids) = native_store.reachable_from(&id) {
+            reachable.extend(ids);
         }
     }
     let all = native_store.all_object_ids()?;

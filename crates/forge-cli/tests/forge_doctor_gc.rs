@@ -279,6 +279,130 @@ fn object_path_containing(repo_path: &std::path::Path, needle: &str) -> Option<s
     None
 }
 
+/// Drive a native repo through `init → start → save → run → propose → check → accept`
+/// and a `checkout` of the accepted commit, so a `commit_checked_out` view row exists —
+/// a reachability root that is reachable ONLY through the op-log (a checkout writes no
+/// `decisions` row). Returns the accepted commit id.
+fn native_repo_with_a_checkout(repo: &TestRepo) -> String {
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "gc fail closed"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("README.md"), "native\n").expect("write readme");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    repo.forge().args(["--json", "propose"]).assert().success();
+    repo.forge().args(["--json", "check"]).assert().success();
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    let commit_id = accepted["data"]["commit_id"]
+        .as_str()
+        .expect("accept returns a native commit id")
+        .to_string();
+    // Check out that commit so a `commit_checked_out` view row (a root reachable only
+    // through the op-log) exists for the corruption tests to target.
+    repo.forge()
+        .args(["--json", "checkout", &commit_id])
+        .assert()
+        .success();
+    commit_id
+}
+
+/// NER-143 R6: `gc --dry-run` must FAIL CLOSED when a ledger row that determines a
+/// reachability root is corrupt — a malformed `views.state_json` could hide a live
+/// `checkout`-target commit (reachable only through the op-log), and silently
+/// under-counting roots would mark a live object for deletion once Phase 8 grants
+/// real mark-sweep deletion. Corrupt ONLY the `commit_checked_out` (root-determining)
+/// view row, so the test proves the failure is attributable to a row that actually
+/// determines a root — and would survive even a future scan narrowed to commit-bearing
+/// views. The failure must be path-free (S1).
+#[test]
+fn gc_fails_closed_on_a_corrupt_ledger_view_row() {
+    let repo = TestRepo::new_git();
+    native_repo_with_a_checkout(&repo);
+
+    // A clean gc dry-run succeeds before the corruption.
+    repo.forge()
+        .args(["--json", "gc", "--dry-run"])
+        .assert()
+        .success();
+
+    // Corrupt ONLY the checkout view row's state_json (the one that names a root reachable
+    // only through the op-log), so the root-enumeration scan cannot parse it.
+    let connection = Connection::open(repo.path().join(".forge/forge.db")).expect("open db");
+    let corrupted = connection
+        .execute(
+            "UPDATE views SET state_json = ?1 WHERE state_json LIKE '%commit_checked_out%'",
+            ["{ not json"],
+        )
+        .expect("corrupt the checkout view state_json");
+    assert_eq!(
+        corrupted, 1,
+        "exactly one checkout view row must be corrupted"
+    );
+
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--dry-run"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(output["status"], "error");
+    assert_eq!(output["errors"][0]["code"], "COMMAND_FAILED");
+    // S1: the failure must not leak a filesystem path in any envelope string.
+    let needle = repo.path().to_string_lossy();
+    let rendered = serde_json::to_string(&output).expect("re-serialize envelope");
+    assert!(
+        !rendered.contains(&*needle),
+        "gc fail-closed leaked a path: {rendered}"
+    );
+}
+
+/// NER-143 R6 (second fail-closed branch): a view row that is VALID json but names an
+/// unparseable reachability root (a `commit_id` that is not a real `f1:` object id) must
+/// also fail gc closed — the root set is untrustworthy. Exercises the `ObjectId::parse`
+/// guard distinctly from the corrupt-json guard above. Path-free (S1).
+#[test]
+fn gc_fails_closed_on_an_unparseable_reachability_root() {
+    let repo = TestRepo::new_git();
+    native_repo_with_a_checkout(&repo);
+
+    // Replace the checkout view's commit_id with valid JSON carrying a garbage id: it parses
+    // as JSON (so it clears the first guard) but fails ObjectId::parse in the root loop.
+    let connection = Connection::open(repo.path().join(".forge/forge.db")).expect("open db");
+    let corrupted = connection
+        .execute(
+            "UPDATE views SET state_json = ?1 WHERE state_json LIKE '%commit_checked_out%'",
+            [r#"{"lifecycle":"commit_checked_out","commit_id":"not-an-object-id"}"#],
+        )
+        .expect("plant an unparseable root id");
+    assert_eq!(
+        corrupted, 1,
+        "exactly one checkout view row must be rewritten"
+    );
+
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--dry-run"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(output["status"], "error");
+    assert_eq!(output["errors"][0]["code"], "COMMAND_FAILED");
+    let needle = repo.path().to_string_lossy();
+    let rendered = serde_json::to_string(&output).expect("re-serialize envelope");
+    assert!(
+        !rendered.contains(&*needle),
+        "gc fail-closed leaked a path: {rendered}"
+    );
+}
+
 #[test]
 fn doctor_reports_mismatched_current_view() {
     let repo = TestRepo::new_git();
