@@ -372,6 +372,22 @@ pub fn init_repository(
     } else {
         git_root(cwd)?
     };
+    // NER-143 R9: refuse to initialize a NATIVE repo nested inside an existing forge repo.
+    // `init` anchors a native root at `cwd` with no ancestor check, but `forge_root`'s
+    // nearest-ancestor walk would then route this subtree's commands to whichever `.forge`
+    // is closer up-tree, and the nested repo's objects look unreachable to the outer repo's
+    // gc (a Phase-8 deletion hazard). A git-backed repo anchors on the git toplevel, so this
+    // guard applies to native init only. Message is path-free (S1). This checks ANCESTORS
+    // only, so re-init of the same root stays the already_initialized path below.
+    if content_backend == "native" {
+        let mut ancestor = root.parent();
+        while let Some(dir) = ancestor {
+            if dir.join(".forge/forge.db").exists() {
+                bail!("refusing to initialize a native forge repo nested inside an existing forge repo");
+            }
+            ancestor = dir.parent();
+        }
+    }
     let forge_dir = root.join(".forge");
     fs::create_dir_all(&forge_dir)
         .with_context(|| format!("failed to create {}", forge_dir.display()))?;
