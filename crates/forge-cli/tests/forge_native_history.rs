@@ -702,3 +702,260 @@ fn dangling_ledger_commit_id_surfaces_native_history_corrupt() {
         "error message leaked a path: {message}"
     );
 }
+
+/// NER-143 R1 (the headline bug): a second navigation command without an intervening `save`
+/// must not spuriously fail `DIRTY_WORKTREE`. Pre-fix, the dirty-check compared the worktree
+/// against the latest SAVED snapshot, so after `undo` restored snapshot A the next nav command
+/// saw worktree(A) != latest-saved(B) and bricked. With the expected-content baseline, undo₁ sets
+/// expected = A so the second nav passes (worktree == expected).
+///
+/// Note the deliberate snapshot-chain v0 semantics (UndoTarget docs): `undo` = "restore the
+/// parent of the attached attempt's latest *snapshot*". Undo writes no snapshot, so the latest
+/// snapshot stays B and repeated undo is idempotent (lands on A each time) — it does NOT walk
+/// B→A→base. The op-log-rewind model that would walk multiple steps is deferred. The bug this
+/// fixes is the spurious *error*, not the step count.
+#[test]
+fn undo_twice_without_intervening_save_succeeds() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "chained undo"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("file.txt"), "state A\n").unwrap();
+    repo.forge().args(["--json", "save"]).assert().success();
+    std::fs::write(repo.path().join("file.txt"), "state B\n").unwrap();
+    repo.forge().args(["--json", "save"]).assert().success();
+
+    // undo B -> A, then undo AGAIN with no save between (the chained case that used to brick).
+    let first = json_output(repo.forge().args(["--json", "undo"]).assert().success());
+    assert_eq!(first["status"], "success");
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+        "state A\n"
+    );
+    // Pre-fix this second undo failed DIRTY_WORKTREE (worktree A != latest-saved B). Post-fix it
+    // succeeds; snapshot-chain v0 means it idempotently lands on A again (parent of latest
+    // snapshot B), which is the point — the command runs instead of bricking.
+    let second = json_output(repo.forge().args(["--json", "undo"]).assert().success());
+    assert_eq!(
+        second["status"], "success",
+        "a second undo without an intervening save must not spuriously fail DIRTY_WORKTREE"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+        "state A\n"
+    );
+}
+
+/// NER-143 R1 (safety property preserved): a GENUINE unsaved edit between two nav commands must
+/// still be refused. After `undo` the expected ref is the restored snapshot; a hand-edit then
+/// makes the worktree match NEITHER expected NOR the next target, so the next nav refuses
+/// `DIRTY_WORKTREE` — the refuse-before-materialize invariant is not traded away for the fix.
+#[test]
+fn nav_then_unsaved_edit_still_refuses_dirty_worktree() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "dirty after nav"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("file.txt"), "state A\n").unwrap();
+    repo.forge().args(["--json", "save"]).assert().success();
+    std::fs::write(repo.path().join("file.txt"), "state B\n").unwrap();
+    repo.forge().args(["--json", "save"]).assert().success();
+
+    // undo B -> A (clean), then make an unsaved edit.
+    repo.forge().args(["--json", "undo"]).assert().success();
+    std::fs::write(repo.path().join("file.txt"), "unsaved edit\n").unwrap();
+
+    let output = json_output(repo.forge().args(["--json", "undo"]).assert().failure());
+    assert_eq!(output["status"], "error");
+    assert_eq!(output["errors"][0]["code"], "DIRTY_WORKTREE");
+    // The worktree is NOT clobbered on the refuse path.
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+        "unsaved edit\n"
+    );
+}
+
+/// NER-143 R1 / DR-F1 (crash-safety hinge): if a materialize completes but the record txn does
+/// not commit (crash / `CurrentStateChanged` CAS-loss), the worktree holds the target while
+/// `expected_content_ref` is still the prior ref. Re-running the same nav command must HEAL via
+/// the `worktree == target` clause, not brick on `DIRTY_WORKTREE`. Simulated by rolling
+/// `expected_content_ref` back to its prior value while the worktree holds the checkout target.
+#[test]
+fn interrupted_nav_self_heals_via_target_match() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    let commit_id = accepted["data"]["commit_id"].as_str().unwrap().to_string();
+
+    // Capture the current expected ref (the accepted state), then check out the commit so the
+    // worktree holds its tree and expected == that tree.
+    let prior_expected: String = db(repo.path())
+        .query_row(
+            "SELECT expected_content_ref FROM current_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("expected ref after accept");
+    repo.forge()
+        .args(["--json", "checkout", &commit_id])
+        .assert()
+        .success();
+
+    // Simulate the crash window: the materialize happened (worktree holds the target) but the
+    // record txn that set expected_content_ref was lost — roll it back to the prior value.
+    db(repo.path())
+        .execute(
+            "UPDATE current_state SET expected_content_ref = ?1 WHERE singleton = 1",
+            [&prior_expected],
+        )
+        .expect("simulate lost record txn");
+
+    // Re-running the same checkout must HEAL (worktree already == target), not fail DIRTY_WORKTREE.
+    let healed = json_output(
+        repo.forge()
+            .args(["--json", "checkout", &commit_id])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        healed["status"], "success",
+        "re-running an interrupted nav must self-heal via the worktree==target clause"
+    );
+}
+
+/// NER-143 R3: `undo` must never restore another attempt's content into the attached attempt's
+/// worktree. Bound to attempt B (whose worktree holds B's latest), `undo` reverses B's last save
+/// — even when a DIFFERENT attempt A holds the repo-wide latest snapshot (saved most recently).
+/// Pre-fix, `undo_target` selected the repo-wide latest (A) and would restore A's parent content
+/// into B's worktree.
+#[test]
+fn undo_does_not_restore_another_attempts_content() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let started = json_output(
+        repo.forge()
+            .args(["--json", "start", "attempt A"])
+            .assert()
+            .success(),
+    );
+    let intent = started["data"]["intent_id"].as_str().unwrap().to_string();
+    let attempt_a = started["data"]["attempt_id"].as_str().unwrap().to_string();
+    // Attempt B's two saves, so B has a parent chain to undo into.
+    let b = json_output(
+        repo.forge()
+            .args(["--json", "attempt", "start", "--intent", &intent])
+            .assert()
+            .success(),
+    );
+    let attempt_b = b["data"]["attempt_id"].as_str().unwrap().to_string();
+    repo.forge()
+        .args(["--json", "attempt", "attach", &attempt_b])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("file.txt"), "B one\n").unwrap();
+    repo.forge()
+        .args(["--json", "save", "--attempt", &attempt_b])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("file.txt"), "B two\n").unwrap();
+    repo.forge()
+        .args(["--json", "save", "--attempt", &attempt_b])
+        .assert()
+        .success();
+
+    // Attempt A saves LAST, so A now holds the repo-wide latest snapshot.
+    repo.forge()
+        .args(["--json", "attempt", "attach", &attempt_a])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("file.txt"), "A latest\n").unwrap();
+    repo.forge()
+        .args(["--json", "save", "--attempt", &attempt_a])
+        .assert()
+        .success();
+
+    // Re-attach B and restore B's latest so the worktree holds B's expected content, while A
+    // remains the repo-wide latest snapshot.
+    repo.forge()
+        .args(["--json", "attempt", "attach", &attempt_b])
+        .assert()
+        .success();
+    let b_second: String = db(repo.path())
+        .query_row(
+            "SELECT id FROM snapshots WHERE attempt_id = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            [&attempt_b],
+            |row| row.get(0),
+        )
+        .expect("B latest snapshot id");
+    repo.forge()
+        .args(["--json", "restore", &b_second, "--yes"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+        "B two\n"
+    );
+
+    // undo while attached to B must restore B's FIRST save ("B one"), never A's content.
+    let undo = json_output(repo.forge().args(["--json", "undo"]).assert().success());
+    assert_eq!(undo["status"], "success");
+    let restored = std::fs::read_to_string(repo.path().join("file.txt")).unwrap();
+    assert_eq!(
+        restored, "B one\n",
+        "undo must restore the attached attempt B's prior save, not attempt A's content"
+    );
+}
+
+/// NER-143 R4: `undone_operation_id` must reference the `save` operation that produced the
+/// snapshot being reversed, NOT the op-log head. After a non-save head op (`run`), the head is
+/// the run op; undo still reverses the last save, so `undone_operation_id` must be that save's op.
+#[test]
+fn undo_labels_the_save_operation_not_the_op_log_head() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "undo label"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("file.txt"), "one\n").unwrap();
+    repo.forge().args(["--json", "save"]).assert().success();
+    std::fs::write(repo.path().join("file.txt"), "two\n").unwrap();
+    let save_b = json_output(repo.forge().args(["--json", "save"]).assert().success());
+    let save_b_op = save_b["operation_id"].as_str().unwrap().to_string();
+
+    // A non-save head op: `run` records an op that becomes the op-log head.
+    let run = json_output(
+        repo.forge()
+            .args(["--json", "run", "--", "sh", "-c", "true"])
+            .assert()
+            .success(),
+    );
+    let run_op = run["operation_id"].as_str().unwrap().to_string();
+    assert_ne!(save_b_op, run_op);
+
+    let undo = json_output(repo.forge().args(["--json", "undo"]).assert().success());
+    assert_eq!(
+        undo["data"]["undone_operation_id"], save_b_op,
+        "undone_operation_id must be the save that created the reversed snapshot, not the run head"
+    );
+    assert_ne!(
+        undo["data"]["undone_operation_id"], run_op,
+        "undone_operation_id must NOT be the op-log head after a non-save head op"
+    );
+}

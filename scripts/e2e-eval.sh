@@ -58,7 +58,7 @@ echo; echo "=== LIFECYCLE (init→start→save→run→propose→check→accept�
 mkrepo life >/dev/null
 F init;    ck "init success" "$(pg "d['status']")" "success"
 F doctor;  ck "doctor ok" "$(pg "d['data']['ok']")" "True"
-ck "doctor schema_version=6" "$(pg "d['data']['schema_version']")" "6"
+ck "doctor schema_version=7" "$(pg "d['data']['schema_version']")" "7"
 F start "build a feature"; ck "start success" "$(pg "d['status']")" "success"
 echo "hello" > feature.txt
 F save;    ck "save success" "$(pg "d['status']")" "success"

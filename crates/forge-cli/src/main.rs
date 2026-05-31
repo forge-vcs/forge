@@ -1,5 +1,6 @@
 mod schema;
 
+use anyhow::Result;
 use clap::{error::ErrorKind, Args, Parser, Subcommand};
 use forge_content::{classify_content_ref, ContentBackend, ContentRefKind};
 use forge_protocol::{
@@ -8,6 +9,7 @@ use forge_protocol::{
 use forge_store::ForgeError;
 use serde_json::{json, Value};
 use std::env;
+use std::path::Path;
 use std::process::ExitCode;
 
 #[derive(Debug, Parser)]
@@ -533,17 +535,39 @@ fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> Respons
     })
 }
 
+/// Refuse a dirty worktree BEFORE a materializing nav command (restore/checkout/undo) clobbers
+/// it (NER-143 R1/R2). The single definition of the refuse-before-materialize safety invariant.
+///
+/// Passes iff the worktree holds the content it is EXPECTED to hold
+/// (`current_state.expected_content_ref`, set by the last materializing op; fallback to the
+/// latest saved snapshot for a pre-007 / pre-first-materialize repo) **OR** it already holds the
+/// `target` we are about to materialize. The OR-target clause is the crash-safety hinge (DR-F1):
+/// after a materialize-then-crash before the record txn commits, the worktree holds `target`
+/// while `expected_content_ref` is still the prior ref — re-running the same nav command then
+/// passes via `worktree == target`, re-materialize is a no-op, and the record txn sets expected.
+/// A genuine unsaved edit matches NEITHER and is refused (the safety property is preserved).
+fn ensure_clean_worktree(cwd: &Path, target_content_ref: &str) -> Result<()> {
+    let current = selected_backend(cwd)?.snapshot_worktree(cwd)?;
+    let expected = match forge_store::expected_content_ref(cwd)? {
+        Some(expected) => Some(expected),
+        None => forge_store::latest_snapshot_content_ref(cwd, None)?,
+    };
+    let matches_expected = expected.as_deref() == Some(current.content_ref.as_str());
+    let matches_target = current.content_ref == target_content_ref;
+    if matches_expected || matches_target {
+        Ok(())
+    } else {
+        Err(ForgeError::DirtyWorktree {
+            paths: current.changed_paths,
+        }
+        .into())
+    }
+}
+
 fn restore_response(request_id: Option<String>, args: RestoreArgs) -> ResponseEnvelope {
     command_result("restore", request_id, |cwd, request_id| {
         let content_ref = forge_store::snapshot_content_ref(&cwd, &args.snapshot_id)?;
-        let current_content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
-        let latest_content_ref = forge_store::latest_snapshot_content_ref(&cwd, None)?;
-        if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
-            return Err(ForgeError::DirtyWorktree {
-                paths: current_content.changed_paths.clone(),
-            }
-            .into());
-        }
+        ensure_clean_worktree(&cwd, &content_ref)?;
         // NER-134 Piece 1b: refuse to materialize a snapshot that belongs to an attempt
         // other than the one the worktree is bound to — otherwise restore is a second
         // cross-attempt contamination vector (it would clobber the worktree with another
@@ -560,7 +584,8 @@ fn restore_response(request_id: Option<String>, args: RestoreArgs) -> ResponseEn
             .into());
         }
         backend_for_content_ref(&content_ref)?.restore_snapshot(&cwd, &content_ref)?;
-        let restored = forge_store::record_restore(&cwd, request_id, &args.snapshot_id)?;
+        let restored =
+            forge_store::record_restore(&cwd, request_id, &args.snapshot_id, &content_ref)?;
         Ok((
             Some(restored.operation_id.clone()),
             json!({
@@ -745,22 +770,15 @@ fn checkout_response(request_id: Option<String>, args: CheckoutArgs) -> Response
         // Resolve + validate the target FIRST (NOT_FOUND for a typo vs NATIVE_HISTORY_CORRUPT
         // for a ledger-referenced-but-missing commit), before touching the worktree.
         let content_ref = forge_store::checkout_target_content_ref(&cwd, &args.commit_id)?;
-        // Refuse a dirty worktree BEFORE materializing (mirrors restore): the irreversible
+        // Refuse a dirty worktree BEFORE materializing (shared helper): the irreversible
         // clobber must not run if there are unsaved changes to lose.
-        let current_content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
-        let latest_content_ref = forge_store::latest_snapshot_content_ref(&cwd, None)?;
-        if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
-            return Err(ForgeError::DirtyWorktree {
-                paths: current_content.changed_paths.clone(),
-            }
-            .into());
-        }
+        ensure_clean_worktree(&cwd, &content_ref)?;
         // Materialize the historical tree (policy-excluded; symlink-aware + R15 via U9).
         backend_for_content_ref(&content_ref)?.restore_snapshot(&cwd, &content_ref)?;
         // Record the checkout in the op-log (so `undo` can reverse it and gc keeps the target
         // reachable). Checkout does NOT move the base anchor — surfaced as base_unchanged so an
         // agent is not misled into expecting git's HEAD-moving checkout semantics.
-        let record = forge_store::record_checkout(&cwd, request_id, &args.commit_id)?;
+        let record = forge_store::record_checkout(&cwd, request_id, &args.commit_id, &content_ref)?;
         Ok((
             Some(record.operation_id.clone()),
             json!({
@@ -778,16 +796,9 @@ fn undo_response(request_id: Option<String>) -> ResponseEnvelope {
     command_result("undo", request_id, |cwd, request_id| {
         // Resolve the prior snapshot to restore (clear "nothing to undo" if none).
         let target = forge_store::undo_target(&cwd)?;
-        // Refuse a dirty worktree BEFORE materializing (mirrors restore/checkout): undo must
-        // not clobber unsaved edits.
-        let current_content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
-        let latest_content_ref = forge_store::latest_snapshot_content_ref(&cwd, None)?;
-        if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
-            return Err(ForgeError::DirtyWorktree {
-                paths: current_content.changed_paths.clone(),
-            }
-            .into());
-        }
+        // Refuse a dirty worktree BEFORE materializing (shared helper): undo must not clobber
+        // unsaved edits.
+        ensure_clean_worktree(&cwd, &target.content_ref)?;
         // Restore the prior snapshot (policy-excluded, crash-atomic, symlink-aware + R15).
         backend_for_content_ref(&target.content_ref)?
             .restore_snapshot(&cwd, &target.content_ref)?;
@@ -797,6 +808,7 @@ fn undo_response(request_id: Option<String>) -> ResponseEnvelope {
             request_id,
             &target.undone_operation_id,
             &target.restored_snapshot_id,
+            &target.content_ref,
         )?;
         Ok((
             Some(record.operation_id.clone()),
