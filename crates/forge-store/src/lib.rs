@@ -868,6 +868,9 @@ pub fn save_snapshot(
                 }),
             },
         )?;
+        // NER-143 R1: the worktree now holds exactly this snapshot's tree (save captured it),
+        // so it becomes the expected dirty-check baseline. Atomic with the op-log advance.
+        set_expected_content_ref(tx, &content_ref)?;
         Ok((snapshot_id, parent_snapshot_id, op))
     })?;
     Ok(SnapshotRecord {
@@ -954,16 +957,51 @@ pub fn latest_snapshot_content_ref(cwd: &Path, attempt_id: Option<&str>) -> Resu
         .map(|snapshot| snapshot.content_ref))
 }
 
+/// The content ref the worktree is EXPECTED to hold — the tree the last materializing op
+/// (save/restore/checkout/undo) put there, tracked in `current_state.expected_content_ref`
+/// (migration 007, NER-143 R1). `None` for a pre-007 repo or a fresh repo before its first
+/// materialize; the dirty-check then falls back to the latest-snapshot baseline. This is the
+/// crash-safe baseline: a non-save op materializes a different tree than the latest *saved*
+/// snapshot, so comparing the worktree against "latest saved" spuriously fails chained
+/// navigation (undo twice) — comparing against "expected" does not.
+pub fn expected_content_ref(cwd: &Path) -> Result<Option<String>> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    Ok(connection
+        .query_row(
+            "SELECT expected_content_ref FROM current_state WHERE singleton = 1",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// Set `current_state.expected_content_ref` to the tree a materializing op just put in the
+/// worktree (NER-143 R1). Called inside the recorder's `IMMEDIATE` txn — atomic with the
+/// op-log advance, so a `CurrentStateChanged` CAS-loss rolls BOTH back together. DR-F2: this
+/// is a DEDICATED UPDATE in each of the four materializing recorders, never folded into the
+/// shared `insert_operation_view` CAS (which every op hits — folding it there would clobber
+/// the expected ref on a non-materializing `accept`/`run`/`propose`/`check`).
+fn set_expected_content_ref(tx: &Connection, content_ref: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE current_state SET expected_content_ref = ?1 WHERE singleton = 1",
+        params![content_ref],
+    )?;
+    Ok(())
+}
+
 pub fn record_restore(
     cwd: &Path,
     request_id: Option<String>,
     snapshot_id: &str,
+    content_ref: &str,
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
     let mut connection = open_connection(&context.database_path)?;
     let op = with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
-        insert_operation_view(
+        let op = insert_operation_view(
             tx,
             &context.repo_id,
             Some(&context.current_operation_id),
@@ -974,7 +1012,10 @@ pub fn record_restore(
                 view_kind: ViewKind::Initialized,
                 state: json!({ "lifecycle": "snapshot_restored", "snapshot_id": snapshot_id }),
             },
-        )
+        )?;
+        // NER-143 R1: restore just materialized this snapshot's tree into the worktree.
+        set_expected_content_ref(tx, content_ref)?;
+        Ok(op)
     })?;
     Ok(op)
 }
@@ -1036,12 +1077,13 @@ pub fn record_checkout(
     cwd: &Path,
     request_id: Option<String>,
     commit_id: &str,
+    content_ref: &str,
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
     let mut connection = open_connection(&context.database_path)?;
     let op = with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
-        insert_operation_view(
+        let op = insert_operation_view(
             tx,
             &context.repo_id,
             Some(&context.current_operation_id),
@@ -1052,15 +1094,25 @@ pub fn record_checkout(
                 view_kind: ViewKind::Initialized,
                 state: json!({ "lifecycle": "commit_checked_out", "commit_id": commit_id }),
             },
-        )
+        )?;
+        // NER-143 R1: checkout just materialized this commit's tree into the worktree.
+        set_expected_content_ref(tx, content_ref)?;
+        Ok(op)
     })?;
     Ok(op)
 }
 
-/// What a `forge undo` will restore (NER-138 Phase 7 slice 3): the operation being undone and
-/// the prior snapshot to materialize. v0 undo reverses the last save by restoring the latest
-/// snapshot's parent (the snapshots table's own `parent_snapshot_id` chain — robust, no
-/// cross-table timestamp comparison).
+/// What a `forge undo` will restore (NER-138 Phase 7 slice 3 / NER-143 R3+R4).
+///
+/// **Semantics (deliberate v0 cut):** undo reverses the **last save of the attached attempt** by
+/// restoring that save's parent snapshot (the `snapshots.parent_snapshot_id` chain — robust, no
+/// cross-table timestamp comparison). It is NOT the op-log `current_state` rewind: after a
+/// non-save head op (accept/checkout/run) undo still reverses the last *save*, not that head op.
+/// The full op-log-rewind model is future work.
+///
+/// `undone_operation_id` (NER-143 R4) is the `save` operation that produced the snapshot being
+/// reversed (the attempt's latest), resolved from that save's view — NOT the op-log head, which
+/// after a non-save head op would mislabel the audit field.
 #[derive(Debug, Clone, Serialize)]
 pub struct UndoTarget {
     pub undone_operation_id: String,
@@ -1068,22 +1120,30 @@ pub struct UndoTarget {
     pub restored_snapshot_id: String,
 }
 
-/// Resolve what `forge undo` will restore: the parent of the latest snapshot. Read-only and
-/// fail-closed with a clear, path-free "nothing to undo" when there is no snapshot, or the
-/// latest snapshot is the first (no earlier state to restore). Restoring past the first
-/// snapshot (to the base) is future work.
+/// Resolve what `forge undo` will restore: the parent of the **attached attempt's** latest
+/// snapshot. Read-only and fail-closed with a clear, path-free "nothing to undo" when there is no
+/// snapshot, or the latest snapshot is the first (no earlier state to restore). Restoring past the
+/// first snapshot (to the base) is future work.
 pub fn undo_target(cwd: &Path) -> Result<UndoTarget> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
+    // NER-143 R3: bind to the attached attempt. The repo-wide latest snapshot could belong to a
+    // DIFFERENT attempt than the one the worktree is bound to, so undo could otherwise restore
+    // attempt X's content into attempt Y's worktree (the dirty-check resolves the attached
+    // attempt's latest, so the two would also disagree). The `parent_snapshot_id` chain stays
+    // within an attempt (`save_snapshot` chains per-attempt), so binding the latest-snapshot
+    // selection to the attached attempt makes "undo the last save" mean "this attempt's last
+    // save" and never crosses attempts.
+    let attempt = resolve_attempt_in_context(&context, None)?.attempt;
     let latest: Option<(String, Option<String>)> = connection
         .query_row(
             "SELECT id, parent_snapshot_id FROM snapshots \
-             WHERE repo_id = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
-            params![context.repo_id],
+             WHERE attempt_id = ?1 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            params![attempt.attempt_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some((_latest_id, parent_snapshot_id)) = latest else {
+    let Some((latest_id, parent_snapshot_id)) = latest else {
         bail!("nothing to undo: this repository has no snapshots");
     };
     let Some(parent_id) = parent_snapshot_id else {
@@ -1094,8 +1154,26 @@ pub fn undo_target(cwd: &Path) -> Result<UndoTarget> {
         params![parent_id],
         |row| row.get(0),
     )?;
+    // NER-143 R4: the undone operation is the SAVE that produced the latest snapshot (the one
+    // being reversed) — found via that save view's `snapshot_id` — not the op-log head. Scoped
+    // to `snapshot_saved` views: a later `restore`/checkout of the same snapshot ALSO carries
+    // `$.snapshot_id`, so without the lifecycle filter the ORDER BY would pick that restore op
+    // and mislabel the audit field (code-review finding). Falls back to the op-log head only if
+    // no save view is found (defensive; a save always records one). `json_extract` is exact (no
+    // LIKE false-matches); SQLite's JSON1 is bundled.
+    let undone_operation_id: String = connection
+        .query_row(
+            "SELECT operation_id FROM views \
+             WHERE repo_id = ?1 AND json_extract(state_json, '$.snapshot_id') = ?2 \
+             AND json_extract(state_json, '$.lifecycle') = 'snapshot_saved' \
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            params![context.repo_id, latest_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| context.current_operation_id.clone());
     Ok(UndoTarget {
-        undone_operation_id: context.current_operation_id,
+        undone_operation_id,
         content_ref,
         restored_snapshot_id: parent_id,
     })
@@ -1110,12 +1188,13 @@ pub fn record_undo(
     request_id: Option<String>,
     undone_operation_id: &str,
     restored_snapshot_id: &str,
+    content_ref: &str,
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
     let mut connection = open_connection(&context.database_path)?;
     let op = with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
-        insert_operation_view(
+        let op = insert_operation_view(
             tx,
             &context.repo_id,
             Some(&context.current_operation_id),
@@ -1130,7 +1209,10 @@ pub fn record_undo(
                     "restored_snapshot_id": restored_snapshot_id,
                 }),
             },
-        )
+        )?;
+        // NER-143 R1: undo just materialized the restored snapshot's tree into the worktree.
+        set_expected_content_ref(tx, content_ref)?;
+        Ok(op)
     })?;
     Ok(op)
 }
@@ -3733,6 +3815,7 @@ pub fn attach_attempt(
     cwd: &Path,
     request_id: Option<String>,
     attempt_id: &str,
+    content_ref: &str,
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
     let attempt =
@@ -3761,6 +3844,12 @@ pub fn attach_attempt(
             "UPDATE current_state SET attached_attempt_id = ?1 WHERE singleton = 1",
             params![attempt.attempt_id],
         )?;
+        // NER-143 R1: `attempt attach` is the FIFTH materializing op — the CLI restores the
+        // attached attempt's tree into the worktree before calling this. Set the expected
+        // baseline atomically with the attach (code-review P1: without this, an attach-then-nav
+        // spuriously fails DIRTY_WORKTREE because `expected` still points at the prior attempt's
+        // tree). Same dedicated-UPDATE discipline as the other recorders (DR-F2).
+        set_expected_content_ref(tx, content_ref)?;
         Ok(op)
     })?;
     Ok(op)

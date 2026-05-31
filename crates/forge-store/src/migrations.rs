@@ -58,6 +58,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "006_native_history_commit_id",
         include_str!("../migrations/006_native_history_commit_id.sql"),
     ),
+    (
+        7,
+        "007_expected_content_ref",
+        include_str!("../migrations/007_expected_content_ref.sql"),
+    ),
 ];
 
 /// The highest migration version this binary knows how to apply.
@@ -407,7 +412,7 @@ mod tests {
 
     #[test]
     fn schema_head_is_max_version() {
-        assert_eq!(schema_head(), 6);
+        assert_eq!(schema_head(), 7);
     }
 
     #[test]
@@ -418,26 +423,28 @@ mod tests {
         assert_eq!(checksum, checksum_of("ALTER TABLE x ADD COLUMN y TEXT;"));
     }
 
-    /// Fresh apply reaches HEAD=6 with non-NULL checksums for every row.
+    /// Fresh apply reaches HEAD=7 with non-NULL checksums for every row.
     #[test]
     fn fresh_apply_reaches_head_with_checksums() {
         let mut conn = mem_conn();
         apply_pending_migrations(&mut conn).expect("apply migrations");
 
         let versions = applied_versions(&conn);
-        assert_eq!(versions.len(), 6);
+        assert_eq!(versions.len(), 7);
         assert_eq!(versions[0].0, 1);
         assert_eq!(versions[1].0, 2);
         assert_eq!(versions[2].0, 3);
         assert_eq!(versions[3].0, 4);
         assert_eq!(versions[4].0, 5);
         assert_eq!(versions[5].0, 6);
+        assert_eq!(versions[6].0, 7);
         assert!(versions[0].1.is_some(), "001 checksum must be non-NULL");
         assert!(versions[1].1.is_some(), "002 checksum must be non-NULL");
         assert!(versions[2].1.is_some(), "003 checksum must be non-NULL");
         assert!(versions[3].1.is_some(), "004 checksum must be non-NULL");
         assert!(versions[4].1.is_some(), "005 checksum must be non-NULL");
         assert!(versions[5].1.is_some(), "006 checksum must be non-NULL");
+        assert!(versions[6].1.is_some(), "007 checksum must be non-NULL");
 
         // 005 seeds one native_object_format row; 006 bumps commit_schema_version -> 2
         // (justified-commit payload epoch) and adds object_format_version = 2 (kind-header
@@ -700,8 +707,8 @@ mod tests {
             "attached_attempt_id added by the reconciling 002"
         );
         let versions = applied_versions(&conn);
-        assert_eq!(versions.last().expect("at least one version").0, 6);
-        assert_eq!(current_schema_version(&conn).expect("version probe"), 6);
+        assert_eq!(versions.last().expect("at least one version").0, 7);
+        assert_eq!(current_schema_version(&conn).expect("version probe"), 7);
     }
 
     /// FIX A: a genuinely-failing migration statement (a malformed `ALTER`, not a

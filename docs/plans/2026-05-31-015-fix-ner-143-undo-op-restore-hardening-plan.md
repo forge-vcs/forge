@@ -74,22 +74,33 @@ commit-format change here).
 
 ## Doc-review resolutions (the design decisions the gate forced)
 
-- **DR-F1 (adversarial+security, the crux): write `expected_content_ref` BEFORE materialize.** The naive
-  "set it in the record txn (after materialize)" reintroduces the brick under a crash/`CurrentStateChanged`
-  CAS-loss between materialize and record: worktree=A, column=stale-B → next nav bricks a clean worktree.
-  **Fix:** for the materializing ops (`restore`/`checkout`/`undo`), set `current_state.expected_content_ref`
-  to the **target** ref in a small txn **before** `restore_snapshot` clobbers the worktree. Then
-  materialize, then `record_*`. Crash analysis:
-  - crash before set-expected ⇒ expected=prior, worktree=prior ⇒ clean.
-  - crash after set-expected, before materialize ⇒ expected=target, worktree=prior ⇒ next nav refuses;
-    **re-running the same nav command is idempotent** (same target → set-expected no-op, materialize
-    overwrites, record) and heals. Bounded, self-healing, documented.
-  - crash after materialize, before record ⇒ expected=target, worktree=target ⇒ **clean**; op-log
-    missing the finalize row (the bounded residual R5 named — materialize is idempotent). Next nav works.
-  This **unifies R1 and R5**: `expected_content_ref` *is* the pre-materialize intent marker, so no
-  separate op-log intent row (which would fight the tamper-chain) is needed. `save` is different — it
-  snapshots the *current* worktree, so it sets `expected_content_ref` to the new snapshot's ref **after**
-  the snapshot (the worktree already holds that content; no pre-write window).
+- **DR-F1 (adversarial+security, the crux): set `expected_content_ref` in the record txn (atomic with the
+  op-log advance), and make the dirty-check accept `worktree == expected OR worktree == target`.**
+  *(Corrected during PR-B implementation from the gate's first sketch of "write before materialize" — that
+  sketch doesn't actually self-heal: a re-run hits the dirty-check FIRST, sees worktree=old vs expected=new,
+  and refuses, so it never reaches the "set-expected no-op, materialize overwrites" step. Both naive
+  single-orderings have a brick window; the dirty-check's OR-target clause is what closes it.)*
+  - **Ordering** for `restore`/`checkout`/`undo`: dirty-check → `restore_snapshot` (materialize) →
+    `record_*` (which, in its `IMMEDIATE` txn, both advances the op-log AND sets
+    `expected_content_ref = target` — one atomic unit; on a `CurrentStateChanged` CAS-loss the whole txn
+    rolls back, leaving expected unchanged). `save` sets `expected_content_ref = new snapshot ref` in its
+    own record txn (the worktree already holds that content — no window).
+  - **Dirty-check** (`ensure_clean_worktree`): pass iff `worktree == expected_content_ref`
+    (fallback `latest_snapshot_content_ref` when expected IS NULL — pre-007 / pre-first-materialize, DR-F4)
+    **OR** `worktree == target`. Else `DIRTY_WORKTREE`.
+  - **Crash/CAS-loss analysis:**
+    - Normal: dirty-check (worktree==expected) ✓ → materialize → txn sets expected=target. Consistent.
+    - Crash/CAS-loss after materialize, before/at the txn: worktree=target, expected=old. **Re-running the
+      same command heals** — the dirty-check passes via `worktree == target`, re-materialize is a no-op, and
+      the txn sets expected=target. A *different* command meanwhile refuses safely until the interrupted op
+      is re-run (never clobbers). This is the bounded, self-healing residual (materialize is idempotent).
+    - Chained `undo` (the headline bug): undo₁ sets expected=A; undo₂ dirty-check worktree(A)==expected(A) ✓.
+    - Genuine unsaved edit: worktree == neither expected nor target → refuse. **Safety property preserved.**
+    - `worktree == target` by coincidence (user edited to exactly the target): materialize is a no-op, nothing
+      is lost — safe.
+  This **unifies R1 and R5**: the atomic record-txn write + the OR-target dirty-check give crash-safety
+  WITHOUT a separate two-phase op-log "intent" row (which would fight the NER-136 tamper-chain). `accept`/`run`
+  don't materialize, so they leave `expected_content_ref` untouched (worktree unchanged → still correct).
 - **DR-F2 (feasibility): the column write has no existing per-command `current_state` UPDATE to extend.**
   The only `current_state` UPDATE is the shared `insert_operation_view_chained` CAS (lib.rs:4134), hit by
   **every** mutating op. Do **NOT** add `expected_content_ref` to that shared UPDATE (it would null/clobber

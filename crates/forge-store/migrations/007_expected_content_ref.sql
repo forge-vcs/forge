@@ -1,0 +1,15 @@
+-- NER-143 R1: crash-safe worktree dirty-check baseline.
+--
+-- expected_content_ref records the content ref the worktree is EXPECTED to hold (the
+-- last materialized tree), separate from the latest SAVED snapshot. The dirty-check
+-- compares the worktree against this, not against the latest snapshot, so chained
+-- navigation (undo twice, checkout then checkout) no longer spuriously fails
+-- DIRTY_WORKTREE: after undo materializes snapshot A the expected ref is A, so the next
+-- nav sees worktree == expected and proceeds.
+--
+-- Additive and nullable (mirrors 002 attached_attempt_id): a pre-007 repo, or a fresh
+-- repo before its first materializing op, has NULL here and the dirty-check falls back to
+-- the prior latest-snapshot baseline until the first save/restore/checkout/undo populates
+-- it. NOTE: the migration applier splits naively on the statement terminator, so neither
+-- the DDL nor these comments may contain that terminator inside text.
+ALTER TABLE current_state ADD COLUMN expected_content_ref TEXT;
