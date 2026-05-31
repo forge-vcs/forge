@@ -176,12 +176,12 @@ fi
 echo; echo "=== MIGRATION state (live binary) ==="
 if [ "$have_sqlite" = 1 ]; then
   vers="$(db "$TMP/life" "SELECT group_concat(version) FROM schema_migrations ORDER BY version;")"
-  ck "schema_migrations has versions 1,2,3,4,5,6" "$vers" "1,2,3,4,5,6"
+  ck "schema_migrations has versions 1,2,3,4,5,6,7" "$vers" "1,2,3,4,5,6,7"
   nullck="$(db "$TMP/life" "SELECT count(*) FROM schema_migrations WHERE checksum IS NULL;")"
   ck "all migration rows carry a checksum" "$nullck" "0"
   # HEAD+1 read-only refuse on a separate repo
   mkrepo headplus1 >/dev/null; F init >/dev/null
-  db "$TMP/headplus1" "INSERT OR REPLACE INTO schema_migrations(version,name,applied_at_ms,checksum) VALUES (7,'future',0,NULL);"
+  db "$TMP/headplus1" "INSERT OR REPLACE INTO schema_migrations(version,name,applied_at_ms,checksum) VALUES (8,'future',0,NULL);"
   F show; ck "DB ahead of binary refuses read-only" "$(pg "d['errors'][0]['code']")" "SCHEMA_VERSION_UNSUPPORTED"
 else
   echo "  (skipped: sqlite3 unavailable)"
