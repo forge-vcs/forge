@@ -167,6 +167,14 @@ if [ -x /bin/sh ]; then
   NG accept; ck "native accept (git removed)" "$(pg "d['status']")" "success"
   ckc "accept writes a native commit (git removed)" "$(pg "d['data']['commit_id']")" "f1:commit:sha256:"
   NG log; ckc "native log walks history (git removed)" "$(pg "len(d['data']['commits'])>=1")" "True"
+  # Navigation (restore/checkout/undo) must also run git-free (NER-143 R11 parity; the Rust
+  # integration tests already cover these — this extends the shell e2e to match). Capture a
+  # save's snapshot + the accepted commit, navigate, and confirm each succeeds with no git.
+  NG save; nsnap_ng="$(pg "d['data']['snapshot_id']")"
+  NG log; ncommit_ng="$(pg "d['data']['commits'][0]['commit_id']")"
+  NG checkout "$ncommit_ng"; ck "native checkout (git removed)" "$(pg "d['status']")" "success"
+  NG restore "$nsnap_ng" --yes; ck "native restore (git removed)" "$(pg "d['status']")" "success"
+  NG undo; ck "native undo (git removed)" "$(pg "d['status']")" "success"
   NG doctor; ck "native doctor healthy (git removed)" "$(pg "d['data']['ok']")" "True"
   cd "$TMP"
 else

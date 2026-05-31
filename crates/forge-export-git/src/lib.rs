@@ -397,9 +397,16 @@ fn synthesize_deterministic_commit(repo_root: &Path, tree: &str) -> Result<Strin
 /// tree is rebuilt through a temporary index (no worktree needed): `read-tree`,
 /// `rm --cached` each dropped path, then `write-tree`.
 fn filter_secret_paths_from_tree(repo_root: &Path, tree: &str) -> Result<(String, Vec<String>)> {
-    let listing = git(repo_root, &["ls-tree", "-r", "--name-only", tree])?;
+    // `-z` (NUL-delimited, never C-quoted) is load-bearing for the secret-path drop:
+    // without it `ls-tree` C-quotes any path containing a tab/newline/non-ASCII byte
+    // (e.g. `.env\u{a0}prod` -> `".env\u{a0}prod"`), which would slip
+    // `is_secret_risk_path` and leak the secret-named blob into the published export tree
+    // (NER-142, the egress twin of the `diff_trees` `-z` fix above). `-z` emits one
+    // `<path>\0` record per entry, so split on `\0` and drop the trailing empty field.
+    let listing = git(repo_root, &["ls-tree", "-r", "-z", "--name-only", tree])?;
     let dropped: Vec<String> = listing
-        .lines()
+        .split('\0')
+        .filter(|path| !path.is_empty())
         .filter(|path| forge_content::is_secret_risk_path(path))
         .map(str::to_string)
         .collect();
@@ -410,10 +417,18 @@ fn filter_secret_paths_from_tree(repo_root: &Path, tree: &str) -> Result<(String
     let index_path = index_dir.path().join("index");
     git_with_index(repo_root, &index_path, &["read-tree", tree])?;
     for path in &dropped {
+        // `:(literal)` pathspec magic: match PATH byte-for-byte, never as a glob. Without
+        // it a secret-risk name containing a pathspec metacharacter (`*`, `[`, `?`) or a
+        // leading `:` is collected into `dropped` above (it matches `is_secret_risk_path`)
+        // but silently NOT removed here — `rm` reads `.env[prod]` as a wildcard that fails
+        // to match the literal file, and `--ignore-unmatch` swallows the miss, leaving the
+        // secret in the published tree (NER-142: the write-side twin of the `-z` read fix
+        // above — together they make the drop robust to every adversarial filename).
+        let literal = format!(":(literal){path}");
         git_with_index(
             repo_root,
             &index_path,
-            &["rm", "--cached", "--ignore-unmatch", path],
+            &["rm", "--cached", "--ignore-unmatch", &literal],
         )?;
     }
     let new_tree = git_with_index(repo_root, &index_path, &["write-tree"])?
@@ -676,6 +691,80 @@ mod tests {
         assert!(
             !listing.lines().any(|line| line == ".env"),
             "exported branch tree must not contain .env"
+        );
+    }
+
+    #[test]
+    fn rewrite_drops_a_secret_path_with_non_ascii_bytes() {
+        // NER-142: `ls-tree` C-quotes a path with a tab/newline/non-ASCII byte unless
+        // `-z` is passed; the quoted form `".env.café"` would slip `is_secret_risk_path`
+        // and leave the secret blob in the rewritten export tree. With `-z` the true
+        // unquoted path reaches the filter and is dropped. `.env.café` matches `.env.*`.
+        let repo = init_repo();
+        let tree = build_tree(
+            repo.path(),
+            &[("README.md", "hello\n"), (".env.café", "SECRET=1\n")],
+        );
+
+        let (new_tree, dropped) =
+            filter_secret_paths_from_tree(repo.path(), &tree).expect("rewrite");
+
+        assert_ne!(
+            new_tree, tree,
+            "tree must be rewritten when a non-ascii secret is present"
+        );
+        assert_eq!(
+            dropped,
+            vec![".env.café".to_string()],
+            "the non-ascii secret path must be reported as dropped, not leaked"
+        );
+        // And it must be physically absent from the rewritten tree (read back with -z so
+        // the assertion itself can't be fooled by C-quoting).
+        let listing = git(
+            repo.path(),
+            &["ls-tree", "-r", "-z", "--name-only", &new_tree],
+        )
+        .unwrap();
+        let entries: Vec<&str> = listing.split('\0').filter(|p| !p.is_empty()).collect();
+        assert_eq!(entries, vec!["README.md"]);
+    }
+
+    #[test]
+    fn rewrite_drops_a_secret_path_with_a_pathspec_magic_prefix() {
+        // NER-142 (write side): a secret-risk name beginning with `:` (e.g. `:secret.txt`)
+        // is collected into `dropped` by `is_secret_risk_path` (it contains "secret"), but a
+        // plain `rm --cached ':secret.txt'` reads the leading `:` as a PATHSPEC MAGIC prefix
+        // that matches nothing — and `--ignore-unmatch` hides the miss, leaving the secret in
+        // the published tree while it is REPORTED as excluded. The `:(literal)` pathspec forces
+        // a verbatim byte match so it is actually removed. (A glob metacharacter like `[` in a
+        // name is NOT a useful fixture here because `.env[prod]` etc. are not secret-risk by
+        // name — only a name that genuinely matches `is_secret_risk_path` AND carries pathspec
+        // magic exercises the leak; a leading `:` is the canonical case.)
+        let repo = init_repo();
+        let tree = build_tree(
+            repo.path(),
+            &[("README.md", "hello\n"), (":secret.txt", "SECRET=1\n")],
+        );
+
+        let (new_tree, dropped) =
+            filter_secret_paths_from_tree(repo.path(), &tree).expect("rewrite");
+
+        assert_eq!(
+            dropped,
+            vec![":secret.txt".to_string()],
+            "the pathspec-magic secret path must be reported as dropped"
+        );
+        // The report is only honest if the file is ACTUALLY gone from the tree.
+        let listing = git(
+            repo.path(),
+            &["ls-tree", "-r", "-z", "--name-only", &new_tree],
+        )
+        .unwrap();
+        let entries: Vec<&str> = listing.split('\0').filter(|p| !p.is_empty()).collect();
+        assert_eq!(
+            entries,
+            vec!["README.md"],
+            "the pathspec-magic secret must be physically removed, not just reported"
         );
     }
 

@@ -321,3 +321,47 @@ fn json_mode_reports_unknown_argument_as_envelope() {
     assert_eq!(json["command"], "init");
     assert_eq!(json["errors"][0]["code"], "UNKNOWN_ARGUMENT");
 }
+
+/// NER-143 R9: a native `init` inside an existing forge repo's subtree must be
+/// REFUSED, not silently create a nested `.forge` that `forge_root`'s
+/// nearest-ancestor routing would shadow (and whose objects look unreachable to
+/// the outer repo's gc — a Phase-8 deletion hazard). The refusal message must be
+/// path-free (S1).
+#[test]
+fn native_init_nested_in_existing_repo_subtree_is_refused() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+
+    // Outer native repo at the temp root (no git needed for native init).
+    forge_in(temp_dir.path())
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+
+    // A subdirectory inside the outer repo's tree.
+    let nested = temp_dir.path().join("nested");
+    std::fs::create_dir(&nested).expect("create nested dir");
+
+    let output = forge_in(&nested)
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: Value = serde_json::from_slice(&output).expect("valid json");
+    assert_eq!(json["command"], "init");
+    assert_eq!(json["status"], "error");
+    // The nested `.forge` must NOT have been created.
+    assert!(
+        !nested.join(".forge/forge.db").exists(),
+        "a refused nested init must not leave a nested .forge/forge.db"
+    );
+    // S1: the refusal must not leak a filesystem path in any error string.
+    let needle = nested.to_string_lossy();
+    let rendered = serde_json::to_string(&json).expect("re-serialize envelope");
+    assert!(
+        !rendered.contains(&*needle),
+        "nested-init refusal leaked a path: {rendered}"
+    );
+}

@@ -1107,3 +1107,53 @@ fn undo_labels_the_save_op_even_after_restoring_the_latest_snapshot() {
         "the restore-of-latest view must not win the undone_operation_id resolution"
     );
 }
+
+/// NER-143 R10 (R15 re-capture): a worktree symlink whose target escapes the worktree
+/// (absolute) round-trips CAPTURE — `save` stores the read-link target string without
+/// following it, deliberately, so a repo with a legitimate absolute symlink can still be
+/// saved — but is REJECTED at materialize (restore), the real security boundary, with a
+/// path-free error. This pins the documented capture-tolerant / materialize-reject split
+/// end-to-end through the CLI. Unix-only: symlinks + `validate_symlink_target` are
+/// `#[cfg(unix)]`; on non-Unix a SYMLINK_MODE entry materializes target bytes as a regular
+/// file (no escape — documented in the NER-143 plan R10).
+#[cfg(unix)]
+#[test]
+fn escaping_symlink_is_captured_but_rejected_at_materialize() {
+    use std::os::unix::fs::symlink;
+
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "escaping symlink"])
+        .assert()
+        .success();
+
+    // An absolute symlink target that escapes the worktree. Capture must tolerate it
+    // (it stores only the read-link string, never follows it).
+    symlink("/etc/passwd", repo.path().join("evil_link")).expect("create escaping symlink");
+    let saved = json_output(repo.forge().args(["--json", "save"]).assert().success());
+    let snapshot_id = saved["data"]["snapshot_id"]
+        .as_str()
+        .expect("save returns a snapshot id")
+        .to_string();
+
+    // Materializing that snapshot (restore) must reject the escaping symlink, path-free.
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "restore", &snapshot_id, "--yes"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(output["status"], "error");
+    assert_eq!(output["errors"][0]["code"], "COMMAND_FAILED");
+    // S1: the rejection must not leak a filesystem path in any envelope string.
+    let needle = repo.path().to_string_lossy();
+    let rendered = serde_json::to_string(&output).expect("re-serialize envelope");
+    assert!(
+        !rendered.contains(&*needle),
+        "escaping-symlink rejection leaked a path: {rendered}"
+    );
+}
