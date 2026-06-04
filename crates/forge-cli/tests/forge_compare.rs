@@ -174,7 +174,7 @@ fn exit_criterion_compare_export_winner_and_verify_trailer() {
     let loser = attempts.iter().find(|a| a["rank"] == 2).unwrap();
     assert_eq!(loser["attempt_id"], attempt_a);
 
-    // Pairwise file/hunk diff between the two competing proposals (via the git adapter).
+    // Pairwise file/hunk diff between the two competing proposals.
     let diffed = forge_ok(&repo, &["compare", "--diff", &attempt_a, &attempt_b]);
     assert!(!diffed["data"]["diff"]["files"]
         .as_array()

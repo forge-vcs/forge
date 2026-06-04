@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const SECRET_RISK_SENSITIVITY: &str = "secret_risk";
@@ -12,6 +12,67 @@ pub const FORGE_TREE_PREFIX: &str = "forge-tree:";
 /// `forge_store::doctor` scans for orphans by this prefix. Defined here, in the
 /// shared base crate, so both content backends exclude it identically.
 pub const RESTORE_TEMP_PREFIX: &str = ".forge-restore-";
+
+/// One file's change between two content trees. `status` uses git's name-status
+/// letter encoding (`A`/`M`/`D`, `R<score>` for renames) so git-backed and native
+/// diffs share one wire contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    pub status: String,
+    pub insertions: Option<u64>,
+    pub deletions: Option<u64>,
+    pub binary: bool,
+    pub hunk: Option<String>,
+    pub truncated: bool,
+    #[serde(default)]
+    pub hunks: Vec<HunkDiff>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HunkDiff {
+    pub old_start: u64,
+    pub old_lines: u64,
+    pub new_start: u64,
+    pub new_lines: u64,
+    pub lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffLine {
+    pub tag: DiffLineTag,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffLineTag {
+    Context,
+    Delete,
+    Insert,
+}
+
+/// Non-fatal diff warning surfaced alongside file entries. Kept structured so the
+/// CLI can merge it into envelope warnings without string parsing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiffWarning {
+    pub code: String,
+    pub message: String,
+}
+
+/// The content-level diff between two trees. Policy-excluded paths are dropped
+/// from `files` and listed here so callers can warn without leaking hunk content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TreeDiff {
+    pub files: Vec<FileDiff>,
+    pub dropped_secret_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<DiffWarning>,
+}
 
 /// True if `path`'s final component is a crash-atomic-restore temp
 /// (`.forge-restore-*`). Such a temp orphaned by a restore killed mid-flight must
@@ -458,6 +519,73 @@ mod tests {
         let (kept, dropped) = filter_secret_risk(&paths);
         assert_eq!(kept, vec!["a.txt", "b.txt", "c.txt"]);
         assert_eq!(dropped, vec![".env", "certs/key.pem"]);
+    }
+
+    #[test]
+    fn diff_contract_serializes_structured_hunks_and_rename_fields() {
+        let diff = TreeDiff {
+            files: vec![FileDiff {
+                path: "src/new.rs".to_string(),
+                status: "R87".to_string(),
+                insertions: Some(2),
+                deletions: Some(1),
+                binary: false,
+                hunk: Some("@@ -1 +1 @@\n-old\n+new\n".to_string()),
+                truncated: false,
+                hunks: vec![HunkDiff {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec![
+                        DiffLine {
+                            tag: DiffLineTag::Delete,
+                            content: "old".to_string(),
+                        },
+                        DiffLine {
+                            tag: DiffLineTag::Insert,
+                            content: "new".to_string(),
+                        },
+                    ],
+                }],
+                old_path: Some("src/old.rs".to_string()),
+                similarity: Some(87),
+            }],
+            dropped_secret_paths: Vec::new(),
+            warnings: vec![DiffWarning {
+                code: "rename_detection_skipped".to_string(),
+                message: "rename detection skipped".to_string(),
+            }],
+        };
+
+        let value = serde_json::to_value(&diff).expect("serialize diff");
+        assert_eq!(value["files"][0]["hunks"][0]["lines"][0]["tag"], "delete");
+        assert_eq!(value["files"][0]["old_path"], "src/old.rs");
+        assert_eq!(value["files"][0]["similarity"], 87);
+        assert_eq!(value["warnings"][0]["code"], "rename_detection_skipped");
+    }
+
+    #[test]
+    fn diff_contract_deserializes_legacy_shape_with_defaults() {
+        let json = serde_json::json!({
+            "files": [{
+                "path": "src/lib.rs",
+                "status": "M",
+                "insertions": 1,
+                "deletions": 2,
+                "binary": false,
+                "hunk": null,
+                "truncated": false
+            }],
+            "dropped_secret_paths": []
+        });
+
+        let diff: TreeDiff = serde_json::from_value(json).expect("legacy diff shape");
+        assert!(diff.warnings.is_empty());
+        let file = &diff.files[0];
+        assert!(file.hunks.is_empty());
+        assert_eq!(file.old_path, None);
+        assert_eq!(file.similarity, None);
     }
 
     // --- NER-136 §U4: hardened redaction leak corpus ---
