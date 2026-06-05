@@ -1,5 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
-use forge_content::{is_ignored_by_policy, ContentBackend, SnapshotContent, FORGE_TREE_PREFIX};
+use forge_content::{
+    is_ignored_by_policy, ContentBackend, DiffLine, DiffLineTag, DiffWarning, FileDiff, HunkDiff,
+    SnapshotContent, TreeDiff, FORGE_TREE_PREFIX,
+};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -16,6 +19,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SCHEMA_VERSION: u32 = 1;
+const HUNK_LIMIT: usize = 4096;
+const BINARY_SCAN_LIMIT: usize = 8000;
+const DIFF_CONTEXT_LINES: usize = 3;
+const DEFAULT_RENAME_THRESHOLD: u8 = 50;
+const DEFAULT_RENAME_LIMIT: usize = 1000;
 
 /// The on-object `CommitObject::schema_version` value to stamp when building a commit in
 /// another crate (slice 3's `forge_store::decide`). Exposed so callers need not hard-code
@@ -27,6 +35,68 @@ pub const COMMIT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
 /// its matching `is_restore_temp_path` exclusion predicate live in the shared base
 /// crate both backends depend on (NER-132 U4).
 pub use forge_content::RESTORE_TEMP_PREFIX;
+
+#[derive(Debug, Clone)]
+pub struct DiffOptions {
+    pub include_hunks: bool,
+    pub detect_renames: bool,
+    pub rename_threshold: u8,
+    pub rename_limit: usize,
+}
+
+impl Default for DiffOptions {
+    fn default() -> Self {
+        Self {
+            include_hunks: true,
+            detect_renames: true,
+            rename_threshold: DEFAULT_RENAME_THRESHOLD,
+            rename_limit: DEFAULT_RENAME_LIMIT,
+        }
+    }
+}
+
+pub fn diff_native_trees(
+    store: &NativeObjectStore,
+    root_a: &ObjectId,
+    root_b: &ObjectId,
+    options: &DiffOptions,
+) -> Result<TreeDiff> {
+    diff_fingerprint_maps(
+        store,
+        store.tree_fingerprints(root_a)?,
+        store.tree_fingerprints(root_b)?,
+        &BTreeMap::new(),
+        options,
+    )
+}
+
+pub fn diff_native_content_refs(
+    store: &NativeObjectStore,
+    content_ref_a: &str,
+    content_ref_b: &str,
+    options: &DiffOptions,
+) -> Result<TreeDiff> {
+    let root_a = object_id_from_content_ref(content_ref_a)?;
+    let root_b = object_id_from_content_ref(content_ref_b)?;
+    diff_native_trees(store, &root_a, &root_b, options)
+}
+
+pub fn diff_working_vs_tree(
+    store: &NativeObjectStore,
+    repo_root: &Path,
+    tree_ref: &str,
+    options: &DiffOptions,
+) -> Result<TreeDiff> {
+    let root = object_id_from_content_ref(tree_ref)?;
+    let (worktree, overlay) = working_fingerprints(repo_root)?;
+    diff_fingerprint_maps(
+        store,
+        store.tree_fingerprints(&root)?,
+        worktree,
+        &overlay,
+        options,
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -353,6 +423,13 @@ impl NativeObjectStore {
             bail!("hash mismatch for native content object {}", id);
         }
         Ok(bytes)
+    }
+
+    pub(crate) fn tree_fingerprints(
+        &self,
+        root: &ObjectId,
+    ) -> Result<BTreeMap<String, FileFingerprint>> {
+        flatten_tree(self, root)
     }
 
     /// Write a native commit object (NER-138 Phase 7 slice 2), returning its
@@ -1039,6 +1116,27 @@ fn scan_worktree(repo_root: &Path) -> Result<Vec<FileEntry>> {
     Ok(files)
 }
 
+fn working_fingerprints(repo_root: &Path) -> Result<(FingerprintMap, BlobOverlay)> {
+    let mut fingerprints = BTreeMap::new();
+    let mut overlay = BTreeMap::new();
+    for file in scan_worktree(repo_root)? {
+        if is_ignored_by_policy(&file.path) {
+            continue;
+        }
+        let (bytes, mode) = match file.symlink_target {
+            Some(target) => (target.into_bytes(), SYMLINK_MODE),
+            None => {
+                let bytes = fs::read(repo_root.join(&file.path))?;
+                (bytes, if file.executable { 0o100755 } else { 0o100644 })
+            }
+        };
+        let id = ObjectId::new(ObjectKind::Blob, &bytes).to_string();
+        overlay.insert(id.clone(), bytes);
+        fingerprints.insert(file.path, (id, mode));
+    }
+    Ok((fingerprints, overlay))
+}
+
 /// Enumerate snapshot-candidate worktree paths natively, without the `git` binary
 /// (NER-138 Phase 7 slice 1). Uses the `ignore` crate to honor repo-local `.gitignore`
 /// (nested, with negation) and `.forgeignore`; the authoritative secret/internal
@@ -1195,10 +1293,463 @@ fn changed_paths(
         .collect())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingFileDiff {
+    path: String,
+    old_path: Option<String>,
+    status: String,
+    similarity: Option<u8>,
+    old: Option<FileFingerprint>,
+    new: Option<FileFingerprint>,
+}
+
+fn diff_fingerprint_maps(
+    store: &NativeObjectStore,
+    old_map: BTreeMap<String, FileFingerprint>,
+    new_map: BTreeMap<String, FileFingerprint>,
+    blob_overlay: &BTreeMap<String, Vec<u8>>,
+    options: &DiffOptions,
+) -> Result<TreeDiff> {
+    let mut dropped_secret_paths = BTreeSet::new();
+    let mut removed = BTreeMap::new();
+    let mut added = BTreeMap::new();
+    let mut pending = Vec::new();
+
+    for (path, old_fp) in &old_map {
+        if is_ignored_by_policy(path) {
+            if new_map.get(path) != Some(old_fp) {
+                dropped_secret_paths.insert(path.clone());
+            }
+            continue;
+        }
+        match new_map.get(path) {
+            None => {
+                removed.insert(path.clone(), old_fp.clone());
+            }
+            Some(new_fp) if new_fp != old_fp => {
+                if is_ignored_by_policy(path) {
+                    dropped_secret_paths.insert(path.clone());
+                } else {
+                    pending.push(PendingFileDiff {
+                        path: path.clone(),
+                        old_path: None,
+                        status: "M".to_string(),
+                        similarity: None,
+                        old: Some(old_fp.clone()),
+                        new: Some(new_fp.clone()),
+                    });
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    for (path, new_fp) in &new_map {
+        if is_ignored_by_policy(path) {
+            if old_map.get(path) != Some(new_fp) {
+                dropped_secret_paths.insert(path.clone());
+            }
+            continue;
+        }
+        if !old_map.contains_key(path) {
+            added.insert(path.clone(), new_fp.clone());
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if options.detect_renames {
+        detect_renames(
+            store,
+            blob_overlay,
+            &mut removed,
+            &mut added,
+            &mut pending,
+            &mut warnings,
+            options,
+        )?;
+    }
+
+    for (path, old) in removed {
+        pending.push(PendingFileDiff {
+            path,
+            old_path: None,
+            status: "D".to_string(),
+            similarity: None,
+            old: Some(old),
+            new: None,
+        });
+    }
+    for (path, new) in added {
+        pending.push(PendingFileDiff {
+            path,
+            old_path: None,
+            status: "A".to_string(),
+            similarity: None,
+            old: None,
+            new: Some(new),
+        });
+    }
+
+    let mut files = Vec::new();
+    for change in pending {
+        if is_ignored_by_policy(&change.path)
+            || change.old_path.as_deref().is_some_and(is_ignored_by_policy)
+        {
+            dropped_secret_paths.insert(change.path);
+            if let Some(old_path) = change.old_path {
+                dropped_secret_paths.insert(old_path);
+            }
+            continue;
+        }
+        files.push(build_file_diff(
+            store,
+            blob_overlay,
+            change,
+            options.include_hunks,
+        )?);
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path).then(a.old_path.cmp(&b.old_path)));
+
+    Ok(TreeDiff {
+        files,
+        dropped_secret_paths: dropped_secret_paths.into_iter().collect(),
+        warnings,
+    })
+}
+
+fn detect_renames(
+    store: &NativeObjectStore,
+    blob_overlay: &BTreeMap<String, Vec<u8>>,
+    removed: &mut BTreeMap<String, FileFingerprint>,
+    added: &mut BTreeMap<String, FileFingerprint>,
+    pending: &mut Vec<PendingFileDiff>,
+    warnings: &mut Vec<DiffWarning>,
+    options: &DiffOptions,
+) -> Result<()> {
+    let mut exact_pairs = Vec::new();
+    for (old_path, old_fp) in removed.iter() {
+        if is_ignored_by_policy(old_path) {
+            continue;
+        }
+        if let Some((new_path, new_fp)) = added
+            .iter()
+            .find(|(new_path, new_fp)| !is_ignored_by_policy(new_path) && new_fp.0 == old_fp.0)
+        {
+            exact_pairs.push((
+                old_path.clone(),
+                new_path.clone(),
+                old_fp.clone(),
+                new_fp.clone(),
+            ));
+        }
+    }
+    for (old_path, new_path, old_fp, new_fp) in exact_pairs {
+        if removed.remove(&old_path).is_some() && added.remove(&new_path).is_some() {
+            pending.push(PendingFileDiff {
+                path: new_path,
+                old_path: Some(old_path),
+                status: "R100".to_string(),
+                similarity: Some(100),
+                old: Some(old_fp),
+                new: Some(new_fp),
+            });
+        }
+    }
+
+    let candidate_count = removed.len().saturating_mul(added.len());
+    if candidate_count > options.rename_limit {
+        warnings.push(DiffWarning {
+            code: "rename_detection_skipped".to_string(),
+            message: "inexact rename detection skipped because the candidate set exceeded the configured limit".to_string(),
+        });
+        return Ok(());
+    }
+
+    loop {
+        let mut best: Option<(u8, String, String)> = None;
+        for (old_path, old_fp) in removed.iter() {
+            if is_ignored_by_policy(old_path) {
+                continue;
+            }
+            for (new_path, new_fp) in added.iter() {
+                if is_ignored_by_policy(new_path)
+                    || old_fp.1 == SYMLINK_MODE
+                    || new_fp.1 == SYMLINK_MODE
+                {
+                    continue;
+                }
+                let score = similarity_score(store, blob_overlay, old_fp, new_fp)?;
+                if score >= options.rename_threshold
+                    && best
+                        .as_ref()
+                        .is_none_or(|(best_score, _, _)| score > *best_score)
+                {
+                    best = Some((score, old_path.clone(), new_path.clone()));
+                }
+            }
+        }
+        let Some((score, old_path, new_path)) = best else {
+            break;
+        };
+        let old_fp = removed
+            .remove(&old_path)
+            .expect("best old path still present");
+        let new_fp = added
+            .remove(&new_path)
+            .expect("best new path still present");
+        pending.push(PendingFileDiff {
+            path: new_path,
+            old_path: Some(old_path),
+            status: format!("R{score}"),
+            similarity: Some(score),
+            old: Some(old_fp),
+            new: Some(new_fp),
+        });
+    }
+
+    Ok(())
+}
+
+fn similarity_score(
+    store: &NativeObjectStore,
+    blob_overlay: &BTreeMap<String, Vec<u8>>,
+    old_fp: &FileFingerprint,
+    new_fp: &FileFingerprint,
+) -> Result<u8> {
+    let old = read_blob(store, blob_overlay, &old_fp.0)?;
+    let new = read_blob(store, blob_overlay, &new_fp.0)?;
+    if is_binary(&old) || is_binary(&new) {
+        return Ok(if old == new { 100 } else { 0 });
+    }
+    let old_lines = split_lines(&old);
+    let new_lines = split_lines(&new);
+    let larger = old_lines.len().max(new_lines.len());
+    if larger == 0 {
+        return Ok(100);
+    }
+    let mut old_counts = BTreeMap::<Vec<u8>, usize>::new();
+    for line in old_lines {
+        *old_counts.entry(line).or_default() += 1;
+    }
+    let mut common = 0usize;
+    for line in new_lines {
+        if let Some(count) = old_counts.get_mut(&line) {
+            if *count > 0 {
+                *count -= 1;
+                common += 1;
+            }
+        }
+    }
+    Ok(((common * 100) / larger).min(100) as u8)
+}
+
+fn build_file_diff(
+    store: &NativeObjectStore,
+    blob_overlay: &BTreeMap<String, Vec<u8>>,
+    change: PendingFileDiff,
+    include_hunks: bool,
+) -> Result<FileDiff> {
+    let old_blob = change.old.as_ref().map(|fp| fp.0.as_str());
+    let new_blob = change.new.as_ref().map(|fp| fp.0.as_str());
+    let old_mode = change.old.as_ref().map(|fp| fp.1);
+    let new_mode = change.new.as_ref().map(|fp| fp.1);
+    let old_bytes = read_optional_blob(store, blob_overlay, old_blob)?;
+    let new_bytes = read_optional_blob(store, blob_overlay, new_blob)?;
+    let binary =
+        old_bytes.as_deref().is_some_and(is_binary) || new_bytes.as_deref().is_some_and(is_binary);
+    let symlink = old_mode == Some(SYMLINK_MODE) || new_mode == Some(SYMLINK_MODE);
+
+    let (insertions, deletions, hunk, hunks, truncated) = if binary {
+        (None, None, None, Vec::new(), false)
+    } else if symlink || !include_hunks {
+        let insertions = new_bytes
+            .as_ref()
+            .map(|bytes| split_lines(bytes).len() as u64);
+        let deletions = old_bytes
+            .as_ref()
+            .map(|bytes| split_lines(bytes).len() as u64);
+        (insertions, deletions, None, Vec::new(), false)
+    } else {
+        let old_bytes = old_bytes.as_deref().unwrap_or(&[]);
+        let new_bytes = new_bytes.as_deref().unwrap_or(&[]);
+        let body = diff_text_bytes(old_bytes, new_bytes)?;
+        (
+            Some(body.insertions),
+            Some(body.deletions),
+            body.hunk,
+            body.hunks,
+            body.truncated,
+        )
+    };
+
+    Ok(FileDiff {
+        path: change.path,
+        status: change.status,
+        insertions,
+        deletions,
+        binary,
+        hunk,
+        truncated,
+        hunks,
+        old_path: change.old_path,
+        similarity: change.similarity,
+    })
+}
+
+fn read_optional_blob(
+    store: &NativeObjectStore,
+    blob_overlay: &BTreeMap<String, Vec<u8>>,
+    id: Option<&str>,
+) -> Result<Option<Vec<u8>>> {
+    id.map(|id| read_blob(store, blob_overlay, id)).transpose()
+}
+
+fn read_blob(
+    store: &NativeObjectStore,
+    blob_overlay: &BTreeMap<String, Vec<u8>>,
+    id: &str,
+) -> Result<Vec<u8>> {
+    if let Some(bytes) = blob_overlay.get(id) {
+        return Ok(bytes.clone());
+    }
+    store.read_object(&ObjectId::parse(id)?)
+}
+
+#[derive(Debug)]
+struct TextDiffBody {
+    insertions: u64,
+    deletions: u64,
+    hunk: Option<String>,
+    hunks: Vec<HunkDiff>,
+    truncated: bool,
+}
+
+fn diff_text_bytes(old: &[u8], new: &[u8]) -> Result<TextDiffBody> {
+    let old_lines = split_lines(old);
+    let new_lines = split_lines(new);
+    let ops = similar::capture_diff_slices(similar::Algorithm::Patience, &old_lines, &new_lines);
+    let groups = similar::group_diff_ops(ops, DIFF_CONTEXT_LINES);
+
+    let mut text = String::new();
+    let mut hunks = Vec::new();
+    let mut insertions = 0u64;
+    let mut deletions = 0u64;
+
+    for group in groups {
+        let Some(first) = group.first() else { continue };
+        let Some(last) = group.last() else { continue };
+        let (_, first_old, first_new) = first.as_tag_tuple();
+        let (_, last_old, last_new) = last.as_tag_tuple();
+        let old_start = first_old.start as u64 + 1;
+        let new_start = first_new.start as u64 + 1;
+        let old_lines_count = last_old.end.saturating_sub(first_old.start) as u64;
+        let new_lines_count = last_new.end.saturating_sub(first_new.start) as u64;
+        text.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            old_start, old_lines_count, new_start, new_lines_count
+        ));
+        let mut lines = Vec::new();
+        for op in &group {
+            for change in op.iter_changes(&old_lines, &new_lines) {
+                let (tag, prefix) = match change.tag() {
+                    similar::ChangeTag::Equal => (DiffLineTag::Context, ' '),
+                    similar::ChangeTag::Delete => {
+                        deletions += 1;
+                        (DiffLineTag::Delete, '-')
+                    }
+                    similar::ChangeTag::Insert => {
+                        insertions += 1;
+                        (DiffLineTag::Insert, '+')
+                    }
+                };
+                let line = line_to_redacted_string(change.value().as_slice());
+                text.push(prefix);
+                text.push_str(&line);
+                text.push('\n');
+                lines.push(DiffLine { tag, content: line });
+            }
+        }
+        hunks.push(HunkDiff {
+            old_start,
+            old_lines: old_lines_count,
+            new_start,
+            new_lines: new_lines_count,
+            lines,
+        });
+    }
+
+    let mut truncated = false;
+    let hunk = if text.is_empty() {
+        None
+    } else {
+        let (bounded, was_truncated) = bound_string(text, HUNK_LIMIT);
+        truncated |= was_truncated;
+        Some(bounded)
+    };
+    while serde_json::to_vec(&hunks)?.len() > HUNK_LIMIT {
+        truncated = true;
+        let Some(last) = hunks.last_mut() else { break };
+        if last.lines.pop().is_none() {
+            hunks.pop();
+        }
+    }
+
+    Ok(TextDiffBody {
+        insertions,
+        deletions,
+        hunk,
+        hunks,
+        truncated,
+    })
+}
+
+fn split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            lines.push(bytes[start..=idx].to_vec());
+            start = idx + 1;
+        }
+    }
+    if start < bytes.len() {
+        lines.push(bytes[start..].to_vec());
+    }
+    lines
+}
+
+fn line_to_redacted_string(line: &[u8]) -> String {
+    let text = String::from_utf8_lossy(line)
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    let (redacted, _kinds) = forge_content::redact_evidence_excerpt(&text);
+    redacted
+}
+
+fn bound_string(value: String, limit: usize) -> (String, bool) {
+    if value.len() <= limit {
+        return (value, false);
+    }
+    let mut end = limit;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (value[..end].to_string(), true)
+}
+
+fn is_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(BINARY_SCAN_LIMIT).any(|byte| *byte == 0)
+}
+
 /// A file leaf's change-detection fingerprint: its blob object id AND its mode, so a
 /// mode-only change (e.g. `chmod +x`) is detected even though the blob content (hence the
 /// blob id) is unchanged.
 type FileFingerprint = (String, u32);
+type FingerprintMap = BTreeMap<String, FileFingerprint>;
+type BlobOverlay = BTreeMap<String, Vec<u8>>;
 
 /// Flatten a native tree into a map of repo-relative file path → `(blob id, mode)`,
 /// recursing into directory entries. Used by `changed_paths` for the name-level
@@ -1369,6 +1920,315 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("hash mismatch"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tree_fingerprints_flatten_nested_executable_and_symlink_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::write(repo.join("src/app.sh"), b"#!/bin/sh\n").unwrap();
+        fs::write(repo.join("README.md"), b"readme\n").unwrap();
+        fs::set_permissions(repo.join("src/app.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = NativeObjectStore::new(repo);
+        let root = write_tree(
+            &store,
+            repo,
+            &[
+                FileEntry {
+                    path: "README.md".to_string(),
+                    executable: false,
+                    symlink_target: None,
+                },
+                FileEntry {
+                    path: "src/app.sh".to_string(),
+                    executable: true,
+                    symlink_target: None,
+                },
+                FileEntry {
+                    path: "src/link".to_string(),
+                    executable: false,
+                    symlink_target: Some("../README.md".to_string()),
+                },
+            ],
+            "",
+        )
+        .unwrap();
+
+        let fingerprints = store.tree_fingerprints(&root).unwrap();
+        assert_eq!(fingerprints["README.md"].1, 0o100644);
+        assert_eq!(fingerprints["src/app.sh"].1, 0o100755);
+        assert_eq!(fingerprints["src/link"].1, 0o120000);
+    }
+
+    #[test]
+    fn tree_fingerprints_empty_tree_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let root = write_tree(&store, temp.path(), &[], "").unwrap();
+        assert!(store.tree_fingerprints(&root).unwrap().is_empty());
+    }
+
+    fn write_test_tree(repo: &Path, files: &[(&str, &[u8], bool)]) -> ObjectId {
+        for (path, bytes, executable) in files {
+            let full = repo.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(&full, bytes).unwrap();
+            #[cfg(unix)]
+            if *executable {
+                fs::set_permissions(&full, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let entries: Vec<FileEntry> = files
+            .iter()
+            .map(|(path, _bytes, executable)| FileEntry {
+                path: (*path).to_string(),
+                executable: *executable,
+                symlink_target: None,
+            })
+            .collect();
+        write_tree(&NativeObjectStore::new(repo), repo, &entries, "").unwrap()
+    }
+
+    #[test]
+    fn diff_native_trees_reports_structured_redacted_hunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let old = write_test_tree(repo, &[("app.txt", b"one\nAPI_TOKEN=oldsecret\n", false)]);
+        let new = write_test_tree(
+            repo,
+            &[("app.txt", b"one\nAPI_TOKEN=newsecret\nthree\n", false)],
+        );
+        let store = NativeObjectStore::new(repo);
+
+        let diff = diff_native_trees(&store, &old, &new, &DiffOptions::default()).unwrap();
+        let file = &diff.files[0];
+        assert_eq!(file.status, "M");
+        assert_eq!(file.insertions, Some(2));
+        assert_eq!(file.deletions, Some(1));
+        assert!(file.hunk.as_deref().unwrap().contains("[REDACTED]"));
+        assert!(!file.hunk.as_deref().unwrap().contains("newsecret"));
+        let rendered = serde_json::to_string(&file.hunks).unwrap();
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("oldsecret"));
+        assert!(!rendered.contains("newsecret"));
+    }
+
+    #[test]
+    fn diff_native_trees_drops_policy_paths_before_emit() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let old = write_test_tree(repo, &[("safe.txt", b"old\n", false)]);
+        let new = write_test_tree(
+            repo,
+            &[
+                ("safe.txt", b"new\n", false),
+                (".forge/forge.db", b"internal\n", false),
+                (".env", b"TOKEN=secret\n", false),
+            ],
+        );
+        let store = NativeObjectStore::new(repo);
+
+        let diff = diff_native_trees(&store, &old, &new, &DiffOptions::default()).unwrap();
+        assert_eq!(
+            diff.files
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["safe.txt"]
+        );
+        assert!(diff
+            .dropped_secret_paths
+            .contains(&".forge/forge.db".to_string()));
+        assert!(diff.dropped_secret_paths.contains(&".env".to_string()));
+    }
+
+    #[test]
+    fn diff_native_trees_handles_binary_and_truncates_structured_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let old = write_test_tree(
+            repo,
+            &[("bin.dat", b"a\0b", false), ("big.txt", b"start\n", false)],
+        );
+        let big = format!("start\n{}", "line\n".repeat(2000));
+        let new = write_test_tree(
+            repo,
+            &[
+                ("bin.dat", b"a\0c", false),
+                ("big.txt", big.as_bytes(), false),
+            ],
+        );
+        let store = NativeObjectStore::new(repo);
+
+        let diff = diff_native_trees(&store, &old, &new, &DiffOptions::default()).unwrap();
+        let by_path: BTreeMap<_, _> = diff.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        assert!(by_path["bin.dat"].binary);
+        assert_eq!(by_path["bin.dat"].insertions, None);
+        assert!(by_path["bin.dat"].hunks.is_empty());
+        assert!(by_path["big.txt"].truncated);
+        assert!(by_path["big.txt"].hunk.as_deref().unwrap().len() <= HUNK_LIMIT);
+        assert!(serde_json::to_vec(&by_path["big.txt"].hunks).unwrap().len() <= HUNK_LIMIT);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn diff_native_trees_reports_chmod_and_symlink_without_line_hunks() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        fs::write(repo.join("script.sh"), b"echo hi\n").unwrap();
+        let store = NativeObjectStore::new(repo);
+        let old = write_tree(
+            &store,
+            repo,
+            &[FileEntry {
+                path: "script.sh".to_string(),
+                executable: false,
+                symlink_target: None,
+            }],
+            "",
+        )
+        .unwrap();
+        fs::set_permissions(repo.join("script.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        let new = write_tree(
+            &store,
+            repo,
+            &[
+                FileEntry {
+                    path: "script.sh".to_string(),
+                    executable: true,
+                    symlink_target: None,
+                },
+                FileEntry {
+                    path: "link".to_string(),
+                    executable: false,
+                    symlink_target: Some("script.sh".to_string()),
+                },
+            ],
+            "",
+        )
+        .unwrap();
+
+        let diff = diff_native_trees(&store, &old, &new, &DiffOptions::default()).unwrap();
+        let by_path: BTreeMap<_, _> = diff.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        assert_eq!(by_path["script.sh"].status, "M");
+        assert!(by_path["script.sh"].hunks.is_empty());
+        assert_eq!(by_path["link"].status, "A");
+        assert!(by_path["link"].hunks.is_empty());
+    }
+
+    #[test]
+    fn diff_native_trees_detects_exact_and_inexact_renames() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let old = write_test_tree(
+            repo,
+            &[
+                ("old.txt", b"a\nb\nc\n", false),
+                ("move.txt", b"one\ntwo\nthree\nfour\n", false),
+            ],
+        );
+        let new = write_test_tree(
+            repo,
+            &[
+                ("new.txt", b"a\nb\nc\n", false),
+                ("moved.txt", b"one\ntwo\nthree\nchanged\n", false),
+            ],
+        );
+        let store = NativeObjectStore::new(repo);
+
+        let diff = diff_native_trees(&store, &old, &new, &DiffOptions::default()).unwrap();
+        let by_path: BTreeMap<_, _> = diff.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        assert_eq!(by_path["new.txt"].status, "R100");
+        assert_eq!(by_path["new.txt"].old_path.as_deref(), Some("old.txt"));
+        assert!(by_path["moved.txt"].status.starts_with('R'));
+        assert_eq!(by_path["moved.txt"].old_path.as_deref(), Some("move.txt"));
+        assert!(by_path["moved.txt"].similarity.unwrap() >= 50);
+    }
+
+    #[test]
+    fn diff_native_trees_never_leaks_secret_old_path_through_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let old = write_test_tree(repo, &[(".env", b"API_TOKEN=oldsecret\nshared\n", false)]);
+        let new = write_test_tree(
+            repo,
+            &[("public.txt", b"API_TOKEN=oldsecret\nshared\n", false)],
+        );
+        let store = NativeObjectStore::new(repo);
+
+        let diff = diff_native_trees(&store, &old, &new, &DiffOptions::default()).unwrap();
+        assert!(diff
+            .files
+            .iter()
+            .all(|file| file.old_path.as_deref() != Some(".env")));
+        assert!(diff.dropped_secret_paths.contains(&".env".to_string()));
+    }
+
+    #[test]
+    fn diff_native_trees_skips_inexact_rename_when_limit_exceeded() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let old = write_test_tree(repo, &[("a.txt", b"a\n", false), ("b.txt", b"b\n", false)]);
+        let new = write_test_tree(repo, &[("c.txt", b"c\n", false), ("d.txt", b"d\n", false)]);
+        let store = NativeObjectStore::new(repo);
+        let options = DiffOptions {
+            rename_limit: 1,
+            ..DiffOptions::default()
+        };
+
+        let diff = diff_native_trees(&store, &old, &new, &options).unwrap();
+        assert!(diff
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "rename_detection_skipped"));
+        assert!(diff.files.iter().all(|file| !file.status.starts_with('R')));
+    }
+
+    #[test]
+    fn diff_native_tree_corrupt_blob_error_is_path_free() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let old = write_test_tree(repo, &[("app.txt", b"old\n", false)]);
+        let new = write_test_tree(repo, &[("app.txt", b"new\n", false)]);
+        let store = NativeObjectStore::new(repo);
+        let blob = store.tree_fingerprints(&new).unwrap()["app.txt"].0.clone();
+        let blob_id = ObjectId::parse(&blob).unwrap();
+        fs::write(store.object_path(&blob_id), b"corrupt").unwrap();
+
+        let error = diff_native_trees(&store, &old, &new, &DiffOptions::default()).unwrap_err();
+        let object_path = store.object_path(&blob_id).to_string_lossy().into_owned();
+        assert!(!error.to_string().contains(&object_path));
+        assert!(!format!("{error:#}").contains(&object_path));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn diff_working_vs_tree_uses_policy_filtered_symlink_aware_overlay() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let root = write_test_tree(
+            repo,
+            &[("app.txt", b"old\n", false), ("gone.txt", b"bye\n", false)],
+        );
+        fs::remove_file(repo.join("gone.txt")).unwrap();
+        fs::write(repo.join("app.txt"), b"new\n").unwrap();
+        fs::write(repo.join("added.txt"), b"added\n").unwrap();
+        fs::write(repo.join(".env"), b"API_TOKEN=secret\n").unwrap();
+        std::os::unix::fs::symlink("app.txt", repo.join("link")).unwrap();
+        let store = NativeObjectStore::new(repo);
+        let root_ref = format!("{FORGE_TREE_PREFIX}{root}");
+
+        let diff = diff_working_vs_tree(&store, repo, &root_ref, &DiffOptions::default()).unwrap();
+        let by_path: BTreeMap<_, _> = diff.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        assert_eq!(by_path["app.txt"].status, "M");
+        assert_eq!(by_path["added.txt"].status, "A");
+        assert_eq!(by_path["gone.txt"].status, "D");
+        assert_eq!(by_path["link"].status, "A");
+        assert!(by_path["link"].hunks.is_empty());
+        assert!(!by_path.contains_key(".env"));
     }
 
     #[test]

@@ -39,6 +39,8 @@ enum Command {
     Proposal(ProposalArgs),
     /// Compare competing attempts (per intent) on verified evidence + rank them.
     Compare(CompareArgs),
+    /// Diff native or git content refs, or the working tree against a native snapshot.
+    Diff(DiffArgs),
     /// Walk the native commit history (tip→genesis) and the evidence that justified it.
     Log(LogArgs),
     /// Materialize a past commit's tree into the worktree (does not move the base anchor).
@@ -62,9 +64,28 @@ struct CompareArgs {
     #[arg(long)]
     attempt: Option<String>,
     /// Two attempt ids to additionally produce a file/hunk content diff between their
-    /// proposals (via the git adapter): `--diff <attempt_a> <attempt_b>`.
+    /// proposals: `--diff <attempt_a> <attempt_b>`.
     #[arg(long, num_args = 2, value_names = ["ATTEMPT_A", "ATTEMPT_B"])]
     diff: Option<Vec<String>>,
+}
+
+#[derive(Debug, Args)]
+struct DiffArgs {
+    /// Content ref for the old side (`forge-tree:...` or `git-tree:...`). Omit with --working.
+    #[arg(long)]
+    from: Option<String>,
+    /// Content ref for the new/base side (`forge-tree:...` or `git-tree:...`).
+    #[arg(long)]
+    to: String,
+    /// Diff the current working tree against --to.
+    #[arg(long)]
+    working: bool,
+    /// Enable rename detection, optionally overriding the similarity threshold (default 50).
+    #[arg(long, num_args = 0..=1, default_missing_value = "50")]
+    find_renames: Option<u8>,
+    /// Disable rename detection.
+    #[arg(long)]
+    no_renames: bool,
 }
 
 #[derive(Debug, Args)]
@@ -270,6 +291,7 @@ fn main() -> ExitCode {
         Command::Show(args) => show_response(request_id, args),
         Command::Proposal(args) => proposal_response(request_id, args),
         Command::Compare(args) => compare_response(request_id, "compare", args),
+        Command::Diff(args) => diff_response(request_id, args),
         Command::Log(args) => log_response(request_id, args),
         Command::Checkout(args) => checkout_response(request_id, args),
         Command::Undo => undo_response(request_id),
@@ -465,9 +487,10 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
 /// `forge compare` / `forge attempt compare` — the read-only compare/rank surface
 /// (NER-137). Both forms share this handler. Returns the per-intent grouped, ranked
 /// comparison; with `--diff <a> <b>` it additionally attaches the file/hunk content
-/// diff between the two attempts' proposals (via the git adapter). Read-only: no
-/// operation_id, no lock. Secret-risk changed paths are already dropped by the store;
-/// any dropped paths in the pairwise diff surface as warnings.
+/// diff between the two attempts' proposals. Native refs use the native diff engine;
+/// git refs keep the git interop adapter. Read-only: no operation_id, no lock.
+/// Secret-risk changed paths are already dropped by the store; any dropped paths in
+/// the pairwise diff surface as warnings.
 fn compare_response(
     request_id: Option<String>,
     command: &'static str,
@@ -485,22 +508,81 @@ fn compare_response(
             // clap enforces exactly two values for --diff.
             let ref_a = forge_store::attempt_proposal_content_ref(&cwd, &pair[0])?;
             let ref_b = forge_store::attempt_proposal_content_ref(&cwd, &pair[1])?;
-            let tree_diff = forge_export_git::diff_trees(&cwd, &ref_a, &ref_b, true)?;
-            warnings.extend(secret_export_warnings(&tree_diff.dropped_secret_paths));
-            // Surface hunk truncation at the envelope level so an agent that only reads
-            // warnings[] (not data.diff.files[].truncated) knows the diff is incomplete.
-            for file in &tree_diff.files {
-                if file.truncated {
-                    warnings.push(format!(
-                        "diff hunk truncated for {} (body exceeded the per-file cap)",
-                        file.path
-                    ));
-                }
-            }
+            let tree_diff = diff_content_refs(&cwd, &ref_a, &ref_b, native_diff_options(true))?;
+            collect_diff_warnings(&tree_diff, &mut warnings);
             data["diff"] = serde_json::to_value(&tree_diff)?;
         }
         Ok((None, data, warnings))
     })
+}
+
+fn diff_response(request_id: Option<String>, args: DiffArgs) -> ResponseEnvelope {
+    command_result("diff", request_id, |cwd, _| {
+        let options = forge_content_native::DiffOptions {
+            include_hunks: true,
+            detect_renames: !args.no_renames,
+            rename_threshold: args.find_renames.unwrap_or(50),
+            rename_limit: 1000,
+        };
+        let tree_diff = if args.working {
+            if args.from.is_some() {
+                anyhow::bail!("--working cannot be combined with --from");
+            }
+            let store = forge_content_native::NativeObjectStore::new(&cwd);
+            forge_content_native::diff_working_vs_tree(&store, &cwd, &args.to, &options)?
+        } else {
+            let from = args
+                .from
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("diff requires --from unless --working is set"))?;
+            diff_content_refs(&cwd, from, &args.to, options)?
+        };
+        let mut warnings = Vec::new();
+        collect_diff_warnings(&tree_diff, &mut warnings);
+        Ok((None, serde_json::to_value(&tree_diff)?, warnings))
+    })
+}
+
+fn native_diff_options(include_hunks: bool) -> forge_content_native::DiffOptions {
+    forge_content_native::DiffOptions {
+        include_hunks,
+        ..forge_content_native::DiffOptions::default()
+    }
+}
+
+fn diff_content_refs(
+    repo_root: &Path,
+    ref_a: &str,
+    ref_b: &str,
+    options: forge_content_native::DiffOptions,
+) -> Result<forge_content::TreeDiff> {
+    match (classify_content_ref(ref_a), classify_content_ref(ref_b)) {
+        (ContentRefKind::ForgeTree(_), ContentRefKind::ForgeTree(_)) => {
+            let store = forge_content_native::NativeObjectStore::new(repo_root);
+            forge_content_native::diff_native_content_refs(&store, ref_a, ref_b, &options)
+        }
+        _ => forge_export_git::diff_trees(repo_root, ref_a, ref_b, options.include_hunks),
+    }
+}
+
+fn collect_diff_warnings(tree_diff: &forge_content::TreeDiff, warnings: &mut Vec<String>) {
+    warnings.extend(secret_export_warnings(&tree_diff.dropped_secret_paths));
+    warnings.extend(
+        tree_diff
+            .warnings
+            .iter()
+            .map(|warning| warning.message.clone()),
+    );
+    // Surface hunk truncation at the envelope level so an agent that only reads
+    // warnings[] (not data.diff.files[].truncated) knows the diff is incomplete.
+    for file in &tree_diff.files {
+        if file.truncated {
+            warnings.push(format!(
+                "diff hunk truncated for {} (body exceeded the per-file cap)",
+                file.path
+            ));
+        }
+    }
 }
 
 fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> ResponseEnvelope {

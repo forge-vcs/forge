@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use forge_content::{classify_content_ref, ContentBackend, ContentRefKind};
+use forge_content::{classify_content_ref, ContentBackend, ContentRefKind, FileDiff, TreeDiff};
 use forge_store::ForgeError;
 use serde::Serialize;
 use std::path::Path;
@@ -19,32 +19,6 @@ const FORGE_SYNTH_BASE_MESSAGE: &str = "Forge native base";
 /// the same so diff hunks and captured evidence excerpts share one bound. A hunk
 /// longer than this is truncated with `truncated: true`.
 const HUNK_LIMIT: usize = 4096;
-
-/// One file's change between two trees (NER-137, Phase 6). `status` is git's
-/// name-status letter (`A`/`M`/`D`/`R…`/`C…`). `insertions`/`deletions` come from
-/// numstat (`None` for a binary file, which git reports as `-`). `hunk` carries the
-/// redacted, bounded unified diff body and is populated only when hunks were
-/// requested and the file is non-secret and non-binary.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct FileDiff {
-    pub path: String,
-    pub status: String,
-    pub insertions: Option<u64>,
-    pub deletions: Option<u64>,
-    pub binary: bool,
-    pub hunk: Option<String>,
-    pub truncated: bool,
-}
-
-/// The content-level diff between two proposals' trees, produced via the git adapter
-/// (NER-137 feature 3 — native diff with rename detection is Phase 8). Secret-risk
-/// paths are dropped from `files` and listed in `dropped_secret_paths` so the caller
-/// can surface them as a warning rather than leaking the filename.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct TreeDiff {
-    pub files: Vec<FileDiff>,
-    pub dropped_secret_paths: Vec<String>,
-}
 
 /// Diff two proposals' `content_ref`s at file (and optionally hunk) granularity,
 /// **via the git adapter** (NER-137 U2). Both refs are resolved to git tree hashes
@@ -134,6 +108,9 @@ pub fn diff_trees(
             binary,
             hunk,
             truncated,
+            hunks: Vec::new(),
+            old_path: None,
+            similarity: None,
         });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -141,6 +118,7 @@ pub fn diff_trees(
     Ok(TreeDiff {
         files,
         dropped_secret_paths,
+        warnings: Vec::new(),
     })
 }
 

@@ -3432,7 +3432,7 @@ pub struct AttemptCompareRow {
     pub proposal: Option<ComparedProposal>,
     /// Secret-redacted file-level diff summary of the proposal vs its base — the paths
     /// the snapshot changed (the per-attempt "diff summary"). The richer pairwise
-    /// file/hunk content diff is the CLI's `compare --diff` path via the git adapter.
+    /// file/hunk content diff is the CLI's backend-routed `compare --diff` path.
     pub changed_paths: Vec<String>,
     pub changed_count: usize,
     pub gates: Vec<forge_policy::GateResult>,
@@ -3777,7 +3777,7 @@ fn rank_compare_rows(rows: &mut Vec<AttemptCompareRow>) {
 }
 
 /// The latest proposal's `content_ref` for an attempt — the diffable tree the pairwise
-/// `compare --diff` path feeds to the git adapter (NER-137). Errors `UnknownAttempt`
+/// `compare --diff` path feeds to the CLI diff router. Errors `UnknownAttempt`
 /// when the attempt does not exist, `NoProposal` when it has no proposal yet.
 pub fn attempt_proposal_content_ref(cwd: &Path, attempt_id: &str) -> Result<String> {
     let context = open_repository(cwd)?;

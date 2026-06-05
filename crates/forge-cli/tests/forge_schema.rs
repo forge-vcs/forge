@@ -200,7 +200,7 @@ fn commands_list_the_lifecycle() {
         })
         .collect();
 
-    for expected in ["init", "save", "accept", "export branch", "schema"] {
+    for expected in ["init", "save", "accept", "diff", "export branch", "schema"] {
         assert!(
             commands.contains(expected),
             "commands[] is missing {expected}"
