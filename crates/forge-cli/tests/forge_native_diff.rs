@@ -122,6 +122,8 @@ fn forge_diff_working_vs_snapshot_detects_renames_and_emits_hunks() {
     assert_eq!(renamed["old_path"], "app.txt");
     assert!(renamed["status"].as_str().unwrap().starts_with('R'));
     assert!(renamed["similarity"].as_u64().unwrap() >= 50);
+    assert_eq!(renamed["insertions"], 1);
+    assert_eq!(renamed["deletions"], 0);
     assert!(renamed["hunk"].as_str().unwrap().contains("forge"));
     assert!(!renamed["hunks"].as_array().unwrap().is_empty());
 }
