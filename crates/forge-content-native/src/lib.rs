@@ -1561,7 +1561,7 @@ fn build_file_diff(
 
     let (insertions, deletions, hunk, hunks, truncated) = if binary {
         (None, None, None, Vec::new(), false)
-    } else if symlink || !include_hunks {
+    } else if symlink {
         let insertions = new_bytes
             .as_ref()
             .map(|bytes| split_lines(bytes).len() as u64);
@@ -1572,14 +1572,19 @@ fn build_file_diff(
     } else {
         let old_bytes = old_bytes.as_deref().unwrap_or(&[]);
         let new_bytes = new_bytes.as_deref().unwrap_or(&[]);
-        let body = diff_text_bytes(old_bytes, new_bytes)?;
-        (
-            Some(body.insertions),
-            Some(body.deletions),
-            body.hunk,
-            body.hunks,
-            body.truncated,
-        )
+        if include_hunks {
+            let body = diff_text_bytes(old_bytes, new_bytes)?;
+            (
+                Some(body.insertions),
+                Some(body.deletions),
+                body.hunk,
+                body.hunks,
+                body.truncated,
+            )
+        } else {
+            let (insertions, deletions) = diff_text_counts(old_bytes, new_bytes);
+            (Some(insertions), Some(deletions), None, Vec::new(), false)
+        }
     };
 
     Ok(FileDiff {
@@ -1701,6 +1706,24 @@ fn diff_text_bytes(old: &[u8], new: &[u8]) -> Result<TextDiffBody> {
         hunks,
         truncated,
     })
+}
+
+fn diff_text_counts(old: &[u8], new: &[u8]) -> (u64, u64) {
+    let old_lines = split_lines(old);
+    let new_lines = split_lines(new);
+    let ops = similar::capture_diff_slices(similar::Algorithm::Patience, &old_lines, &new_lines);
+    let mut insertions = 0u64;
+    let mut deletions = 0u64;
+    for op in ops {
+        for change in op.iter_changes(&old_lines, &new_lines) {
+            match change.tag() {
+                similar::ChangeTag::Equal => {}
+                similar::ChangeTag::Delete => deletions += 1,
+                similar::ChangeTag::Insert => insertions += 1,
+            }
+        }
+    }
+    (insertions, deletions)
 }
 
 fn split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
@@ -2071,6 +2094,28 @@ mod tests {
         assert!(by_path["big.txt"].truncated);
         assert!(by_path["big.txt"].hunk.as_deref().unwrap().len() <= HUNK_LIMIT);
         assert!(serde_json::to_vec(&by_path["big.txt"].hunks).unwrap().len() <= HUNK_LIMIT);
+    }
+
+    #[test]
+    fn diff_native_trees_counts_text_changes_when_hunks_are_suppressed() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let old = write_test_tree(repo, &[("app.txt", b"one\ntwo\nthree\n", false)]);
+        let new = write_test_tree(repo, &[("app.txt", b"one\nTWO\nthree\nfour\n", false)]);
+        let store = NativeObjectStore::new(repo);
+        let options = DiffOptions {
+            include_hunks: false,
+            ..DiffOptions::default()
+        };
+
+        let diff = diff_native_trees(&store, &old, &new, &options).unwrap();
+        let file = &diff.files[0];
+        assert_eq!(file.status, "M");
+        assert_eq!(file.insertions, Some(2));
+        assert_eq!(file.deletions, Some(1));
+        assert!(file.hunk.is_none());
+        assert!(file.hunks.is_empty());
+        assert!(!file.truncated);
     }
 
     #[test]

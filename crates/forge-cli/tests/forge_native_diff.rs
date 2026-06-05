@@ -101,6 +101,33 @@ fn forge_diff_working_vs_snapshot_is_policy_filtered_and_symlink_aware() {
 
 #[test]
 #[cfg(unix)]
+fn forge_diff_working_vs_snapshot_detects_renames_and_emits_hunks() {
+    let repo = TestRepo::new_git();
+    let (_intent_id, attempt_id) = start_native(&repo);
+    std::fs::write(repo.path().join("app.txt"), "hello\nworld\n").unwrap();
+    let saved = forge_ok(&repo, &["save", "--attempt", &attempt_id]);
+    let snapshot_ref = saved["data"]["content_ref"].as_str().unwrap().to_string();
+
+    std::fs::rename(repo.path().join("app.txt"), repo.path().join("renamed.txt")).unwrap();
+    std::fs::write(repo.path().join("renamed.txt"), "hello\nforge\nworld\n").unwrap();
+
+    let out = forge_ok(
+        &repo,
+        &["diff", "--working", "--to", &snapshot_ref, "--find-renames"],
+    );
+    let files = out["data"]["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    let renamed = &files[0];
+    assert_eq!(renamed["path"], "renamed.txt");
+    assert_eq!(renamed["old_path"], "app.txt");
+    assert!(renamed["status"].as_str().unwrap().starts_with('R'));
+    assert!(renamed["similarity"].as_u64().unwrap() >= 50);
+    assert!(renamed["hunk"].as_str().unwrap().contains("forge"));
+    assert!(!renamed["hunks"].as_array().unwrap().is_empty());
+}
+
+#[test]
+#[cfg(unix)]
 fn native_compare_diff_runs_with_git_removed_from_path() {
     let repo = TestRepo::new_git();
     let (attempt_a, attempt_b) = native_rename_attempts(&repo);
