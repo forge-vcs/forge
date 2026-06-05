@@ -1431,10 +1431,9 @@ fn detect_renames(
         if is_ignored_by_policy(old_path) {
             continue;
         }
-        if let Some((new_path, new_fp)) = added
-            .iter()
-            .find(|(new_path, new_fp)| !is_ignored_by_policy(new_path) && new_fp.0 == old_fp.0)
-        {
+        if let Some((new_path, new_fp)) = added.iter().find(|(new_path, new_fp)| {
+            !is_ignored_by_policy(new_path) && new_fp.0 == old_fp.0 && new_fp.1 == old_fp.1
+        }) {
             exact_pairs.push((
                 old_path.clone(),
                 new_path.clone(),
@@ -1475,6 +1474,7 @@ fn detect_renames(
                 if is_ignored_by_policy(new_path)
                     || old_fp.1 == SYMLINK_MODE
                     || new_fp.1 == SYMLINK_MODE
+                    || old_fp.1 != new_fp.1
                 {
                     continue;
                 }
@@ -1561,7 +1561,7 @@ fn build_file_diff(
 
     let (insertions, deletions, hunk, hunks, truncated) = if binary {
         (None, None, None, Vec::new(), false)
-    } else if symlink || !include_hunks {
+    } else if symlink {
         let insertions = new_bytes
             .as_ref()
             .map(|bytes| split_lines(bytes).len() as u64);
@@ -1572,7 +1572,7 @@ fn build_file_diff(
     } else {
         let old_bytes = old_bytes.as_deref().unwrap_or(&[]);
         let new_bytes = new_bytes.as_deref().unwrap_or(&[]);
-        let body = diff_text_bytes(old_bytes, new_bytes)?;
+        let body = diff_text_bytes(old_bytes, new_bytes, include_hunks)?;
         (
             Some(body.insertions),
             Some(body.deletions),
@@ -1624,7 +1624,7 @@ struct TextDiffBody {
     truncated: bool,
 }
 
-fn diff_text_bytes(old: &[u8], new: &[u8]) -> Result<TextDiffBody> {
+fn diff_text_bytes(old: &[u8], new: &[u8], include_hunks: bool) -> Result<TextDiffBody> {
     let old_lines = split_lines(old);
     let new_lines = split_lines(new);
     let ops = similar::capture_diff_slices(similar::Algorithm::Patience, &old_lines, &new_lines);
@@ -1638,44 +1638,57 @@ fn diff_text_bytes(old: &[u8], new: &[u8]) -> Result<TextDiffBody> {
     for group in groups {
         let Some(first) = group.first() else { continue };
         let Some(last) = group.last() else { continue };
-        let (_, first_old, first_new) = first.as_tag_tuple();
-        let (_, last_old, last_new) = last.as_tag_tuple();
-        let old_start = first_old.start as u64 + 1;
-        let new_start = first_new.start as u64 + 1;
-        let old_lines_count = last_old.end.saturating_sub(first_old.start) as u64;
-        let new_lines_count = last_new.end.saturating_sub(first_new.start) as u64;
-        text.push_str(&format!(
-            "@@ -{},{} +{},{} @@\n",
-            old_start, old_lines_count, new_start, new_lines_count
-        ));
+        let mut hunk_header = None;
+        if include_hunks {
+            let (_, first_old, first_new) = first.as_tag_tuple();
+            let (_, last_old, last_new) = last.as_tag_tuple();
+            let old_start = first_old.start as u64 + 1;
+            let new_start = first_new.start as u64 + 1;
+            let old_lines_count = last_old.end.saturating_sub(first_old.start) as u64;
+            let new_lines_count = last_new.end.saturating_sub(first_new.start) as u64;
+            text.push_str(&format!(
+                "@@ -{},{} +{},{} @@\n",
+                old_start, old_lines_count, new_start, new_lines_count
+            ));
+            hunk_header = Some((old_start, old_lines_count, new_start, new_lines_count));
+        }
         let mut lines = Vec::new();
         for op in &group {
             for change in op.iter_changes(&old_lines, &new_lines) {
-                let (tag, prefix) = match change.tag() {
-                    similar::ChangeTag::Equal => (DiffLineTag::Context, ' '),
+                let tag = match change.tag() {
+                    similar::ChangeTag::Equal => DiffLineTag::Context,
                     similar::ChangeTag::Delete => {
                         deletions += 1;
-                        (DiffLineTag::Delete, '-')
+                        DiffLineTag::Delete
                     }
                     similar::ChangeTag::Insert => {
                         insertions += 1;
-                        (DiffLineTag::Insert, '+')
+                        DiffLineTag::Insert
                     }
                 };
-                let line = line_to_redacted_string(change.value().as_slice());
-                text.push(prefix);
-                text.push_str(&line);
-                text.push('\n');
-                lines.push(DiffLine { tag, content: line });
+                if include_hunks {
+                    let prefix = match tag {
+                        DiffLineTag::Context => ' ',
+                        DiffLineTag::Delete => '-',
+                        DiffLineTag::Insert => '+',
+                    };
+                    let line = line_to_redacted_string(change.value().as_slice());
+                    text.push(prefix);
+                    text.push_str(&line);
+                    text.push('\n');
+                    lines.push(DiffLine { tag, content: line });
+                }
             }
         }
-        hunks.push(HunkDiff {
-            old_start,
-            old_lines: old_lines_count,
-            new_start,
-            new_lines: new_lines_count,
-            lines,
-        });
+        if let Some((old_start, old_lines_count, new_start, new_lines_count)) = hunk_header {
+            hunks.push(HunkDiff {
+                old_start,
+                old_lines: old_lines_count,
+                new_start,
+                new_lines: new_lines_count,
+                lines,
+            });
+        }
     }
 
     let mut truncated = false;
@@ -2074,6 +2087,28 @@ mod tests {
     }
 
     #[test]
+    fn diff_native_trees_counts_text_changes_when_hunks_are_suppressed() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let old = write_test_tree(repo, &[("app.txt", b"one\ntwo\nthree\n", false)]);
+        let new = write_test_tree(repo, &[("app.txt", b"one\nTWO\nthree\nfour\n", false)]);
+        let store = NativeObjectStore::new(repo);
+        let options = DiffOptions {
+            include_hunks: false,
+            ..DiffOptions::default()
+        };
+
+        let diff = diff_native_trees(&store, &old, &new, &options).unwrap();
+        let file = &diff.files[0];
+        assert_eq!(file.status, "M");
+        assert_eq!(file.insertions, Some(2));
+        assert_eq!(file.deletions, Some(1));
+        assert!(file.hunk.is_none());
+        assert!(file.hunks.is_empty());
+        assert!(!file.truncated);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn diff_native_trees_reports_chmod_and_symlink_without_line_hunks() {
         let temp = tempfile::tempdir().unwrap();
@@ -2146,6 +2181,61 @@ mod tests {
         assert!(by_path["moved.txt"].status.starts_with('R'));
         assert_eq!(by_path["moved.txt"].old_path.as_deref(), Some("move.txt"));
         assert!(by_path["moved.txt"].similarity.unwrap() >= 50);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn diff_native_trees_does_not_pair_renames_across_mode_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let old = write_test_tree(repo, &[("old.txt", b"same\n", false)]);
+        let new = write_test_tree(repo, &[("new.txt", b"same\n", true)]);
+        let store = NativeObjectStore::new(repo);
+
+        let diff = diff_native_trees(&store, &old, &new, &DiffOptions::default()).unwrap();
+        let by_path: BTreeMap<_, _> = diff.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        assert_eq!(by_path["old.txt"].status, "D");
+        assert_eq!(by_path["new.txt"].status, "A");
+        assert!(diff.files.iter().all(|file| !file.status.starts_with('R')));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn diff_native_trees_does_not_pair_regular_file_to_symlink_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        fs::write(repo.join("old.txt"), b"target").unwrap();
+        let store = NativeObjectStore::new(repo);
+        let old = write_tree(
+            &store,
+            repo,
+            &[FileEntry {
+                path: "old.txt".to_string(),
+                executable: false,
+                symlink_target: None,
+            }],
+            "",
+        )
+        .unwrap();
+
+        std::os::unix::fs::symlink("target", repo.join("link")).unwrap();
+        let new = write_tree(
+            &store,
+            repo,
+            &[FileEntry {
+                path: "link".to_string(),
+                executable: false,
+                symlink_target: Some("target".to_string()),
+            }],
+            "",
+        )
+        .unwrap();
+
+        let diff = diff_native_trees(&store, &old, &new, &DiffOptions::default()).unwrap();
+        let by_path: BTreeMap<_, _> = diff.files.iter().map(|f| (f.path.as_str(), f)).collect();
+        assert_eq!(by_path["old.txt"].status, "D");
+        assert_eq!(by_path["link"].status, "A");
+        assert!(diff.files.iter().all(|file| !file.status.starts_with('R')));
     }
 
     #[test]
