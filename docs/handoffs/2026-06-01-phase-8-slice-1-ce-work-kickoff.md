@@ -1,6 +1,6 @@
 # Handoff — NER-139 Phase 8 · Slice S1 (native content diff) · `/ce-work` kickoff
 
-**Date:** 2026-06-01 · **Ticket:** Linear **NER-139** (XL), Forge project `2b5e82f7-7a78-4354-af7d-68609e6e77bc`, team **SE Engineers**, prefix **NER** · **Plan (authoritative):** `docs/plans/2026-05-31-016-feat-phase-8-slice-1-native-diff-plan.md` · **Origin requirements:** `docs/brainstorms/2026-05-31-ner-139-phase-8-requirements.md`
+**Date:** 2026-06-01 · **Ticket:** Linear **NER-139** (XL), Forge project `2b5e82f7-7a78-4354-af7d-68609e6e77bc`, team **SE Engineers**, prefix **NER** · **Plan (authoritative):** `docs/plans/completed/2026-05-31-016-feat-phase-8-slice-1-native-diff-plan.md` · **Origin requirements:** `docs/brainstorms/2026-05-31-ner-139-phase-8-requirements.md`
 
 ## Where things stand
 
@@ -77,13 +77,13 @@ Current expected repo context:
 
 Read first:
 1. `docs/handoffs/2026-06-01-phase-8-slice-1-ce-work-kickoff.md`
-2. `docs/plans/2026-05-31-016-feat-phase-8-slice-1-native-diff-plan.md`
+2. `docs/plans/completed/2026-05-31-016-feat-phase-8-slice-1-native-diff-plan.md`
 3. `docs/brainstorms/2026-05-31-ner-139-phase-8-requirements.md`
 4. `docs/ROADMAP.md` Phase 8 and Phase 9 boundary
 5. Relevant learnings in `docs/solutions/architecture-patterns/`, especially native walker / commit-on-accept / mode+symlink keying notes
 
 Then run the Compound Engineering work flow against the authoritative plan:
-`compound-engineering:ce-work docs/plans/2026-05-31-016-feat-phase-8-slice-1-native-diff-plan.md`
+`compound-engineering:ce-work docs/plans/completed/2026-05-31-016-feat-phase-8-slice-1-native-diff-plan.md`
 
 Scope to implement:
 - U1: move shared diff types into `forge-content`, add `similar` with `bytes`, expose native tree fingerprints.
