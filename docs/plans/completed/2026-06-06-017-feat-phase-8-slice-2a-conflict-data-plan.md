@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 8 Slice 2a - Conflict-as-data substrate + multi-parent native walkers"
 type: feat
-status: active
+status: completed
 date: 2026-06-06
 origin: docs/brainstorms/2026-05-31-ner-139-phase-8-requirements.md
 previous_plan: docs/plans/completed/2026-05-31-016-feat-phase-8-slice-1-native-diff-plan.md

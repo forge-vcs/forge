@@ -103,6 +103,43 @@ ckc "native export tree keeps feature.txt" "$ntree" "feature.txt"
 case "$ntree" in *".env"*) FAIL=$((FAIL+1)); FAILS+=(".env LEAKED into native exported tree"); printf '  \033[31m✗\033[0m .env must NOT be in the native exported branch tree\n';; *) PASS=$((PASS+1)); printf '  \033[32m✓\033[0m .env is absent from the native exported branch tree\n';; esac
 F restore "$nsnap" --yes; ck "native restore round-trips" "$(pg "d['status']")" "success"
 
+echo; echo "=== NATIVE merge + conflict resolution (Phase 8 S2b) ==="
+mkrepo native-merge-clean >/dev/null
+printf 'one\ntwo\nthree\nfour\n' > README.md
+F init --content-backend native >/dev/null
+F start "native clean merge"; mi="$(pg "d['data']['intent_id']")"; ma="$(pg "d['data']['attempt_id']")"
+F attempt start --intent "$mi"; mb="$(pg "d['data']['attempt_id']")"
+F attempt attach "$ma" >/dev/null
+printf 'ONE\ntwo\nthree\nfour\n' > README.md
+F save --attempt "$ma" >/dev/null; F run --attempt "$ma" -- true >/dev/null; F propose --attempt "$ma"; mpa="$(pg "d['data']['proposal_id']")"; F check --attempt "$ma" >/dev/null
+F attempt attach "$mb" >/dev/null
+printf 'one\ntwo\nthree\nFOUR\n' > README.md
+F save --attempt "$mb" >/dev/null; F run --attempt "$mb" -- true >/dev/null; F propose --attempt "$mb"; mpb="$(pg "d['data']['proposal_id']")"
+F accept --attempt "$ma" --proposal "$mpa" >/dev/null
+F merge --proposal "$mpb"; ck "native clean merge returns merged tree" "$(pg "d['data']['merged']")" "True"
+ckc "native clean merge content ref is forge-tree" "$(pg "d['data']['merged_content_ref']")" "forge-tree:"
+
+mkrepo native-merge-conflict >/dev/null
+printf 'one\ntwo\nthree\nfour\n' > README.md
+F init --content-backend native >/dev/null
+F start "native conflict merge"; ci="$(pg "d['data']['intent_id']")"; ca="$(pg "d['data']['attempt_id']")"
+F attempt start --intent "$ci"; cb="$(pg "d['data']['attempt_id']")"
+F attempt attach "$ca" >/dev/null
+printf 'one\nOURS\nthree\nfour\n' > README.md
+F save --attempt "$ca" >/dev/null; F run --attempt "$ca" -- true >/dev/null; F propose --attempt "$ca"; cpa="$(pg "d['data']['proposal_id']")"; F check --attempt "$ca" >/dev/null
+F attempt attach "$cb" >/dev/null
+printf 'one\nTHEIRS\nthree\nfour\n' > README.md
+F save --attempt "$cb" >/dev/null; F run --attempt "$cb" -- true >/dev/null; F propose --attempt "$cb"; cpb="$(pg "d['data']['proposal_id']")"
+F accept --attempt "$ca" --proposal "$cpa" >/dev/null
+F merge --proposal "$cpb"; ck "native conflicting merge returns conflict" "$(pg "d['data']['merged']")" "False"
+csid="$(pg "d['data']['conflict_set_id']")"
+F conflict show "$csid"; ck "native merge conflict is content-typed" "$(pg "d['data']['path_conflicts'][0]['kind']")" "content"
+resolution="$(pg "d['data']['conflict']['ours_content_ref']")"
+F conflict resolve "$csid" --tree "$resolution"; ck "native conflict resolve succeeds" "$(pg "d['status']")" "success"
+ckc "native conflict resolve records evidence" "$(pg "d['data']['evidence_id']")" "evidence_"
+F accept --attempt "$cb" --proposal "$cpb" --allow-unverified >/dev/null
+F log; ck "resolved native merge commit has two parents" "$(pg "len(next(c for c in d['data']['commits'] if c.get('proposal_revision_id') is not None)['parents'])")" "2"
+
 echo; echo "=== DECLARATIVE CHECK GATES (NER-135) ==="
 mkrepo gates >/dev/null
 F init >/dev/null
