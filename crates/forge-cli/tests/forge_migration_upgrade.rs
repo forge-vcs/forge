@@ -28,13 +28,13 @@ fn open(db: &Path) -> Connection {
 }
 
 /// Stamp `schema_migrations` with a HEAD+1 row, simulating a DB written by a newer
-/// Forge. The `init`-created ledger already carries the `checksum` column. NER-143 added
-/// migration 007, so HEAD is now 7 and HEAD+1 is 8 (version 7 is a valid current version that
+/// Forge. The `init`-created ledger already carries the `checksum` column. NER-139 added
+/// migration 008, so HEAD is now 8 and HEAD+1 is 9 (version 8 is a valid current version that
 /// the runner would accept — the refusal test requires a genuinely-ahead version).
 fn stamp_future_version(db: &Path) {
     let conn = open(db);
     conn.execute(
-        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (8, 'future', 0)",
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (9, 'future', 0)",
         [],
     )
     .expect("stamp future version");

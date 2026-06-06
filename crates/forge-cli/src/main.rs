@@ -41,6 +41,8 @@ enum Command {
     Compare(CompareArgs),
     /// Diff native or git content refs, or the working tree against a native snapshot.
     Diff(DiffArgs),
+    /// Inspect persisted conflict-as-data records.
+    Conflict(ConflictArgs),
     /// Walk the native commit history (tip→genesis) and the evidence that justified it.
     Log(LogArgs),
     /// Materialize a past commit's tree into the worktree (does not move the base anchor).
@@ -86,6 +88,18 @@ struct DiffArgs {
     /// Disable rename detection.
     #[arg(long)]
     no_renames: bool,
+}
+
+#[derive(Debug, Args)]
+struct ConflictArgs {
+    #[command(subcommand)]
+    command: ConflictCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConflictCommand {
+    List,
+    Show { conflict_set_id: String },
 }
 
 #[derive(Debug, Args)]
@@ -292,6 +306,7 @@ fn main() -> ExitCode {
         Command::Proposal(args) => proposal_response(request_id, args),
         Command::Compare(args) => compare_response(request_id, "compare", args),
         Command::Diff(args) => diff_response(request_id, args),
+        Command::Conflict(args) => conflict_response(request_id, args),
         Command::Log(args) => log_response(request_id, args),
         Command::Checkout(args) => checkout_response(request_id, args),
         Command::Undo => undo_response(request_id),
@@ -352,6 +367,9 @@ fn command_from_args(args: &[String]) -> String {
         [command, subcommand, ..]
             if matches!(command.as_str(), "export" | "attempt" | "proposal") =>
         {
+            format!("{command} {subcommand}")
+        }
+        [command, subcommand, ..] if matches!(command.as_str(), "conflict") => {
             format!("{command} {subcommand}")
         }
         [command, ..] => command.clone(),
@@ -541,6 +559,27 @@ fn diff_response(request_id: Option<String>, args: DiffArgs) -> ResponseEnvelope
         collect_diff_warnings(&tree_diff, &mut warnings);
         Ok((None, serde_json::to_value(&tree_diff)?, warnings))
     })
+}
+
+fn conflict_response(request_id: Option<String>, args: ConflictArgs) -> ResponseEnvelope {
+    match args.command {
+        ConflictCommand::List => command_result("conflict list", request_id, |cwd, _| {
+            Ok((
+                None,
+                serde_json::to_value(forge_store::conflict_list(&cwd)?)?,
+                Vec::new(),
+            ))
+        }),
+        ConflictCommand::Show { conflict_set_id } => {
+            command_result("conflict show", request_id, |cwd, _| {
+                Ok((
+                    None,
+                    serde_json::to_value(forge_store::conflict_show(&cwd, &conflict_set_id)?)?,
+                    Vec::new(),
+                ))
+            })
+        }
+    }
 }
 
 fn native_diff_options(include_hunks: bool) -> forge_content_native::DiffOptions {
@@ -761,25 +800,21 @@ fn accept_response(request_id: Option<String>, args: AcceptArgs) -> ResponseEnve
             args.attempt.as_deref(),
             args.proposal.as_deref(),
         )?;
-        let current_head = selected_backend(&cwd)?.current_base(&cwd)?;
+        let backend = selected_backend(&cwd)?;
+        let current_head = backend.current_base(&cwd)?;
         if current_head != proposal.base_head {
-            // Persist the stale-base divergence under the held lock BEFORE bailing,
-            // so the otherwise-unused `conflict_sets` table records it (NER-133 U7).
-            // Metadata only — no merge engine. Best-effort: the conflict-set insert
-            // must NEVER mask the domain error, so its Result is discarded and
-            // STALE_BASE is always the surfaced error (FIX B). This CLI-layer read
-            // runs under the held repo lock; the evidence gate runs in-txn inside
-            // `decide` (NER-135), not here.
-            let _ = forge_store::record_conflict_set(
-                &cwd,
-                "stale_base_accept",
-                &proposal.base_head,
-                &current_head,
-                &proposal.changed_paths,
-            );
-            return Err(ForgeError::StaleBase {
-                expected_head: proposal.base_head.clone(),
-                actual_head: current_head,
+            let base_content_ref = backend.base_content_ref(&cwd, &proposal.base_head)?;
+            let ours_content_ref = backend.base_content_ref(&cwd, &current_head)?;
+            return Err(forge_store::StaleBaseConflict {
+                input: forge_store::StaleBaseConflictInput {
+                    context: "stale_base_accept".to_string(),
+                    expected_head: proposal.base_head.clone(),
+                    actual_head: current_head,
+                    base_content_ref,
+                    ours_content_ref,
+                    theirs_content_ref: proposal.content_ref.clone(),
+                    changed_paths: proposal.changed_paths.clone(),
+                },
             }
             .into());
         }
@@ -978,7 +1013,8 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                 // branch (NER-136 R4): a tampered decision row that forged `accepted`
                 // is refused here, under the held repo lock, so no branch is created.
                 forge_store::verify_decision_integrity(&cwd, &proposal.proposal_revision_id)?;
-                let current_head = selected_backend(&cwd)?.current_base(&cwd)?;
+                let backend = selected_backend(&cwd)?;
+                let current_head = backend.current_base(&cwd)?;
                 // CLI-layer stale-base pre-check mirroring `accept`: persist the
                 // divergence to `conflict_sets` under the held lock BEFORE bailing
                 // (NER-133 U7). NER-138 slice 3: after commit-on-accept the ref-store HEAD
@@ -994,19 +1030,18 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                 )?
                 .unwrap_or_else(|| proposal.base_head.clone());
                 if current_head != expected_head {
-                    // Best-effort metadata (FIX B): conflict-set persistence must
-                    // never mask the domain error, so discard the Result and always
-                    // surface STALE_BASE.
-                    let _ = forge_store::record_conflict_set(
-                        &cwd,
-                        "stale_base_export",
-                        &expected_head,
-                        &current_head,
-                        &proposal.changed_paths,
-                    );
-                    return Err(ForgeError::StaleBase {
-                        expected_head,
-                        actual_head: current_head,
+                    let base_content_ref = backend.base_content_ref(&cwd, &expected_head)?;
+                    let ours_content_ref = backend.base_content_ref(&cwd, &current_head)?;
+                    return Err(forge_store::StaleBaseConflict {
+                        input: forge_store::StaleBaseConflictInput {
+                            context: "stale_base_export".to_string(),
+                            expected_head,
+                            actual_head: current_head,
+                            base_content_ref,
+                            ours_content_ref,
+                            theirs_content_ref: proposal.content_ref.clone(),
+                            changed_paths: proposal.changed_paths.clone(),
+                        },
                     }
                     .into());
                 }
@@ -1239,8 +1274,23 @@ where
             // NOT be persisted under the `--request-id` — a later retry of the same
             // id should re-execute, not replay a sticky failure (R7). Deterministic
             // domain failures keep the status-aware replay contract.
-            let failed_operation_id = if is_mutating_command(command) && !is_transient_error(&error)
+            let failed_operation_id = if let Some(stale_conflict) =
+                error.downcast_ref::<forge_store::StaleBaseConflict>()
             {
+                env::current_dir().ok().and_then(|cwd| {
+                    forge_store::record_failed_operation_with_conflict(
+                        &cwd,
+                        request_id.clone(),
+                        command,
+                        &error_object.code,
+                        &error_object.message,
+                        error_object.details.clone(),
+                        &stale_conflict.input,
+                    )
+                    .ok()
+                    .map(|op| op.operation_id)
+                })
+            } else if is_mutating_command(command) && !is_transient_error(&error) {
                 env::current_dir().ok().and_then(|cwd| {
                     forge_store::record_failed_operation(
                         &cwd,
@@ -1407,6 +1457,18 @@ fn print_human(response: &ResponseEnvelope) {
 /// not-a-git-repo at `init` (the only place that classification is meaningful).
 fn error_to_object(command: &str, error: &anyhow::Error) -> (ErrorObject, RetryMetadata) {
     let message = error.to_string();
+    if let Some(stale_conflict) = error.downcast_ref::<forge_store::StaleBaseConflict>() {
+        let forge_error = stale_conflict.forge_error();
+        let retry = if forge_error.retryable() {
+            RetryMetadata::retryable(forge_error.after_ms())
+        } else {
+            RetryMetadata::no()
+        };
+        return (
+            ErrorObject::new(forge_error.code(), message).with_details(forge_error.details()),
+            retry,
+        );
+    }
     if let Some(forge_error) = error.downcast_ref::<ForgeError>() {
         let retry = if forge_error.retryable() {
             RetryMetadata::retryable(forge_error.after_ms())

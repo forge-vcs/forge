@@ -31,6 +31,7 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "PROVENANCE_MISMATCH",
     "MISSING_PROVENANCE_TRAILER",
     "NATIVE_HISTORY_CORRUPT",
+    "CONFLICT_SET_NOT_FOUND",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.
@@ -200,7 +201,16 @@ fn commands_list_the_lifecycle() {
         })
         .collect();
 
-    for expected in ["init", "save", "accept", "diff", "export branch", "schema"] {
+    for expected in [
+        "init",
+        "save",
+        "accept",
+        "diff",
+        "conflict list",
+        "conflict show",
+        "export branch",
+        "schema",
+    ] {
         assert!(
             commands.contains(expected),
             "commands[] is missing {expected}"

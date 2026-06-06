@@ -63,6 +63,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "007_expected_content_ref",
         include_str!("../migrations/007_expected_content_ref.sql"),
     ),
+    (
+        8,
+        "008_conflict_data",
+        include_str!("../migrations/008_conflict_data.sql"),
+    ),
 ];
 
 /// The highest migration version this binary knows how to apply.
@@ -412,7 +417,7 @@ mod tests {
 
     #[test]
     fn schema_head_is_max_version() {
-        assert_eq!(schema_head(), 7);
+        assert_eq!(schema_head(), 8);
     }
 
     #[test]
@@ -423,14 +428,14 @@ mod tests {
         assert_eq!(checksum, checksum_of("ALTER TABLE x ADD COLUMN y TEXT;"));
     }
 
-    /// Fresh apply reaches HEAD=7 with non-NULL checksums for every row.
+    /// Fresh apply reaches HEAD=8 with non-NULL checksums for every row.
     #[test]
     fn fresh_apply_reaches_head_with_checksums() {
         let mut conn = mem_conn();
         apply_pending_migrations(&mut conn).expect("apply migrations");
 
         let versions = applied_versions(&conn);
-        assert_eq!(versions.len(), 7);
+        assert_eq!(versions.len(), 8);
         assert_eq!(versions[0].0, 1);
         assert_eq!(versions[1].0, 2);
         assert_eq!(versions[2].0, 3);
@@ -438,6 +443,7 @@ mod tests {
         assert_eq!(versions[4].0, 5);
         assert_eq!(versions[5].0, 6);
         assert_eq!(versions[6].0, 7);
+        assert_eq!(versions[7].0, 8);
         assert!(versions[0].1.is_some(), "001 checksum must be non-NULL");
         assert!(versions[1].1.is_some(), "002 checksum must be non-NULL");
         assert!(versions[2].1.is_some(), "003 checksum must be non-NULL");
@@ -445,6 +451,7 @@ mod tests {
         assert!(versions[4].1.is_some(), "005 checksum must be non-NULL");
         assert!(versions[5].1.is_some(), "006 checksum must be non-NULL");
         assert!(versions[6].1.is_some(), "007 checksum must be non-NULL");
+        assert!(versions[7].1.is_some(), "008 checksum must be non-NULL");
 
         // 005 seeds one native_object_format row; 006 bumps commit_schema_version -> 2
         // (justified-commit payload epoch) and adds object_format_version = 2 (kind-header
@@ -465,6 +472,20 @@ mod tests {
         assert_eq!(
             (tag.as_str(), algo.as_str(), commit_v, object_v),
             ("f1", "sha256", 2, 2)
+        );
+        let conflict_columns = column_set(&conn, "conflict_sets");
+        assert!(
+            conflict_columns
+                .iter()
+                .any(|c| c.starts_with("content_hash|")),
+            "008 adds conflict_sets.content_hash"
+        );
+        let path_columns = column_set(&conn, "path_conflicts");
+        assert!(
+            path_columns
+                .iter()
+                .any(|c| c.starts_with("path_fingerprint|")),
+            "008 creates path_conflicts with path_fingerprint"
         );
     }
 
@@ -693,7 +714,7 @@ mod tests {
 
         apply_pending_migrations(&mut conn).expect("cd1bb3b v1 must converge, not brick");
 
-        // Both columns now present; version advanced to HEAD (6).
+        // Both columns now present; version advanced to HEAD.
         assert!(
             column_set(&conn, "repositories")
                 .iter()
@@ -707,8 +728,14 @@ mod tests {
             "attached_attempt_id added by the reconciling 002"
         );
         let versions = applied_versions(&conn);
-        assert_eq!(versions.last().expect("at least one version").0, 7);
-        assert_eq!(current_schema_version(&conn).expect("version probe"), 7);
+        assert_eq!(
+            versions.last().expect("at least one version").0,
+            schema_head()
+        );
+        assert_eq!(
+            current_schema_version(&conn).expect("version probe"),
+            schema_head()
+        );
     }
 
     /// FIX A: a genuinely-failing migration statement (a malformed `ALTER`, not a
