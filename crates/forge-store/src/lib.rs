@@ -2988,16 +2988,24 @@ pub fn resolve_conflict_with_tree(
     let mut out: Option<ConflictResolutionRecord> = None;
     with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
-        let (paths_json, status): (String, String) = tx
+        let (paths_json, status, resolver_backend): (String, String, Option<String>) = tx
             .query_row(
-                "SELECT paths_json, status FROM conflict_sets WHERE id = ?1 AND repo_id = ?2",
+                "SELECT paths_json, status, resolver_backend FROM conflict_sets WHERE id = ?1 AND repo_id = ?2",
                 params![conflict_set_id, context.repo_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
             .ok_or_else(|| ForgeError::ConflictSetNotFound {
                 conflict_set_id: conflict_set_id.to_string(),
             })?;
+        if resolver_backend.as_deref() != Some("native_merge") {
+            return Err(ForgeError::UnsupportedContentBackend {
+                command: "conflict resolve".to_string(),
+                required: "native_merge".to_string(),
+                actual: resolver_backend.unwrap_or_else(|| "unknown".to_string()),
+            }
+            .into());
+        }
         if status == "resolved" {
             return Err(anyhow!("conflict set is already resolved"));
         }
@@ -3195,16 +3203,24 @@ pub fn preflight_conflict_resolution(
         ));
     }
     let connection = open_connection(&context.database_path)?;
-    let (paths_json, status): (String, String) = connection
+    let (paths_json, status, resolver_backend): (String, String, Option<String>) = connection
         .query_row(
-            "SELECT paths_json, status FROM conflict_sets WHERE id = ?1 AND repo_id = ?2",
+            "SELECT paths_json, status, resolver_backend FROM conflict_sets WHERE id = ?1 AND repo_id = ?2",
             params![conflict_set_id, context.repo_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?
         .ok_or_else(|| ForgeError::ConflictSetNotFound {
             conflict_set_id: conflict_set_id.to_string(),
         })?;
+    if resolver_backend.as_deref() != Some("native_merge") {
+        return Err(ForgeError::UnsupportedContentBackend {
+            command: "conflict resolve".to_string(),
+            required: "native_merge".to_string(),
+            actual: resolver_backend.unwrap_or_else(|| "unknown".to_string()),
+        }
+        .into());
+    }
     if status == "resolved" {
         return Err(anyhow!("conflict set is already resolved"));
     }

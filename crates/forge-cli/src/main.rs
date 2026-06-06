@@ -586,17 +586,21 @@ fn merge_response(request_id: Option<String>, args: MergeArgs) -> ResponseEnvelo
         let ours_head = backend.current_base(&cwd)?;
         let ours_content_ref = backend.base_content_ref(&cwd, &ours_head)?;
         let theirs_content_ref = proposal.content_ref.clone();
-        match (
+        let ref_kinds = [
             classify_content_ref(&base_content_ref),
             classify_content_ref(&ours_content_ref),
             classify_content_ref(&theirs_content_ref),
-        ) {
-            (
-                ContentRefKind::ForgeTree(_),
-                ContentRefKind::ForgeTree(_),
-                ContentRefKind::ForgeTree(_),
-            ) => {}
-            _ => anyhow::bail!("merge currently requires native forge-tree refs"),
+        ];
+        if !ref_kinds
+            .iter()
+            .all(|kind| matches!(kind, ContentRefKind::ForgeTree(_)))
+        {
+            return Err(forge_store::ForgeError::UnsupportedContentBackend {
+                command: "merge".to_string(),
+                required: "native".to_string(),
+                actual: content_backend_label(&ref_kinds).to_string(),
+            }
+            .into());
         }
         let store = forge_content_native::NativeObjectStore::new(&cwd);
         let result = forge_content_native::merge_native_content_refs(
@@ -1534,6 +1538,24 @@ fn backend_for_content_ref(content_ref: &str) -> anyhow::Result<Box<dyn ContentB
         ContentRefKind::GitTree(_) => Ok(Box::new(forge_content_git::GitContentBackend)),
         ContentRefKind::ForgeTree(_) => Ok(Box::new(forge_content_native::NativeContentBackend)),
         ContentRefKind::Unsupported => anyhow::bail!("unsupported content ref"),
+    }
+}
+
+fn content_backend_label(kinds: &[ContentRefKind<'_>]) -> &'static str {
+    let has_forge = kinds
+        .iter()
+        .any(|kind| matches!(kind, ContentRefKind::ForgeTree(_)));
+    let has_git = kinds
+        .iter()
+        .any(|kind| matches!(kind, ContentRefKind::GitTree(_)));
+    let has_unsupported = kinds
+        .iter()
+        .any(|kind| matches!(kind, ContentRefKind::Unsupported));
+    match (has_forge, has_git, has_unsupported) {
+        (true, false, false) => "native",
+        (false, true, false) => "git",
+        (false, false, true) => "unsupported",
+        _ => "mixed",
     }
 }
 
