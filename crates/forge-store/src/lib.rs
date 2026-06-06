@@ -225,6 +225,83 @@ pub struct PublicationRecord {
     pub operation_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct StaleBaseConflictInput {
+    pub context: String,
+    pub expected_head: String,
+    pub actual_head: String,
+    pub base_content_ref: String,
+    pub ours_content_ref: String,
+    pub theirs_content_ref: String,
+    pub changed_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StaleBaseConflict {
+    pub input: StaleBaseConflictInput,
+}
+
+impl StaleBaseConflict {
+    pub fn forge_error(&self) -> ForgeError {
+        ForgeError::StaleBase {
+            expected_head: self.input.expected_head.clone(),
+            actual_head: self.input.actual_head.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for StaleBaseConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.forge_error().fmt(f)
+    }
+}
+
+impl std::error::Error for StaleBaseConflict {}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictListRecord {
+    pub conflicts: Vec<ConflictSetSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictShowRecord {
+    pub conflict: ConflictSetSummary,
+    pub path_conflicts: Vec<PathConflictSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictSetSummary {
+    pub conflict_set_id: String,
+    pub context: String,
+    pub base_content_ref: Option<String>,
+    pub ours_content_ref: Option<String>,
+    pub theirs_content_ref: Option<String>,
+    pub generated_by_operation_id: Option<String>,
+    pub resolver_backend: Option<String>,
+    pub status: String,
+    pub path_conflict_count: i64,
+    pub redacted_count: i64,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PathConflictSummary {
+    pub path_conflict_id: String,
+    pub path_fingerprint: String,
+    pub kind: String,
+    pub base_ref: Option<String>,
+    pub ours_ref: Option<String>,
+    pub theirs_ref: Option<String>,
+    pub base_status: Option<String>,
+    pub ours_status: Option<String>,
+    pub theirs_status: Option<String>,
+    pub base_mode: Option<String>,
+    pub ours_mode: Option<String>,
+    pub theirs_mode: Option<String>,
+    pub resolution_ref: Option<String>,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ShowRecord {
     pub attempt: Option<AttemptRecord>,
@@ -1924,42 +2001,14 @@ pub fn reconcile_native_head(cwd: &Path) -> Result<()> {
     }
     // Walk the tip's ancestry: every object must exist (a miss is the store-before-DB
     // violation), there is no cycle, and the current HEAD must be an ancestor of the tip
-    // (HEAD lags, never forks). Linear history → follow the first parent.
+    // (HEAD lags, never forks). Merge history may reach the same shared ancestor more
+    // than once; repeated visited commits are normal diamond ancestry, not corruption.
     let store = forge_content_native::NativeObjectStore::new(&context.root_path);
-    let mut cursor = Some(tip.clone());
-    let mut seen = std::collections::BTreeSet::new();
-    let mut head_reached = current_head.is_none();
-    while let Some(cid) = cursor {
-        if current_head.as_ref() == Some(&cid) {
-            head_reached = true;
-            break;
-        }
-        if !seen.insert(cid.clone()) {
-            return Err(ForgeError::NativeHistoryCorrupt {
-                kind: NativeHistoryCorruptKind::Cycle,
-                commit_id: cid.to_string(),
-                related_id: None,
-            }
-            .into());
-        }
-        let commit = store.read_commit(&cid).map_err(|_| {
-            // The tip miss is a dangling commit_id; a deeper miss is a dangling parent.
-            let kind = if cid == tip {
-                NativeHistoryCorruptKind::DanglingCommitId
-            } else {
-                NativeHistoryCorruptKind::DanglingParent
-            };
-            anyhow::Error::from(ForgeError::NativeHistoryCorrupt {
-                kind,
-                commit_id: cid.to_string(),
-                related_id: None,
-            })
-        })?;
-        cursor = match commit.parents.first() {
-            Some(parent) => Some(forge_content_native::ObjectId::parse(parent)?),
-            None => None,
-        };
-    }
+    let commits = walk_native_commits(&store, &tip)?;
+    let head_reached = current_head
+        .as_ref()
+        .map(|head| commits.iter().any(|(cid, _)| cid == head))
+        .unwrap_or(true);
     if !head_reached {
         // The ledger tip does not descend from the current HEAD — a fork, which lock-
         // serialized accepts cannot produce: the store is corrupt.
@@ -2033,29 +2082,10 @@ pub fn native_log(cwd: &Path, intent: Option<&str>) -> Result<Vec<CommitView>> {
     let store = forge_content_native::NativeObjectStore::new(&context.root_path);
     let tip = native_tip(&context, &connection)?;
     let mut out = Vec::new();
-    let mut cursor = tip.clone();
-    let mut seen = std::collections::BTreeSet::new();
-    while let Some(cid) = cursor {
-        if !seen.insert(cid.clone()) {
-            return Err(ForgeError::NativeHistoryCorrupt {
-                kind: NativeHistoryCorruptKind::Cycle,
-                commit_id: cid.to_string(),
-                related_id: None,
-            }
-            .into());
-        }
-        let commit = store.read_commit(&cid).map_err(|_| {
-            let kind = if Some(&cid) == tip.as_ref() {
-                NativeHistoryCorruptKind::DanglingCommitId
-            } else {
-                NativeHistoryCorruptKind::DanglingParent
-            };
-            anyhow::Error::from(ForgeError::NativeHistoryCorrupt {
-                kind,
-                commit_id: cid.to_string(),
-                related_id: None,
-            })
-        })?;
+    let Some(tip) = tip else {
+        return Ok(out);
+    };
+    for (cid, commit) in walk_native_commits(&store, &tip)? {
         let matches = intent
             .map(|want| commit.intent_id.as_deref() == Some(want))
             .unwrap_or(true);
@@ -2075,10 +2105,63 @@ pub fn native_log(cwd: &Path, intent: Option<&str>) -> Result<Vec<CommitView>> {
                     .map(|h| h.as_str().to_string()),
             });
         }
-        cursor = match commit.parents.first() {
-            Some(parent) => Some(forge_content_native::ObjectId::parse(parent)?),
-            None => None,
-        };
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeVisitState {
+    Visiting,
+    Visited,
+}
+
+fn walk_native_commits(
+    store: &forge_content_native::NativeObjectStore,
+    tip: &forge_content_native::ObjectId,
+) -> Result<
+    Vec<(
+        forge_content_native::ObjectId,
+        forge_content_native::CommitObject,
+    )>,
+> {
+    let mut out = Vec::new();
+    let mut states = std::collections::BTreeMap::new();
+    let mut stack = vec![(tip.clone(), false)];
+    while let Some((cid, expanded)) = stack.pop() {
+        if expanded {
+            states.insert(cid, NativeVisitState::Visited);
+            continue;
+        }
+        match states.get(&cid).copied() {
+            Some(NativeVisitState::Visited) => continue,
+            Some(NativeVisitState::Visiting) => {
+                return Err(ForgeError::NativeHistoryCorrupt {
+                    kind: NativeHistoryCorruptKind::Cycle,
+                    commit_id: cid.to_string(),
+                    related_id: None,
+                }
+                .into());
+            }
+            None => {}
+        }
+        states.insert(cid.clone(), NativeVisitState::Visiting);
+        let commit = store.read_commit(&cid).map_err(|_| {
+            let kind = if &cid == tip {
+                NativeHistoryCorruptKind::DanglingCommitId
+            } else {
+                NativeHistoryCorruptKind::DanglingParent
+            };
+            anyhow::Error::from(ForgeError::NativeHistoryCorrupt {
+                kind,
+                commit_id: cid.to_string(),
+                related_id: None,
+            })
+        })?;
+        out.push((cid.clone(), commit.clone()));
+        stack.push((cid, true));
+        for parent in commit.parents.iter().rev() {
+            stack.push((forge_content_native::ObjectId::parse(parent)?, false));
+        }
     }
     Ok(out)
 }
@@ -2514,6 +2597,259 @@ pub fn record_conflict_set(
     Ok(conflict_set_id)
 }
 
+pub fn record_failed_operation_with_conflict(
+    cwd: &Path,
+    request_id: Option<String>,
+    command: &str,
+    code: &str,
+    message: &str,
+    details: Value,
+    conflict: &StaleBaseConflictInput,
+) -> Result<OperationViewResult> {
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    let operation_id = OperationId::new().to_string();
+    let view_id = ViewId::new().to_string();
+    let conflict_set_id = new_id("conflict");
+    let now = now_ms();
+    with_immediate_retry(&mut connection, |tx| {
+        let prepared_conflict =
+            prepare_stale_base_conflict(&context, &operation_id, &conflict_set_id, now, conflict)?;
+        let parent_hash = op_content_hash(tx, Some(&context.current_operation_id))?;
+        let content_hash = integrity::operation_link_hash(
+            &parent_hash,
+            &integrity::OperationDigestInput {
+                operation_id: &operation_id,
+                command,
+                kind: "recoverable_failure",
+                created_at_ms: now,
+            },
+            Some(&prepared_conflict.content_hash),
+        );
+        tx.execute(
+            "INSERT INTO operations (
+                id, repo_id, request_id, command, status, kind, parent_operation_id,
+                resulting_view_id, error_json, content_hash, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, 'failed', 'recoverable_failure', ?5, ?6, ?7, ?8, ?9)",
+            params![
+                operation_id,
+                context.repo_id,
+                request_id,
+                command,
+                context.current_operation_id,
+                view_id,
+                json!({ "message": message, "code": code, "details": details }).to_string(),
+                content_hash,
+                now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO views (id, repo_id, operation_id, kind, state_json, created_at_ms)
+             VALUES (?1, ?2, ?3, 'failed', ?4, ?5)",
+            params![
+                view_id,
+                context.repo_id,
+                operation_id,
+                json!({
+                    "lifecycle": "recoverable_failure",
+                    "failed_command": command,
+                    "message": message,
+                    "conflict_set_id": conflict_set_id,
+                })
+                .to_string(),
+                now
+            ],
+        )?;
+        let updated = tx.execute(
+            "UPDATE current_state
+             SET current_operation_id = ?1, current_view_id = ?2, updated_at_ms = ?3
+             WHERE singleton = 1 AND current_operation_id = ?4",
+            params![operation_id, view_id, now, context.current_operation_id],
+        )?;
+        if updated != 1 {
+            return Err(anyhow!("current operation changed"));
+        }
+        insert_prepared_conflict(tx, &context, &operation_id, &prepared_conflict)?;
+        Ok(())
+    })?;
+    Ok(OperationViewResult {
+        operation_id,
+        view_id,
+    })
+}
+
+fn prepare_stale_base_conflict(
+    context: &RepositoryContext,
+    operation_id: &str,
+    conflict_set_id: &str,
+    now: i64,
+    input: &StaleBaseConflictInput,
+) -> Result<PreparedConflict> {
+    let (kept, dropped) = forge_content::filter_secret_risk(&input.changed_paths);
+    let paths_json = json!({
+        "expected_head": input.expected_head,
+        "actual_head": input.actual_head,
+        "paths": kept,
+        "redacted_count": dropped.len(),
+    })
+    .to_string();
+    let mut path_rows = Vec::with_capacity(kept.len());
+    for path in kept {
+        path_rows.push(ConflictPathRow {
+            id: new_id("path_conflict"),
+            path_fingerprint: integrity::path_fingerprint(&path),
+            path,
+            kind: "content".to_string(),
+            base_ref: Some(input.base_content_ref.clone()),
+            ours_ref: Some(input.ours_content_ref.clone()),
+            theirs_ref: Some(input.theirs_content_ref.clone()),
+            status: "unresolved".to_string(),
+            created_at_ms: now,
+        });
+    }
+    let digest_rows = path_rows
+        .iter()
+        .map(|row| row.digest_input())
+        .collect::<Vec<_>>();
+    let content_hash = integrity::conflict_set_digest(&integrity::ConflictSetDigestInput {
+        id: conflict_set_id,
+        repo_id: &context.repo_id,
+        context: &input.context,
+        paths_json: &paths_json,
+        base_content_ref: Some(&input.base_content_ref),
+        ours_content_ref: Some(&input.ours_content_ref),
+        theirs_content_ref: Some(&input.theirs_content_ref),
+        generated_by_operation_id: Some(operation_id),
+        resolver_backend: Some("stale_base"),
+        status: "unresolved",
+        created_at_ms: now,
+        path_conflicts: &digest_rows,
+    });
+    Ok(PreparedConflict {
+        id: conflict_set_id.to_string(),
+        context: input.context.clone(),
+        paths_json,
+        base_content_ref: input.base_content_ref.clone(),
+        ours_content_ref: input.ours_content_ref.clone(),
+        theirs_content_ref: input.theirs_content_ref.clone(),
+        resolver_backend: "stale_base".to_string(),
+        status: "unresolved".to_string(),
+        content_hash,
+        path_rows,
+        created_at_ms: now,
+        repo_id: context.repo_id.clone(),
+    })
+}
+
+fn insert_prepared_conflict(
+    tx: &Transaction<'_>,
+    _context: &RepositoryContext,
+    operation_id: &str,
+    prepared: &PreparedConflict,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO conflict_sets (
+            id, repo_id, context, paths_json, created_at_ms, base_content_ref,
+            ours_content_ref, theirs_content_ref, generated_by_operation_id,
+            resolver_backend, status, content_hash
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            prepared.id,
+            prepared.repo_id,
+            prepared.context,
+            prepared.paths_json,
+            prepared.created_at_ms,
+            prepared.base_content_ref,
+            prepared.ours_content_ref,
+            prepared.theirs_content_ref,
+            operation_id,
+            prepared.resolver_backend,
+            prepared.status,
+            prepared.content_hash,
+        ],
+    )?;
+    for row in &prepared.path_rows {
+        tx.execute(
+            "INSERT INTO path_conflicts (
+                id, conflict_set_id, path, path_fingerprint, base_path, ours_path, theirs_path,
+                kind, base_ref, ours_ref, theirs_ref, base_status, ours_status, theirs_status,
+                base_mode, ours_mode, theirs_mode, resolution_ref, status, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?12, ?13)",
+            params![
+                row.id,
+                prepared.id,
+                row.path,
+                row.path_fingerprint,
+                row.path,
+                row.path,
+                row.path,
+                row.kind,
+                row.base_ref,
+                row.ours_ref,
+                row.theirs_ref,
+                row.status,
+                row.created_at_ms,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct PreparedConflict {
+    id: String,
+    repo_id: String,
+    context: String,
+    paths_json: String,
+    base_content_ref: String,
+    ours_content_ref: String,
+    theirs_content_ref: String,
+    resolver_backend: String,
+    status: String,
+    content_hash: String,
+    path_rows: Vec<ConflictPathRow>,
+    created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ConflictPathRow {
+    id: String,
+    path: String,
+    path_fingerprint: String,
+    kind: String,
+    base_ref: Option<String>,
+    ours_ref: Option<String>,
+    theirs_ref: Option<String>,
+    status: String,
+    created_at_ms: i64,
+}
+
+impl ConflictPathRow {
+    fn digest_input(&self) -> integrity::PathConflictDigestInput<'_> {
+        integrity::PathConflictDigestInput {
+            id: &self.id,
+            path: &self.path,
+            path_fingerprint: &self.path_fingerprint,
+            base_path: Some(&self.path),
+            ours_path: Some(&self.path),
+            theirs_path: Some(&self.path),
+            kind: &self.kind,
+            base_ref: self.base_ref.as_deref(),
+            ours_ref: self.ours_ref.as_deref(),
+            theirs_ref: self.theirs_ref.as_deref(),
+            base_status: None,
+            ours_status: None,
+            theirs_status: None,
+            base_mode: None,
+            ours_mode: None,
+            theirs_mode: None,
+            resolution_ref: None,
+            status: &self.status,
+            created_at_ms: self.created_at_ms,
+        }
+    }
+}
+
 pub fn show(cwd: &Path, attempt_id: Option<&str>) -> Result<ShowRecord> {
     let context = open_repository(cwd)?;
     let attempt = match resolve_attempt_in_context(&context, attempt_id) {
@@ -2556,6 +2892,124 @@ pub fn show(cwd: &Path, attempt_id: Option<&str>) -> Result<ShowRecord> {
             .flatten(),
         attempt,
     })
+}
+
+pub fn conflict_list(cwd: &Path) -> Result<ConflictListRecord> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    Ok(ConflictListRecord {
+        conflicts: query_conflict_summaries(&connection, None)?,
+    })
+}
+
+pub fn conflict_show(cwd: &Path, conflict_set_id: &str) -> Result<ConflictShowRecord> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let mut conflicts = query_conflict_summaries(&connection, Some(conflict_set_id))?;
+    let Some(conflict) = conflicts.pop() else {
+        return Err(ForgeError::ConflictSetNotFound {
+            conflict_set_id: conflict_set_id.to_string(),
+        }
+        .into());
+    };
+    let mut statement = connection.prepare(
+        "SELECT id, path_fingerprint, kind, base_ref, ours_ref, theirs_ref,
+                base_status, ours_status, theirs_status, base_mode, ours_mode,
+                theirs_mode, resolution_ref, status
+         FROM path_conflicts
+         WHERE conflict_set_id = ?1
+         ORDER BY rowid",
+    )?;
+    let path_conflicts = statement
+        .query_map(params![conflict_set_id], |row| {
+            Ok(PathConflictSummary {
+                path_conflict_id: row.get(0)?,
+                path_fingerprint: row.get(1)?,
+                kind: row.get(2)?,
+                base_ref: row.get(3)?,
+                ours_ref: row.get(4)?,
+                theirs_ref: row.get(5)?,
+                base_status: row.get(6)?,
+                ours_status: row.get(7)?,
+                theirs_status: row.get(8)?,
+                base_mode: row.get(9)?,
+                ours_mode: row.get(10)?,
+                theirs_mode: row.get(11)?,
+                resolution_ref: row.get(12)?,
+                status: row.get(13)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(ConflictShowRecord {
+        conflict,
+        path_conflicts,
+    })
+}
+
+fn query_conflict_summaries(
+    connection: &Connection,
+    conflict_set_id: Option<&str>,
+) -> Result<Vec<ConflictSetSummary>> {
+    let sql = if conflict_set_id.is_some() {
+        "SELECT cs.id, cs.context, cs.paths_json, cs.base_content_ref, cs.ours_content_ref,
+                cs.theirs_content_ref, cs.generated_by_operation_id, cs.resolver_backend,
+                cs.status, COUNT(pc.id)
+         FROM conflict_sets cs
+         LEFT JOIN path_conflicts pc ON pc.conflict_set_id = cs.id
+         WHERE cs.id = ?1
+         GROUP BY cs.id
+         ORDER BY cs.created_at_ms, cs.rowid"
+    } else {
+        "SELECT cs.id, cs.context, cs.paths_json, cs.base_content_ref, cs.ours_content_ref,
+                cs.theirs_content_ref, cs.generated_by_operation_id, cs.resolver_backend,
+                cs.status, COUNT(pc.id)
+         FROM conflict_sets cs
+         LEFT JOIN path_conflicts pc ON pc.conflict_set_id = cs.id
+         GROUP BY cs.id
+         ORDER BY cs.created_at_ms, cs.rowid"
+    };
+    let mut statement = connection.prepare(sql)?;
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ConflictSetSummary> {
+        let paths_json: String = row.get(2)?;
+        let redacted_count = conflict_redacted_count(&paths_json);
+        let warnings = if redacted_count > 0 {
+            vec![format!(
+                "redacted {redacted_count} secret-risk path(s) from conflict metadata"
+            )]
+        } else {
+            Vec::new()
+        };
+        Ok(ConflictSetSummary {
+            conflict_set_id: row.get(0)?,
+            context: row.get(1)?,
+            base_content_ref: row.get(3)?,
+            ours_content_ref: row.get(4)?,
+            theirs_content_ref: row.get(5)?,
+            generated_by_operation_id: row.get(6)?,
+            resolver_backend: row.get(7)?,
+            status: row.get(8)?,
+            path_conflict_count: row.get(9)?,
+            redacted_count,
+            warnings,
+        })
+    };
+    let rows = if let Some(id) = conflict_set_id {
+        statement
+            .query_map(params![id], map_row)?
+            .collect::<rusqlite::Result<_>>()?
+    } else {
+        statement
+            .query_map([], map_row)?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    Ok(rows)
+}
+
+fn conflict_redacted_count(paths_json: &str) -> i64 {
+    serde_json::from_str::<Value>(paths_json)
+        .ok()
+        .and_then(|value| value.get("redacted_count").and_then(Value::as_i64))
+        .unwrap_or(0)
 }
 
 pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
@@ -2700,17 +3154,26 @@ fn verify_native_history(
     };
 
     if let Some(tip) = native_tip(context, connection)? {
-        let mut seen = std::collections::BTreeSet::new();
-        let mut stack = vec![tip];
-        while let Some(commit_id) = stack.pop() {
-            if !seen.insert(commit_id.clone()) {
-                push(NativeHistoryFinding {
-                    kind: NativeHistoryCorruptKind::Cycle,
-                    commit_id: commit_id.to_string(),
-                    related_id: None,
-                });
+        let mut states = std::collections::BTreeMap::new();
+        let mut stack = vec![(tip, false)];
+        while let Some((commit_id, expanded)) = stack.pop() {
+            if expanded {
+                states.insert(commit_id, NativeVisitState::Visited);
                 continue;
             }
+            match states.get(&commit_id).copied() {
+                Some(NativeVisitState::Visited) => continue,
+                Some(NativeVisitState::Visiting) => {
+                    push(NativeHistoryFinding {
+                        kind: NativeHistoryCorruptKind::Cycle,
+                        commit_id: commit_id.to_string(),
+                        related_id: None,
+                    });
+                    continue;
+                }
+                None => {}
+            }
+            states.insert(commit_id.clone(), NativeVisitState::Visiting);
             let commit = match store.read_commit(&commit_id) {
                 Ok(commit) => commit,
                 Err(_) => {
@@ -2722,6 +3185,7 @@ fn verify_native_history(
                     continue;
                 }
             };
+            stack.push((commit_id.clone(), true));
             let tree_ref = format!("{}{}", forge_content::FORGE_TREE_PREFIX, commit.tree);
             if store.verify_content_ref(&tree_ref).is_err() {
                 push(NativeHistoryFinding {
@@ -2733,7 +3197,7 @@ fn verify_native_history(
             for parent in &commit.parents {
                 match forge_content_native::ObjectId::parse(parent) {
                     Ok(parent_id) if store.read_commit(&parent_id).is_ok() => {
-                        stack.push(parent_id);
+                        stack.push((parent_id, false));
                     }
                     _ => push(NativeHistoryFinding {
                         kind: NativeHistoryCorruptKind::DanglingParent,
@@ -2840,7 +3304,32 @@ fn verify_integrity_chain(conn: &Connection) -> Result<Vec<TamperedRow>> {
         }
     }
 
-    // (c) Every operation's chain link (folding its domain digest), in chain order.
+    // (c) Every operation-owned conflict set's own digest.
+    let mut conflict_rows = conn.prepare(
+        "SELECT id FROM conflict_sets
+         WHERE generated_by_operation_id IS NOT NULL
+         ORDER BY rowid",
+    )?;
+    let conflict_ids: Vec<String> = conflict_rows
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in conflict_ids {
+        match recompute_conflict_set_hash(conn, &id)? {
+            None => tampered.push(TamperedRow {
+                id,
+                table: "conflict_sets".to_string(),
+                kind: TamperKind::MissingHash,
+            }),
+            Some((stored, recomputed)) if stored != recomputed => tampered.push(TamperedRow {
+                id,
+                table: "conflict_sets".to_string(),
+                kind: TamperKind::ContentEdit,
+            }),
+            Some(_) => {}
+        }
+    }
+
+    // (d) Every operation's chain link (folding its domain digest), in chain order.
     let mut op_rows = conn.prepare(
         "SELECT id, parent_operation_id, command, kind, resulting_view_id, content_hash, created_at_ms, rowid
          FROM operations ORDER BY created_at_ms, rowid",
@@ -2892,6 +3381,156 @@ fn verify_integrity_chain(conn: &Connection) -> Result<Vec<TamperedRow>> {
     }
 
     Ok(tampered)
+}
+
+fn recompute_conflict_set_hash(
+    conn: &Connection,
+    conflict_set_id: &str,
+) -> Result<Option<(String, String)>> {
+    let conflict: Option<StoredConflictSet> = conn
+        .query_row(
+            "SELECT id, repo_id, context, paths_json, created_at_ms, base_content_ref,
+                    ours_content_ref, theirs_content_ref, generated_by_operation_id,
+                    resolver_backend, status, content_hash
+             FROM conflict_sets WHERE id = ?1",
+            params![conflict_set_id],
+            |row| {
+                Ok(StoredConflictSet {
+                    id: row.get(0)?,
+                    repo_id: row.get(1)?,
+                    context: row.get(2)?,
+                    paths_json: row.get(3)?,
+                    created_at_ms: row.get(4)?,
+                    base_content_ref: row.get(5)?,
+                    ours_content_ref: row.get(6)?,
+                    theirs_content_ref: row.get(7)?,
+                    generated_by_operation_id: row.get(8)?,
+                    resolver_backend: row.get(9)?,
+                    status: row.get(10)?,
+                    content_hash: row.get(11)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(conflict) = conflict else {
+        return Ok(None);
+    };
+    let Some(stored) = conflict.content_hash.clone() else {
+        return Ok(None);
+    };
+    let mut path_stmt = conn.prepare(
+        "SELECT id, path, path_fingerprint, base_path, ours_path, theirs_path, kind,
+                base_ref, ours_ref, theirs_ref, base_status, ours_status, theirs_status,
+                base_mode, ours_mode, theirs_mode, resolution_ref, status, created_at_ms
+         FROM path_conflicts WHERE conflict_set_id = ?1 ORDER BY rowid",
+    )?;
+    let path_rows: Vec<StoredPathConflict> = path_stmt
+        .query_map(params![conflict_set_id], |row| {
+            Ok(StoredPathConflict {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                path_fingerprint: row.get(2)?,
+                base_path: row.get(3)?,
+                ours_path: row.get(4)?,
+                theirs_path: row.get(5)?,
+                kind: row.get(6)?,
+                base_ref: row.get(7)?,
+                ours_ref: row.get(8)?,
+                theirs_ref: row.get(9)?,
+                base_status: row.get(10)?,
+                ours_status: row.get(11)?,
+                theirs_status: row.get(12)?,
+                base_mode: row.get(13)?,
+                ours_mode: row.get(14)?,
+                theirs_mode: row.get(15)?,
+                resolution_ref: row.get(16)?,
+                status: row.get(17)?,
+                created_at_ms: row.get(18)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let digest_rows = path_rows
+        .iter()
+        .map(StoredPathConflict::digest_input)
+        .collect::<Vec<_>>();
+    let recomputed = integrity::conflict_set_digest(&integrity::ConflictSetDigestInput {
+        id: &conflict.id,
+        repo_id: &conflict.repo_id,
+        context: &conflict.context,
+        paths_json: &conflict.paths_json,
+        base_content_ref: conflict.base_content_ref.as_deref(),
+        ours_content_ref: conflict.ours_content_ref.as_deref(),
+        theirs_content_ref: conflict.theirs_content_ref.as_deref(),
+        generated_by_operation_id: conflict.generated_by_operation_id.as_deref(),
+        resolver_backend: conflict.resolver_backend.as_deref(),
+        status: &conflict.status,
+        created_at_ms: conflict.created_at_ms,
+        path_conflicts: &digest_rows,
+    });
+    Ok(Some((stored, recomputed)))
+}
+
+struct StoredConflictSet {
+    id: String,
+    repo_id: String,
+    context: String,
+    paths_json: String,
+    created_at_ms: i64,
+    base_content_ref: Option<String>,
+    ours_content_ref: Option<String>,
+    theirs_content_ref: Option<String>,
+    generated_by_operation_id: Option<String>,
+    resolver_backend: Option<String>,
+    status: String,
+    content_hash: Option<String>,
+}
+
+struct StoredPathConflict {
+    id: String,
+    path: String,
+    path_fingerprint: String,
+    base_path: Option<String>,
+    ours_path: Option<String>,
+    theirs_path: Option<String>,
+    kind: String,
+    base_ref: Option<String>,
+    ours_ref: Option<String>,
+    theirs_ref: Option<String>,
+    base_status: Option<String>,
+    ours_status: Option<String>,
+    theirs_status: Option<String>,
+    base_mode: Option<String>,
+    ours_mode: Option<String>,
+    theirs_mode: Option<String>,
+    resolution_ref: Option<String>,
+    status: String,
+    created_at_ms: i64,
+}
+
+impl StoredPathConflict {
+    fn digest_input(&self) -> integrity::PathConflictDigestInput<'_> {
+        integrity::PathConflictDigestInput {
+            id: &self.id,
+            path: &self.path,
+            path_fingerprint: &self.path_fingerprint,
+            base_path: self.base_path.as_deref(),
+            ours_path: self.ours_path.as_deref(),
+            theirs_path: self.theirs_path.as_deref(),
+            kind: &self.kind,
+            base_ref: self.base_ref.as_deref(),
+            ours_ref: self.ours_ref.as_deref(),
+            theirs_ref: self.theirs_ref.as_deref(),
+            base_status: self.base_status.as_deref(),
+            ours_status: self.ours_status.as_deref(),
+            theirs_status: self.theirs_status.as_deref(),
+            base_mode: self.base_mode.as_deref(),
+            ours_mode: self.ours_mode.as_deref(),
+            theirs_mode: self.theirs_mode.as_deref(),
+            resolution_ref: self.resolution_ref.as_deref(),
+            status: &self.status,
+            created_at_ms: self.created_at_ms,
+        }
+    }
 }
 
 /// A decision row read back for `doctor`'s chain pass.
@@ -2968,6 +3607,17 @@ fn op_domain_digest(conn: &Connection, view_id: Option<&str>) -> Result<Option<S
             .query_row(
                 "SELECT content_hash FROM decisions WHERE id = ?1",
                 params![decision_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(Into::into);
+    }
+    if let Some(conflict_set_id) = state.get("conflict_set_id").and_then(Value::as_str) {
+        return conn
+            .query_row(
+                "SELECT content_hash FROM conflict_sets WHERE id = ?1",
+                params![conflict_set_id],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()

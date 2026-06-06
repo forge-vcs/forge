@@ -32,6 +32,12 @@ const DECISION_TAG: &[u8] = b"forge.decision.v0\0";
 /// evidence rows' Phase 5 `content_hash`es, the decision digest, and the gate outcomes
 /// — so it gets its own tag and can never collide with an evidence/decision/op digest.
 const PUBLICATION_TAG: &[u8] = b"forge.publication.v0\0";
+/// Domain-separation tag for a conflict-set digest (NER-139 Phase 8 S2a). The
+/// digest covers the conflict_sets row plus ordered path_conflicts child rows.
+const CONFLICT_SET_TAG: &[u8] = b"forge.conflict_set.v0\0";
+/// Domain-separation tag for an opaque, non-reversible path identifier emitted in
+/// conflict JSON instead of raw paths.
+const PATH_FINGERPRINT_TAG: &[u8] = b"forge.path_fingerprint.v0\0";
 
 /// The documented genesis parent hash: 64 hex zeros (a SHA-256 hex digest is 64
 /// chars). Used as the `parent_hash` input for the `init` genesis operation and as
@@ -235,6 +241,89 @@ pub fn publication_digest(input: &PublicationDigestInput) -> String {
         .str_slice(input.evidence_hashes)
         .str(input.decision_digest)
         .str_slice(input.gate_outcomes);
+    writer.finish()
+}
+
+pub struct PathConflictDigestInput<'a> {
+    pub id: &'a str,
+    pub path: &'a str,
+    pub path_fingerprint: &'a str,
+    pub base_path: Option<&'a str>,
+    pub ours_path: Option<&'a str>,
+    pub theirs_path: Option<&'a str>,
+    pub kind: &'a str,
+    pub base_ref: Option<&'a str>,
+    pub ours_ref: Option<&'a str>,
+    pub theirs_ref: Option<&'a str>,
+    pub base_status: Option<&'a str>,
+    pub ours_status: Option<&'a str>,
+    pub theirs_status: Option<&'a str>,
+    pub base_mode: Option<&'a str>,
+    pub ours_mode: Option<&'a str>,
+    pub theirs_mode: Option<&'a str>,
+    pub resolution_ref: Option<&'a str>,
+    pub status: &'a str,
+    pub created_at_ms: i64,
+}
+
+pub struct ConflictSetDigestInput<'a> {
+    pub id: &'a str,
+    pub repo_id: &'a str,
+    pub context: &'a str,
+    pub paths_json: &'a str,
+    pub base_content_ref: Option<&'a str>,
+    pub ours_content_ref: Option<&'a str>,
+    pub theirs_content_ref: Option<&'a str>,
+    pub generated_by_operation_id: Option<&'a str>,
+    pub resolver_backend: Option<&'a str>,
+    pub status: &'a str,
+    pub created_at_ms: i64,
+    pub path_conflicts: &'a [PathConflictDigestInput<'a>],
+}
+
+pub fn path_fingerprint(path: &str) -> String {
+    let mut writer = DigestWriter::new(PATH_FINGERPRINT_TAG);
+    writer.str(path);
+    writer.finish()
+}
+
+pub fn conflict_set_digest(input: &ConflictSetDigestInput) -> String {
+    let mut writer = DigestWriter::new(CONFLICT_SET_TAG);
+    writer
+        .str(input.id)
+        .str(input.repo_id)
+        .str(input.context)
+        .str(input.paths_json)
+        .opt_str(input.base_content_ref)
+        .opt_str(input.ours_content_ref)
+        .opt_str(input.theirs_content_ref)
+        .opt_str(input.generated_by_operation_id)
+        .opt_str(input.resolver_backend)
+        .str(input.status)
+        .i64(input.created_at_ms)
+        .bytes(&(input.path_conflicts.len() as u64).to_le_bytes());
+    for path in input.path_conflicts {
+        writer
+            .str(path.id)
+            .str(path.path)
+            .str(path.path_fingerprint)
+            .opt_str(path.base_path)
+            .opt_str(path.ours_path)
+            .opt_str(path.theirs_path)
+            .str(path.kind)
+            .opt_str(path.base_ref)
+            .opt_str(path.ours_ref)
+            .opt_str(path.theirs_ref)
+            .opt_str(path.base_status)
+            .opt_str(path.ours_status)
+            .opt_str(path.theirs_status)
+            .opt_str(path.base_mode)
+            .opt_str(path.ours_mode)
+            .opt_str(path.theirs_mode)
+            .opt_str(path.resolution_ref)
+            .str(path.status)
+            .i64(path.created_at_ms);
+    }
     writer.finish()
 }
 

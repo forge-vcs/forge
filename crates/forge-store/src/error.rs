@@ -196,6 +196,10 @@ pub enum ForgeError {
         commit_id: String,
         related_id: Option<String>,
     },
+    /// A read-only conflict inspection command named a conflict set that is not in
+    /// the local ledger. The selector is intentionally not echoed because it may
+    /// be path-like user input.
+    ConflictSetNotFound { conflict_set_id: String },
 }
 
 impl ForgeError {
@@ -227,6 +231,7 @@ impl ForgeError {
             ForgeError::ProvenanceMismatch { .. } => "PROVENANCE_MISMATCH",
             ForgeError::MissingProvenanceTrailer { .. } => "MISSING_PROVENANCE_TRAILER",
             ForgeError::NativeHistoryCorrupt { .. } => "NATIVE_HISTORY_CORRUPT",
+            ForgeError::ConflictSetNotFound { .. } => "CONFLICT_SET_NOT_FOUND",
         }
     }
 
@@ -330,6 +335,7 @@ impl ForgeError {
                 "commit_id": commit_id,
                 "related_id": related_id,
             }),
+            ForgeError::ConflictSetNotFound { .. } => json!({ "selector_present": true }),
             _ => Value::Object(Default::default()),
         }
     }
@@ -458,6 +464,7 @@ impl std::fmt::Display for ForgeError {
                     kind.as_str()
                 ),
             },
+            ForgeError::ConflictSetNotFound { .. } => write!(f, "conflict set not found"),
         }
     }
 }
@@ -629,6 +636,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             retryable: false,
             after_ms: None,
             details_keys: &["kind", "commit_id", "related_id"],
+        },
+        ErrorCodeSpec {
+            code: "CONFLICT_SET_NOT_FOUND",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["selector_present"],
         },
     ]
 }
@@ -1120,6 +1133,9 @@ mod tests {
                 commit_id: "f1:commit:sha256:aa".into(),
                 related_id: None,
             },
+            ForgeError::ConflictSetNotFound {
+                conflict_set_id: "conflict_missing".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -1149,7 +1165,8 @@ mod tests {
                 | ForgeError::EvidenceTampered { .. }
                 | ForgeError::ProvenanceMismatch { .. }
                 | ForgeError::MissingProvenanceTrailer { .. }
-                | ForgeError::NativeHistoryCorrupt { .. } => {}
+                | ForgeError::NativeHistoryCorrupt { .. }
+                | ForgeError::ConflictSetNotFound { .. } => {}
             }
         }
 

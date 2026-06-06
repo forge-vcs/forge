@@ -23,6 +23,44 @@ fn db(path: &Path) -> Connection {
     Connection::open(path.join(".forge/forge.db")).expect("open forge db")
 }
 
+fn insert_synthetic_decision_tip(repo: &TestRepo, commit_id: &str) {
+    db(repo.path())
+        .execute(
+            "INSERT INTO decisions (
+                id, repo_id, proposal_id, proposal_revision_id, decision, actor,
+                content_hash, created_at_ms, commit_id
+             )
+             SELECT 'decision_synthetic_' || (SELECT COUNT(*) FROM decisions),
+                    repo_id, proposal_id, proposal_revision_id, 'accepted', 'synthetic',
+                    NULL, created_at_ms + 1000, ?1
+             FROM decisions
+             WHERE decision = 'accepted'
+             ORDER BY rowid DESC
+             LIMIT 1",
+            [commit_id],
+        )
+        .expect("insert synthetic decision tip");
+}
+
+fn synthetic_commit(repo: &TestRepo, tree: &str, parents: Vec<String>, intent_id: &str) -> String {
+    let store = forge_content_native::NativeObjectStore::new(repo.path());
+    let commit = forge_content_native::CommitObject {
+        schema_version: 1,
+        tree: tree.to_string(),
+        parents,
+        intent_id: Some(intent_id.to_string()),
+        proposal_revision_id: None,
+        decision_id: None,
+        evidence_digest: None,
+        actor: Some("synthetic".to_string()),
+        authored_time: Some(42),
+    };
+    store
+        .write_commit(&commit)
+        .expect("write synthetic commit")
+        .to_string()
+}
+
 /// Drive a native repo through `init → start → save → run → propose → check`, leaving a
 /// checked proposal ready to accept. Returns nothing; the caller reads HEAD / the ledger.
 fn prepare_native_proposal(repo: &TestRepo) {
@@ -193,6 +231,103 @@ fn reconcile_advances_head_from_a_torn_accept() {
         head(repo.path()).as_deref(),
         Some(commit_id.as_str()),
         "reconcile advances HEAD to the ledger tip after a torn accept"
+    );
+}
+
+#[test]
+fn reconcile_accepts_current_head_reachable_through_second_parent() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    let accepted_id = accepted["data"]["commit_id"].as_str().unwrap().to_string();
+    let store = forge_content_native::NativeObjectStore::new(repo.path());
+    let accepted_commit = store
+        .read_commit(&forge_content_native::ObjectId::parse(&accepted_id).unwrap())
+        .expect("read accepted commit");
+    let genesis = accepted_commit.parents[0].clone();
+    let side = synthetic_commit(
+        &repo,
+        &accepted_commit.tree,
+        vec![genesis],
+        "intent_side_parent",
+    );
+    let merge = synthetic_commit(
+        &repo,
+        &accepted_commit.tree,
+        vec![side, accepted_id.clone()],
+        "intent_merge_tip",
+    );
+    insert_synthetic_decision_tip(&repo, &merge);
+    std::fs::write(repo.path().join(".forge/refs/HEAD"), &accepted_id).expect("rewind HEAD");
+
+    repo.forge()
+        .args(["--json", "start", "after synthetic merge"])
+        .assert()
+        .success();
+    assert_eq!(head(repo.path()).as_deref(), Some(merge.as_str()));
+}
+
+#[test]
+fn native_log_walks_second_parent_and_skips_diamond_repeats() {
+    let repo = TestRepo::new_git();
+    prepare_native_proposal(&repo);
+    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
+    let accepted_id = accepted["data"]["commit_id"].as_str().unwrap().to_string();
+    let store = forge_content_native::NativeObjectStore::new(repo.path());
+    let accepted_commit = store
+        .read_commit(&forge_content_native::ObjectId::parse(&accepted_id).unwrap())
+        .expect("read accepted commit");
+    let left = synthetic_commit(
+        &repo,
+        &accepted_commit.tree,
+        vec![accepted_id.clone()],
+        "intent_left_parent",
+    );
+    let right = synthetic_commit(
+        &repo,
+        &accepted_commit.tree,
+        vec![accepted_id.clone()],
+        "intent_right_parent",
+    );
+    let merge = synthetic_commit(
+        &repo,
+        &accepted_commit.tree,
+        vec![left.clone(), right.clone()],
+        "intent_merge_tip",
+    );
+    insert_synthetic_decision_tip(&repo, &merge);
+
+    let logged = json_output(repo.forge().args(["--json", "log"]).assert().success());
+    let commits = logged["data"]["commits"].as_array().expect("commits");
+    let ids: Vec<&str> = commits
+        .iter()
+        .filter_map(|commit| commit["commit_id"].as_str())
+        .collect();
+    assert!(ids.contains(&merge.as_str()), "merge tip logged: {ids:?}");
+    assert!(ids.contains(&left.as_str()), "left parent logged: {ids:?}");
+    assert!(
+        ids.contains(&right.as_str()),
+        "right parent logged: {ids:?}"
+    );
+
+    let right_only = json_output(
+        repo.forge()
+            .args(["--json", "log", "--intent", "intent_right_parent"])
+            .assert()
+            .success(),
+    );
+    let filtered = right_only["data"]["commits"].as_array().expect("commits");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0]["commit_id"], right);
+
+    let doctor = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(
+        doctor["data"]["native_history_issues"]
+            .as_array()
+            .expect("native history issues")
+            .len(),
+        0,
+        "doctor must treat shared diamond ancestors as valid DAG repeats: {doctor}"
     );
 }
 
