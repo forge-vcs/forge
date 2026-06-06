@@ -606,12 +606,17 @@ fn merge_response(request_id: Option<String>, args: MergeArgs) -> ResponseEnvelo
             &theirs_content_ref,
         )?;
         if let Some(merged_content_ref) = result.merged_content_ref {
+            ensure_clean_worktree(&cwd, &merged_content_ref)?;
+            backend_for_content_ref(&merged_content_ref)?
+                .restore_snapshot(&cwd, &merged_content_ref)?;
             let record = forge_store::record_merge_success(
                 &cwd,
                 request_id,
                 "merge",
                 &proposal,
                 &forge_store::MergeSuccessInput {
+                    base_head: proposal.base_head.clone(),
+                    ours_head: ours_head.clone(),
                     base_content_ref,
                     ours_content_ref,
                     theirs_content_ref,
@@ -624,6 +629,7 @@ fn merge_response(request_id: Option<String>, args: MergeArgs) -> ResponseEnvelo
                     "merged": true,
                     "proposal_id": record.proposal_id,
                     "proposal_revision_id": record.proposal_revision_id,
+                    "snapshot_id": record.snapshot_id,
                     "base_content_ref": record.base_content_ref,
                     "ours_content_ref": record.ours_content_ref,
                     "theirs_content_ref": record.theirs_content_ref,
@@ -681,6 +687,9 @@ fn conflict_response(request_id: Option<String>, args: ConflictArgs) -> Response
             conflict_set_id,
             tree,
         } => command_result("conflict resolve", request_id, |cwd, request_id| {
+            forge_store::preflight_conflict_resolution(&cwd, &conflict_set_id, &tree)?;
+            ensure_clean_worktree(&cwd, &tree)?;
+            backend_for_content_ref(&tree)?.restore_snapshot(&cwd, &tree)?;
             let record =
                 forge_store::resolve_conflict_with_tree(&cwd, request_id, &conflict_set_id, &tree)?;
             Ok((

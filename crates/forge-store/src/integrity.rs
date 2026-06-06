@@ -35,6 +35,8 @@ const PUBLICATION_TAG: &[u8] = b"forge.publication.v0\0";
 /// Domain-separation tag for a conflict-set digest (NER-139 Phase 8 S2a). The
 /// digest covers the conflict_sets row plus ordered path_conflicts child rows.
 const CONFLICT_SET_TAG: &[u8] = b"forge.conflict_set.v0\0";
+/// Domain-separation tag for clean native merge lineage folded into the op chain.
+const MERGE_LINEAGE_TAG: &[u8] = b"forge.merge_lineage.v0\0";
 /// Domain-separation tag for an opaque, non-reversible path identifier emitted in
 /// conflict JSON instead of raw paths.
 const PATH_FINGERPRINT_TAG: &[u8] = b"forge.path_fingerprint.v0\0";
@@ -281,9 +283,36 @@ pub struct ConflictSetDigestInput<'a> {
     pub path_conflicts: &'a [PathConflictDigestInput<'a>],
 }
 
+pub struct MergeLineageDigestInput<'a> {
+    pub proposal_id: &'a str,
+    pub proposal_revision_id: &'a str,
+    pub snapshot_id: &'a str,
+    pub base_head: &'a str,
+    pub ours_head: &'a str,
+    pub base_content_ref: &'a str,
+    pub ours_content_ref: &'a str,
+    pub theirs_content_ref: &'a str,
+    pub merged_content_ref: &'a str,
+}
+
 pub fn path_fingerprint(path: &str) -> String {
     let mut writer = DigestWriter::new(PATH_FINGERPRINT_TAG);
     writer.str(path);
+    writer.finish()
+}
+
+pub fn merge_lineage_digest(input: &MergeLineageDigestInput) -> String {
+    let mut writer = DigestWriter::new(MERGE_LINEAGE_TAG);
+    writer
+        .str(input.proposal_id)
+        .str(input.proposal_revision_id)
+        .str(input.snapshot_id)
+        .str(input.base_head)
+        .str(input.ours_head)
+        .str(input.base_content_ref)
+        .str(input.ours_content_ref)
+        .str(input.theirs_content_ref)
+        .str(input.merged_content_ref);
     writer.finish()
 }
 

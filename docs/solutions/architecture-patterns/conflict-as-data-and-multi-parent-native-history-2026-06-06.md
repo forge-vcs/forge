@@ -11,6 +11,10 @@ applies_when:
   - Adding JSON read surfaces for conflict payloads
   - Making native history readers safe for merge commits and diamond ancestry
   - Extending operation integrity digests with child records
+symptoms:
+  - Stale-base or merge conflicts are only visible as command failures
+  - Native history traversal rejects valid merge commits or diamond ancestry
+  - Conflict JSON risks exposing raw paths or inline content
 tags: [conflict-as-data, path-conflicts, native-history, multi-parent, redaction, integrity, phase-8, ner-139]
 ---
 

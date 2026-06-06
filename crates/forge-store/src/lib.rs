@@ -264,6 +264,7 @@ pub struct MergeConflictRecord {
 pub struct MergeSuccessRecord {
     pub proposal_id: String,
     pub proposal_revision_id: String,
+    pub snapshot_id: String,
     pub base_content_ref: String,
     pub ours_content_ref: String,
     pub theirs_content_ref: String,
@@ -274,6 +275,8 @@ pub struct MergeSuccessRecord {
 
 #[derive(Debug, Clone)]
 pub struct MergeSuccessInput {
+    pub base_head: String,
+    pub ours_head: String,
     pub base_content_ref: String,
     pub ours_content_ref: String,
     pub theirs_content_ref: String,
@@ -2836,8 +2839,57 @@ pub fn record_merge_success(
     let operation_id = OperationId::new().to_string();
     let view_id = ViewId::new().to_string();
     let now = now_ms();
+    let mut out: Option<MergeSuccessRecord> = None;
     with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let parent_snapshot_id =
+            latest_snapshot_on(tx, &proposal.attempt_id)?.map(|snapshot| snapshot.snapshot_id);
+        let snapshot_id = new_id("snapshot");
+        let revision_id = new_id("revision");
+        let changed_paths_json = serde_json::to_string(&proposal.changed_paths)?;
+        tx.execute(
+            "INSERT INTO snapshots (
+                id, repo_id, attempt_id, parent_snapshot_id, content_ref, changed_paths_json, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                snapshot_id,
+                context.repo_id,
+                proposal.attempt_id,
+                parent_snapshot_id,
+                input.merged_content_ref,
+                changed_paths_json,
+                now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO proposal_revisions (id, proposal_id, snapshot_id, content_ref, changed_paths_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                revision_id,
+                proposal.proposal_id,
+                snapshot_id,
+                input.merged_content_ref,
+                changed_paths_json,
+                now
+            ],
+        )?;
+        tx.execute(
+            "UPDATE proposals SET snapshot_id = ?1, content_ref = ?2, status = 'draft' WHERE id = ?3",
+            params![snapshot_id, input.merged_content_ref, proposal.proposal_id],
+        )?;
+        set_expected_content_ref(tx, &input.merged_content_ref)?;
+        let merge_lineage_hash =
+            integrity::merge_lineage_digest(&integrity::MergeLineageDigestInput {
+                proposal_id: &proposal.proposal_id,
+                proposal_revision_id: &revision_id,
+                snapshot_id: &snapshot_id,
+                base_head: &input.base_head,
+                ours_head: &input.ours_head,
+                base_content_ref: &input.base_content_ref,
+                ours_content_ref: &input.ours_content_ref,
+                theirs_content_ref: &input.theirs_content_ref,
+                merged_content_ref: &input.merged_content_ref,
+            });
         let parent_hash = op_content_hash(tx, Some(&context.current_operation_id))?;
         let content_hash = integrity::operation_link_hash(
             &parent_hash,
@@ -2847,7 +2899,7 @@ pub fn record_merge_success(
                 kind: "merge_clean",
                 created_at_ms: now,
             },
-            None,
+            Some(&merge_lineage_hash),
         );
         tx.execute(
             "INSERT INTO operations (
@@ -2875,11 +2927,15 @@ pub fn record_merge_success(
                 json!({
                     "lifecycle": "merge_clean",
                     "proposal_id": proposal.proposal_id.clone(),
-                    "proposal_revision_id": proposal.proposal_revision_id.clone(),
+                    "proposal_revision_id": revision_id,
+                    "snapshot_id": snapshot_id,
+                    "base_head": input.base_head.clone(),
+                    "ours_head": input.ours_head.clone(),
                     "base_content_ref": input.base_content_ref.clone(),
                     "ours_content_ref": input.ours_content_ref.clone(),
                     "theirs_content_ref": input.theirs_content_ref.clone(),
                     "merged_content_ref": input.merged_content_ref.clone(),
+                    "merge_lineage_hash": merge_lineage_hash,
                 })
                 .to_string(),
                 now
@@ -2894,18 +2950,20 @@ pub fn record_merge_success(
         if updated != 1 {
             return Err(anyhow!("current operation changed"));
         }
+        out = Some(MergeSuccessRecord {
+            proposal_id: proposal.proposal_id.clone(),
+            proposal_revision_id: revision_id,
+            snapshot_id,
+            base_content_ref: input.base_content_ref.clone(),
+            ours_content_ref: input.ours_content_ref.clone(),
+            theirs_content_ref: input.theirs_content_ref.clone(),
+            merged_content_ref: input.merged_content_ref.clone(),
+            operation_id: operation_id.clone(),
+            view_id: view_id.clone(),
+        });
         Ok(())
     })?;
-    Ok(MergeSuccessRecord {
-        proposal_id: proposal.proposal_id.clone(),
-        proposal_revision_id: proposal.proposal_revision_id.clone(),
-        base_content_ref: input.base_content_ref.clone(),
-        ours_content_ref: input.ours_content_ref.clone(),
-        theirs_content_ref: input.theirs_content_ref.clone(),
-        merged_content_ref: input.merged_content_ref.clone(),
-        operation_id,
-        view_id,
-    })
+    out.ok_or_else(|| anyhow!("merge did not produce a record"))
 }
 
 pub fn resolve_conflict_with_tree(
@@ -3000,7 +3058,7 @@ pub fn resolve_conflict_with_tree(
         let cwd = ".".to_string();
         let evidence_hash = integrity::evidence_digest(&integrity::EvidenceDigestInput {
             attempt_id: &proposal.attempt_id,
-            snapshot_id: Some(&snapshot_id),
+            snapshot_id: None,
             command: "forge",
             args: &evidence_args,
             cwd: &cwd,
@@ -3029,7 +3087,7 @@ pub fn resolve_conflict_with_tree(
                 evidence_id,
                 context.repo_id,
                 proposal.attempt_id,
-                snapshot_id,
+                Option::<String>::None,
                 serde_json::to_string(&evidence_args)?,
                 cwd,
                 now,
@@ -3051,12 +3109,7 @@ pub fn resolve_conflict_with_tree(
             "UPDATE conflict_sets SET status = 'resolved' WHERE id = ?1",
             params![conflict_set_id],
         )?;
-        if let Some((_stored, recomputed)) = recompute_conflict_set_hash(tx, conflict_set_id)? {
-            tx.execute(
-                "UPDATE conflict_sets SET content_hash = ?1 WHERE id = ?2",
-                params![recomputed, conflict_set_id],
-            )?;
-        }
+        set_expected_content_ref(tx, resolution_ref)?;
         let parent_hash = op_content_hash(tx, Some(&context.current_operation_id))?;
         let content_hash = integrity::operation_link_hash(
             &parent_hash,
@@ -3066,7 +3119,7 @@ pub fn resolve_conflict_with_tree(
                 kind: "conflict_resolved",
                 created_at_ms: now,
             },
-            None,
+            Some(&evidence_hash),
         );
         tx.execute(
             "INSERT INTO operations (
@@ -3125,6 +3178,51 @@ pub fn resolve_conflict_with_tree(
         Ok(())
     })?;
     out.ok_or_else(|| anyhow!("conflict resolution did not produce a record"))
+}
+
+pub fn preflight_conflict_resolution(
+    cwd: &Path,
+    conflict_set_id: &str,
+    resolution_ref: &str,
+) -> Result<()> {
+    let context = open_repository(cwd)?;
+    if resolution_ref.starts_with(forge_content::FORGE_TREE_PREFIX) {
+        forge_content_native::NativeObjectStore::new(&context.root_path)
+            .verify_content_ref(resolution_ref)?;
+    } else {
+        return Err(anyhow!(
+            "conflict resolution requires a forge-tree content ref"
+        ));
+    }
+    let connection = open_connection(&context.database_path)?;
+    let (paths_json, status): (String, String) = connection
+        .query_row(
+            "SELECT paths_json, status FROM conflict_sets WHERE id = ?1 AND repo_id = ?2",
+            params![conflict_set_id, context.repo_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| ForgeError::ConflictSetNotFound {
+            conflict_set_id: conflict_set_id.to_string(),
+        })?;
+    if status == "resolved" {
+        return Err(anyhow!("conflict set is already resolved"));
+    }
+    let proposal_id = serde_json::from_str::<Value>(&paths_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("proposal_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .ok_or_else(|| anyhow!("conflict set has no proposal binding"))?;
+    proposal_by_id_on(&connection, &context, &proposal_id)?.ok_or({
+        ForgeError::UnknownProposal {
+            selector: proposal_id,
+        }
+    })?;
+    Ok(())
 }
 
 fn prepare_stale_base_conflict(
@@ -3963,7 +4061,7 @@ fn recompute_conflict_set_hash(
         .query_row(
             "SELECT id, repo_id, context, paths_json, created_at_ms, base_content_ref,
                     ours_content_ref, theirs_content_ref, generated_by_operation_id,
-                    resolver_backend, status, content_hash
+                    resolver_backend, content_hash
              FROM conflict_sets WHERE id = ?1",
             params![conflict_set_id],
             |row| {
@@ -3978,8 +4076,7 @@ fn recompute_conflict_set_hash(
                     theirs_content_ref: row.get(7)?,
                     generated_by_operation_id: row.get(8)?,
                     resolver_backend: row.get(9)?,
-                    status: row.get(10)?,
-                    content_hash: row.get(11)?,
+                    content_hash: row.get(10)?,
                 })
             },
         )
@@ -3993,7 +4090,7 @@ fn recompute_conflict_set_hash(
     let mut path_stmt = conn.prepare(
         "SELECT id, path, path_fingerprint, base_path, ours_path, theirs_path, kind,
                 base_ref, ours_ref, theirs_ref, base_status, ours_status, theirs_status,
-                base_mode, ours_mode, theirs_mode, resolution_ref, status, created_at_ms
+                base_mode, ours_mode, theirs_mode, created_at_ms
          FROM path_conflicts WHERE conflict_set_id = ?1 ORDER BY rowid",
     )?;
     let path_rows: Vec<StoredPathConflict> = path_stmt
@@ -4015,15 +4112,13 @@ fn recompute_conflict_set_hash(
                 base_mode: row.get(13)?,
                 ours_mode: row.get(14)?,
                 theirs_mode: row.get(15)?,
-                resolution_ref: row.get(16)?,
-                status: row.get(17)?,
-                created_at_ms: row.get(18)?,
+                created_at_ms: row.get(16)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
     let digest_rows = path_rows
         .iter()
-        .map(StoredPathConflict::digest_input)
+        .map(StoredPathConflict::immutable_digest_input)
         .collect::<Vec<_>>();
     let recomputed = integrity::conflict_set_digest(&integrity::ConflictSetDigestInput {
         id: &conflict.id,
@@ -4035,7 +4130,7 @@ fn recompute_conflict_set_hash(
         theirs_content_ref: conflict.theirs_content_ref.as_deref(),
         generated_by_operation_id: conflict.generated_by_operation_id.as_deref(),
         resolver_backend: conflict.resolver_backend.as_deref(),
-        status: &conflict.status,
+        status: "unresolved",
         created_at_ms: conflict.created_at_ms,
         path_conflicts: &digest_rows,
     });
@@ -4053,7 +4148,6 @@ struct StoredConflictSet {
     theirs_content_ref: Option<String>,
     generated_by_operation_id: Option<String>,
     resolver_backend: Option<String>,
-    status: String,
     content_hash: Option<String>,
 }
 
@@ -4074,13 +4168,11 @@ struct StoredPathConflict {
     base_mode: Option<String>,
     ours_mode: Option<String>,
     theirs_mode: Option<String>,
-    resolution_ref: Option<String>,
-    status: String,
     created_at_ms: i64,
 }
 
 impl StoredPathConflict {
-    fn digest_input(&self) -> integrity::PathConflictDigestInput<'_> {
+    fn immutable_digest_input(&self) -> integrity::PathConflictDigestInput<'_> {
         integrity::PathConflictDigestInput {
             id: &self.id,
             path: &self.path,
@@ -4098,8 +4190,8 @@ impl StoredPathConflict {
             base_mode: self.base_mode.as_deref(),
             ours_mode: self.ours_mode.as_deref(),
             theirs_mode: self.theirs_mode.as_deref(),
-            resolution_ref: self.resolution_ref.as_deref(),
-            status: &self.status,
+            resolution_ref: None,
+            status: "unresolved",
             created_at_ms: self.created_at_ms,
         }
     }
@@ -4184,6 +4276,51 @@ fn op_domain_digest(conn: &Connection, view_id: Option<&str>) -> Result<Option<S
             .optional()
             .map(Option::flatten)
             .map_err(Into::into);
+    }
+    if let Some(stored) = state.get("merge_lineage_hash").and_then(Value::as_str) {
+        let recomputed = integrity::merge_lineage_digest(&integrity::MergeLineageDigestInput {
+            proposal_id: state
+                .get("proposal_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            proposal_revision_id: state
+                .get("proposal_revision_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            snapshot_id: state
+                .get("snapshot_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            base_head: state
+                .get("base_head")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            ours_head: state
+                .get("ours_head")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            base_content_ref: state
+                .get("base_content_ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            ours_content_ref: state
+                .get("ours_content_ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            theirs_content_ref: state
+                .get("theirs_content_ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            merged_content_ref: state
+                .get("merged_content_ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        });
+        return Ok(Some(if recomputed == stored {
+            stored.to_string()
+        } else {
+            recomputed
+        }));
     }
     if let Some(conflict_set_id) = state.get("conflict_set_id").and_then(Value::as_str) {
         return conn
@@ -5271,6 +5408,44 @@ fn resolved_merge_parents_for_proposal_on(
     proposal_id: &str,
     content_ref: Option<&str>,
 ) -> Result<Option<(String, String)>> {
+    let mut merge_statement = connection.prepare(
+        "SELECT v.state_json
+         FROM views v
+         JOIN operations o ON o.id = v.operation_id
+         WHERE v.repo_id = ?1 AND v.kind = 'merge_clean' AND o.status = 'success'
+         ORDER BY v.created_at_ms DESC, v.rowid DESC",
+    )?;
+    let merge_rows = merge_statement.query_map(params![repo_id], |row| row.get::<_, String>(0))?;
+    for row in merge_rows {
+        let state_json = row?;
+        let Ok(value) = serde_json::from_str::<Value>(&state_json) else {
+            continue;
+        };
+        if value.get("proposal_id").and_then(Value::as_str) != Some(proposal_id) {
+            continue;
+        }
+        if let Some(content_ref) = content_ref {
+            if value.get("merged_content_ref").and_then(Value::as_str) != Some(content_ref) {
+                continue;
+            }
+        }
+        let Some(ours_head) = value
+            .get("ours_head")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Some(base_head) = value
+            .get("base_head")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        return Ok(Some((ours_head, base_head)));
+    }
+
     let mut statement = connection.prepare(
         "SELECT id, paths_json
          FROM conflict_sets
@@ -5330,6 +5505,12 @@ fn proposals_for_attempt(
          FROM proposals p
          JOIN proposal_revisions pr ON pr.proposal_id = p.id
          WHERE p.repo_id = ?1 AND p.attempt_id = ?2
+           AND NOT EXISTS (
+               SELECT 1 FROM proposal_revisions newer
+               WHERE newer.proposal_id = pr.proposal_id
+                 AND (newer.created_at_ms > pr.created_at_ms
+                      OR (newer.created_at_ms = pr.created_at_ms AND newer.rowid > pr.rowid))
+           )
          ORDER BY pr.created_at_ms ASC",
     )?;
     let rows = statement.query_map(params![context.repo_id, attempt_id], |row| {

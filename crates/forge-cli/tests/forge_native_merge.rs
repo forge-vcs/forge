@@ -1,6 +1,7 @@
 mod common;
 
 use common::TestRepo;
+use rusqlite::Connection;
 use serde_json::Value;
 
 fn json_output(assert: assert_cmd::assert::Assert) -> Value {
@@ -11,6 +12,16 @@ fn forge_ok(repo: &TestRepo, args: &[&str]) -> Value {
     let mut full = vec!["--json"];
     full.extend_from_slice(args);
     json_output(repo.forge().args(&full).assert().success())
+}
+
+fn forge_fail(repo: &TestRepo, args: &[&str]) -> Value {
+    let mut full = vec!["--json"];
+    full.extend_from_slice(args);
+    json_output(repo.forge().args(&full).assert().failure())
+}
+
+fn db(repo: &TestRepo) -> Connection {
+    Connection::open(repo.path().join(".forge/forge.db")).expect("open forge db")
 }
 
 fn init_two_native_attempts(repo: &TestRepo) -> (String, String, String) {
@@ -59,6 +70,61 @@ fn native_merge_clean_non_overlapping_changes_returns_merged_tree() {
         .unwrap()
         .starts_with("forge-tree:"));
     assert_eq!(out["data"]["proposal_id"], proposal_b);
+    let merged_content_ref = out["data"]["merged_content_ref"].as_str().unwrap();
+    let merged_revision = out["data"]["proposal_revision_id"].as_str().unwrap();
+
+    let premature_accept = forge_fail(
+        &repo,
+        &["accept", "--attempt", &attempt_b, "--proposal", &proposal_b],
+    );
+    assert_eq!(premature_accept["errors"][0]["code"], "CHECK_NOT_PASSED");
+
+    forge_ok(
+        &repo,
+        &["run", "--attempt", &attempt_b, "--", "sh", "-c", "true"],
+    );
+    let checked = forge_ok(&repo, &["check", "--attempt", &attempt_b]);
+    assert_eq!(checked["data"]["proposal_revision_id"], merged_revision);
+    assert_eq!(checked["data"]["status"], "passed");
+    forge_ok(
+        &repo,
+        &["accept", "--attempt", &attempt_b, "--proposal", &proposal_b],
+    );
+    let log = forge_ok(&repo, &["log"]);
+    let commits = log["data"]["commits"].as_array().unwrap();
+    let merge_commit = commits
+        .iter()
+        .find(|commit| commit["proposal_revision_id"] == merged_revision)
+        .expect("clean merge commit is logged");
+    assert_eq!(
+        merge_commit["tree"],
+        merged_content_ref.trim_start_matches("forge-tree:")
+    );
+    assert_eq!(merge_commit["parents"].as_array().unwrap().len(), 2);
+    let doctor = forge_ok(&repo, &["doctor"]);
+    assert!(doctor["data"]["issues"].as_array().unwrap().is_empty());
+
+    let connection = db(&repo);
+    let state_json: String = connection
+        .query_row(
+            "SELECT state_json FROM views WHERE kind = 'merge_clean' ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("merge_clean view exists");
+    let mut state: Value = serde_json::from_str(&state_json).expect("view json");
+    state["ours_head"] = Value::String(
+        "f1:commit:sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
+    );
+    connection
+        .execute(
+            "UPDATE views SET state_json = ?1 WHERE kind = 'merge_clean'",
+            [serde_json::to_string(&state).unwrap()],
+        )
+        .expect("tamper merge lineage");
+    let tampered = forge_ok(&repo, &["doctor"]);
+    assert!(!tampered["data"]["issues"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -92,6 +158,25 @@ fn native_merge_overlapping_changes_persists_conflict_set() {
         .as_str()
         .unwrap()
         .to_string();
+    let before_failed_resolve = std::fs::read_to_string(repo.path().join("README.md")).unwrap();
+    let failed_resolve = forge_fail(
+        &repo,
+        &[
+            "conflict",
+            "resolve",
+            "conflict_missing",
+            "--tree",
+            &resolution_ref,
+        ],
+    );
+    assert_eq!(
+        failed_resolve["errors"][0]["code"],
+        "CONFLICT_SET_NOT_FOUND"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        before_failed_resolve
+    );
     let resolved = forge_ok(
         &repo,
         &[
@@ -116,16 +201,26 @@ fn native_merge_overlapping_changes_persists_conflict_set() {
         resolution_ref
     );
 
+    let premature_accept = forge_fail(
+        &repo,
+        &["accept", "--attempt", &attempt_b, "--proposal", &proposal_b],
+    );
+    assert_eq!(premature_accept["errors"][0]["code"], "CHECK_NOT_PASSED");
+    let stale_check = forge_ok(&repo, &["check", "--attempt", &attempt_b]);
+    assert_ne!(stale_check["data"]["status"], "passed");
     forge_ok(
         &repo,
-        &[
-            "accept",
-            "--attempt",
-            &attempt_b,
-            "--proposal",
-            &proposal_b,
-            "--allow-unverified",
-        ],
+        &["run", "--attempt", &attempt_b, "--", "sh", "-c", "true"],
+    );
+    let checked = forge_ok(&repo, &["check", "--attempt", &attempt_b]);
+    assert_eq!(
+        checked["data"]["proposal_revision_id"],
+        resolved["data"]["proposal_revision_id"]
+    );
+    assert_eq!(checked["data"]["status"], "passed");
+    forge_ok(
+        &repo,
+        &["accept", "--attempt", &attempt_b, "--proposal", &proposal_b],
     );
     let log = forge_ok(&repo, &["log"]);
     let commits = log["data"]["commits"].as_array().unwrap();
@@ -134,4 +229,6 @@ fn native_merge_overlapping_changes_persists_conflict_set() {
         .find(|commit| commit["proposal_revision_id"] == resolved["data"]["proposal_revision_id"])
         .expect("resolved merge commit is logged");
     assert_eq!(merge_commit["parents"].as_array().unwrap().len(), 2);
+    let doctor = forge_ok(&repo, &["doctor"]);
+    assert!(doctor["data"]["issues"].as_array().unwrap().is_empty());
 }
