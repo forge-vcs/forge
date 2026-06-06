@@ -41,6 +41,8 @@ enum Command {
     Compare(CompareArgs),
     /// Diff native or git content refs, or the working tree against a native snapshot.
     Diff(DiffArgs),
+    /// Merge a proposal against the current native head.
+    Merge(MergeArgs),
     /// Inspect persisted conflict-as-data records.
     Conflict(ConflictArgs),
     /// Walk the native commit history (tip→genesis) and the evidence that justified it.
@@ -91,6 +93,13 @@ struct DiffArgs {
 }
 
 #[derive(Debug, Args)]
+struct MergeArgs {
+    /// Proposal id whose base/theirs tree should merge with the current repo head.
+    #[arg(long)]
+    proposal: String,
+}
+
+#[derive(Debug, Args)]
 struct ConflictArgs {
     #[command(subcommand)]
     command: ConflictCommand,
@@ -99,7 +108,14 @@ struct ConflictArgs {
 #[derive(Debug, Subcommand)]
 enum ConflictCommand {
     List,
-    Show { conflict_set_id: String },
+    Show {
+        conflict_set_id: String,
+    },
+    Resolve {
+        conflict_set_id: String,
+        #[arg(long)]
+        tree: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -306,6 +322,7 @@ fn main() -> ExitCode {
         Command::Proposal(args) => proposal_response(request_id, args),
         Command::Compare(args) => compare_response(request_id, "compare", args),
         Command::Diff(args) => diff_response(request_id, args),
+        Command::Merge(args) => merge_response(request_id, args),
         Command::Conflict(args) => conflict_response(request_id, args),
         Command::Log(args) => log_response(request_id, args),
         Command::Checkout(args) => checkout_response(request_id, args),
@@ -561,6 +578,93 @@ fn diff_response(request_id: Option<String>, args: DiffArgs) -> ResponseEnvelope
     })
 }
 
+fn merge_response(request_id: Option<String>, args: MergeArgs) -> ResponseEnvelope {
+    command_result("merge", request_id, |cwd, request_id| {
+        let proposal = forge_store::proposal_for_merge(&cwd, &args.proposal)?;
+        let backend = selected_backend(&cwd)?;
+        let base_content_ref = backend.base_content_ref(&cwd, &proposal.base_head)?;
+        let ours_head = backend.current_base(&cwd)?;
+        let ours_content_ref = backend.base_content_ref(&cwd, &ours_head)?;
+        let theirs_content_ref = proposal.content_ref.clone();
+        match (
+            classify_content_ref(&base_content_ref),
+            classify_content_ref(&ours_content_ref),
+            classify_content_ref(&theirs_content_ref),
+        ) {
+            (
+                ContentRefKind::ForgeTree(_),
+                ContentRefKind::ForgeTree(_),
+                ContentRefKind::ForgeTree(_),
+            ) => {}
+            _ => anyhow::bail!("merge currently requires native forge-tree refs"),
+        }
+        let store = forge_content_native::NativeObjectStore::new(&cwd);
+        let result = forge_content_native::merge_native_content_refs(
+            &store,
+            &base_content_ref,
+            &ours_content_ref,
+            &theirs_content_ref,
+        )?;
+        if let Some(merged_content_ref) = result.merged_content_ref {
+            ensure_clean_worktree(&cwd, &merged_content_ref)?;
+            backend_for_content_ref(&merged_content_ref)?
+                .restore_snapshot(&cwd, &merged_content_ref)?;
+            let record = forge_store::record_merge_success(
+                &cwd,
+                request_id,
+                "merge",
+                &proposal,
+                &forge_store::MergeSuccessInput {
+                    base_head: proposal.base_head.clone(),
+                    ours_head: ours_head.clone(),
+                    base_content_ref,
+                    ours_content_ref,
+                    theirs_content_ref,
+                    merged_content_ref,
+                },
+            )?;
+            Ok((
+                Some(record.operation_id.clone()),
+                json!({
+                    "merged": true,
+                    "proposal_id": record.proposal_id,
+                    "proposal_revision_id": record.proposal_revision_id,
+                    "snapshot_id": record.snapshot_id,
+                    "base_content_ref": record.base_content_ref,
+                    "ours_content_ref": record.ours_content_ref,
+                    "theirs_content_ref": record.theirs_content_ref,
+                    "merged_content_ref": record.merged_content_ref,
+                    "operation_id": record.operation_id,
+                }),
+                secret_export_warnings(&result.dropped_secret_paths),
+            ))
+        } else {
+            let input = forge_store::MergeConflictInput {
+                context: "native_merge".to_string(),
+                proposal_id: Some(proposal.proposal_id.clone()),
+                base_head: Some(proposal.base_head.clone()),
+                ours_head: Some(ours_head),
+                base_content_ref,
+                ours_content_ref,
+                theirs_content_ref,
+                conflicts: result.conflicts,
+            };
+            let record = forge_store::record_merge_conflict(&cwd, request_id, "merge", &input)?;
+            Ok((
+                Some(record.operation_id.clone()),
+                json!({
+                    "merged": false,
+                    "proposal_id": proposal.proposal_id,
+                    "proposal_revision_id": proposal.proposal_revision_id,
+                    "conflict_set_id": record.conflict_set_id,
+                    "operation_id": record.operation_id,
+                }),
+                secret_export_warnings(&result.dropped_secret_paths),
+            ))
+        }
+    })
+}
+
 fn conflict_response(request_id: Option<String>, args: ConflictArgs) -> ResponseEnvelope {
     match args.command {
         ConflictCommand::List => command_result("conflict list", request_id, |cwd, _| {
@@ -579,6 +683,21 @@ fn conflict_response(request_id: Option<String>, args: ConflictArgs) -> Response
                 ))
             })
         }
+        ConflictCommand::Resolve {
+            conflict_set_id,
+            tree,
+        } => command_result("conflict resolve", request_id, |cwd, request_id| {
+            forge_store::preflight_conflict_resolution(&cwd, &conflict_set_id, &tree)?;
+            ensure_clean_worktree(&cwd, &tree)?;
+            backend_for_content_ref(&tree)?.restore_snapshot(&cwd, &tree)?;
+            let record =
+                forge_store::resolve_conflict_with_tree(&cwd, request_id, &conflict_set_id, &tree)?;
+            Ok((
+                Some(record.operation_id.clone()),
+                serde_json::to_value(record)?,
+                Vec::new(),
+            ))
+        }),
     }
 }
 
@@ -803,20 +922,33 @@ fn accept_response(request_id: Option<String>, args: AcceptArgs) -> ResponseEnve
         let backend = selected_backend(&cwd)?;
         let current_head = backend.current_base(&cwd)?;
         if current_head != proposal.base_head {
-            let base_content_ref = backend.base_content_ref(&cwd, &proposal.base_head)?;
-            let ours_content_ref = backend.base_content_ref(&cwd, &current_head)?;
-            return Err(forge_store::StaleBaseConflict {
-                input: forge_store::StaleBaseConflictInput {
-                    context: "stale_base_accept".to_string(),
-                    expected_head: proposal.base_head.clone(),
-                    actual_head: current_head,
-                    base_content_ref,
-                    ours_content_ref,
-                    theirs_content_ref: proposal.content_ref.clone(),
-                    changed_paths: proposal.changed_paths.clone(),
-                },
+            if forge_store::resolved_merge_ours_head(
+                &cwd,
+                &proposal.proposal_id,
+                &proposal.content_ref,
+            )?
+            .as_deref()
+                == Some(current_head.as_str())
+            {
+                // The proposal was explicitly resolved from a native merge against this
+                // head. `decide` writes the two-parent commit from the stored merge
+                // metadata, so this is not a stale-base bypass.
+            } else {
+                let base_content_ref = backend.base_content_ref(&cwd, &proposal.base_head)?;
+                let ours_content_ref = backend.base_content_ref(&cwd, &current_head)?;
+                return Err(forge_store::StaleBaseConflict {
+                    input: forge_store::StaleBaseConflictInput {
+                        context: "stale_base_accept".to_string(),
+                        expected_head: proposal.base_head.clone(),
+                        actual_head: current_head,
+                        base_content_ref,
+                        ours_content_ref,
+                        theirs_content_ref: proposal.content_ref.clone(),
+                        changed_paths: proposal.changed_paths.clone(),
+                    },
+                }
+                .into());
             }
-            .into());
         }
         // Evidence gate (NER-135 R6): enforced in-txn inside `decide` unless
         // --allow-unverified. On bypass, surface the non-passing status as a warning.
@@ -1518,6 +1650,8 @@ fn is_mutating_command(command: &str) -> bool {
             | "run"
             | "propose"
             | "check"
+            | "merge"
+            | "conflict resolve"
             | "accept"
             | "reject"
             | "export branch"

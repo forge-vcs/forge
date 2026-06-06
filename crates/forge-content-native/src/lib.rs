@@ -98,6 +98,70 @@ pub fn diff_working_vs_tree(
     )
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeMergeResult {
+    pub merged_content_ref: Option<String>,
+    pub conflicts: Vec<NativeMergeConflict>,
+    pub dropped_secret_paths: Vec<String>,
+}
+
+impl NativeMergeResult {
+    pub fn is_clean(&self) -> bool {
+        self.conflicts.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NativeMergeConflict {
+    pub path: String,
+    pub kind: NativeMergeConflictKind,
+    pub base_ref: Option<String>,
+    pub ours_ref: Option<String>,
+    pub theirs_ref: Option<String>,
+    pub base_status: Option<String>,
+    pub ours_status: Option<String>,
+    pub theirs_status: Option<String>,
+    pub base_mode: Option<u32>,
+    pub ours_mode: Option<u32>,
+    pub theirs_mode: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeMergeConflictKind {
+    Content,
+    Binary,
+    DeleteModify,
+    Rename,
+    DirFile,
+    Mode,
+    Symlink,
+}
+
+pub fn merge_native_content_refs(
+    store: &NativeObjectStore,
+    base_ref: &str,
+    ours_ref: &str,
+    theirs_ref: &str,
+) -> Result<NativeMergeResult> {
+    let base = object_id_from_content_ref(base_ref)?;
+    let ours = object_id_from_content_ref(ours_ref)?;
+    let theirs = object_id_from_content_ref(theirs_ref)?;
+    merge_native_trees(store, &base, &ours, &theirs)
+}
+
+pub fn merge_native_trees(
+    store: &NativeObjectStore,
+    base: &ObjectId,
+    ours: &ObjectId,
+    theirs: &ObjectId,
+) -> Result<NativeMergeResult> {
+    let base_map = store.tree_fingerprints(base)?;
+    let ours_map = store.tree_fingerprints(ours)?;
+    let theirs_map = store.tree_fingerprints(theirs)?;
+    merge_fingerprint_maps(store, &base_map, &ours_map, &theirs_map)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ObjectKind {
@@ -1764,6 +1828,379 @@ type FileFingerprint = (String, u32);
 type FingerprintMap = BTreeMap<String, FileFingerprint>;
 type BlobOverlay = BTreeMap<String, Vec<u8>>;
 
+fn merge_fingerprint_maps(
+    store: &NativeObjectStore,
+    base: &FingerprintMap,
+    ours: &FingerprintMap,
+    theirs: &FingerprintMap,
+) -> Result<NativeMergeResult> {
+    let mut paths = BTreeSet::new();
+    paths.extend(base.keys().cloned());
+    paths.extend(ours.keys().cloned());
+    paths.extend(theirs.keys().cloned());
+
+    let mut merged = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    let mut dropped_secret_paths = Vec::new();
+
+    for path in paths {
+        if is_ignored_by_policy(&path) {
+            dropped_secret_paths.push(path);
+            continue;
+        }
+        let base_fp = base.get(&path);
+        let ours_fp = ours.get(&path);
+        let theirs_fp = theirs.get(&path);
+
+        if has_dir_file_collision(&path, ours, theirs) {
+            conflicts.push(native_merge_conflict(
+                path,
+                NativeMergeConflictKind::DirFile,
+                base_fp,
+                ours_fp,
+                theirs_fp,
+            ));
+            continue;
+        }
+
+        if ours_fp == theirs_fp {
+            if let Some(fp) = ours_fp {
+                merged.insert(path, fp.clone());
+            }
+            continue;
+        }
+        if ours_fp == base_fp {
+            if let Some(fp) = theirs_fp {
+                merged.insert(path, fp.clone());
+            }
+            continue;
+        }
+        if theirs_fp == base_fp {
+            if let Some(fp) = ours_fp {
+                merged.insert(path, fp.clone());
+            }
+            continue;
+        }
+
+        match (base_fp, ours_fp, theirs_fp) {
+            (Some(base_fp), Some(ours_fp), Some(theirs_fp)) => {
+                if let Some(fp) = merge_regular_text_file(store, base_fp, ours_fp, theirs_fp)? {
+                    merged.insert(path, fp);
+                } else {
+                    conflicts.push(native_merge_conflict(
+                        path,
+                        classify_three_way_conflict(store, base_fp, ours_fp, theirs_fp)?,
+                        Some(base_fp),
+                        Some(ours_fp),
+                        Some(theirs_fp),
+                    ));
+                }
+            }
+            (Some(_), None, Some(_)) | (Some(_), Some(_), None) => {
+                conflicts.push(native_merge_conflict(
+                    path,
+                    NativeMergeConflictKind::DeleteModify,
+                    base_fp,
+                    ours_fp,
+                    theirs_fp,
+                ));
+            }
+            (None, Some(ours_fp), Some(theirs_fp)) => {
+                let kind = if merge_entry_is_binary_or_symlink(store, ours_fp, theirs_fp)? {
+                    classify_added_added_conflict(store, ours_fp, theirs_fp)?
+                } else {
+                    NativeMergeConflictKind::Content
+                };
+                conflicts.push(native_merge_conflict(
+                    path,
+                    kind,
+                    base_fp,
+                    Some(ours_fp),
+                    Some(theirs_fp),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let merged_content_ref = if conflicts.is_empty() {
+        let root = write_tree_from_fingerprints(store, &merged, "")?;
+        Some(format!("{FORGE_TREE_PREFIX}{root}"))
+    } else {
+        None
+    };
+    Ok(NativeMergeResult {
+        merged_content_ref,
+        conflicts,
+        dropped_secret_paths,
+    })
+}
+
+fn has_dir_file_collision(path: &str, ours: &FingerprintMap, theirs: &FingerprintMap) -> bool {
+    (ours.contains_key(path) && has_descendant(theirs, path))
+        || (theirs.contains_key(path) && has_descendant(ours, path))
+}
+
+fn has_descendant(map: &FingerprintMap, path: &str) -> bool {
+    let prefix = format!("{path}/");
+    map.keys().any(|candidate| candidate.starts_with(&prefix))
+}
+
+fn native_merge_conflict(
+    path: String,
+    kind: NativeMergeConflictKind,
+    base: Option<&FileFingerprint>,
+    ours: Option<&FileFingerprint>,
+    theirs: Option<&FileFingerprint>,
+) -> NativeMergeConflict {
+    NativeMergeConflict {
+        path,
+        kind,
+        base_ref: base.map(|fp| fp.0.clone()),
+        ours_ref: ours.map(|fp| fp.0.clone()),
+        theirs_ref: theirs.map(|fp| fp.0.clone()),
+        base_status: side_status(base),
+        ours_status: side_status(ours),
+        theirs_status: side_status(theirs),
+        base_mode: base.map(|fp| fp.1),
+        ours_mode: ours.map(|fp| fp.1),
+        theirs_mode: theirs.map(|fp| fp.1),
+    }
+}
+
+fn side_status(side: Option<&FileFingerprint>) -> Option<String> {
+    Some(if side.is_some() { "present" } else { "absent" }.to_string())
+}
+
+fn classify_three_way_conflict(
+    store: &NativeObjectStore,
+    base: &FileFingerprint,
+    ours: &FileFingerprint,
+    theirs: &FileFingerprint,
+) -> Result<NativeMergeConflictKind> {
+    if [base.1, ours.1, theirs.1].contains(&SYMLINK_MODE) {
+        return Ok(NativeMergeConflictKind::Symlink);
+    }
+    if ours.1 != theirs.1 || ours.1 != base.1 {
+        return Ok(NativeMergeConflictKind::Mode);
+    }
+    let base_bytes = read_blob(store, &BTreeMap::new(), &base.0)?;
+    let ours_bytes = read_blob(store, &BTreeMap::new(), &ours.0)?;
+    let theirs_bytes = read_blob(store, &BTreeMap::new(), &theirs.0)?;
+    if is_binary(&base_bytes) || is_binary(&ours_bytes) || is_binary(&theirs_bytes) {
+        return Ok(NativeMergeConflictKind::Binary);
+    }
+    Ok(NativeMergeConflictKind::Content)
+}
+
+fn classify_added_added_conflict(
+    store: &NativeObjectStore,
+    ours: &FileFingerprint,
+    theirs: &FileFingerprint,
+) -> Result<NativeMergeConflictKind> {
+    if ours.1 == SYMLINK_MODE || theirs.1 == SYMLINK_MODE {
+        return Ok(NativeMergeConflictKind::Symlink);
+    }
+    if ours.1 != theirs.1 {
+        return Ok(NativeMergeConflictKind::Mode);
+    }
+    let ours_bytes = read_blob(store, &BTreeMap::new(), &ours.0)?;
+    let theirs_bytes = read_blob(store, &BTreeMap::new(), &theirs.0)?;
+    if is_binary(&ours_bytes) || is_binary(&theirs_bytes) {
+        return Ok(NativeMergeConflictKind::Binary);
+    }
+    Ok(NativeMergeConflictKind::Content)
+}
+
+fn merge_entry_is_binary_or_symlink(
+    store: &NativeObjectStore,
+    ours: &FileFingerprint,
+    theirs: &FileFingerprint,
+) -> Result<bool> {
+    if ours.1 == SYMLINK_MODE || theirs.1 == SYMLINK_MODE {
+        return Ok(true);
+    }
+    let ours_bytes = read_blob(store, &BTreeMap::new(), &ours.0)?;
+    let theirs_bytes = read_blob(store, &BTreeMap::new(), &theirs.0)?;
+    Ok(is_binary(&ours_bytes) || is_binary(&theirs_bytes))
+}
+
+fn merge_regular_text_file(
+    store: &NativeObjectStore,
+    base: &FileFingerprint,
+    ours: &FileFingerprint,
+    theirs: &FileFingerprint,
+) -> Result<Option<FileFingerprint>> {
+    if [base.1, ours.1, theirs.1].contains(&SYMLINK_MODE) || base.1 != ours.1 || base.1 != theirs.1
+    {
+        return Ok(None);
+    }
+    let base_bytes = read_blob(store, &BTreeMap::new(), &base.0)?;
+    let ours_bytes = read_blob(store, &BTreeMap::new(), &ours.0)?;
+    let theirs_bytes = read_blob(store, &BTreeMap::new(), &theirs.0)?;
+    if is_binary(&base_bytes) || is_binary(&ours_bytes) || is_binary(&theirs_bytes) {
+        return Ok(None);
+    }
+    let Some(merged) = merge_text_non_overlapping(&base_bytes, &ours_bytes, &theirs_bytes)? else {
+        return Ok(None);
+    };
+    let blob = store.write_object(ObjectKind::Blob, &merged)?;
+    Ok(Some((blob.to_string(), base.1)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextReplacement {
+    start: usize,
+    end: usize,
+    lines: Vec<Vec<u8>>,
+}
+
+fn merge_text_non_overlapping(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<Option<Vec<u8>>> {
+    let base_lines = split_lines(base);
+    let ours_replacements = text_replacements(&base_lines, &split_lines(ours));
+    let theirs_replacements = text_replacements(&base_lines, &split_lines(theirs));
+    for ours_replacement in &ours_replacements {
+        for theirs_replacement in &theirs_replacements {
+            if replacements_conflict(ours_replacement, theirs_replacement) {
+                return Ok(None);
+            }
+        }
+    }
+    let mut replacements = ours_replacements;
+    replacements.extend(theirs_replacements);
+    coalesce_shared_boundary_replacements(&mut replacements);
+    replacements.sort_by(|a, b| {
+        b.start
+            .cmp(&a.start)
+            .then(b.end.cmp(&a.end))
+            .then(b.lines.cmp(&a.lines))
+    });
+    replacements.dedup();
+    let mut merged = base_lines;
+    for replacement in replacements {
+        merged.splice(replacement.start..replacement.end, replacement.lines);
+    }
+    Ok(Some(merged.into_iter().flatten().collect()))
+}
+
+fn coalesce_shared_boundary_replacements(replacements: &mut Vec<TextReplacement>) {
+    let mut index = 0;
+    while index < replacements.len() {
+        let mut merged = false;
+        let mut other_index = index + 1;
+        while other_index < replacements.len() {
+            if let Some(replacement) =
+                merge_shared_boundary_replacements(&replacements[index], &replacements[other_index])
+            {
+                replacements[index] = replacement;
+                replacements.remove(other_index);
+                merged = true;
+                break;
+            }
+            other_index += 1;
+        }
+        if !merged {
+            index += 1;
+        }
+    }
+}
+
+fn merge_shared_boundary_replacements(
+    a: &TextReplacement,
+    b: &TextReplacement,
+) -> Option<TextReplacement> {
+    if a.end == b.start && a.lines.last()? == b.lines.first()? {
+        let mut lines = a.lines.clone();
+        lines.extend_from_slice(&b.lines[1..]);
+        return Some(TextReplacement {
+            start: a.start,
+            end: b.end,
+            lines,
+        });
+    }
+    if b.end == a.start && b.lines.last()? == a.lines.first()? {
+        let mut lines = b.lines.clone();
+        lines.extend_from_slice(&a.lines[1..]);
+        return Some(TextReplacement {
+            start: b.start,
+            end: a.end,
+            lines,
+        });
+    }
+    None
+}
+
+fn text_replacements(base: &[Vec<u8>], side: &[Vec<u8>]) -> Vec<TextReplacement> {
+    similar::capture_diff_slices(similar::Algorithm::Patience, base, side)
+        .into_iter()
+        .filter_map(|op| {
+            let (tag, old_range, new_range) = op.as_tag_tuple();
+            if matches!(tag, similar::DiffTag::Equal) {
+                return None;
+            }
+            Some(TextReplacement {
+                start: old_range.start,
+                end: old_range.end,
+                lines: side[new_range].to_vec(),
+            })
+        })
+        .collect()
+}
+
+fn replacements_conflict(a: &TextReplacement, b: &TextReplacement) -> bool {
+    let overlapping = a.start < b.end && b.start < a.end;
+    let same_insertion = a.start == a.end && b.start == b.end && a.start == b.start;
+    overlapping || (same_insertion && a.lines != b.lines)
+}
+
+fn write_tree_from_fingerprints(
+    store: &NativeObjectStore,
+    files: &FingerprintMap,
+    prefix: &str,
+) -> Result<ObjectId> {
+    let mut entries = Vec::new();
+    let mut child_dirs = BTreeSet::new();
+    for (path, (object, mode)) in files {
+        let rest = if prefix.is_empty() {
+            path.as_str()
+        } else if let Some(rest) = path.strip_prefix(&format!("{prefix}/")) {
+            rest
+        } else {
+            continue;
+        };
+        if let Some((dir, _)) = rest.split_once('/') {
+            child_dirs.insert(dir.to_string());
+            continue;
+        }
+        entries.push(TreeEntry {
+            name: rest.to_string(),
+            kind: TreeEntryKind::File,
+            mode: *mode,
+            object: object.clone(),
+        });
+    }
+    for dir in child_dirs {
+        let child_prefix = if prefix.is_empty() {
+            dir.clone()
+        } else {
+            format!("{prefix}/{dir}")
+        };
+        let child = write_tree_from_fingerprints(store, files, &child_prefix)?;
+        entries.push(TreeEntry {
+            name: dir,
+            kind: TreeEntryKind::Dir,
+            mode: 0o040000,
+            object: child.to_string(),
+        });
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    let payload = serde_json::to_vec(&TreeObject {
+        schema_version: SCHEMA_VERSION,
+        entries,
+    })?;
+    store.write_object(ObjectKind::Tree, &payload)
+}
+
 /// Flatten a native tree into a map of repo-relative file path → `(blob id, mode)`,
 /// recursing into directory entries. Used by `changed_paths` for the name-level
 /// base-vs-worktree diff.
@@ -1919,6 +2356,31 @@ mod tests {
     }
 
     #[test]
+    fn merge_commit_object_id_is_a_golden_vector() {
+        let commit = CommitObject {
+            schema_version: COMMIT_SCHEMA_VERSION,
+            tree: format!("f1:tree:sha256:{}", "1".repeat(64)),
+            parents: vec![
+                format!("f1:commit:sha256:{}", "2".repeat(64)),
+                format!("f1:commit:sha256:{}", "3".repeat(64)),
+            ],
+            intent_id: Some("intent_merge".to_string()),
+            proposal_revision_id: Some("revision_merge".to_string()),
+            decision_id: Some("decision_merge".to_string()),
+            evidence_digest: Some(Hex64::new("4".repeat(64)).unwrap()),
+            actor: Some("agent".to_string()),
+            authored_time: Some(1_234_567_890),
+        };
+        let payload = serde_json::to_vec(&commit).unwrap();
+        let id = ObjectId::new(ObjectKind::Commit, &payload);
+
+        assert_eq!(
+            id.to_string(),
+            "f1:commit:sha256:1009c818d414f87683ecd37232868515820a6b99b6b0bac55cb0e15f1801fca7"
+        );
+    }
+
+    #[test]
     fn loose_object_write_is_idempotent_and_verified() {
         let temp = tempfile::tempdir().unwrap();
         let store = NativeObjectStore::new(temp.path());
@@ -2003,6 +2465,139 @@ mod tests {
             })
             .collect();
         write_tree(&NativeObjectStore::new(repo), repo, &entries, "").unwrap()
+    }
+
+    fn merged_file_bytes(repo: &Path, content_ref: &str, path: &str) -> Vec<u8> {
+        let store = NativeObjectStore::new(repo);
+        let root = object_id_from_content_ref(content_ref).unwrap();
+        let fingerprints = store.tree_fingerprints(&root).unwrap();
+        let (blob, _mode) = fingerprints.get(path).expect("merged path exists");
+        store.read_object(&ObjectId::parse(blob).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn merge_native_trees_takes_one_sided_text_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let store = NativeObjectStore::new(repo);
+        let base = write_test_tree(repo, &[("app.txt", b"one\n", false)]);
+        let ours = write_test_tree(repo, &[("app.txt", b"ours\n", false)]);
+        let theirs = write_test_tree(repo, &[("app.txt", b"one\n", false)]);
+
+        let result = merge_native_trees(&store, &base, &ours, &theirs).unwrap();
+
+        assert!(result.is_clean(), "{result:?}");
+        let content_ref = result.merged_content_ref.as_deref().unwrap();
+        assert_eq!(merged_file_bytes(repo, content_ref, "app.txt"), b"ours\n");
+    }
+
+    #[test]
+    fn merge_native_trees_combines_non_overlapping_text_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let store = NativeObjectStore::new(repo);
+        let base = write_test_tree(repo, &[("app.txt", b"one\ntwo\nthree\nfour\n", false)]);
+        let ours = write_test_tree(repo, &[("app.txt", b"ONE\ntwo\nthree\nfour\n", false)]);
+        let theirs = write_test_tree(repo, &[("app.txt", b"one\ntwo\nthree\nFOUR\n", false)]);
+
+        let result = merge_native_trees(&store, &base, &ours, &theirs).unwrap();
+
+        assert!(result.is_clean(), "{result:?}");
+        let content_ref = result.merged_content_ref.as_deref().unwrap();
+        assert_eq!(
+            merged_file_bytes(repo, content_ref, "app.txt"),
+            b"ONE\ntwo\nthree\nFOUR\n"
+        );
+    }
+
+    #[test]
+    fn merge_native_trees_deduplicates_identical_concurrent_insertions() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let store = NativeObjectStore::new(repo);
+        let base = write_test_tree(repo, &[("app.txt", b"one\nthree\n", false)]);
+        let ours = write_test_tree(repo, &[("app.txt", b"ONE\ntwo\nthree\n", false)]);
+        let theirs = write_test_tree(repo, &[("app.txt", b"one\ntwo\nTHREE\n", false)]);
+
+        let result = merge_native_trees(&store, &base, &ours, &theirs).unwrap();
+
+        assert!(result.is_clean(), "{result:?}");
+        let content_ref = result.merged_content_ref.as_deref().unwrap();
+        assert_eq!(
+            merged_file_bytes(repo, content_ref, "app.txt"),
+            b"ONE\ntwo\nTHREE\n"
+        );
+    }
+
+    #[test]
+    fn merge_native_trees_reports_overlapping_content_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let store = NativeObjectStore::new(repo);
+        let base = write_test_tree(repo, &[("app.txt", b"one\ntwo\nthree\n", false)]);
+        let ours = write_test_tree(repo, &[("app.txt", b"one\nours\nthree\n", false)]);
+        let theirs = write_test_tree(repo, &[("app.txt", b"one\ntheirs\nthree\n", false)]);
+
+        let result = merge_native_trees(&store, &base, &ours, &theirs).unwrap();
+
+        assert_eq!(result.merged_content_ref, None);
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].path, "app.txt");
+        assert_eq!(result.conflicts[0].kind, NativeMergeConflictKind::Content);
+    }
+
+    #[test]
+    fn merge_native_trees_reports_binary_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let store = NativeObjectStore::new(repo);
+        let base = write_test_tree(repo, &[("bin.dat", b"a\0base", false)]);
+        let ours = write_test_tree(repo, &[("bin.dat", b"a\0ours", false)]);
+        let theirs = write_test_tree(repo, &[("bin.dat", b"a\0theirs", false)]);
+
+        let result = merge_native_trees(&store, &base, &ours, &theirs).unwrap();
+
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].kind, NativeMergeConflictKind::Binary);
+    }
+
+    #[test]
+    fn merge_native_trees_reports_delete_modify_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let store = NativeObjectStore::new(repo);
+        let base = write_test_tree(repo, &[("app.txt", b"base\n", false)]);
+        let ours = write_test_tree(repo, &[]);
+        let theirs = write_test_tree(repo, &[("app.txt", b"changed\n", false)]);
+
+        let result = merge_native_trees(&store, &base, &ours, &theirs).unwrap();
+
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(
+            result.conflicts[0].kind,
+            NativeMergeConflictKind::DeleteModify
+        );
+    }
+
+    #[test]
+    fn merge_native_trees_reports_dir_file_conflict() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        let store = NativeObjectStore::new(repo);
+        let ours_blob = store.write_object(ObjectKind::Blob, b"file\n").unwrap();
+        let theirs_blob = store.write_object(ObjectKind::Blob, b"nested\n").unwrap();
+        let base = BTreeMap::new();
+        let ours = BTreeMap::from([("node".to_string(), (ours_blob.to_string(), 0o100644))]);
+        let theirs = BTreeMap::from([(
+            "node/file.txt".to_string(),
+            (theirs_blob.to_string(), 0o100644),
+        )]);
+
+        let result = merge_fingerprint_maps(&store, &base, &ours, &theirs).unwrap();
+
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].path, "node");
+        assert_eq!(result.conflicts[0].kind, NativeMergeConflictKind::DirFile);
     }
 
     #[test]

@@ -206,8 +206,10 @@ fn commands_list_the_lifecycle() {
         "save",
         "accept",
         "diff",
+        "merge",
         "conflict list",
         "conflict show",
+        "conflict resolve",
         "export branch",
         "schema",
     ] {
