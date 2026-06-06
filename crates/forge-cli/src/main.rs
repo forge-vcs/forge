@@ -812,6 +812,29 @@ fn ensure_clean_worktree(cwd: &Path, target_content_ref: &str) -> Result<()> {
     }
 }
 
+fn ensure_worktree_matches_expected(cwd: &Path) -> Result<()> {
+    let backend = selected_backend(cwd)?;
+    let expected = match forge_store::expected_content_ref(cwd)? {
+        Some(expected) => expected,
+        None => match forge_store::latest_snapshot_content_ref(cwd, None)? {
+            Some(content_ref) => content_ref,
+            None => {
+                let attempt = forge_store::resolve_attempt(cwd, None)?.attempt;
+                backend.base_content_ref(cwd, &attempt.base_head)?
+            }
+        },
+    };
+    let current = backend.snapshot_worktree(cwd)?;
+    if current.content_ref == expected {
+        Ok(())
+    } else {
+        Err(ForgeError::DirtyWorktree {
+            paths: current.changed_paths,
+        }
+        .into())
+    }
+}
+
 fn restore_response(request_id: Option<String>, args: RestoreArgs) -> ResponseEnvelope {
     command_result("restore", request_id, |cwd, request_id| {
         let content_ref = forge_store::snapshot_content_ref(&cwd, &args.snapshot_id)?;
@@ -851,6 +874,7 @@ fn run_response(request_id: Option<String>, args: RunArgs) -> ResponseEnvelope {
         if args.command.is_empty() {
             anyhow::bail!("missing command after --");
         }
+        ensure_worktree_matches_expected(&cwd)?;
         let captured = forge_evidence::capture_with_timeout(&cwd, &args.command, args.timeout_ms)?;
         // Surface each secret redaction the capture applied as a warnings[] entry
         // (NER-136 §U4), grouped by detector kind with a count.
