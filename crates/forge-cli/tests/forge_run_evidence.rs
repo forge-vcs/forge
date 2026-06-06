@@ -31,6 +31,93 @@ fn run_records_successful_command_evidence() {
 }
 
 #[test]
+fn run_allows_clean_saved_worktree() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    repo.forge()
+        .args(["--json", "start", "run clean guard"])
+        .assert()
+        .success();
+    repo.forge().args(["--json", "save"]).assert().success();
+
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "run", "--", "sh", "-c", "printf ok"])
+            .assert()
+            .success(),
+    );
+
+    assert_eq!(output["data"]["exit_code"], 0);
+    assert_eq!(output["data"]["stdout_excerpt"], "ok");
+}
+
+#[test]
+fn run_refuses_dirty_worktree_before_first_save() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    repo.forge()
+        .args(["--json", "start", "run base guard"])
+        .assert()
+        .success();
+
+    std::fs::write(repo.path().join("README.md"), "dirty before first save\n")
+        .expect("dirty readme");
+    let marker = repo.path().join("run-marker.txt");
+    let output = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "run",
+                "--",
+                "sh",
+                "-c",
+                "printf executed > run-marker.txt",
+            ])
+            .assert()
+            .failure(),
+    );
+
+    assert_eq!(output["errors"][0]["code"], "DIRTY_WORKTREE");
+    assert!(
+        !marker.exists(),
+        "run command must not execute when worktree differs from attempt base"
+    );
+}
+
+#[test]
+fn run_refuses_dirty_worktree_before_executing_command() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    repo.forge()
+        .args(["--json", "start", "run dirty guard"])
+        .assert()
+        .success();
+    repo.forge().args(["--json", "save"]).assert().success();
+
+    std::fs::write(repo.path().join("README.md"), "dirty before run\n").expect("dirty readme");
+    let marker = repo.path().join("run-marker.txt");
+    let output = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "run",
+                "--",
+                "sh",
+                "-c",
+                "printf executed > run-marker.txt",
+            ])
+            .assert()
+            .failure(),
+    );
+
+    assert_eq!(output["errors"][0]["code"], "DIRTY_WORKTREE");
+    assert!(
+        !marker.exists(),
+        "run command must not execute when worktree is dirty"
+    );
+}
+
+#[test]
 fn run_records_failed_command_and_truncates_output() {
     let repo = TestRepo::new_git();
     repo.forge().args(["--json", "init"]).assert().success();
