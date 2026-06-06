@@ -32,6 +32,7 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "MISSING_PROVENANCE_TRAILER",
     "NATIVE_HISTORY_CORRUPT",
     "CONFLICT_SET_NOT_FOUND",
+    "UNSUPPORTED_CONTENT_BACKEND",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.

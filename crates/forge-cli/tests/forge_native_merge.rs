@@ -52,6 +52,30 @@ fn propose_attempt(repo: &TestRepo, attempt_id: &str, body: &str) -> String {
 }
 
 #[test]
+fn merge_in_git_backed_repo_returns_typed_unsupported_backend() {
+    let repo = TestRepo::new_git();
+    forge_ok(&repo, &["init"]);
+    let started = forge_ok(&repo, &["start", "git merge unsupported"]);
+    let attempt = started["data"]["attempt_id"].as_str().unwrap();
+    std::fs::write(repo.path().join("README.md"), "git backed\n").unwrap();
+    forge_ok(&repo, &["save", "--attempt", attempt]);
+    forge_ok(
+        &repo,
+        &["run", "--attempt", attempt, "--", "sh", "-c", "true"],
+    );
+    let proposed = forge_ok(&repo, &["propose", "--attempt", attempt]);
+    let proposal = proposed["data"]["proposal_id"].as_str().unwrap();
+
+    let out = forge_fail(&repo, &["merge", "--proposal", proposal]);
+
+    assert_eq!(out["errors"][0]["code"], "UNSUPPORTED_CONTENT_BACKEND");
+    assert_eq!(out["errors"][0]["details"]["command"], "merge");
+    assert_eq!(out["errors"][0]["details"]["required"], "native");
+    assert_eq!(out["errors"][0]["details"]["actual"], "git");
+    assert_eq!(out["retry"]["retryable"], false);
+}
+
+#[test]
 fn native_merge_clean_non_overlapping_changes_returns_merged_tree() {
     let repo = TestRepo::new_git();
     let (_intent_id, attempt_a, attempt_b) = init_two_native_attempts(&repo);

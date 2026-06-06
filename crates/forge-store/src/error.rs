@@ -200,6 +200,15 @@ pub enum ForgeError {
     /// the local ledger. The selector is intentionally not echoed because it may
     /// be path-like user input.
     ConflictSetNotFound { conflict_set_id: String },
+    /// A command is valid only for a specific content backend/ref family. Used when
+    /// a v0 command is published but deliberately native-only for this slice, so
+    /// agents can distinguish "unsupported backend" from an unexpected command
+    /// failure. Details carry closed backend labels, never paths or content.
+    UnsupportedContentBackend {
+        command: String,
+        required: String,
+        actual: String,
+    },
 }
 
 impl ForgeError {
@@ -232,6 +241,7 @@ impl ForgeError {
             ForgeError::MissingProvenanceTrailer { .. } => "MISSING_PROVENANCE_TRAILER",
             ForgeError::NativeHistoryCorrupt { .. } => "NATIVE_HISTORY_CORRUPT",
             ForgeError::ConflictSetNotFound { .. } => "CONFLICT_SET_NOT_FOUND",
+            ForgeError::UnsupportedContentBackend { .. } => "UNSUPPORTED_CONTENT_BACKEND",
         }
     }
 
@@ -336,6 +346,11 @@ impl ForgeError {
                 "related_id": related_id,
             }),
             ForgeError::ConflictSetNotFound { .. } => json!({ "selector_present": true }),
+            ForgeError::UnsupportedContentBackend {
+                command,
+                required,
+                actual,
+            } => json!({ "command": command, "required": required, "actual": actual }),
             _ => Value::Object(Default::default()),
         }
     }
@@ -465,6 +480,11 @@ impl std::fmt::Display for ForgeError {
                 ),
             },
             ForgeError::ConflictSetNotFound { .. } => write!(f, "conflict set not found"),
+            ForgeError::UnsupportedContentBackend {
+                command,
+                required,
+                actual,
+            } => write!(f, "{command} requires {required}, but found {actual}"),
         }
     }
 }
@@ -642,6 +662,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             retryable: false,
             after_ms: None,
             details_keys: &["selector_present"],
+        },
+        ErrorCodeSpec {
+            code: "UNSUPPORTED_CONTENT_BACKEND",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["command", "required", "actual"],
         },
     ]
 }
@@ -1136,6 +1162,11 @@ mod tests {
             ForgeError::ConflictSetNotFound {
                 conflict_set_id: "conflict_missing".into(),
             },
+            ForgeError::UnsupportedContentBackend {
+                command: "merge".into(),
+                required: "native".into(),
+                actual: "git".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -1166,7 +1197,8 @@ mod tests {
                 | ForgeError::ProvenanceMismatch { .. }
                 | ForgeError::MissingProvenanceTrailer { .. }
                 | ForgeError::NativeHistoryCorrupt { .. }
-                | ForgeError::ConflictSetNotFound { .. } => {}
+                | ForgeError::ConflictSetNotFound { .. }
+                | ForgeError::UnsupportedContentBackend { .. } => {}
             }
         }
 

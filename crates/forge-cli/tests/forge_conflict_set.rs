@@ -1,6 +1,7 @@
 mod common;
 
 use common::TestRepo;
+use forge_content::ContentBackend;
 use serde_json::Value;
 
 fn json_output(assert: assert_cmd::assert::Assert) -> Value {
@@ -80,6 +81,14 @@ fn path_conflict_count(repo: &TestRepo, conflict_set_id: &str) -> i64 {
         .expect("count path_conflicts")
 }
 
+fn native_tree_ref_for_current_worktree(repo: &TestRepo) -> String {
+    let backend = forge_content_native::NativeContentBackend;
+    backend
+        .snapshot_worktree(repo.path())
+        .expect("snapshot native worktree")
+        .content_ref
+}
+
 /// `init` + an attempt with one saved normal file + a proposal, leaving HEAD at
 /// the attempt's base. Mirrors `forge_accept_export`'s `prepare_proposal`.
 fn prepare_proposal(repo: &TestRepo) {
@@ -144,6 +153,33 @@ fn accept_stale_base_persists_conflict_set() {
         paths.get("actual_head").is_some(),
         "actual_head key missing: {}",
         row.paths_json
+    );
+
+    let before_resolve = std::fs::read_to_string(repo.path().join("README.md")).unwrap();
+    let resolution_ref = native_tree_ref_for_current_worktree(&repo);
+    let rejected = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "conflict",
+                "resolve",
+                &row.id,
+                "--tree",
+                &resolution_ref,
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(rejected["errors"][0]["code"], "UNSUPPORTED_CONTENT_BACKEND");
+    assert_eq!(
+        rejected["errors"][0]["details"]["command"],
+        "conflict resolve"
+    );
+    assert_eq!(rejected["errors"][0]["details"]["required"], "native_merge");
+    assert_eq!(rejected["errors"][0]["details"]["actual"], "stale_base");
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        before_resolve
     );
 }
 
