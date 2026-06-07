@@ -362,6 +362,25 @@ fn gc_fails_closed_on_a_corrupt_ledger_view_row() {
         !rendered.contains(&*needle),
         "gc fail-closed leaked a path: {rendered}"
     );
+
+    let doctor = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(doctor["data"]["ok"], false);
+    assert!(doctor["data"]["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue.as_str().unwrap().contains("corrupt ledger view row")));
+    let view_issues = doctor["data"]["ledger_view_issues"].as_array().unwrap();
+    assert_eq!(view_issues.len(), 1);
+    assert_eq!(view_issues[0]["kind"], "corrupt_state_json");
+    assert!(view_issues[0]["view_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("view_"));
+    assert!(view_issues[0]["operation_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("op_"));
 }
 
 /// NER-143 R6 (second fail-closed branch): a view row that is VALID json but names an
@@ -401,6 +420,16 @@ fn gc_fails_closed_on_an_unparseable_reachability_root() {
         !rendered.contains(&*needle),
         "gc fail-closed leaked a path: {rendered}"
     );
+
+    let doctor = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(doctor["data"]["ok"], false);
+    let view_issues = doctor["data"]["ledger_view_issues"].as_array().unwrap();
+    assert_eq!(view_issues.len(), 1);
+    assert_eq!(view_issues[0]["kind"], "unparseable_commit_id");
+    assert!(view_issues[0]["view_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("view_"));
 }
 
 #[test]

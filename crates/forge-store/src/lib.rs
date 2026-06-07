@@ -500,6 +500,9 @@ pub struct DoctorReport {
     /// Empty in a healthy repo. This is the "DAG has no cycles/dangling parents (doctor
     /// verifies)" whole-phase exit criterion.
     pub native_history_issues: Vec<NativeHistoryFinding>,
+    /// Corrupt `views.state_json` rows that make GC's reachability root set
+    /// untrustworthy. Empty in a healthy repo.
+    pub ledger_view_issues: Vec<LedgerViewFinding>,
 }
 
 /// One row that failed integrity verification in `doctor`'s chain pass. Carries only
@@ -524,6 +527,20 @@ pub struct NativeHistoryFinding {
     pub commit_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub related_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerViewFinding {
+    pub kind: LedgerViewFindingKind,
+    pub view_id: String,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerViewFindingKind {
+    CorruptStateJson,
+    UnparseableCommitId,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4124,6 +4141,13 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
             native_history_issues.len()
         ));
     }
+    let ledger_view_issues = ledger_commit_roots(&context, &connection)?.view_issues;
+    if !ledger_view_issues.is_empty() {
+        issues.push(format!(
+            "{} corrupt ledger view row(s) detected",
+            ledger_view_issues.len()
+        ));
+    }
 
     Ok(DoctorReport {
         ok: issues.is_empty(),
@@ -4134,6 +4158,7 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         half_applied_worktrees,
         tampered_rows,
         native_history_issues,
+        ledger_view_issues,
     })
 }
 
@@ -4821,51 +4846,27 @@ pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
     // writes NO decision row, so its commit is reachable only through the op-log). Each is
     // walked as a DAG root (commit → ancestry → trees). Best-effort: a dangling root is
     // surfaced by `doctor`, not fatal to this dry-run report. No-op for git-backend repos.
-    let mut roots: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    if let Some(tip) = native_tip(&context, &connection)? {
-        roots.insert(tip.to_string());
+    let roots = ledger_commit_roots(&context, &connection)?;
+    if roots
+        .view_issues
+        .iter()
+        .any(|finding| finding.kind == LedgerViewFindingKind::CorruptStateJson)
+    {
+        return Err(anyhow!(
+            "gc cannot read a ledger view row (corrupt views.state_json); run `forge doctor`"
+        ));
     }
-    let mut decision_stmt = connection
-        .prepare("SELECT commit_id FROM decisions WHERE repo_id = ?1 AND commit_id IS NOT NULL")?;
-    for row in decision_stmt.query_map(params![context.repo_id], |row| row.get::<_, String>(0))? {
-        roots.insert(row?);
+    if roots
+        .view_issues
+        .iter()
+        .any(|finding| finding.kind == LedgerViewFindingKind::UnparseableCommitId)
+    {
+        return Err(anyhow!(
+            "gc found an unparseable reachability root in the ledger; run `forge doctor`"
+        ));
     }
-    let mut view_stmt = connection.prepare("SELECT state_json FROM views WHERE repo_id = ?1")?;
-    for row in view_stmt.query_map(params![context.repo_id], |row| row.get::<_, String>(0))? {
-        // NER-143 R6: FAIL CLOSED when a ledger row that DETERMINES a root cannot be read.
-        // A malformed `views.state_json` means we cannot know whether this op-log entry named
-        // a live commit (a `checkout` target is reachable ONLY through the op-log), so silently
-        // skipping it under-counts the root set — harmless for this dry-run report, but a live
-        // commit marked "unreachable" would be deleted once Phase 8 (NER-139) wires real
-        // mark-sweep deletion to this scan. Propagate instead. Path-free (S1): never interpolate
-        // the row. Contrast with a *dangling object* (a determined root/ref whose object is
-        // absent) below, which stays best-effort — that is `doctor`'s domain and the established
-        // gc-tolerance contract (`doctor_reports_corrupt_native_content_and_gc_reports_unreachable_objects`).
-        // Message is honest about the remedy: `doctor` does NOT currently parse every
-        // `views.state_json`, so it would not pinpoint this row — say "the ledger is damaged"
-        // rather than dead-end the user at `forge doctor` (code-review reliability finding).
-        let value: serde_json::Value = serde_json::from_str(&row?).map_err(|_| {
-            anyhow!("gc cannot read a ledger view row (corrupt views.state_json); the ledger is damaged")
-        })?;
-        if let Some(commit_id) = value.get("commit_id").and_then(|v| v.as_str()) {
-            roots.insert(commit_id.to_string());
-        }
-    }
-    for root in &roots {
-        // NER-143 R6: FAIL CLOSED on a corrupt root id string (the ledger names a root we cannot
-        // even parse → the root set is untrustworthy). This covers EVERY root source — the
-        // native_tip, the `decisions.commit_id` set (inserted raw above), and the view-derived
-        // ids — so an unparseable accepted-commit id also fails closed here, not only a corrupt
-        // view row. The reachability WALK from a parseable root stays best-effort: a
-        // determined-but-dangling object is a `doctor` finding, not a root-enumeration failure
-        // (mirrors the `verify_content_ref` snapshot loop above and the existing corrupt-content
-        // gc-tolerance contract). Path-free (S1): never interpolate `root`.
-        let id = forge_content_native::ObjectId::parse(root).map_err(|_| {
-            anyhow!(
-                "gc found an unparseable reachability root in the ledger; the ledger is damaged"
-            )
-        })?;
-        if let Ok(ids) = native_store.reachable_from(&id) {
+    for id in &roots.roots {
+        if let Ok(ids) = native_store.reachable_from(id) {
             reachable.extend(ids);
         }
     }
@@ -4881,6 +4882,72 @@ pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
         unreachable_native_objects,
         deleted: Vec::new(),
     })
+}
+
+struct LedgerCommitRoots {
+    roots: std::collections::BTreeSet<forge_content_native::ObjectId>,
+    view_issues: Vec<LedgerViewFinding>,
+}
+
+fn ledger_commit_roots(
+    context: &RepositoryContext,
+    connection: &Connection,
+) -> Result<LedgerCommitRoots> {
+    let mut root_strings: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut view_issues = Vec::new();
+    if let Some(tip) = native_tip(context, connection)? {
+        root_strings.insert(tip.to_string());
+    }
+    let mut decision_stmt = connection
+        .prepare("SELECT commit_id FROM decisions WHERE repo_id = ?1 AND commit_id IS NOT NULL")?;
+    for row in decision_stmt.query_map(params![context.repo_id], |row| row.get::<_, String>(0))? {
+        root_strings.insert(row?);
+    }
+    let mut view_stmt = connection.prepare(
+        "SELECT id, operation_id, state_json
+         FROM views
+         WHERE repo_id = ?1
+         ORDER BY created_at_ms, rowid",
+    )?;
+    for row in view_stmt.query_map(params![context.repo_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (view_id, operation_id, state_json) = row?;
+        let value: Value = match serde_json::from_str(&state_json) {
+            Ok(value) => value,
+            Err(_) => {
+                view_issues.push(LedgerViewFinding {
+                    kind: LedgerViewFindingKind::CorruptStateJson,
+                    view_id,
+                    operation_id,
+                });
+                continue;
+            }
+        };
+        if let Some(commit_id) = value.get("commit_id").and_then(|value| value.as_str()) {
+            if forge_content_native::ObjectId::parse(commit_id).is_err() {
+                view_issues.push(LedgerViewFinding {
+                    kind: LedgerViewFindingKind::UnparseableCommitId,
+                    view_id,
+                    operation_id,
+                });
+                continue;
+            }
+            root_strings.insert(commit_id.to_string());
+        }
+    }
+    let mut roots = std::collections::BTreeSet::new();
+    for root in root_strings {
+        let id = forge_content_native::ObjectId::parse(&root).map_err(|_| {
+            anyhow!("gc found an unparseable reachability root in the ledger; run `forge doctor`")
+        })?;
+        roots.insert(id);
+    }
+    Ok(LedgerCommitRoots { roots, view_issues })
 }
 
 pub fn record_failed_operation(
