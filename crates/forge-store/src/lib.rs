@@ -1109,8 +1109,13 @@ pub fn save_snapshot(
             },
         )?;
         // NER-143 R1: the worktree now holds exactly this snapshot's tree (save captured it),
-        // so it becomes the expected dirty-check baseline. Atomic with the op-log advance.
-        set_expected_content_ref(tx, &content_ref)?;
+        // so it becomes the expected dirty-check baseline for the worktree that issued `save`.
+        // Native attempt workspaces have independent materialized baselines; do not let a
+        // workspace save poison the owner repo's root-level dirty check.
+        set_context_expected_content_ref(tx, &context, &content_ref)?;
+        if context.workspace_attempt_id.is_some() {
+            initialize_root_expected_content_ref_if_missing(tx, &context, &attempt.base_head)?;
+        }
         Ok((snapshot_id, parent_snapshot_id, op))
     })?;
     Ok(SnapshotRecord {
@@ -1269,16 +1274,31 @@ pub fn latest_snapshot_content_ref(cwd: &Path, attempt_id: Option<&str>) -> Resu
         .map(|snapshot| snapshot.content_ref))
 }
 
-/// The content ref the worktree is EXPECTED to hold — the tree the last materializing op
-/// (save/restore/checkout/undo) put there, tracked in `current_state.expected_content_ref`
-/// (migration 007, NER-143 R1). `None` for a pre-007 repo or a fresh repo before its first
-/// materialize; the dirty-check then falls back to the latest-snapshot baseline. This is the
-/// crash-safe baseline: a non-save op materializes a different tree than the latest *saved*
-/// snapshot, so comparing the worktree against "latest saved" spuriously fails chained
-/// navigation (undo twice) — comparing against "expected" does not.
+/// The content ref the effective worktree is EXPECTED to hold — the tree the last materializing
+/// op put there. Owner-root worktrees use `current_state.expected_content_ref` (migration 007,
+/// NER-143 R1). Native attempt workspaces use their own `attempt_workspaces.materialized_content_ref`
+/// so a save/run/propose loop in one isolated workspace does not poison root-level dirty checks
+/// or another attempt workspace's baseline.
+///
+/// `None` for a pre-007 repo or a fresh worktree before its first materialize; the dirty-check
+/// then falls back to the latest-snapshot baseline. This is the crash-safe baseline: a non-save
+/// op materializes a different tree than the latest *saved* snapshot, so comparing the worktree
+/// against "latest saved" spuriously fails chained navigation (undo twice) — comparing against
+/// "expected" does not.
 pub fn expected_content_ref(cwd: &Path) -> Result<Option<String>> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
+    if let Some(attempt_id) = context.workspace_attempt_id.as_deref() {
+        return Ok(connection
+            .query_row(
+                "SELECT materialized_content_ref FROM attempt_workspaces
+                 WHERE repo_id = ?1 AND attempt_id = ?2",
+                params![context.repo_id, attempt_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten());
+    }
     Ok(connection
         .query_row(
             "SELECT expected_content_ref FROM current_state WHERE singleton = 1",
@@ -1289,18 +1309,70 @@ pub fn expected_content_ref(cwd: &Path) -> Result<Option<String>> {
         .flatten())
 }
 
-/// Set `current_state.expected_content_ref` to the tree a materializing op just put in the
-/// worktree (NER-143 R1). Called inside the recorder's `IMMEDIATE` txn — atomic with the
-/// op-log advance, so a `CurrentStateChanged` CAS-loss rolls BOTH back together. DR-F2: this
-/// is a DEDICATED UPDATE in each of the four materializing recorders, never folded into the
-/// shared `insert_operation_view` CAS (which every op hits — folding it there would clobber
-/// the expected ref on a non-materializing `accept`/`run`/`propose`/`check`).
+/// Set `current_state.expected_content_ref` to the tree a root worktree materializing op just put
+/// in the owner repo (NER-143 R1). Called inside the recorder's `IMMEDIATE` txn — atomic with the
+/// op-log advance, so a `CurrentStateChanged` CAS-loss rolls BOTH back together. DR-F2: this is a
+/// DEDICATED UPDATE in each materializing recorder, never folded into the shared
+/// `insert_operation_view` CAS (which every op hits — folding it there would clobber the expected
+/// ref on a non-materializing `accept`/`run`/`propose`/`check`).
 fn set_expected_content_ref(tx: &Connection, content_ref: &str) -> Result<()> {
     tx.execute(
         "UPDATE current_state SET expected_content_ref = ?1 WHERE singleton = 1",
         params![content_ref],
     )?;
     Ok(())
+}
+
+fn set_workspace_expected_content_ref(
+    tx: &Connection,
+    context: &RepositoryContext,
+    attempt_id: &str,
+    content_ref: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE attempt_workspaces
+         SET materialized_content_ref = ?1, updated_at_ms = ?2
+         WHERE repo_id = ?3 AND attempt_id = ?4",
+        params![content_ref, now_ms(), context.repo_id, attempt_id],
+    )?;
+    Ok(())
+}
+
+fn set_context_expected_content_ref(
+    tx: &Connection,
+    context: &RepositoryContext,
+    content_ref: &str,
+) -> Result<()> {
+    if let Some(attempt_id) = context.workspace_attempt_id.as_deref() {
+        set_workspace_expected_content_ref(tx, context, attempt_id, content_ref)
+    } else {
+        set_expected_content_ref(tx, content_ref)
+    }
+}
+
+fn initialize_root_expected_content_ref_if_missing(
+    tx: &Connection,
+    context: &RepositoryContext,
+    base_head: &str,
+) -> Result<()> {
+    let existing = tx.query_row(
+        "SELECT expected_content_ref FROM current_state WHERE singleton = 1",
+        [],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    if existing.is_some() || context.content_backend != "native" {
+        return Ok(());
+    }
+    let id = match forge_content_native::ObjectId::parse(base_head) {
+        Ok(id) if matches!(id.kind(), Ok(forge_content_native::ObjectKind::Commit)) => id,
+        _ => return Ok(()),
+    };
+    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let commit = store.read_commit(&id)?;
+    set_expected_content_ref(
+        tx,
+        &format!("{}{}", forge_content::FORGE_TREE_PREFIX, commit.tree),
+    )
 }
 
 pub fn record_restore(
@@ -1326,7 +1398,7 @@ pub fn record_restore(
             },
         )?;
         // NER-143 R1: restore just materialized this snapshot's tree into the worktree.
-        set_expected_content_ref(tx, content_ref)?;
+        set_context_expected_content_ref(tx, &context, content_ref)?;
         Ok(op)
     })?;
     Ok(op)
@@ -1408,7 +1480,7 @@ pub fn record_checkout(
             },
         )?;
         // NER-143 R1: checkout just materialized this commit's tree into the worktree.
-        set_expected_content_ref(tx, content_ref)?;
+        set_context_expected_content_ref(tx, &context, content_ref)?;
         Ok(op)
     })?;
     Ok(op)
@@ -1523,7 +1595,7 @@ pub fn record_undo(
             },
         )?;
         // NER-143 R1: undo just materialized the restored snapshot's tree into the worktree.
-        set_expected_content_ref(tx, content_ref)?;
+        set_context_expected_content_ref(tx, &context, content_ref)?;
         Ok(op)
     })?;
     Ok(op)
@@ -3058,7 +3130,7 @@ pub fn record_merge_success(
             "UPDATE proposals SET snapshot_id = ?1, content_ref = ?2, status = 'draft' WHERE id = ?3",
             params![snapshot_id, input.merged_content_ref, proposal.proposal_id],
         )?;
-        set_expected_content_ref(tx, &input.merged_content_ref)?;
+        set_context_expected_content_ref(tx, &context, &input.merged_content_ref)?;
         let merge_lineage_hash =
             integrity::merge_lineage_digest(&integrity::MergeLineageDigestInput {
                 proposal_id: &proposal.proposal_id,
@@ -3298,7 +3370,7 @@ pub fn resolve_conflict_with_tree(
             "UPDATE conflict_sets SET status = 'resolved' WHERE id = ?1",
             params![conflict_set_id],
         )?;
-        set_expected_content_ref(tx, resolution_ref)?;
+        set_context_expected_content_ref(tx, &context, resolution_ref)?;
         let parent_hash = op_content_hash(tx, Some(&context.current_operation_id))?;
         let content_hash = integrity::operation_link_hash(
             &parent_hash,
@@ -5748,7 +5820,7 @@ pub fn attach_attempt(
         // baseline atomically with the attach (code-review P1: without this, an attach-then-nav
         // spuriously fails DIRTY_WORKTREE because `expected` still points at the prior attempt's
         // tree). Same dedicated-UPDATE discipline as the other recorders (DR-F2).
-        set_expected_content_ref(tx, content_ref)?;
+        set_context_expected_content_ref(tx, &context, content_ref)?;
         Ok(op)
     })?;
     Ok(op)

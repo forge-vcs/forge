@@ -385,6 +385,126 @@ fn native_attempt_workspaces_are_isolated_and_bind_saves() {
 }
 
 #[test]
+fn workspace_save_does_not_poison_repo_root_dirty_baseline() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let first = json_output(
+        repo.forge()
+            .args(["--json", "start", "parallel merge"])
+            .assert()
+            .success(),
+    );
+    let intent_id = first["data"]["intent_id"].as_str().unwrap();
+    let first_attempt = first["data"]["attempt_id"].as_str().unwrap();
+    let first_workspace = repo
+        .path()
+        .join(first["data"]["workspace_path"].as_str().unwrap());
+    let second = json_output(
+        repo.forge()
+            .args(["--json", "attempt", "start", "--intent", intent_id])
+            .assert()
+            .success(),
+    );
+    let second_attempt = second["data"]["attempt_id"].as_str().unwrap();
+    let second_workspace = repo
+        .path()
+        .join(second["data"]["workspace_path"].as_str().unwrap());
+
+    std::fs::write(first_workspace.join("README.md"), "attempt one\n").expect("write first");
+    forge_in(&first_workspace)
+        .args(["--json", "save"])
+        .assert()
+        .success();
+    forge_in(&first_workspace)
+        .args(["--json", "run", "--", "true"])
+        .assert()
+        .success();
+    let first_proposal = json_output(
+        forge_in(&first_workspace)
+            .args(["--json", "propose"])
+            .assert()
+            .success(),
+    );
+
+    std::fs::write(second_workspace.join("OTHER.md"), "attempt two\n").expect("write second");
+    forge_in(&second_workspace)
+        .args(["--json", "save"])
+        .assert()
+        .success();
+    forge_in(&second_workspace)
+        .args(["--json", "run", "--", "true"])
+        .assert()
+        .success();
+    let second_proposal = json_output(
+        forge_in(&second_workspace)
+            .args(["--json", "propose"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        "hello\n",
+        "workspace saves must leave the repo root at its own baseline"
+    );
+
+    repo.forge()
+        .args([
+            "--json",
+            "check",
+            "--attempt",
+            first_attempt,
+            "--proposal",
+            first_proposal["data"]["proposal_id"].as_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    repo.forge()
+        .args([
+            "--json",
+            "accept",
+            "--attempt",
+            first_attempt,
+            "--proposal",
+            first_proposal["data"]["proposal_id"].as_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        "hello\n",
+        "accept records the decision but does not materialize into the repo root"
+    );
+
+    let merged = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "merge",
+                "--proposal",
+                second_proposal["data"]["proposal_id"].as_str().unwrap(),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(merged["data"]["merged"], true);
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        "attempt one\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("OTHER.md")).unwrap(),
+        "attempt two\n"
+    );
+    assert_eq!(
+        second_attempt,
+        second_proposal["data"]["attempt_id"].as_str().unwrap()
+    );
+}
+
+#[test]
 fn attach_base_revision_preserves_tracked_secret_risk_paths() {
     let repo = TestRepo::new_git();
     std::fs::write(repo.path().join(".env"), "TOKEN=committed\n").expect("write env");

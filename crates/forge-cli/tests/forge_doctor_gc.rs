@@ -1,6 +1,6 @@
 mod common;
 
-use common::TestRepo;
+use common::{forge_in, TestRepo};
 use forge_content_native::{NativeObjectStore, ObjectKind};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -156,6 +156,60 @@ fn gc_yes_deletes_only_old_unreachable_native_objects() {
     assert!(!contains_id(&deleted["data"]["deleted"], &recent_orphan));
     assert!(!object_path(repo.path(), &old_orphan).exists());
     assert!(object_path(repo.path(), &recent_orphan).exists());
+}
+
+#[test]
+fn gc_yes_keeps_objects_reachable_from_attempt_workspace_snapshot() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let started = json_output(
+        repo.forge()
+            .args(["--json", "start", "workspace gc root"])
+            .assert()
+            .success(),
+    );
+    let workspace = repo
+        .path()
+        .join(started["data"]["workspace_path"].as_str().unwrap());
+    std::fs::write(
+        workspace.join("workspace-only.txt"),
+        "live workspace object\n",
+    )
+    .expect("write workspace file");
+    let saved = json_output(
+        forge_in(&workspace)
+            .args(["--json", "save"])
+            .assert()
+            .success(),
+    );
+    let content_ref = saved["data"]["content_ref"].as_str().unwrap();
+    let root_id = forge_content_native::ObjectId::parse(
+        content_ref
+            .strip_prefix(forge_content::FORGE_TREE_PREFIX)
+            .unwrap(),
+    )
+    .expect("parse root tree");
+    mark_object_old(repo.path(), &root_id);
+
+    let dry = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--dry-run"])
+            .assert()
+            .success(),
+    );
+    let digest = dry["data"]["plan_digest"].as_str().unwrap();
+    assert!(
+        !contains_id(&dry["data"]["unreachable_native_objects"], &root_id),
+        "saved workspace content must remain reachable"
+    );
+    repo.forge()
+        .args(["--json", "gc", "--yes", "--plan-digest", digest])
+        .assert()
+        .success();
+    assert!(object_path(repo.path(), &root_id).exists());
 }
 
 #[test]
