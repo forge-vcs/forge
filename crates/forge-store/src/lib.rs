@@ -5,10 +5,11 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 mod error;
 mod integrity;
@@ -549,8 +550,15 @@ pub struct GcDryRunReport {
     pub unreachable_snapshots: Vec<String>,
     pub unreachable_evidence: Vec<String>,
     pub unreachable_native_objects: Vec<String>,
+    pub protected_native_objects: Vec<String>,
+    pub protection_window_days: u64,
+    pub plan_digest: String,
     pub deleted: Vec<String>,
 }
+
+const GC_PROTECTION_WINDOW_DAYS: u64 = 7;
+const GC_PROTECTION_WINDOW: Duration =
+    Duration::from_secs(60 * 60 * 24 * GC_PROTECTION_WINDOW_DAYS);
 
 pub fn init_repository(
     cwd: &Path,
@@ -4822,6 +4830,57 @@ pub fn pr_body_for(
 }
 
 pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
+    Ok(gc_plan(cwd)?.into_report(true, Vec::new()))
+}
+
+pub fn gc_delete(cwd: &Path, expected_plan_digest: &str) -> Result<GcDryRunReport> {
+    let doctor_report = doctor(cwd)?;
+    if !doctor_report.ok {
+        bail!("gc refuses deletion while doctor reports repository issues");
+    }
+    let plan = gc_plan(cwd)?;
+    if plan.plan_digest != expected_plan_digest {
+        return Err(ForgeError::GcPlanChanged {
+            expected_digest: expected_plan_digest.to_string(),
+            actual_digest: plan.plan_digest.clone(),
+        }
+        .into());
+    }
+    let context = open_repository(cwd)?;
+    let native_store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let mut deleted = Vec::new();
+    for object in &plan.deletable_native_objects {
+        let id = forge_content_native::ObjectId::parse(object)?;
+        native_store.delete_object(&id)?;
+        deleted.push(object.clone());
+        forge_content::maybe_crash("gc_after_unlink");
+    }
+    Ok(plan.into_report(false, deleted))
+}
+
+struct GcPlan {
+    unreachable_native_objects: Vec<String>,
+    protected_native_objects: Vec<String>,
+    deletable_native_objects: Vec<String>,
+    plan_digest: String,
+}
+
+impl GcPlan {
+    fn into_report(self, dry_run: bool, deleted: Vec<String>) -> GcDryRunReport {
+        GcDryRunReport {
+            dry_run,
+            unreachable_snapshots: Vec::new(),
+            unreachable_evidence: Vec::new(),
+            unreachable_native_objects: self.unreachable_native_objects,
+            protected_native_objects: self.protected_native_objects,
+            protection_window_days: GC_PROTECTION_WINDOW_DAYS,
+            plan_digest: self.plan_digest,
+            deleted,
+        }
+    }
+}
+
+fn gc_plan(cwd: &Path) -> Result<GcPlan> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
     let native_store = forge_content_native::NativeObjectStore::new(&context.root_path);
@@ -4871,17 +4930,58 @@ pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
         }
     }
     let all = native_store.all_object_ids()?;
-    let unreachable_native_objects = all
-        .difference(&reachable)
-        .map(ToString::to_string)
-        .collect();
-    Ok(GcDryRunReport {
-        dry_run: true,
-        unreachable_snapshots: Vec::new(),
-        unreachable_evidence: Vec::new(),
+    let now = SystemTime::now();
+    let mut unreachable_native_objects = Vec::new();
+    let mut protected_native_objects = Vec::new();
+    let mut deletable_native_objects = Vec::new();
+    for id in all.difference(&reachable) {
+        let rendered = id.to_string();
+        unreachable_native_objects.push(rendered.clone());
+        let protected = native_store
+            .object_modified_time(id)
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_none_or(|age| age < GC_PROTECTION_WINDOW);
+        if protected {
+            protected_native_objects.push(rendered);
+        } else {
+            deletable_native_objects.push(rendered);
+        }
+    }
+    let plan_digest = gc_plan_digest(&deletable_native_objects, &protected_native_objects);
+    Ok(GcPlan {
         unreachable_native_objects,
-        deleted: Vec::new(),
+        protected_native_objects,
+        deletable_native_objects,
+        plan_digest,
     })
+}
+
+fn gc_plan_digest(
+    deletable_native_objects: &[String],
+    protected_native_objects: &[String],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"forge-gc-plan-v1\n");
+    hasher.update(format!(
+        "protection_window_days={GC_PROTECTION_WINDOW_DAYS}\n"
+    ));
+    for id in deletable_native_objects {
+        hasher.update(b"delete ");
+        hasher.update(id.as_bytes());
+        hasher.update(b"\n");
+    }
+    for id in protected_native_objects {
+        hasher.update(b"protect ");
+        hasher.update(id.as_bytes());
+        hasher.update(b"\n");
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 struct LedgerCommitRoots {

@@ -254,6 +254,10 @@ struct RunArgs {
 struct GcArgs {
     #[arg(long)]
     dry_run: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    plan_digest: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -332,6 +336,15 @@ fn main() -> ExitCode {
         Command::Checkout(args) => checkout_response(request_id, args),
         Command::Undo => undo_response(request_id),
         Command::Doctor => doctor_response(request_id),
+        Command::Gc(args) if !args.dry_run && (!args.yes || args.plan_digest.is_none()) => {
+            structured_error(
+                "gc",
+                request_id,
+                "CONFIRMATION_REQUIRED",
+                "gc deletion requires --yes and --plan-digest from a prior dry-run",
+                json!({}),
+            )
+        }
         Command::Gc(args) => gc_response(request_id, args),
         Command::Export(args) => export_response(request_id, args),
         Command::Schema => schema_response(request_id),
@@ -1131,10 +1144,11 @@ fn doctor_response(request_id: Option<String>) -> ResponseEnvelope {
 
 fn gc_response(request_id: Option<String>, args: GcArgs) -> ResponseEnvelope {
     command_result("gc", request_id, |cwd, _request_id| {
-        if !args.dry_run {
-            anyhow::bail!("gc only supports --dry-run in v0");
-        }
-        let report = forge_store::gc_dry_run(&cwd)?;
+        let report = if args.dry_run {
+            forge_store::gc_dry_run(&cwd)?
+        } else {
+            forge_store::gc_delete(&cwd, args.plan_digest.as_deref().unwrap_or_default())?
+        };
         Ok((None, serde_json::to_value(report)?, Vec::new()))
     })
 }
@@ -1762,6 +1776,7 @@ fn is_mutating_command(command: &str) -> bool {
             | "export branch"
             | "checkout"
             | "undo"
+            | "gc"
     )
 }
 

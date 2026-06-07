@@ -622,6 +622,19 @@ impl NativeObjectStore {
         Ok(ids)
     }
 
+    pub fn object_modified_time(&self, id: &ObjectId) -> Result<std::time::SystemTime> {
+        Ok(fs::metadata(self.object_path(id))?.modified()?)
+    }
+
+    pub fn delete_object(&self, id: &ObjectId) -> Result<()> {
+        let path = self.object_path(id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("delete native object {}", id)),
+        }
+    }
+
     fn verify_reachable(&self, id: &ObjectId, seen: &mut BTreeSet<ObjectId>) -> Result<()> {
         if !seen.insert(id.clone()) {
             return Ok(());

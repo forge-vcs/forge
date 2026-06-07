@@ -81,6 +81,139 @@ fn gc_dry_run_reports_without_deleting() {
     );
     assert_eq!(report["data"]["dry_run"], true);
     assert!(report["data"]["deleted"].as_array().unwrap().is_empty());
+    assert!(report["data"]["plan_digest"].as_str().unwrap().len() == 64);
+    assert_eq!(report["data"]["protection_window_days"], 7);
+}
+
+#[test]
+fn gc_requires_confirmation_for_real_deletion() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+
+    let output = json_output(repo.forge().args(["--json", "gc"]).assert().failure());
+    assert_eq!(output["errors"][0]["code"], "CONFIRMATION_REQUIRED");
+
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--yes"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(output["errors"][0]["code"], "CONFIRMATION_REQUIRED");
+}
+
+#[test]
+fn gc_yes_deletes_only_old_unreachable_native_objects() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let store = NativeObjectStore::new(repo.path());
+    let old_orphan = store
+        .write_object(ObjectKind::Blob, b"old unreachable")
+        .expect("write old orphan");
+    mark_object_old(repo.path(), &old_orphan);
+    let recent_orphan = store
+        .write_object(ObjectKind::Blob, b"recent unreachable")
+        .expect("write recent orphan");
+
+    let dry = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--dry-run"])
+            .assert()
+            .success(),
+    );
+    let digest = dry["data"]["plan_digest"].as_str().unwrap();
+    assert!(contains_id(
+        &dry["data"]["unreachable_native_objects"],
+        &old_orphan
+    ));
+    assert!(contains_id(
+        &dry["data"]["unreachable_native_objects"],
+        &recent_orphan
+    ));
+    assert!(!contains_id(
+        &dry["data"]["protected_native_objects"],
+        &old_orphan
+    ));
+    assert!(contains_id(
+        &dry["data"]["protected_native_objects"],
+        &recent_orphan
+    ));
+
+    let deleted = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--yes", "--plan-digest", digest])
+            .assert()
+            .success(),
+    );
+    assert_eq!(deleted["data"]["dry_run"], false);
+    assert!(contains_id(&deleted["data"]["deleted"], &old_orphan));
+    assert!(!contains_id(&deleted["data"]["deleted"], &recent_orphan));
+    assert!(!object_path(repo.path(), &old_orphan).exists());
+    assert!(object_path(repo.path(), &recent_orphan).exists());
+}
+
+#[test]
+fn gc_yes_refuses_when_plan_digest_changed() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let dry = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--dry-run"])
+            .assert()
+            .success(),
+    );
+    let digest = dry["data"]["plan_digest"].as_str().unwrap();
+    let store = NativeObjectStore::new(repo.path());
+    store
+        .write_object(ObjectKind::Blob, b"new unreachable")
+        .expect("write new orphan");
+
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--yes", "--plan-digest", digest])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(output["errors"][0]["code"], "GC_PLAN_CHANGED");
+}
+
+#[test]
+fn gc_yes_refuses_when_doctor_is_not_clean() {
+    let repo = TestRepo::new_git();
+    native_repo_with_a_checkout(&repo);
+    let dry = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--dry-run"])
+            .assert()
+            .success(),
+    );
+    let digest = dry["data"]["plan_digest"].as_str().unwrap();
+    let connection = Connection::open(repo.path().join(".forge/forge.db")).expect("open db");
+    connection
+        .execute(
+            "UPDATE views SET state_json = ?1 WHERE state_json LIKE '%commit_checked_out%'",
+            ["{ not json"],
+        )
+        .expect("corrupt checkout view");
+
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--yes", "--plan-digest", digest])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(output["errors"][0]["code"], "COMMAND_FAILED");
+    let rendered = serde_json::to_string(&output).expect("serialize output");
+    assert!(rendered.contains("doctor"));
 }
 
 #[test]
@@ -277,6 +410,35 @@ fn object_path_containing(repo_path: &std::path::Path, needle: &str) -> Option<s
         }
     }
     None
+}
+
+fn object_path(
+    repo_path: &std::path::Path,
+    id: &forge_content_native::ObjectId,
+) -> std::path::PathBuf {
+    repo_path
+        .join(".forge/objects/sha256")
+        .join(&id.digest()[..2])
+        .join(id.digest())
+}
+
+fn mark_object_old(repo_path: &std::path::Path, id: &forge_content_native::ObjectId) {
+    let path = object_path(repo_path, id);
+    let status = std::process::Command::new("touch")
+        .args(["-t", "202001010000"])
+        .arg(&path)
+        .status()
+        .expect("run touch");
+    assert!(status.success(), "touch old mtime failed");
+}
+
+fn contains_id(value: &Value, id: &forge_content_native::ObjectId) -> bool {
+    let rendered = id.to_string();
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value.as_str() == Some(rendered.as_str()))
 }
 
 /// Drive a native repo through `init → start → save → run → propose → check → accept`
