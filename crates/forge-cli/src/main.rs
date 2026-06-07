@@ -110,6 +110,10 @@ enum ConflictCommand {
     List,
     Show {
         conflict_set_id: String,
+        /// Emit gated, ranked native resolution suggestions. Suggestions are advisory only;
+        /// use `conflict resolve --tree <ref>` to apply one explicitly.
+        #[arg(long)]
+        suggest: bool,
     },
     Resolve {
         conflict_set_id: String,
@@ -678,15 +682,16 @@ fn conflict_response(request_id: Option<String>, args: ConflictArgs) -> Response
                 Vec::new(),
             ))
         }),
-        ConflictCommand::Show { conflict_set_id } => {
-            command_result("conflict show", request_id, |cwd, _| {
-                Ok((
-                    None,
-                    serde_json::to_value(forge_store::conflict_show(&cwd, &conflict_set_id)?)?,
-                    Vec::new(),
-                ))
-            })
-        }
+        ConflictCommand::Show {
+            conflict_set_id,
+            suggest,
+        } => command_result("conflict show", request_id, |cwd, _| {
+            Ok((
+                None,
+                serde_json::to_value(forge_store::conflict_show(&cwd, &conflict_set_id, suggest)?)?,
+                Vec::new(),
+            ))
+        }),
         ConflictCommand::Resolve {
             conflict_set_id,
             tree,

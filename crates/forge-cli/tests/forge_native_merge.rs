@@ -256,3 +256,237 @@ fn native_merge_overlapping_changes_persists_conflict_set() {
     let doctor = forge_ok(&repo, &["doctor"]);
     assert!(doctor["data"]["issues"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn native_conflict_show_suggests_ranked_resolution_without_applying() {
+    let repo = TestRepo::new_git();
+    let (_intent_id, attempt_a, attempt_b) = init_two_native_attempts(&repo);
+    let proposal_a = propose_attempt(&repo, &attempt_a, "one\nOURS\nthree\nfour\n");
+    let proposal_b = propose_attempt(&repo, &attempt_b, "one\nTHEIRS\nthree\nfour\n");
+    forge_ok(
+        &repo,
+        &["accept", "--attempt", &attempt_a, "--proposal", &proposal_a],
+    );
+
+    let merge = forge_ok(&repo, &["merge", "--proposal", &proposal_b]);
+
+    assert_eq!(merge["data"]["merged"], false);
+    assert!(merge["data"].get("suggestions").is_none());
+    let conflict_set_id = merge["data"]["conflict_set_id"].as_str().unwrap();
+    let plain_show = forge_ok(&repo, &["conflict", "show", conflict_set_id]);
+    assert!(plain_show["data"].get("suggestions").is_none());
+    assert_eq!(plain_show["data"]["conflict"]["status"], "unresolved");
+
+    let suggested = forge_ok(&repo, &["conflict", "show", conflict_set_id, "--suggest"]);
+
+    let suggestions = suggested["data"]["suggestions"].as_array().unwrap();
+    assert_eq!(suggestions.len(), 2);
+    assert_eq!(suggestions[0]["rank"], 1);
+    assert_eq!(suggestions[1]["rank"], 2);
+    assert_eq!(suggestions[0]["requires_explicit_resolve"], true);
+    assert_eq!(suggestions[1]["requires_explicit_resolve"], true);
+    assert_eq!(
+        suggestions[0]["resolution_ref"],
+        suggested["data"]["conflict"]["ours_content_ref"]
+    );
+    assert_eq!(
+        suggestions[1]["resolution_ref"],
+        suggested["data"]["conflict"]["theirs_content_ref"]
+    );
+    assert_eq!(
+        suggestions[0]["provenance"]["conflict_set_id"],
+        conflict_set_id
+    );
+    assert_eq!(
+        suggestions[0]["provenance"]["proposal_id"],
+        proposal_b.as_str()
+    );
+    assert!(suggestions[0]["provenance"]["proposal_revision_id"]
+        .as_str()
+        .is_some());
+    assert_eq!(suggestions[0]["provenance"]["evidence_input_count"], 1);
+    assert_eq!(
+        suggestions[0]["provenance"]["evidence_input_status"],
+        "present"
+    );
+    assert_eq!(
+        suggestions[0]["provenance"]["evidence_input_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(suggestions[0]["provenance"]["check_input_status"], "passed");
+    assert_eq!(
+        suggestions[1]["provenance"]["evidence_input_status"],
+        "present"
+    );
+    assert_eq!(
+        suggestions[0]["provenance"]["intent_input_status"],
+        "conflict_set_metadata"
+    );
+    assert_eq!(
+        suggestions[0]["provenance"]["path_conflict_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        suggestions[0]["provenance"]["source_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let body = serde_json::to_string(&suggested).unwrap();
+    assert!(
+        !body.contains("README.md"),
+        "raw paths must stay redacted: {body}"
+    );
+    assert!(
+        !body.contains("OURS") && !body.contains("THEIRS"),
+        "inline content must not be emitted: {body}"
+    );
+
+    let after_suggest = forge_ok(&repo, &["conflict", "show", conflict_set_id]);
+    assert_eq!(after_suggest["data"]["conflict"]["status"], "unresolved");
+    assert_eq!(
+        after_suggest["data"]["path_conflicts"][0]["status"],
+        "unresolved"
+    );
+
+    let resolution_ref = suggestions[0]["resolution_ref"].as_str().unwrap();
+    let resolved = forge_ok(
+        &repo,
+        &[
+            "conflict",
+            "resolve",
+            conflict_set_id,
+            "--tree",
+            resolution_ref,
+        ],
+    );
+    assert_eq!(resolved["data"]["resolution_ref"], resolution_ref);
+    assert!(resolved["data"]["evidence_id"].as_str().is_some());
+    let resolved_revision = resolved["data"]["proposal_revision_id"].as_str().unwrap();
+    let shown_after = forge_ok(&repo, &["conflict", "show", conflict_set_id, "--suggest"]);
+    assert_eq!(shown_after["data"]["conflict"]["status"], "resolved");
+    assert!(shown_after["data"].get("suggestions").is_none());
+
+    let premature_accept = forge_fail(
+        &repo,
+        &["accept", "--attempt", &attempt_b, "--proposal", &proposal_b],
+    );
+    assert_eq!(premature_accept["errors"][0]["code"], "CHECK_NOT_PASSED");
+    forge_ok(
+        &repo,
+        &["run", "--attempt", &attempt_b, "--", "sh", "-c", "true"],
+    );
+    let checked = forge_ok(&repo, &["check", "--attempt", &attempt_b]);
+    assert_eq!(checked["data"]["proposal_revision_id"], resolved_revision);
+    assert_eq!(checked["data"]["status"], "passed");
+    forge_ok(
+        &repo,
+        &["accept", "--attempt", &attempt_b, "--proposal", &proposal_b],
+    );
+}
+
+#[test]
+fn native_conflict_suggestion_provenance_stays_bound_to_conflict_revision() {
+    let repo = TestRepo::new_git();
+    let (_intent_id, attempt_a, attempt_b) = init_two_native_attempts(&repo);
+    let proposal_a = propose_attempt(&repo, &attempt_a, "one\nOURS\nthree\nfour\n");
+    let proposal_b = propose_attempt(&repo, &attempt_b, "one\nTHEIRS\nthree\nfour\n");
+    forge_ok(
+        &repo,
+        &["accept", "--attempt", &attempt_a, "--proposal", &proposal_a],
+    );
+    let merge = forge_ok(&repo, &["merge", "--proposal", &proposal_b]);
+    let conflict_set_id = merge["data"]["conflict_set_id"].as_str().unwrap();
+    let original = forge_ok(&repo, &["conflict", "show", conflict_set_id, "--suggest"]);
+    let original_revision = original["data"]["suggestions"][0]["provenance"]
+        ["proposal_revision_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let original_theirs_ref = original["data"]["conflict"]["theirs_content_ref"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    forge_ok(&repo, &["attempt", "attach", &attempt_b]);
+    std::fs::write(
+        repo.path().join("README.md"),
+        "one\nTHEIRS AGAIN\nthree\nfour\n",
+    )
+    .unwrap();
+    forge_ok(&repo, &["save", "--attempt", &attempt_b]);
+    forge_ok(
+        &repo,
+        &["run", "--attempt", &attempt_b, "--", "sh", "-c", "true"],
+    );
+    let reproposed = forge_ok(&repo, &["propose", "--attempt", &attempt_b]);
+    assert_ne!(
+        reproposed["data"]["proposal_revision_id"],
+        original_revision
+    );
+    let reproposed_id = reproposed["data"]["proposal_id"].as_str().unwrap();
+    let checked_newer_tree = forge_ok(
+        &repo,
+        &[
+            "check",
+            "--attempt",
+            &attempt_b,
+            "--proposal",
+            reproposed_id,
+        ],
+    );
+    let connection = db(&repo);
+    let repo_id: String = connection
+        .query_row("SELECT id FROM repositories LIMIT 1", [], |row| row.get(0))
+        .unwrap();
+    let evidence_id = checked_newer_tree["data"]["evidence_id"].as_str().unwrap();
+    let fake_revision_id = "proposal_revision_newer_different_tree";
+    connection
+        .execute(
+            "INSERT INTO proposal_revisions (
+                id, proposal_id, snapshot_id, content_ref, changed_paths_json, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                fake_revision_id,
+                proposal_b,
+                reproposed["data"]["snapshot_id"].as_str().unwrap(),
+                reproposed["data"]["content_ref"].as_str().unwrap(),
+                "[\"README.md\"]",
+                9_999_999_999_999_i64,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO check_results (
+                id, repo_id, proposal_id, proposal_revision_id, status, reason, evidence_id, created_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, 'passed', 'injected newer stale provenance probe', ?5, ?6)",
+            rusqlite::params![
+                "check_newer_different_tree",
+                repo_id,
+                proposal_b,
+                fake_revision_id,
+                evidence_id,
+                9_999_999_999_999_i64,
+            ],
+        )
+        .unwrap();
+
+    let suggested = forge_ok(&repo, &["conflict", "show", conflict_set_id, "--suggest"]);
+
+    assert_eq!(
+        suggested["data"]["conflict"]["theirs_content_ref"],
+        original_theirs_ref
+    );
+    assert_eq!(
+        suggested["data"]["suggestions"][0]["provenance"]["proposal_revision_id"],
+        original_revision
+    );
+}

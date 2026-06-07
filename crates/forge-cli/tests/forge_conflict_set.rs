@@ -293,6 +293,17 @@ fn conflict_list_and_show_redact_raw_paths() {
         !rendered.contains("changed\n"),
         "conflict JSON must not emit inline blob content: {rendered}"
     );
+
+    let suggested = json_output(
+        repo.forge()
+            .args(["--json", "conflict", "show", conflict_id, "--suggest"])
+            .assert()
+            .success(),
+    );
+    assert!(
+        suggested["data"].get("suggestions").is_none(),
+        "stale-base conflicts must not emit native auto-resolution suggestions: {suggested}"
+    );
 }
 
 #[test]
