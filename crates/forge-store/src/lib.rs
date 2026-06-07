@@ -57,11 +57,19 @@ pub struct RequestIdOperation {
 pub struct RepositoryContext {
     pub repo_id: String,
     pub root_path: PathBuf,
+    pub worktree_path: PathBuf,
     pub database_path: PathBuf,
     pub content_backend: String,
     pub current_operation_id: String,
     pub current_view_id: String,
     pub attached_attempt_id: Option<String>,
+    pub workspace_attempt_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceMarker {
+    repo_root: String,
+    attempt_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +78,7 @@ pub struct StartAttempt {
     pub attempt_id: String,
     pub base_head: String,
     pub attached: bool,
+    pub workspace_path: String,
     pub operation_id: String,
     pub current_view_id: String,
 }
@@ -91,6 +100,7 @@ pub struct AttemptSummary {
     pub base_head: String,
     pub status: String,
     pub attached: bool,
+    pub workspace_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -674,7 +684,7 @@ pub fn init_repository(
 pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     // Git-free root resolution (slice 3): walk up for `.forge/forge.db` rather than shelling
     // `git rev-parse`, so every post-init command works with git removed from PATH.
-    let root = forge_root(cwd)?;
+    let (root, worktree_path, workspace_attempt_id) = repository_location(cwd)?;
     let database_path = root.join(".forge/forge.db");
     if !database_path.exists() {
         return Err(ForgeError::NotInitialized.into());
@@ -700,12 +710,22 @@ pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     Ok(RepositoryContext {
         repo_id,
         root_path: root,
+        worktree_path,
         database_path,
         content_backend,
         current_operation_id,
         current_view_id,
         attached_attempt_id,
+        workspace_attempt_id,
     })
+}
+
+pub fn effective_worktree_path(cwd: &Path) -> Result<PathBuf> {
+    Ok(open_repository(cwd)?.worktree_path)
+}
+
+pub fn repository_root_path(cwd: &Path) -> Result<PathBuf> {
+    Ok(open_repository(cwd)?.root_path)
 }
 
 pub fn repository_content_backend(cwd: &Path) -> Result<String> {
@@ -948,6 +968,18 @@ fn create_attempt(
              VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
             params![attempt_id, context.repo_id, intent_id, base_head, now],
         )?;
+        tx.execute(
+            "INSERT INTO attempt_workspaces (
+                attempt_id, repo_id, workspace_rel_path, status,
+                materialized_content_ref, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, 'active', NULL, ?4, ?4)",
+            params![
+                attempt_id,
+                context.repo_id,
+                workspace_rel_path_for_attempt(&attempt_id),
+                now
+            ],
+        )?;
 
         let op = insert_operation_view(
             tx,
@@ -976,6 +1008,7 @@ fn create_attempt(
 
     Ok(StartAttempt {
         intent_id,
+        workspace_path: workspace_rel_path_for_attempt(&attempt_id),
         attempt_id,
         base_head,
         attached: attach,
@@ -1054,6 +1087,68 @@ pub fn save_snapshot(
     })
 }
 
+fn workspace_rel_path_for_attempt(attempt_id: &str) -> String {
+    format!(".forge/worktrees/{attempt_id}")
+}
+
+fn attempt_workspace_rel_path(context: &RepositoryContext, attempt_id: &str) -> Result<String> {
+    let connection = open_connection(&context.database_path)?;
+    connection
+        .query_row(
+            "SELECT workspace_rel_path FROM attempt_workspaces
+             WHERE repo_id = ?1 AND attempt_id = ?2",
+            params![context.repo_id, attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or_else(|| workspace_rel_path_for_attempt(attempt_id)))
+        .map_err(Into::into)
+}
+
+pub fn attempt_workspace_path(cwd: &Path, attempt_id: &str) -> Result<PathBuf> {
+    let context = open_repository(cwd)?;
+    attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+        selector: attempt_id.to_string(),
+    })?;
+    let rel = attempt_workspace_rel_path(&context, attempt_id)?;
+    Ok(context.root_path.join(rel))
+}
+
+pub fn ensure_attempt_workspace_marker(cwd: &Path, attempt_id: &str) -> Result<PathBuf> {
+    let context = open_repository(cwd)?;
+    attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+        selector: attempt_id.to_string(),
+    })?;
+    let path = attempt_workspace_path(cwd, attempt_id)?;
+    fs::create_dir_all(&path).map_err(|error| anyhow!("create workspace: {}", error.kind()))?;
+    let marker = WorkspaceMarker {
+        repo_root: context.root_path.to_string_lossy().into_owned(),
+        attempt_id: attempt_id.to_string(),
+    };
+    let marker_path = path.join(forge_content::WORKSPACE_MARKER_FILE);
+    fs::write(&marker_path, serde_json::to_vec(&marker)?)
+        .map_err(|error| anyhow!("write workspace marker: {}", error.kind()))?;
+    Ok(path)
+}
+
+pub fn record_attempt_workspace_materialized(
+    cwd: &Path,
+    attempt_id: &str,
+    content_ref: &str,
+) -> Result<()> {
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        tx.execute(
+            "UPDATE attempt_workspaces
+             SET materialized_content_ref = ?1, updated_at_ms = ?2
+             WHERE repo_id = ?3 AND attempt_id = ?4",
+            params![content_ref, now_ms(), context.repo_id, attempt_id],
+        )?;
+        Ok(())
+    })
+}
+
 /// Write-binding verification (NER-134): refuse to act on the worktree under
 /// `target_attempt_id` when the worktree is currently materialized for a
 /// *different* attempt (`current_state.attached_attempt_id`).
@@ -1067,6 +1162,16 @@ pub fn save_snapshot(
 /// check runs only after attempt resolution succeeds, so an unqualified ambiguous
 /// selector still surfaces `AmbiguousAttempt` first.
 fn verify_worktree_binding(context: &RepositoryContext, target_attempt_id: &str) -> Result<()> {
+    if let Some(workspace_attempt_id) = context.workspace_attempt_id.as_deref() {
+        if workspace_attempt_id != target_attempt_id {
+            return Err(ForgeError::AttemptWorktreeMismatch {
+                requested_attempt: target_attempt_id.to_string(),
+                attached_attempt: workspace_attempt_id.to_string(),
+            }
+            .into());
+        }
+        return Ok(());
+    }
     if let Some(attached) = context.attached_attempt_id.as_deref() {
         if attached != target_attempt_id {
             return Err(ForgeError::AttemptWorktreeMismatch {
@@ -4875,6 +4980,14 @@ fn resolve_attempt_in_context(
         return Ok(ResolvedAttempt { attempt });
     }
 
+    if let Some(workspace_attempt_id) = context.workspace_attempt_id.as_deref() {
+        if let Some(attempt) = attempt_by_id(context, workspace_attempt_id)? {
+            if attempt.status == "active" {
+                return Ok(ResolvedAttempt { attempt });
+            }
+        }
+    }
+
     if let Some(attached_attempt_id) = context.attached_attempt_id.as_deref() {
         if let Some(attempt) = attempt_by_id(context, attached_attempt_id)? {
             if attempt.status == "active" {
@@ -4948,9 +5061,11 @@ pub fn list_attempts(cwd: &Path) -> Result<Vec<AttemptSummary>> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
     let mut statement = connection.prepare(
-        "SELECT a.id, a.intent_id, i.text, a.base_head, a.status
+        "SELECT a.id, a.intent_id, i.text, a.base_head, a.status,
+                COALESCE(aw.workspace_rel_path, '.forge/worktrees/' || a.id)
          FROM attempts a
          JOIN intents i ON i.id = a.intent_id
+         LEFT JOIN attempt_workspaces aw ON aw.attempt_id = a.id AND aw.repo_id = a.repo_id
          WHERE a.repo_id = ?1
          ORDER BY a.created_at_ms ASC",
     )?;
@@ -4964,6 +5079,7 @@ pub fn list_attempts(cwd: &Path) -> Result<Vec<AttemptSummary>> {
             intent: row.get(2)?,
             base_head: row.get(3)?,
             status: row.get(4)?,
+            workspace_path: row.get(5)?,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -5407,6 +5523,7 @@ pub fn show_attempt(cwd: &Path, attempt_id: &str) -> Result<AttemptShowRecord> {
             intent: attempt.intent.clone(),
             base_head: attempt.base_head.clone(),
             status: attempt.status.clone(),
+            workspace_path: attempt_workspace_rel_path(&context, &attempt.attempt_id)?,
         },
         latest_snapshot: latest_snapshot_for_attempt(&context, &attempt.attempt_id)?,
         latest_evidence: latest_evidence_for_attempt(&context, &attempt.attempt_id)?,
@@ -6210,18 +6327,35 @@ fn read_init_repository(
 /// still anchors a *git-backed* repo on the git toplevel (Forge layers on an existing git
 /// repo); a *native* repo's root is established at init without git. Returns
 /// `NotInitialized` when no `.forge/forge.db` is found up the tree.
-fn forge_root(cwd: &Path) -> Result<PathBuf> {
+fn repository_location(cwd: &Path) -> Result<(PathBuf, PathBuf, Option<String>)> {
     let start = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let mut current: &Path = &start;
     loop {
         if current.join(".forge/forge.db").exists() {
-            return Ok(current.to_path_buf());
+            return Ok((current.to_path_buf(), current.to_path_buf(), None));
+        }
+        let marker_path = current.join(forge_content::WORKSPACE_MARKER_FILE);
+        if marker_path.exists() {
+            let marker: WorkspaceMarker = serde_json::from_slice(
+                &fs::read(&marker_path)
+                    .map_err(|error| anyhow!("read workspace marker: {}", error.kind()))?,
+            )
+            .map_err(|_| anyhow!("workspace marker is corrupt"))?;
+            let root = PathBuf::from(marker.repo_root);
+            if !root.join(".forge/forge.db").exists() {
+                return Err(ForgeError::NotInitialized.into());
+            }
+            return Ok((root, current.to_path_buf(), Some(marker.attempt_id)));
         }
         match current.parent() {
             Some(parent) => current = parent,
             None => return Err(ForgeError::NotInitialized.into()),
         }
     }
+}
+
+fn forge_root(cwd: &Path) -> Result<PathBuf> {
+    repository_location(cwd).map(|(root, _, _)| root)
 }
 
 fn git_root(cwd: &Path) -> Result<PathBuf> {

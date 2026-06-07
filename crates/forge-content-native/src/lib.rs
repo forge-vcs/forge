@@ -292,43 +292,11 @@ pub struct NativeContentBackend;
 
 impl ContentBackend for NativeContentBackend {
     fn snapshot_worktree(&self, repo_root: &Path) -> Result<SnapshotContent> {
-        let store = NativeObjectStore::new(repo_root);
-        let files = scan_worktree(repo_root)?;
-        let root = write_tree(&store, repo_root, &files, "")?;
-        // NER-138 Phase 7 slice 2: changed_paths is now a native name-level diff of the
-        // base HEAD tree against the freshly-built worktree tree — reusing `root` rather
-        // than re-walking/re-hashing the worktree.
-        let changed = changed_paths(&store, repo_root, &root)?;
-        Ok(SnapshotContent {
-            content_ref: format!("{FORGE_TREE_PREFIX}{root}"),
-            changed_paths: changed,
-        })
+        snapshot_worktree_into_store(repo_root, repo_root)
     }
 
     fn restore_snapshot(&self, repo_root: &Path, content_ref: &str) -> Result<()> {
-        let root = object_id_from_content_ref(content_ref)?;
-        let store = NativeObjectStore::new(repo_root);
-        store.verify_content_ref(content_ref)?;
-        let mut target_paths = BTreeSet::new();
-        let mut synced_dirs = BTreeSet::new();
-        materialize_tree(
-            &store,
-            repo_root,
-            &root,
-            "",
-            &mut target_paths,
-            &mut synced_dirs,
-        )?;
-        for path in materialized_paths(repo_root)? {
-            if !target_paths.contains(&path) {
-                let full = repo_root.join(&path);
-                if full.is_file() || full.is_symlink() {
-                    fs::remove_file(&full)
-                        .map_err(|error| anyhow!("remove worktree entry: {}", error.kind()))?;
-                }
-            }
-        }
-        Ok(())
+        restore_content_ref_to_worktree(repo_root, repo_root, content_ref)
     }
 
     // NER-138 Phase 7 slice 2: native base anchoring. `current_base` returns the native
@@ -351,6 +319,52 @@ impl ContentBackend for NativeContentBackend {
         let commit = store.read_commit(&ObjectId::parse(base)?)?;
         Ok(format!("{FORGE_TREE_PREFIX}{}", commit.tree))
     }
+}
+
+pub fn snapshot_worktree_into_store(
+    repo_root: &Path,
+    worktree_root: &Path,
+) -> Result<SnapshotContent> {
+    let store = NativeObjectStore::new(repo_root);
+    let files = scan_worktree(worktree_root)?;
+    let root = write_tree(&store, worktree_root, &files, "")?;
+    // NER-138 Phase 7 slice 2: changed_paths is a native name-level diff of the
+    // owner repo's base HEAD tree against the freshly-built effective worktree tree.
+    let changed = changed_paths(&store, repo_root, &root)?;
+    Ok(SnapshotContent {
+        content_ref: format!("{FORGE_TREE_PREFIX}{root}"),
+        changed_paths: changed,
+    })
+}
+
+pub fn restore_content_ref_to_worktree(
+    repo_root: &Path,
+    worktree_root: &Path,
+    content_ref: &str,
+) -> Result<()> {
+    let root = object_id_from_content_ref(content_ref)?;
+    let store = NativeObjectStore::new(repo_root);
+    store.verify_content_ref(content_ref)?;
+    let mut target_paths = BTreeSet::new();
+    let mut synced_dirs = BTreeSet::new();
+    materialize_tree(
+        &store,
+        worktree_root,
+        &root,
+        "",
+        &mut target_paths,
+        &mut synced_dirs,
+    )?;
+    for path in materialized_paths(worktree_root)? {
+        if !target_paths.contains(&path) {
+            let full = worktree_root.join(&path);
+            if full.is_file() || full.is_symlink() {
+                fs::remove_file(&full)
+                    .map_err(|error| anyhow!("remove worktree entry: {}", error.kind()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Ensure the native ref store has a `HEAD` and return it (NER-138 Phase 7 slice 2).

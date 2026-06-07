@@ -1,6 +1,6 @@
 mod common;
 
-use common::TestRepo;
+use common::{forge_in, TestRepo};
 use rusqlite::Connection;
 use serde_json::Value;
 
@@ -251,6 +251,136 @@ fn attach_materializes_native_base_via_forge_tree_ref() {
         std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
         "hello\n",
         "attach must materialize the native base via the forge-tree: ref"
+    );
+}
+
+#[test]
+fn native_attempts_surface_and_materialize_workspace_paths() {
+    let repo = TestRepo::new_git();
+    std::fs::write(repo.path().join(".env"), "TOKEN=committed\n").expect("write env");
+    git(repo.path(), &["add", ".env"]);
+    git(repo.path(), &["commit", "-m", "track env"]);
+
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let started = json_output(
+        repo.forge()
+            .args(["--json", "start", "workspace"])
+            .assert()
+            .success(),
+    );
+    let workspace_path = started["data"]["workspace_path"].as_str().unwrap();
+    assert!(workspace_path.starts_with(".forge/worktrees/"));
+    let workspace = repo.path().join(workspace_path);
+    assert!(workspace
+        .join(forge_content::WORKSPACE_MARKER_FILE)
+        .exists());
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("README.md")).unwrap(),
+        "hello\n"
+    );
+    assert!(
+        !workspace.join(".env").exists(),
+        "secret-risk paths must not materialize into attempt workspaces"
+    );
+
+    let listed = json_output(
+        repo.forge()
+            .args(["--json", "attempt", "list"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        listed["data"]["attempts"][0]["workspace_path"],
+        started["data"]["workspace_path"]
+    );
+    let shown = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "attempt",
+                "show",
+                started["data"]["attempt_id"].as_str().unwrap(),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        shown["data"]["attempt"]["workspace_path"],
+        started["data"]["workspace_path"]
+    );
+}
+
+#[test]
+fn native_attempt_workspaces_are_isolated_and_bind_saves() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let first = json_output(
+        repo.forge()
+            .args(["--json", "start", "parallel"])
+            .assert()
+            .success(),
+    );
+    let intent_id = first["data"]["intent_id"].as_str().unwrap();
+    let first_workspace = repo
+        .path()
+        .join(first["data"]["workspace_path"].as_str().unwrap());
+
+    std::fs::write(first_workspace.join("README.md"), "attempt one\n").expect("write first");
+    let first_save = json_output(
+        forge_in(&first_workspace)
+            .args(["--json", "save"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        first_save["data"]["attempt_id"],
+        first["data"]["attempt_id"]
+    );
+
+    let second = json_output(
+        repo.forge()
+            .args(["--json", "attempt", "start", "--intent", intent_id])
+            .assert()
+            .success(),
+    );
+    let second_workspace = repo
+        .path()
+        .join(second["data"]["workspace_path"].as_str().unwrap());
+
+    assert_eq!(
+        std::fs::read_to_string(first_workspace.join("README.md")).unwrap(),
+        "attempt one\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(second_workspace.join("README.md")).unwrap(),
+        "hello\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+        "hello\n",
+        "workspace saves must not mutate the repo-root checkout"
+    );
+
+    std::fs::write(second_workspace.join("README.md"), "attempt two\n").expect("write second");
+    let second_save = json_output(
+        forge_in(&second_workspace)
+            .args(["--json", "save"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        second_save["data"]["attempt_id"],
+        second["data"]["attempt_id"]
+    );
+    assert_eq!(
+        std::fs::read_to_string(first_workspace.join("README.md")).unwrap(),
+        "attempt one\n"
     );
 }
 

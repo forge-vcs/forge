@@ -35,8 +35,10 @@ const NATIVE_HISTORY_COMMIT_ID_006: &str =
     include_str!("../migrations/006_native_history_commit_id.sql");
 /// The 007 expected-content-ref migration (NER-143 R1) — used to build an at-head fixture.
 const EXPECTED_CONTENT_REF_007: &str = include_str!("../migrations/007_expected_content_ref.sql");
-/// The 008 conflict-data migration (NER-139 Phase 8 S2a) — the current HEAD.
+/// The 008 conflict-data migration (NER-139 Phase 8 S2a).
 const CONFLICT_DATA_008: &str = include_str!("../migrations/008_conflict_data.sql");
+/// The 009 attempt-workspaces migration (NER-139 Phase 8 S4) — the current HEAD.
+const ATTEMPT_WORKSPACES_009: &str = include_str!("../migrations/009_attempt_workspaces.sql");
 
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
@@ -175,7 +177,11 @@ fn behind_db_upgrades_to_head() {
         has_column(&conn, "path_conflicts", "path_fingerprint"),
         "008 created path_conflicts"
     );
-    assert_eq!(max_version(&conn), 8, "reached HEAD=8");
+    assert!(
+        has_column(&conn, "attempt_workspaces", "workspace_rel_path"),
+        "009 created attempt_workspaces"
+    );
+    assert_eq!(max_version(&conn), 9, "reached HEAD=9");
 }
 
 #[test]
@@ -196,6 +202,8 @@ fn at_head_db_is_a_noop() {
             .expect("apply 007 expected-content-ref");
         conn.execute_batch(CONFLICT_DATA_008)
             .expect("apply 008 conflict-data");
+        conn.execute_batch(ATTEMPT_WORKSPACES_009)
+            .expect("apply 009 attempt-workspaces");
         stamp_versions(
             &conn,
             &[
@@ -207,15 +215,16 @@ fn at_head_db_is_a_noop() {
                 (6, "006_native_history_commit_id"),
                 (7, "007_expected_content_ref"),
                 (8, "008_conflict_data"),
+                (9, "009_attempt_workspaces"),
             ],
         );
-        assert_eq!(max_version(&conn), 8);
+        assert_eq!(max_version(&conn), 9);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 8, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 9, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -236,7 +245,9 @@ fn head_plus_one_is_refused() {
             .expect("apply 007 expected-content-ref");
         conn.execute_batch(CONFLICT_DATA_008)
             .expect("apply 008 conflict-data");
-        // HEAD is now 8, so the genuinely-ahead stamp is 9.
+        conn.execute_batch(ATTEMPT_WORKSPACES_009)
+            .expect("apply 009 attempt-workspaces");
+        // HEAD is now 9, so the genuinely-ahead stamp is 10.
         stamp_versions(
             &conn,
             &[
@@ -248,10 +259,11 @@ fn head_plus_one_is_refused() {
                 (6, "006_native_history_commit_id"),
                 (7, "007_expected_content_ref"),
                 (8, "008_conflict_data"),
-                (9, "future"),
+                (9, "009_attempt_workspaces"),
+                (10, "future"),
             ],
         );
-        assert_eq!(max_version(&conn), 9);
+        assert_eq!(max_version(&conn), 10);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -260,8 +272,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 9);
-            assert_eq!(*supported_head, 8);
+            assert_eq!(*db_version, 10);
+            assert_eq!(*supported_head, 9);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }

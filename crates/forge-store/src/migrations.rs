@@ -68,6 +68,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "008_conflict_data",
         include_str!("../migrations/008_conflict_data.sql"),
     ),
+    (
+        9,
+        "009_attempt_workspaces",
+        include_str!("../migrations/009_attempt_workspaces.sql"),
+    ),
 ];
 
 /// The highest migration version this binary knows how to apply.
@@ -417,7 +422,7 @@ mod tests {
 
     #[test]
     fn schema_head_is_max_version() {
-        assert_eq!(schema_head(), 8);
+        assert_eq!(schema_head(), 9);
     }
 
     #[test]
@@ -428,14 +433,14 @@ mod tests {
         assert_eq!(checksum, checksum_of("ALTER TABLE x ADD COLUMN y TEXT;"));
     }
 
-    /// Fresh apply reaches HEAD=8 with non-NULL checksums for every row.
+    /// Fresh apply reaches HEAD=9 with non-NULL checksums for every row.
     #[test]
     fn fresh_apply_reaches_head_with_checksums() {
         let mut conn = mem_conn();
         apply_pending_migrations(&mut conn).expect("apply migrations");
 
         let versions = applied_versions(&conn);
-        assert_eq!(versions.len(), 8);
+        assert_eq!(versions.len(), 9);
         assert_eq!(versions[0].0, 1);
         assert_eq!(versions[1].0, 2);
         assert_eq!(versions[2].0, 3);
@@ -444,6 +449,7 @@ mod tests {
         assert_eq!(versions[5].0, 6);
         assert_eq!(versions[6].0, 7);
         assert_eq!(versions[7].0, 8);
+        assert_eq!(versions[8].0, 9);
         assert!(versions[0].1.is_some(), "001 checksum must be non-NULL");
         assert!(versions[1].1.is_some(), "002 checksum must be non-NULL");
         assert!(versions[2].1.is_some(), "003 checksum must be non-NULL");
