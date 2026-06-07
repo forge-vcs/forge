@@ -321,6 +321,8 @@ pub struct ConflictListRecord {
 pub struct ConflictShowRecord {
     pub conflict: ConflictSetSummary,
     pub path_conflicts: Vec<PathConflictSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<ConflictResolutionSuggestion>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -354,6 +356,43 @@ pub struct PathConflictSummary {
     pub theirs_mode: Option<String>,
     pub resolution_ref: Option<String>,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictResolutionSuggestion {
+    pub suggestion_id: String,
+    pub rank: i64,
+    pub resolution_ref: String,
+    pub strategy: String,
+    pub confidence: String,
+    pub requires_explicit_resolve: bool,
+    pub provenance: ConflictResolutionSuggestionProvenance,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictResolutionSuggestionProvenance {
+    pub conflict_set_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposal_revision_id: Option<String>,
+    pub evidence_input_count: i64,
+    pub evidence_input_status: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence_input_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_input_status: Option<String>,
+    pub intent_input_status: String,
+    pub path_conflict_ids: Vec<String>,
+    pub source_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConflictSuggestionInputs {
+    proposal_id: Option<String>,
+    proposal_revision_id: Option<String>,
+    evidence_input_ids: Vec<String>,
+    check_input_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3588,7 +3627,11 @@ pub fn conflict_list(cwd: &Path) -> Result<ConflictListRecord> {
     })
 }
 
-pub fn conflict_show(cwd: &Path, conflict_set_id: &str) -> Result<ConflictShowRecord> {
+pub fn conflict_show(
+    cwd: &Path,
+    conflict_set_id: &str,
+    suggest: bool,
+) -> Result<ConflictShowRecord> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
     let mut conflicts = query_conflict_summaries(&connection, Some(conflict_set_id))?;
@@ -3625,10 +3668,169 @@ pub fn conflict_show(cwd: &Path, conflict_set_id: &str) -> Result<ConflictShowRe
                 status: row.get(13)?,
             })
         })?
-        .collect::<rusqlite::Result<_>>()?;
+        .collect::<rusqlite::Result<Vec<PathConflictSummary>>>()?;
+    let suggestions = if suggest {
+        let paths_json = conflict_paths_json(&connection, conflict_set_id)?;
+        let inputs = conflict_suggestion_inputs(
+            &connection,
+            &context.repo_id,
+            &paths_json,
+            conflict.theirs_content_ref.as_deref(),
+        )?;
+        conflict_resolution_suggestions(&conflict, &path_conflicts, &inputs)
+    } else {
+        Vec::new()
+    };
     Ok(ConflictShowRecord {
         conflict,
         path_conflicts,
+        suggestions,
+    })
+}
+
+fn conflict_resolution_suggestions(
+    conflict: &ConflictSetSummary,
+    path_conflicts: &[PathConflictSummary],
+    inputs: &ConflictSuggestionInputs,
+) -> Vec<ConflictResolutionSuggestion> {
+    if conflict.status != "unresolved"
+        || conflict.resolver_backend.as_deref() != Some("native_merge")
+    {
+        return Vec::new();
+    }
+
+    let path_conflict_ids = path_conflicts
+        .iter()
+        .map(|path_conflict| path_conflict.path_conflict_id.clone())
+        .collect::<Vec<_>>();
+    let source_refs = [
+        conflict.base_content_ref.as_ref(),
+        conflict.ours_content_ref.as_ref(),
+        conflict.theirs_content_ref.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .cloned()
+    .collect::<Vec<_>>();
+    let evidence_input_count = inputs.evidence_input_ids.len() as i64;
+    let evidence_input_status = if evidence_input_count == 0 {
+        "empty"
+    } else {
+        "present"
+    };
+    let provenance = ConflictResolutionSuggestionProvenance {
+        conflict_set_id: conflict.conflict_set_id.clone(),
+        proposal_id: inputs.proposal_id.clone(),
+        proposal_revision_id: inputs.proposal_revision_id.clone(),
+        evidence_input_count,
+        evidence_input_status: evidence_input_status.to_string(),
+        evidence_input_ids: inputs.evidence_input_ids.clone(),
+        check_input_status: inputs.check_input_status.clone(),
+        intent_input_status: "conflict_set_metadata".to_string(),
+        path_conflict_ids,
+        source_refs,
+    };
+    let mut suggestions = Vec::new();
+    if let Some(resolution_ref) = &conflict.ours_content_ref {
+        suggestions.push(ConflictResolutionSuggestion {
+            suggestion_id: "suggestion_keep_current_head".to_string(),
+            rank: 1,
+            resolution_ref: resolution_ref.clone(),
+            strategy: "keep_current_head_tree".to_string(),
+            confidence: "low".to_string(),
+            requires_explicit_resolve: true,
+            provenance: provenance.clone(),
+        });
+    }
+    if let Some(resolution_ref) = &conflict.theirs_content_ref {
+        let duplicate = conflict.ours_content_ref.as_ref() == Some(resolution_ref);
+        if !duplicate {
+            suggestions.push(ConflictResolutionSuggestion {
+                suggestion_id: "suggestion_use_proposal_tree".to_string(),
+                rank: suggestions.len() as i64 + 1,
+                resolution_ref: resolution_ref.clone(),
+                strategy: "use_proposal_tree".to_string(),
+                confidence: "low".to_string(),
+                requires_explicit_resolve: true,
+                provenance,
+            });
+        }
+    }
+    suggestions
+}
+
+fn conflict_paths_json(connection: &Connection, conflict_set_id: &str) -> Result<String> {
+    connection
+        .query_row(
+            "SELECT paths_json FROM conflict_sets WHERE id = ?1",
+            params![conflict_set_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn conflict_suggestion_inputs(
+    connection: &Connection,
+    repo_id: &str,
+    paths_json: &str,
+    theirs_content_ref: Option<&str>,
+) -> Result<ConflictSuggestionInputs> {
+    let proposal_id = serde_json::from_str::<Value>(paths_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("proposal_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let Some(proposal_id) = proposal_id else {
+        return Ok(ConflictSuggestionInputs::default());
+    };
+    let Some(theirs_content_ref) = theirs_content_ref else {
+        return Ok(ConflictSuggestionInputs {
+            proposal_id: Some(proposal_id),
+            ..ConflictSuggestionInputs::default()
+        });
+    };
+    let proposal: Option<(String, String)> = connection
+        .query_row(
+            "SELECT p.attempt_id, pr.id
+             FROM proposals p
+             JOIN proposal_revisions pr ON pr.proposal_id = p.id
+             WHERE p.repo_id = ?1 AND p.id = ?2 AND pr.content_ref = ?3
+             ORDER BY pr.created_at_ms DESC, pr.rowid DESC LIMIT 1",
+            params![repo_id, proposal_id, theirs_content_ref],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((attempt_id, proposal_revision_id)) = proposal else {
+        return Ok(ConflictSuggestionInputs {
+            proposal_id: Some(proposal_id),
+            ..ConflictSuggestionInputs::default()
+        });
+    };
+    let mut evidence_statement = connection.prepare(
+        "SELECT id FROM evidence
+         WHERE repo_id = ?1 AND attempt_id = ?2
+         ORDER BY created_at_ms DESC, rowid DESC",
+    )?;
+    let evidence_input_ids = evidence_statement
+        .query_map(params![repo_id, attempt_id], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    let check_input_status = connection
+        .query_row(
+            "SELECT status FROM check_results
+             WHERE repo_id = ?1 AND proposal_revision_id = ?2
+             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            params![repo_id, proposal_revision_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(ConflictSuggestionInputs {
+        proposal_id: Some(proposal_id),
+        proposal_revision_id: Some(proposal_revision_id),
+        evidence_input_ids,
+        check_input_status,
     })
 }
 
