@@ -24,6 +24,21 @@ fn hold_repo_lock(repo: &TestRepo) -> std::fs::File {
     file
 }
 
+fn hold_worktree_lock(repo: &TestRepo, attempt_id: &str) -> std::fs::File {
+    let lock_dir = repo.path().join(".forge/worktree-locks");
+    std::fs::create_dir_all(&lock_dir).expect("create worktree lock dir");
+    let lock_path = lock_dir.join(format!("{attempt_id}.lock"));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open worktree lock file");
+    file.try_lock().expect("test acquires the worktree lock");
+    file
+}
+
 #[test]
 fn mutating_command_times_out_with_lock_timeout_when_lock_held() {
     let repo = TestRepo::new_git();
@@ -90,6 +105,70 @@ fn run_and_read_commands_do_not_block_on_a_held_write_lock() {
     repo.forge()
         .env("FORGE_LOCK_TIMEOUT_MS", "80")
         .args(["--json", "doctor"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn same_attempt_workspace_materialization_times_out_on_held_worktree_lock() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let started = json_output(
+        repo.forge()
+            .args(["--json", "start", "worktree lock"])
+            .assert()
+            .success(),
+    );
+    let attempt_id = started["data"]["attempt_id"].as_str().unwrap();
+    let held = hold_worktree_lock(&repo, attempt_id);
+
+    let out = json_output(
+        repo.forge()
+            .env("FORGE_LOCK_TIMEOUT_MS", "80")
+            .args(["--json", "attempt", "attach", attempt_id])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(out["errors"][0]["code"], "LOCK_TIMEOUT");
+    assert_eq!(out["retry"]["retryable"], true);
+
+    held.unlock().expect("release worktree lock");
+    repo.forge()
+        .args(["--json", "attempt", "attach", attempt_id])
+        .assert()
+        .success();
+}
+
+#[test]
+fn different_attempt_workspace_locks_do_not_block_each_other() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let first = json_output(
+        repo.forge()
+            .args(["--json", "start", "worktree lock split"])
+            .assert()
+            .success(),
+    );
+    let first_attempt = first["data"]["attempt_id"].as_str().unwrap();
+    let intent_id = first["data"]["intent_id"].as_str().unwrap();
+    let second = json_output(
+        repo.forge()
+            .args(["--json", "attempt", "start", "--intent", intent_id])
+            .assert()
+            .success(),
+    );
+    let second_attempt = second["data"]["attempt_id"].as_str().unwrap();
+    let _held = hold_worktree_lock(&repo, first_attempt);
+
+    repo.forge()
+        .env("FORGE_LOCK_TIMEOUT_MS", "80")
+        .args(["--json", "attempt", "attach", second_attempt])
         .assert()
         .success();
 }

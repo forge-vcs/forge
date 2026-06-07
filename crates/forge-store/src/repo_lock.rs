@@ -99,7 +99,11 @@ impl std::error::Error for LockTimeout {}
 /// creates it before calling this). Acquire exactly once per command — never
 /// nested (see the module docs on the std re-entrancy caveat).
 pub fn acquire(forge_dir: &Path) -> Result<RepoLock> {
-    acquire_with_timeout(forge_dir, configured_timeout())
+    acquire_file_with_timeout(&forge_dir.join(LOCK_FILE_NAME), configured_timeout())
+}
+
+pub fn acquire_lock_file(path: &Path) -> Result<RepoLock> {
+    acquire_file_with_timeout(path, configured_timeout())
 }
 
 /// Resolve the acquire deadline from the environment, clamped to the floor.
@@ -115,8 +119,16 @@ fn configured_timeout() -> Duration {
 
 /// Core acquire loop with an explicit timeout (separated out so tests can drive a
 /// short deadline deterministically).
+#[cfg(test)]
 fn acquire_with_timeout(forge_dir: &Path, timeout: Duration) -> Result<RepoLock> {
-    let path = forge_dir.join(LOCK_FILE_NAME);
+    acquire_file_with_timeout(&forge_dir.join(LOCK_FILE_NAME), timeout)
+}
+
+fn acquire_file_with_timeout(path: &Path, timeout: Duration) -> Result<RepoLock> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create lock directory {}", parent.display()))?;
+    }
     // read+write+create: Windows refuses to lock an append-only handle, and the
     // file must exist to be locked — so create it on first acquire.
     let file = OpenOptions::new()
@@ -124,7 +136,7 @@ fn acquire_with_timeout(forge_dir: &Path, timeout: Duration) -> Result<RepoLock>
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&path)
+        .open(path)
         .with_context(|| format!("failed to open lock file {}", path.display()))?;
 
     let deadline = Instant::now() + timeout;

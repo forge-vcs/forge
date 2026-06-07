@@ -1606,6 +1606,7 @@ fn materialize_attempt_workspace(
     attempt_id: &str,
     content_ref: &str,
 ) -> anyhow::Result<std::path::PathBuf> {
+    let _worktree_lock = forge_store::acquire_worktree_lock(cwd, attempt_id)?;
     let workspace = forge_store::ensure_attempt_workspace_marker(cwd, attempt_id)?;
     match classify_content_ref(content_ref) {
         ContentRefKind::ForgeTree(_) => {

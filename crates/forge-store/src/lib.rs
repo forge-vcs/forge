@@ -754,6 +754,18 @@ pub fn acquire_repo_lock(cwd: &Path) -> Result<Option<RepoLock>> {
     repo_lock::acquire(&forge_dir).map(Some)
 }
 
+pub fn acquire_worktree_lock(cwd: &Path, attempt_id: &str) -> Result<RepoLock> {
+    let context = open_repository(cwd)?;
+    attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+        selector: attempt_id.to_string(),
+    })?;
+    let lock_path = context
+        .root_path
+        .join(".forge/worktree-locks")
+        .join(format!("{attempt_id}.lock"));
+    repo_lock::acquire_lock_file(&lock_path)
+}
+
 /// Bring the repository's schema up to this binary's head, acquiring the repo
 /// write lock **only when a migration is actually pending** (NER-133 U4).
 ///
