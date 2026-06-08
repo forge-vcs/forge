@@ -1,6 +1,6 @@
 ---
 title: "feat: Phase 8 Slice 4 - real GC deletion and physical attempt worktrees"
-status: active
+status: completed
 date: 2026-06-07
 origin: docs/brainstorms/2026-05-31-ner-139-phase-8-requirements.md
 ---
