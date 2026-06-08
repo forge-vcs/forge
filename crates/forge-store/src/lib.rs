@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod error;
 mod integrity;
@@ -507,6 +507,9 @@ pub struct DoctorReport {
     /// Corrupt `views.state_json` rows that make GC's reachability root set
     /// untrustworthy. Empty in a healthy repo.
     pub ledger_view_issues: Vec<LedgerViewFinding>,
+    /// Native pack/index entries that fail offset, checksum, decompression, hash, or kind
+    /// verification. Empty in a healthy repo.
+    pub native_pack_issues: Vec<String>,
 }
 
 /// One row that failed integrity verification in `doctor`'s chain pass. Carries only
@@ -572,10 +575,15 @@ pub struct GcDryRunReport {
     pub unreachable_evidence: Vec<String>,
     pub unreachable_native_objects: Vec<String>,
     pub protected_native_objects: Vec<String>,
+    pub pack_candidate_native_objects: Vec<String>,
+    pub loose_duplicate_native_objects: Vec<String>,
+    pub deletable_native_packs: Vec<String>,
     pub protection_window_days: u64,
     pub storage: StorageAccounting,
     pub plan_digest: String,
     pub deleted: Vec<String>,
+    pub created_packs: Vec<String>,
+    pub deleted_packs: Vec<String>,
 }
 
 const GC_PROTECTION_WINDOW_DAYS: u64 = 7;
@@ -4351,6 +4359,13 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
             ledger_view_issues.len()
         ));
     }
+    let native_pack_issues = native_store.validate_packs();
+    if !native_pack_issues.is_empty() {
+        issues.push(format!(
+            "{} native pack/index issue(s) detected",
+            native_pack_issues.len()
+        ));
+    }
 
     Ok(DoctorReport {
         ok: issues.is_empty(),
@@ -4363,6 +4378,7 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         tampered_rows,
         native_history_issues,
         ledger_view_issues,
+        native_pack_issues,
     })
 }
 
@@ -5026,7 +5042,7 @@ pub fn pr_body_for(
 }
 
 pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
-    Ok(gc_plan(cwd)?.into_report(true, Vec::new()))
+    Ok(gc_plan(cwd)?.into_report(true, Vec::new(), Vec::new(), Vec::new()))
 }
 
 pub fn gc_delete(cwd: &Path, expected_plan_digest: &str) -> Result<GcDryRunReport> {
@@ -5045,35 +5061,64 @@ pub fn gc_delete(cwd: &Path, expected_plan_digest: &str) -> Result<GcDryRunRepor
     let context = open_repository(cwd)?;
     let native_store = forge_content_native::NativeObjectStore::new(&context.root_path);
     let mut deleted = Vec::new();
-    for object in &plan.deletable_native_objects {
+    let mut created_packs = Vec::new();
+    let mut loose_deletions = plan.loose_duplicate_native_objects.clone();
+    let pack_candidate_ids = parse_native_object_ids(&plan.pack_candidate_native_objects)?;
+    if let Some(pack) = native_store.write_pack_from_loose_objects(&pack_candidate_ids)? {
+        created_packs.push(pack.pack_id);
+        loose_deletions.extend(pack.object_ids.into_iter().map(|id| id.to_string()));
+        loose_deletions.sort();
+        loose_deletions.dedup();
+        forge_content::maybe_crash("gc_after_pack_before_loose_delete");
+    }
+    for object in &loose_deletions {
         let id = forge_content_native::ObjectId::parse(object)?;
-        native_store.delete_object(&id)?;
+        native_store.delete_loose_duplicate(&id)?;
         deleted.push(object.clone());
         forge_content::maybe_crash("gc_after_unlink");
     }
-    Ok(plan.into_report(false, deleted))
+    let mut deleted_packs = Vec::new();
+    for pack_id in &plan.deletable_native_packs {
+        native_store.delete_pack(pack_id)?;
+        deleted_packs.push(pack_id.clone());
+        forge_content::maybe_crash("gc_after_unlink");
+    }
+    Ok(plan.into_report(false, deleted, created_packs, deleted_packs))
 }
 
 struct GcPlan {
     unreachable_native_objects: Vec<String>,
     protected_native_objects: Vec<String>,
-    deletable_native_objects: Vec<String>,
+    pack_candidate_native_objects: Vec<String>,
+    loose_duplicate_native_objects: Vec<String>,
+    deletable_native_packs: Vec<String>,
     storage: StorageAccounting,
     plan_digest: String,
 }
 
 impl GcPlan {
-    fn into_report(self, dry_run: bool, deleted: Vec<String>) -> GcDryRunReport {
+    fn into_report(
+        self,
+        dry_run: bool,
+        deleted: Vec<String>,
+        created_packs: Vec<String>,
+        deleted_packs: Vec<String>,
+    ) -> GcDryRunReport {
         GcDryRunReport {
             dry_run,
             unreachable_snapshots: Vec::new(),
             unreachable_evidence: Vec::new(),
             unreachable_native_objects: self.unreachable_native_objects,
             protected_native_objects: self.protected_native_objects,
+            pack_candidate_native_objects: self.pack_candidate_native_objects,
+            loose_duplicate_native_objects: self.loose_duplicate_native_objects,
+            deletable_native_packs: self.deletable_native_packs,
             protection_window_days: GC_PROTECTION_WINDOW_DAYS,
             storage: self.storage,
             plan_digest: self.plan_digest,
             deleted,
+            created_packs,
+            deleted_packs,
         }
     }
 }
@@ -5128,47 +5173,109 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
             reachable.extend(ids);
         }
     }
-    let all = native_store.all_object_ids()?;
+    let loose = native_store.loose_object_ids()?;
+    let packed_infos = native_store.packed_object_infos()?;
+    let mut packed = std::collections::BTreeSet::new();
+    let mut infos_by_pack: std::collections::BTreeMap<
+        String,
+        Vec<forge_content_native::PackedObjectInfo>,
+    > = std::collections::BTreeMap::new();
+    for info in packed_infos {
+        packed.insert(info.object_id.clone());
+        infos_by_pack
+            .entry(info.pack_id.clone())
+            .or_default()
+            .push(info);
+    }
+    let mut all = loose.clone();
+    all.extend(packed.iter().cloned());
     let now = SystemTime::now();
+    let now_ms = system_time_ms(now).unwrap_or(u64::MAX);
     let mut unreachable_native_objects = Vec::new();
     let mut protected_native_objects = Vec::new();
-    let mut deletable_native_objects = Vec::new();
     for id in all.difference(&reachable) {
         let rendered = id.to_string();
         unreachable_native_objects.push(rendered.clone());
-        let protected = native_store
-            .object_modified_time(id)
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_none_or(|age| age < GC_PROTECTION_WINDOW);
+        let protected = if loose.contains(id) {
+            loose_object_protected(&native_store, id, now)
+        } else {
+            infos_by_pack
+                .values()
+                .flatten()
+                .filter(|info| &info.object_id == id)
+                .all(|info| pack_entry_protected(info, now_ms))
+        };
         if protected {
             protected_native_objects.push(rendered);
-        } else {
-            deletable_native_objects.push(rendered);
         }
     }
-    let plan_digest = gc_plan_digest(&deletable_native_objects, &protected_native_objects);
+
+    let mut pack_candidate_native_objects = Vec::new();
+    for id in &loose {
+        if !packed.contains(id) && !loose_object_protected(&native_store, id, now) {
+            pack_candidate_native_objects.push(id.to_string());
+        }
+    }
+
+    let mut loose_duplicate_native_objects = Vec::new();
+    for id in loose.intersection(&packed) {
+        if native_store.has_verified_packed_object(id)? {
+            loose_duplicate_native_objects.push(id.to_string());
+        }
+    }
+
+    let mut deletable_native_packs = Vec::new();
+    for (pack_id, infos) in &infos_by_pack {
+        if !infos.is_empty()
+            && infos.iter().all(|info| {
+                !reachable.contains(&info.object_id) && !pack_entry_protected(info, now_ms)
+            })
+        {
+            deletable_native_packs.push(pack_id.clone());
+        }
+    }
+
+    let plan_digest = gc_plan_digest(
+        &pack_candidate_native_objects,
+        &loose_duplicate_native_objects,
+        &deletable_native_packs,
+        &protected_native_objects,
+    );
     Ok(GcPlan {
         unreachable_native_objects,
         protected_native_objects,
-        deletable_native_objects,
+        pack_candidate_native_objects,
+        loose_duplicate_native_objects,
+        deletable_native_packs,
         storage,
         plan_digest,
     })
 }
 
 fn gc_plan_digest(
-    deletable_native_objects: &[String],
+    pack_candidate_native_objects: &[String],
+    loose_duplicate_native_objects: &[String],
+    deletable_native_packs: &[String],
     protected_native_objects: &[String],
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"forge-gc-plan-v1\n");
+    hasher.update(b"forge-gc-plan-v2\n");
     hasher.update(format!(
         "protection_window_days={GC_PROTECTION_WINDOW_DAYS}\n"
     ));
-    for id in deletable_native_objects {
-        hasher.update(b"delete ");
+    for id in pack_candidate_native_objects {
+        hasher.update(b"pack ");
         hasher.update(id.as_bytes());
+        hasher.update(b"\n");
+    }
+    for id in loose_duplicate_native_objects {
+        hasher.update(b"delete-loose ");
+        hasher.update(id.as_bytes());
+        hasher.update(b"\n");
+    }
+    for pack_id in deletable_native_packs {
+        hasher.update(b"delete-pack ");
+        hasher.update(pack_id.as_bytes());
         hasher.update(b"\n");
     }
     for id in protected_native_objects {
@@ -5182,6 +5289,46 @@ fn gc_plan_digest(
         hex.push_str(&format!("{byte:02x}"));
     }
     hex
+}
+
+fn parse_native_object_ids(values: &[String]) -> Result<Vec<forge_content_native::ObjectId>> {
+    values
+        .iter()
+        .map(|value| forge_content_native::ObjectId::parse(value))
+        .collect()
+}
+
+fn loose_object_protected(
+    native_store: &forge_content_native::NativeObjectStore,
+    id: &forge_content_native::ObjectId,
+    now: SystemTime,
+) -> bool {
+    native_store
+        .object_modified_time(id)
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_none_or(|age| age < GC_PROTECTION_WINDOW)
+}
+
+fn pack_entry_protected(info: &forge_content_native::PackedObjectInfo, now_ms: u64) -> bool {
+    let Some(packed_at_ms) = info.packed_at_ms else {
+        return true;
+    };
+    let Some(loose_mtime_ms) = info.loose_mtime_ms else {
+        return true;
+    };
+    let newest_ms = packed_at_ms.max(loose_mtime_ms);
+    let protection_ms: u64 = match GC_PROTECTION_WINDOW.as_millis().try_into() {
+        Ok(value) => value,
+        Err(_) => return true,
+    };
+    now_ms.saturating_sub(newest_ms) < protection_ms
+}
+
+fn system_time_ms(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| duration.as_millis().try_into().ok())
 }
 
 struct LedgerCommitRoots {

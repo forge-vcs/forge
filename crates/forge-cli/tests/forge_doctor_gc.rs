@@ -210,7 +210,9 @@ fn gc_yes_keeps_objects_reachable_from_attempt_workspace_snapshot() {
         .args(["--json", "gc", "--yes", "--plan-digest", digest])
         .assert()
         .success();
-    assert!(object_path(repo.path(), &root_id).exists());
+    NativeObjectStore::new(repo.path())
+        .read_object(&root_id)
+        .expect("reachable workspace snapshot remains readable after gc");
 }
 
 #[test]

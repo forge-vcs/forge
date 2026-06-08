@@ -604,6 +604,12 @@ impl NativeObjectStore {
     }
 
     pub fn all_object_ids(&self) -> Result<BTreeSet<ObjectId>> {
+        let mut ids = self.loose_object_ids()?;
+        ids.extend(pack::all_packed_object_ids(&self.root)?);
+        Ok(ids)
+    }
+
+    pub fn loose_object_ids(&self) -> Result<BTreeSet<ObjectId>> {
         let mut ids = BTreeSet::new();
         let dir = self.root.join(".forge/objects/sha256");
         if dir.exists() {
@@ -644,8 +650,52 @@ impl NativeObjectStore {
                 }
             }
         }
-        ids.extend(pack::all_packed_object_ids(&self.root)?);
         Ok(ids)
+    }
+
+    pub fn packed_object_infos(&self) -> Result<Vec<PackedObjectInfo>> {
+        pack::packed_object_infos(&self.root).map(|infos| {
+            infos
+                .into_iter()
+                .map(|info| PackedObjectInfo {
+                    object_id: info.object_id,
+                    pack_id: info.pack_id,
+                    packed_at_ms: info.packed_at_ms,
+                    loose_mtime_ms: info.loose_mtime_ms,
+                })
+                .collect()
+        })
+    }
+
+    pub fn write_pack_from_loose_objects(
+        &self,
+        ids: &[ObjectId],
+    ) -> Result<Option<PackWriteReport>> {
+        pack::write_pack_from_loose_objects(&self.root, ids).map(|summary| {
+            summary.map(|summary| PackWriteReport {
+                pack_id: summary.pack_id,
+                object_ids: summary.object_ids,
+            })
+        })
+    }
+
+    pub fn has_verified_packed_object(&self, id: &ObjectId) -> Result<bool> {
+        pack::has_verified_packed_object(&self.root, id)
+    }
+
+    pub fn delete_loose_duplicate(&self, id: &ObjectId) -> Result<()> {
+        if !self.has_verified_packed_object(id)? {
+            bail!("cannot delete native loose object without verified packed copy");
+        }
+        self.delete_object(id)
+    }
+
+    pub fn delete_pack(&self, pack_id: &str) -> Result<()> {
+        pack::delete_pack(&self.root, pack_id)
+    }
+
+    pub fn validate_packs(&self) -> Vec<String> {
+        pack::validate_packs(&self.root)
     }
 
     pub fn object_modified_time(&self, id: &ObjectId) -> Result<std::time::SystemTime> {
@@ -692,6 +742,20 @@ impl NativeObjectStore {
     fn tmp_dir(&self) -> PathBuf {
         self.root.join(".forge/tmp")
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackedObjectInfo {
+    pub object_id: ObjectId,
+    pub pack_id: String,
+    pub packed_at_ms: Option<u64>,
+    pub loose_mtime_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackWriteReport {
+    pub pack_id: String,
+    pub object_ids: Vec<ObjectId>,
 }
 
 /// The native ref store (NER-138 Phase 7 slice 2): a small, crash-atomic, lock-agnostic
@@ -4008,6 +4072,8 @@ mod tests {
                     framed_len: 1,
                     compressed_len: 1024,
                     checksum: "0".repeat(64),
+                    packed_at_ms: None,
+                    loose_mtime_ms: None,
                 }],
             })
             .unwrap(),
