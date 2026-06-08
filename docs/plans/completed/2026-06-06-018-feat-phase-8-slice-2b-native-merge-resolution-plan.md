@@ -1,7 +1,7 @@
 ---
 title: "feat: Phase 8 Slice 2b - Native 3-way merge engine + conflict resolution loop"
 type: feat
-status: active
+status: completed
 date: 2026-06-06
 origin: docs/brainstorms/2026-05-31-ner-139-phase-8-requirements.md
 previous_plan: docs/plans/completed/2026-06-06-017-feat-phase-8-slice-2a-conflict-data-plan.md
@@ -354,7 +354,7 @@ forge conflict resolve <conflict-set-id> --tree <forge-tree-ref>
   - check
   - accept
   - log/doctor
-- `ce-code-review mode:autofix plan:docs/plans/2026-06-06-018-feat-phase-8-slice-2b-native-merge-resolution-plan.md`
+- `ce-code-review mode:autofix plan:docs/plans/completed/2026-06-06-018-feat-phase-8-slice-2b-native-merge-resolution-plan.md`
 
 ---
 
@@ -364,4 +364,3 @@ forge conflict resolve <conflict-set-id> --tree <forge-tree-ref>
 - Whether `forge conflict resolve` should initially accept only a full resolved tree or also per-path resolution refs. Default: full tree first because it binds cleanly to proposal revisions; per-path resolution can layer on once hunk-level UX is proven.
 - What exact parent pair should a resolved merge commit store when the proposal's `theirs` side is a tree rather than a commit id. Default: use current native HEAD as ours and the proposal base/native attempt lineage where available; if unavailable, preserve the merged tree and record the missing lineage in operation state rather than fabricating a parent.
 - Whether git-backed merge should be fully implemented in S2b or return a typed unsupported response while native merge ships. Default: preserve existing git-tree compatibility by delegating where practical, but do not block native merge on git adapter completeness.
-
