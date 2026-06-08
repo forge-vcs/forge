@@ -191,6 +191,29 @@ PY
   echo "storage_evidence_output_bytes=$(json_get data.storage.evidence_outputs.bytes)"
 }
 
+assert_large_file_streaming_paths() {
+  local source="$ROOT/crates/forge-content-native/src/lib.rs"
+  python3 - "$source" <<'PY'
+import sys
+
+source = open(sys.argv[1]).read()
+write_tree = source.split("fn write_tree(", 1)[1].split("fn materialize_tree(", 1)[0]
+materialize_tree = source.split("fn materialize_tree(", 1)[1].split("/// Lexically normalize", 1)[0]
+checks = [
+    ("large-file snapshot path is not using streaming blob writes",
+     "write_blob_from_path(&repo_root.join(&file.path))" in write_tree),
+    ("large-file restore path is not using streaming object reads",
+     "write_object_payload_to(&child, &mut writer)" in materialize_tree),
+    ("large-file snapshot path regressed to whole-file fs::read",
+     "let bytes = fs::read(repo_root.join(&file.path))?;" not in write_tree),
+]
+for message, ok in checks:
+    if not ok:
+        print(message, file=sys.stderr)
+        raise SystemExit(1)
+PY
+}
+
 need git
 need python3
 
@@ -208,6 +231,7 @@ case "$MODE" in
     run_storage_case 1000 256
     ;;
   --large-file-smoke)
+    assert_large_file_streaming_paths
     run_storage_case 4 1048576
     ;;
   *)
