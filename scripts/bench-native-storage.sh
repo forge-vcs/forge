@@ -79,15 +79,43 @@ print(f"{label}_ms={elapsed_ms}")
 PY
 }
 
+measure_capture() {
+  local label="$1"
+  local stdout_path="$2"
+  local stderr_path="$3"
+  shift 3
+  python3 - "$label" "$stdout_path" "$stderr_path" "$@" <<'PY'
+import subprocess
+import sys
+import time
+
+label = sys.argv[1]
+stdout_path = sys.argv[2]
+stderr_path = sys.argv[3]
+cmd = sys.argv[4:]
+start = time.perf_counter_ns()
+with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
+    subprocess.run(cmd, check=True, stdout=stdout, stderr=stderr)
+elapsed_ms = (time.perf_counter_ns() - start) // 1_000_000
+print(f"{label}_ms={elapsed_ms}")
+PY
+}
+
 make_repo() {
   local dir="$1"
-  local files="$2"
-  local bytes_per_file="$3"
   mkdir -p "$dir"
   cd "$dir"
   git init -q
   git config user.email bench@example.test
   git config user.name "Forge Bench"
+  printf 'native storage benchmark baseline\n' > README.md
+  git add README.md
+  git commit -qm "benchmark baseline"
+}
+
+write_corpus() {
+  local files="$1"
+  local bytes_per_file="$2"
   python3 - "$files" "$bytes_per_file" <<'PY'
 import sys
 from pathlib import Path
@@ -95,7 +123,7 @@ from pathlib import Path
 files = int(sys.argv[1])
 bytes_per_file = int(sys.argv[2])
 root = Path("corpus")
-root.mkdir()
+root.mkdir(exist_ok=True)
 base = ("forge native storage benchmark repeated payload\n" * 128).encode()
 for i in range(files):
     payload = (base + f"file={i % 32:04d}\n".encode())
@@ -114,16 +142,29 @@ run_storage_case() {
   local files="$1"
   local bytes_per_file="$2"
   local repo="$TMP/storage"
-  make_repo "$repo" "$files" "$bytes_per_file"
+  make_repo "$repo"
 
   "$FORGE" --json init --content-backend native >"$OUT" 2>"$ERR"
   "$FORGE" --json start "native storage benchmark" >"$OUT" 2>"$ERR"
-  measure "native_save" "$FORGE" --json save
-  "$FORGE" --json save >"$OUT" 2>"$ERR"
+  write_corpus "$files" "$bytes_per_file"
+  measure_capture "native_save" "$OUT" "$ERR" "$FORGE" --json save
   local content_ref
   local snapshot_id
+  local changed_path_count
   content_ref="$(json_get data.content_ref)"
   snapshot_id="$(json_get data.snapshot_id)"
+  changed_path_count="$(python3 - "$OUT" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1]))
+print(len(data["data"]["changed_paths"]))
+PY
+)"
+  if [ "$changed_path_count" = "0" ]; then
+    echo "benchmark save produced no changed paths; corpus was not measured" >&2
+    exit 1
+  fi
   measure "native_restore_clean" "$FORGE" --json restore "$snapshot_id" --yes
 
   python3 - <<'PY'
@@ -138,7 +179,7 @@ PY
   echo "repo=$repo"
   echo "corpus_files=$files"
   echo "corpus_payload_bytes=$((files * bytes_per_file))"
-  echo "forge_bytes=$(du_bytes .forge)"
+  echo "post_doctor_forge_file_bytes=$(du_bytes .forge)"
   echo "git_object_bytes=$(du_bytes .git/objects)"
   echo "storage_total_bytes=$(json_get data.storage.total_bytes)"
   echo "storage_loose_object_bytes=$(json_get data.storage.loose_objects.bytes)"
