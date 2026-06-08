@@ -60,6 +60,6 @@ Native commit objects already had `parents: Vec<String>`, but a reader that foll
 ## See also
 
 - `docs/plans/completed/2026-06-06-017-feat-phase-8-slice-2a-conflict-data-plan.md`
-- `docs/plans/2026-06-06-018-feat-phase-8-slice-2b-native-merge-resolution-plan.md`
+- `docs/plans/completed/2026-06-06-018-feat-phase-8-slice-2b-native-merge-resolution-plan.md`
 - `docs/brainstorms/2026-05-31-ner-139-phase-8-requirements.md`
 - `docs/solutions/architecture-patterns/commit-on-accept-ordering-ledger-authoritative-reconcile-and-the-last-hidden-git-dependency-2026-05-31.md`

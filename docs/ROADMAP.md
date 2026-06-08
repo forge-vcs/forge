@@ -156,8 +156,10 @@ The order is three movements — **bulletproof the ledger (Phases 1–2), fund t
 
 > **Why I keep Phase 7 as a single phase depending on Phase 2/3 (and drop the false Phase 6 edge):** the critique correctly notes the original's Phase 6→7 dependency is sequencing-by-movement, not a technical edge — the walker depends only on durability, the migration framework, and the `ContentBackend` boundary. **I removed the false technical dependency on Phase 6.** I did **not** split the walker and the commit/DAG into parallel tracks as the critique suggested, and this is a deliberate disagreement (see below): the value-weighting "finish and prove the wedge before opening an XL greenfield front" is a real resourcing decision, not a falsehood, and splitting it invites two half-finished fronts. The sequencing is explicit, not encoded as a fake edge.
 
-### Phase 8 — Native diff + intent-aware 3-way merge, and operational scale (pack/delta/compression/real GC); physical attempt isolation
+### Phase 8 — Native diff + intent-aware 3-way merge, operational scale, and physical attempt isolation (completed)
 **Goal:** Build the convergence primitives git has and Forge lacks, make the native store survive a heavy agent fleet, and land the deferred physical per-attempt workspaces here where GC can reclaim them.
+
+**Status:** Completed in June 2026 through the Phase 8 slice plans now archived under `docs/plans/completed/`, including conflict-as-data/native merge resolution, real GC plus physical attempt workspaces, and pack/index/retention scale work.
 
 **Features**
 - Native content diff (working vs snapshot, snapshot vs snapshot, base vs proposal) at hunk/line granularity with rename detection, exposed through the JSON contract — replacing the Phase 6 git-adapter diff and removing that interop dependency from the core review path.
