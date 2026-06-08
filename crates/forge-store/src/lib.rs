@@ -481,6 +481,9 @@ pub struct DoctorReport {
     pub ok: bool,
     pub issues: Vec<String>,
     pub schema_version: Option<i64>,
+    /// File-byte accounting for `.forge`, grouped by stable storage category. This is
+    /// informational only; storage-budget enforcement/warnings land in a later S5 unit.
+    pub storage: StorageAccounting,
     pub dangling_temp_files: Vec<String>,
     /// `content_ref` rows whose referenced object is missing or fails
     /// verification — the failure mode the store-before-DB ordering (NER-132)
@@ -544,6 +547,24 @@ pub enum LedgerViewFindingKind {
     UnparseableCommitId,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct StorageAccounting {
+    pub total_bytes: u64,
+    pub loose_objects: StorageCategoryAccounting,
+    pub packs: StorageCategoryAccounting,
+    pub database: StorageCategoryAccounting,
+    pub temp: StorageCategoryAccounting,
+    pub worktrees: StorageCategoryAccounting,
+    pub evidence_outputs: StorageCategoryAccounting,
+    pub other: StorageCategoryAccounting,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct StorageCategoryAccounting {
+    pub bytes: u64,
+    pub files: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GcDryRunReport {
     pub dry_run: bool,
@@ -552,6 +573,7 @@ pub struct GcDryRunReport {
     pub unreachable_native_objects: Vec<String>,
     pub protected_native_objects: Vec<String>,
     pub protection_window_days: u64,
+    pub storage: StorageAccounting,
     pub plan_digest: String,
     pub deleted: Vec<String>,
 }
@@ -559,6 +581,106 @@ pub struct GcDryRunReport {
 const GC_PROTECTION_WINDOW_DAYS: u64 = 7;
 const GC_PROTECTION_WINDOW: Duration =
     Duration::from_secs(60 * 60 * 24 * GC_PROTECTION_WINDOW_DAYS);
+
+pub fn storage_accounting(cwd: &Path) -> Result<StorageAccounting> {
+    let context = open_repository(cwd)?;
+    storage_accounting_for_root(&context.root_path)
+}
+
+fn storage_accounting_for_root(root: &Path) -> Result<StorageAccounting> {
+    let forge_dir = root.join(".forge");
+    let total = account_path(&forge_dir)?;
+    let loose_objects = account_path(&forge_dir.join("objects"))?;
+    let packs = account_path(&forge_dir.join("packs"))?;
+    let temp = account_path(&forge_dir.join("tmp"))?;
+    let worktrees = account_path(&forge_dir.join("worktrees"))?;
+    let evidence_outputs = account_multiple_paths(&[
+        forge_dir.join("evidence"),
+        forge_dir.join("evidence-outputs"),
+        forge_dir.join("outputs"),
+    ])?;
+    let database = account_multiple_paths(&[
+        forge_dir.join("forge.db"),
+        forge_dir.join("forge.db-wal"),
+        forge_dir.join("forge.db-shm"),
+        forge_dir.join("forge.db-journal"),
+    ])?;
+
+    let known_bytes = loose_objects
+        .bytes
+        .saturating_add(packs.bytes)
+        .saturating_add(database.bytes)
+        .saturating_add(temp.bytes)
+        .saturating_add(worktrees.bytes)
+        .saturating_add(evidence_outputs.bytes);
+    let known_files = loose_objects
+        .files
+        .saturating_add(packs.files)
+        .saturating_add(database.files)
+        .saturating_add(temp.files)
+        .saturating_add(worktrees.files)
+        .saturating_add(evidence_outputs.files);
+
+    Ok(StorageAccounting {
+        total_bytes: total.bytes,
+        loose_objects,
+        packs,
+        database,
+        temp,
+        worktrees,
+        evidence_outputs,
+        other: StorageCategoryAccounting {
+            bytes: total.bytes.saturating_sub(known_bytes),
+            files: total.files.saturating_sub(known_files),
+        },
+    })
+}
+
+fn account_multiple_paths(paths: &[PathBuf]) -> Result<StorageCategoryAccounting> {
+    let mut total = StorageCategoryAccounting::default();
+    for path in paths {
+        total.add(account_path(path)?);
+    }
+    Ok(total)
+}
+
+fn account_path(path: &Path) -> Result<StorageCategoryAccounting> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(StorageCategoryAccounting::default());
+        }
+        Err(error) => return Err(error).with_context(|| "read storage metadata"),
+    };
+    if metadata.is_file() {
+        return Ok(StorageCategoryAccounting {
+            bytes: metadata.len(),
+            files: 1,
+        });
+    }
+    if metadata.file_type().is_symlink() {
+        return Ok(StorageCategoryAccounting {
+            bytes: metadata.len(),
+            files: 1,
+        });
+    }
+    if !metadata.is_dir() {
+        return Ok(StorageCategoryAccounting::default());
+    }
+
+    let mut total = StorageCategoryAccounting::default();
+    for entry in fs::read_dir(path).with_context(|| "read storage directory")? {
+        total.add(account_path(&entry?.path())?);
+    }
+    Ok(total)
+}
+
+impl StorageCategoryAccounting {
+    fn add(&mut self, other: StorageCategoryAccounting) {
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.files = self.files.saturating_add(other.files);
+    }
+}
 
 pub fn init_repository(
     cwd: &Path,
@@ -4117,6 +4239,7 @@ fn conflict_redacted_count(paths_json: &str) -> i64 {
 pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
+    let storage = storage_accounting_for_root(&context.root_path)?;
     let mut issues = Vec::new();
     let mut foreign_key_statement = connection.prepare("PRAGMA foreign_key_check")?;
     let mut foreign_key_rows = foreign_key_statement.query([])?;
@@ -4233,6 +4356,7 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         ok: issues.is_empty(),
         issues,
         schema_version,
+        storage,
         dangling_temp_files,
         dangling_content_refs,
         half_applied_worktrees,
@@ -4934,6 +5058,7 @@ struct GcPlan {
     unreachable_native_objects: Vec<String>,
     protected_native_objects: Vec<String>,
     deletable_native_objects: Vec<String>,
+    storage: StorageAccounting,
     plan_digest: String,
 }
 
@@ -4946,6 +5071,7 @@ impl GcPlan {
             unreachable_native_objects: self.unreachable_native_objects,
             protected_native_objects: self.protected_native_objects,
             protection_window_days: GC_PROTECTION_WINDOW_DAYS,
+            storage: self.storage,
             plan_digest: self.plan_digest,
             deleted,
         }
@@ -4955,6 +5081,7 @@ impl GcPlan {
 fn gc_plan(cwd: &Path) -> Result<GcPlan> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
+    let storage = storage_accounting_for_root(&context.root_path)?;
     let native_store = forge_content_native::NativeObjectStore::new(&context.root_path);
     let mut reachable = std::collections::BTreeSet::new();
     let mut statement = connection.prepare(
@@ -5025,6 +5152,7 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
         unreachable_native_objects,
         protected_native_objects,
         deletable_native_objects,
+        storage,
         plan_digest,
     })
 }
