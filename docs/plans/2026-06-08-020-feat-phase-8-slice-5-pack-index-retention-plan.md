@@ -1,6 +1,6 @@
 ---
 title: "feat: Phase 8 Slice 5 - pack storage, retention, budget warnings, and scale benchmarks"
-status: active
+status: completed
 date: 2026-06-08
 origin: docs/brainstorms/2026-05-31-ner-139-phase-8-requirements.md
 ---
