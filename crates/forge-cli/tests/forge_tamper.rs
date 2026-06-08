@@ -208,6 +208,17 @@ fn legacy_null_hash_evidence_is_grandfathered_not_tampered() {
             [],
         )
         .expect("lift markers to the legacy boundary");
+    connection
+        .execute("DELETE FROM ledger_signatures", [])
+        .expect("remove post-Phase-9 signatures");
+    connection
+        .execute(
+            "UPDATE signature_marker SET
+               evidence_high_water = (SELECT COALESCE(MAX(rowid), 0) FROM evidence),
+               decision_high_water = (SELECT COALESCE(MAX(rowid), 0) FROM decisions)",
+            [],
+        )
+        .expect("lift signature markers to the legacy boundary");
 
     let report = json(repo.forge().args(["--json", "doctor"]).assert().success());
     assert_eq!(

@@ -39,8 +39,10 @@ const EXPECTED_CONTENT_REF_007: &str = include_str!("../migrations/007_expected_
 const CONFLICT_DATA_008: &str = include_str!("../migrations/008_conflict_data.sql");
 /// The 009 attempt-workspaces migration (NER-139 Phase 8 S4).
 const ATTEMPT_WORKSPACES_009: &str = include_str!("../migrations/009_attempt_workspaces.sql");
-/// The 010 storage-policy migration (Phase 8 S5) — the current HEAD.
+/// The 010 storage-policy migration (Phase 8 S5).
 const STORAGE_POLICY_010: &str = include_str!("../migrations/010_storage_policy.sql");
+/// The 011 local-signatures migration (Phase 9 S1) — the current HEAD.
+const LOCAL_SIGNATURES_011: &str = include_str!("../migrations/011_local_signatures.sql");
 
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
@@ -183,7 +185,7 @@ fn behind_db_upgrades_to_head() {
         has_column(&conn, "attempt_workspaces", "workspace_rel_path"),
         "009 created attempt_workspaces"
     );
-    assert_eq!(max_version(&conn), 10, "reached HEAD=10");
+    assert_eq!(max_version(&conn), 11, "reached HEAD=11");
 }
 
 #[test]
@@ -208,6 +210,8 @@ fn at_head_db_is_a_noop() {
             .expect("apply 009 attempt-workspaces");
         conn.execute_batch(STORAGE_POLICY_010)
             .expect("apply 010 storage-policy");
+        conn.execute_batch(LOCAL_SIGNATURES_011)
+            .expect("apply 011 local-signatures");
         stamp_versions(
             &conn,
             &[
@@ -221,15 +225,16 @@ fn at_head_db_is_a_noop() {
                 (8, "008_conflict_data"),
                 (9, "009_attempt_workspaces"),
                 (10, "010_storage_policy"),
+                (11, "011_local_signatures"),
             ],
         );
-        assert_eq!(max_version(&conn), 10);
+        assert_eq!(max_version(&conn), 11);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 10, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 11, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -252,7 +257,11 @@ fn head_plus_one_is_refused() {
             .expect("apply 008 conflict-data");
         conn.execute_batch(ATTEMPT_WORKSPACES_009)
             .expect("apply 009 attempt-workspaces");
-        // HEAD is now 10, so the genuinely-ahead stamp is 11.
+        conn.execute_batch(STORAGE_POLICY_010)
+            .expect("apply 010 storage-policy");
+        conn.execute_batch(LOCAL_SIGNATURES_011)
+            .expect("apply 011 local-signatures");
+        // HEAD is now 11, so the genuinely-ahead stamp is 12.
         stamp_versions(
             &conn,
             &[
@@ -266,10 +275,11 @@ fn head_plus_one_is_refused() {
                 (8, "008_conflict_data"),
                 (9, "009_attempt_workspaces"),
                 (10, "010_storage_policy"),
-                (11, "future"),
+                (11, "011_local_signatures"),
+                (12, "future"),
             ],
         );
-        assert_eq!(max_version(&conn), 11);
+        assert_eq!(max_version(&conn), 12);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -278,8 +288,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 11);
-            assert_eq!(*supported_head, 10);
+            assert_eq!(*db_version, 12);
+            assert_eq!(*supported_head, 11);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }
