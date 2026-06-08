@@ -157,6 +157,7 @@ pub struct ForgeTrailers {
     pub proposal_id: Option<String>,
     pub proposal_revision_id: Option<String>,
     pub provenance_digest: Option<String>,
+    pub local_signature_fingerprint: Option<String>,
     pub decision_actor: Option<String>,
     pub gates: Option<String>,
 }
@@ -169,6 +170,8 @@ pub struct TrailerVerification {
     pub verified: bool,
     pub proposal_id: String,
     pub provenance_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_signature_fingerprint: Option<String>,
 }
 
 /// Read a commit's full message body via `git show -s --format=%B` (NER-137).
@@ -188,6 +191,8 @@ pub fn parse_forge_trailers(message: &str) -> ForgeTrailers {
             trailers.proposal_revision_id = Some(value.trim().to_string());
         } else if let Some(value) = line.strip_prefix("Forge-Provenance-Digest:") {
             trailers.provenance_digest = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("Forge-Local-Signature-Fingerprint:") {
+            trailers.local_signature_fingerprint = Some(value.trim().to_string());
         } else if let Some(value) = line.strip_prefix("Forge-Decision-Actor:") {
             trailers.decision_actor = Some(value.trim().to_string());
         } else if let Some(value) = line.strip_prefix("Forge-Gates:") {
@@ -239,10 +244,34 @@ pub fn verify_publication_trailer(
         }
         .into());
     }
+    let verified_fingerprint = match (
+        trailers.local_signature_fingerprint,
+        recomputed.local_signature_fingerprint.clone(),
+    ) {
+        (Some(published), Some(recomputed_fingerprint)) if published != recomputed_fingerprint => {
+            return Err(ForgeError::LocalSignatureMismatch {
+                proposal_id: recomputed.proposal_id,
+                published_fingerprint: published,
+                recomputed_fingerprint,
+            }
+            .into());
+        }
+        (Some(published), None) => {
+            return Err(ForgeError::LocalSignatureMismatch {
+                proposal_id: recomputed.proposal_id,
+                published_fingerprint: published,
+                recomputed_fingerprint: String::new(),
+            }
+            .into());
+        }
+        (Some(_), Some(recomputed_fingerprint)) => Some(recomputed_fingerprint),
+        (None, _) => None,
+    };
     Ok(TrailerVerification {
         verified: true,
         proposal_id: recomputed.proposal_id,
         provenance_digest: recomputed.provenance_digest,
+        local_signature_fingerprint: verified_fingerprint,
     })
 }
 

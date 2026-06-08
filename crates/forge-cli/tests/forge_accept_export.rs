@@ -46,6 +46,17 @@ fn prepare_proposal_with_init(repo: &TestRepo, init_args: &[&str]) {
     repo.forge().args(["--json", "check"]).assert().success();
 }
 
+fn decision_signature_fingerprint(repo: &TestRepo) -> String {
+    let connection = Connection::open(repo.path().join(".forge/forge.db")).expect("open db");
+    connection
+        .query_row(
+            "SELECT key_fingerprint FROM ledger_signatures WHERE subject_kind = 'decision'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("decision signature fingerprint")
+}
+
 #[test]
 fn accept_records_decision_and_export_branch_leaves_current_branch() {
     let repo = TestRepo::new_git();
@@ -218,6 +229,8 @@ fn export_carries_a_structured_provenance_trailer() {
     assert!(message.contains("Forge-Proposal-Revision-Id: "));
     assert!(message.contains("Forge-Decision-Actor: alice"));
     assert!(message.contains("Forge-Gates: "));
+    let fingerprint = decision_signature_fingerprint(&repo);
+    assert!(message.contains(&format!("Forge-Local-Signature-Fingerprint: {fingerprint}")));
 
     let digest_lines: Vec<&str> = message
         .lines()
@@ -229,6 +242,8 @@ fn export_carries_a_structured_provenance_trailer() {
         .trim();
     assert_eq!(digest.len(), 64, "64-hex provenance digest");
     assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(fingerprint.len(), 32, "32-hex key fingerprint");
+    assert!(fingerprint.chars().all(|c| c.is_ascii_hexdigit()));
     // The split that an earlier draft carried must NOT appear.
     assert!(!message.contains("Forge-Evidence-Digest"));
     assert!(!message.contains("Forge-Publication-Digest"));
@@ -253,12 +268,17 @@ fn verify_branch_confirms_a_clean_provenance_trailer() {
     );
     assert_eq!(out["data"]["verified"], true);
     let digest = out["data"]["provenance_digest"].as_str().unwrap();
+    let fingerprint = out["data"]["local_signature_fingerprint"]
+        .as_str()
+        .expect("signed export verification returns fingerprint");
+    assert_eq!(fingerprint, decision_signature_fingerprint(&repo));
     // The verified digest is the one the commit carries.
     let message = git(
         repo.path(),
         &["show", "-s", "--format=%B", "forge/verified"],
     );
     assert!(message.contains(&format!("Forge-Provenance-Digest: {digest}")));
+    assert!(message.contains(&format!("Forge-Local-Signature-Fingerprint: {fingerprint}")));
 }
 
 #[test]
@@ -363,6 +383,57 @@ fn verify_branch_reports_provenance_mismatch_for_a_rewritten_trailer() {
     );
     assert_eq!(out["errors"][0]["code"], "PROVENANCE_MISMATCH");
     assert_eq!(out["errors"][0]["details"]["published_digest"], zeros);
+}
+
+#[test]
+fn verify_branch_reports_local_signature_mismatch_for_a_rewritten_fingerprint() {
+    let repo = TestRepo::new_git();
+    prepare_proposal(&repo);
+    repo.forge().args(["--json", "accept"]).assert().success();
+    repo.forge()
+        .args(["--json", "export", "branch", "forge/signed"])
+        .assert()
+        .success();
+
+    let message = git(repo.path(), &["show", "-s", "--format=%B", "forge/signed"]);
+    let bogus = "f".repeat(32);
+    let forged: String = message
+        .lines()
+        .map(|line| {
+            if line.starts_with("Forge-Local-Signature-Fingerprint: ") {
+                format!("Forge-Local-Signature-Fingerprint: {bogus}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tree = git(repo.path(), &["show", "-s", "--format=%T", "forge/signed"]);
+    let parent = git(repo.path(), &["show", "-s", "--format=%P", "forge/signed"]);
+    let commit = git(
+        repo.path(),
+        &[
+            "commit-tree",
+            tree.trim(),
+            "-p",
+            parent.trim(),
+            "-m",
+            &forged,
+        ],
+    );
+    git(
+        repo.path(),
+        &["branch", "forge/signed-forged", commit.trim()],
+    );
+
+    let out = json_output(
+        repo.forge()
+            .args(["--json", "export", "verify-branch", "forge/signed-forged"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(out["errors"][0]["code"], "LOCAL_SIGNATURE_MISMATCH");
+    assert_eq!(out["errors"][0]["details"]["published_fingerprint"], bogus);
 }
 
 #[test]
