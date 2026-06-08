@@ -482,8 +482,10 @@ pub struct DoctorReport {
     pub issues: Vec<String>,
     pub schema_version: Option<i64>,
     /// File-byte accounting for `.forge`, grouped by stable storage category. This is
-    /// informational only; storage-budget enforcement/warnings land in a later S5 unit.
+    /// informational only; storage-budget overflow is reported separately and never evicts.
     pub storage: StorageAccounting,
+    pub storage_policy: StoragePolicy,
+    pub storage_budget: StorageBudgetStatus,
     pub dangling_temp_files: Vec<String>,
     /// `content_ref` rows whose referenced object is missing or fails
     /// verification — the failure mode the store-before-DB ordering (NER-132)
@@ -569,6 +571,21 @@ pub struct StorageCategoryAccounting {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct StoragePolicy {
+    pub protection_window_days: u64,
+    pub storage_budget_bytes: u64,
+    pub automatic_eviction: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageBudgetStatus {
+    pub limit_bytes: u64,
+    pub used_bytes: u64,
+    pub over_budget: bool,
+    pub over_by_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct GcDryRunReport {
     pub dry_run: bool,
     pub unreachable_snapshots: Vec<String>,
@@ -580,6 +597,8 @@ pub struct GcDryRunReport {
     pub deletable_native_packs: Vec<String>,
     pub protection_window_days: u64,
     pub storage: StorageAccounting,
+    pub storage_policy: StoragePolicy,
+    pub storage_budget: StorageBudgetStatus,
     pub plan_digest: String,
     pub deleted: Vec<String>,
     pub created_packs: Vec<String>,
@@ -587,12 +606,19 @@ pub struct GcDryRunReport {
 }
 
 const GC_PROTECTION_WINDOW_DAYS: u64 = 7;
-const GC_PROTECTION_WINDOW: Duration =
-    Duration::from_secs(60 * 60 * 24 * GC_PROTECTION_WINDOW_DAYS);
+const DEFAULT_STORAGE_BUDGET_BYTES: u64 = 1_073_741_824;
 
 pub fn storage_accounting(cwd: &Path) -> Result<StorageAccounting> {
     let context = open_repository(cwd)?;
     storage_accounting_for_root(&context.root_path)
+}
+
+pub fn storage_budget_status(cwd: &Path) -> Result<StorageBudgetStatus> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let storage = storage_accounting_for_root(&context.root_path)?;
+    let policy = storage_policy(&connection)?;
+    Ok(storage_budget_status_for(&storage, &policy))
 }
 
 fn storage_accounting_for_root(root: &Path) -> Result<StorageAccounting> {
@@ -642,6 +668,55 @@ fn storage_accounting_for_root(root: &Path) -> Result<StorageAccounting> {
             files: total.files.saturating_sub(known_files),
         },
     })
+}
+
+fn storage_policy(connection: &Connection) -> Result<StoragePolicy> {
+    let row = connection
+        .query_row(
+            "SELECT protection_window_days, storage_budget_bytes, automatic_eviction
+             FROM storage_policy
+             WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((protection_window_days, storage_budget_bytes, automatic_eviction)) = row else {
+        return Ok(default_storage_policy());
+    };
+    Ok(StoragePolicy {
+        protection_window_days: protection_window_days.max(1) as u64,
+        storage_budget_bytes: storage_budget_bytes.max(0) as u64,
+        automatic_eviction: automatic_eviction != 0,
+    })
+}
+
+fn default_storage_policy() -> StoragePolicy {
+    StoragePolicy {
+        protection_window_days: GC_PROTECTION_WINDOW_DAYS,
+        storage_budget_bytes: DEFAULT_STORAGE_BUDGET_BYTES,
+        automatic_eviction: false,
+    }
+}
+
+fn storage_budget_status_for(
+    storage: &StorageAccounting,
+    policy: &StoragePolicy,
+) -> StorageBudgetStatus {
+    let over_by_bytes = storage
+        .total_bytes
+        .saturating_sub(policy.storage_budget_bytes);
+    StorageBudgetStatus {
+        limit_bytes: policy.storage_budget_bytes,
+        used_bytes: storage.total_bytes,
+        over_budget: over_by_bytes > 0,
+        over_by_bytes,
+    }
 }
 
 fn account_multiple_paths(paths: &[PathBuf]) -> Result<StorageCategoryAccounting> {
@@ -4248,6 +4323,8 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
     let storage = storage_accounting_for_root(&context.root_path)?;
+    let storage_policy = storage_policy(&connection)?;
+    let storage_budget = storage_budget_status_for(&storage, &storage_policy);
     let mut issues = Vec::new();
     let mut foreign_key_statement = connection.prepare("PRAGMA foreign_key_check")?;
     let mut foreign_key_rows = foreign_key_statement.query([])?;
@@ -4372,6 +4449,8 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         issues,
         schema_version,
         storage,
+        storage_policy,
+        storage_budget,
         dangling_temp_files,
         dangling_content_refs,
         half_applied_worktrees,
@@ -5093,6 +5172,9 @@ struct GcPlan {
     loose_duplicate_native_objects: Vec<String>,
     deletable_native_packs: Vec<String>,
     storage: StorageAccounting,
+    storage_policy: StoragePolicy,
+    storage_budget: StorageBudgetStatus,
+    protection_window_days: u64,
     plan_digest: String,
 }
 
@@ -5113,8 +5195,10 @@ impl GcPlan {
             pack_candidate_native_objects: self.pack_candidate_native_objects,
             loose_duplicate_native_objects: self.loose_duplicate_native_objects,
             deletable_native_packs: self.deletable_native_packs,
-            protection_window_days: GC_PROTECTION_WINDOW_DAYS,
+            protection_window_days: self.protection_window_days,
             storage: self.storage,
+            storage_policy: self.storage_policy,
+            storage_budget: self.storage_budget,
             plan_digest: self.plan_digest,
             deleted,
             created_packs,
@@ -5127,6 +5211,9 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
     let storage = storage_accounting_for_root(&context.root_path)?;
+    let storage_policy = storage_policy(&connection)?;
+    let storage_budget = storage_budget_status_for(&storage, &storage_policy);
+    let protection_window = protection_window_duration(storage_policy.protection_window_days);
     let native_store = forge_content_native::NativeObjectStore::new(&context.root_path);
     let mut reachable = std::collections::BTreeSet::new();
     let mut statement = connection.prepare(
@@ -5197,13 +5284,13 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
         let rendered = id.to_string();
         unreachable_native_objects.push(rendered.clone());
         let protected = if loose.contains(id) {
-            loose_object_protected(&native_store, id, now)
+            loose_object_protected(&native_store, id, now, protection_window)
         } else {
             infos_by_pack
                 .values()
                 .flatten()
                 .filter(|info| &info.object_id == id)
-                .all(|info| pack_entry_protected(info, now_ms))
+                .all(|info| pack_entry_protected(info, now_ms, protection_window))
         };
         if protected {
             protected_native_objects.push(rendered);
@@ -5212,7 +5299,9 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
 
     let mut pack_candidate_native_objects = Vec::new();
     for id in &loose {
-        if !packed.contains(id) && !loose_object_protected(&native_store, id, now) {
+        if !packed.contains(id)
+            && !loose_object_protected(&native_store, id, now, protection_window)
+        {
             pack_candidate_native_objects.push(id.to_string());
         }
     }
@@ -5228,7 +5317,8 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
     for (pack_id, infos) in &infos_by_pack {
         if !infos.is_empty()
             && infos.iter().all(|info| {
-                !reachable.contains(&info.object_id) && !pack_entry_protected(info, now_ms)
+                !reachable.contains(&info.object_id)
+                    && !pack_entry_protected(info, now_ms, protection_window)
             })
         {
             deletable_native_packs.push(pack_id.clone());
@@ -5240,6 +5330,7 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
         &loose_duplicate_native_objects,
         &deletable_native_packs,
         &protected_native_objects,
+        storage_policy.protection_window_days,
     );
     Ok(GcPlan {
         unreachable_native_objects,
@@ -5248,6 +5339,9 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
         loose_duplicate_native_objects,
         deletable_native_packs,
         storage,
+        storage_policy: storage_policy.clone(),
+        storage_budget,
+        protection_window_days: storage_policy.protection_window_days,
         plan_digest,
     })
 }
@@ -5257,12 +5351,11 @@ fn gc_plan_digest(
     loose_duplicate_native_objects: &[String],
     deletable_native_packs: &[String],
     protected_native_objects: &[String],
+    protection_window_days: u64,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"forge-gc-plan-v2\n");
-    hasher.update(format!(
-        "protection_window_days={GC_PROTECTION_WINDOW_DAYS}\n"
-    ));
+    hasher.update(format!("protection_window_days={protection_window_days}\n"));
     for id in pack_candidate_native_objects {
         hasher.update(b"pack ");
         hasher.update(id.as_bytes());
@@ -5302,15 +5395,20 @@ fn loose_object_protected(
     native_store: &forge_content_native::NativeObjectStore,
     id: &forge_content_native::ObjectId,
     now: SystemTime,
+    protection_window: Duration,
 ) -> bool {
     native_store
         .object_modified_time(id)
         .ok()
         .and_then(|modified| now.duration_since(modified).ok())
-        .is_none_or(|age| age < GC_PROTECTION_WINDOW)
+        .is_none_or(|age| age < protection_window)
 }
 
-fn pack_entry_protected(info: &forge_content_native::PackedObjectInfo, now_ms: u64) -> bool {
+fn pack_entry_protected(
+    info: &forge_content_native::PackedObjectInfo,
+    now_ms: u64,
+    protection_window: Duration,
+) -> bool {
     let Some(packed_at_ms) = info.packed_at_ms else {
         return true;
     };
@@ -5318,11 +5416,15 @@ fn pack_entry_protected(info: &forge_content_native::PackedObjectInfo, now_ms: u
         return true;
     };
     let newest_ms = packed_at_ms.max(loose_mtime_ms);
-    let protection_ms: u64 = match GC_PROTECTION_WINDOW.as_millis().try_into() {
+    let protection_ms: u64 = match protection_window.as_millis().try_into() {
         Ok(value) => value,
         Err(_) => return true,
     };
     now_ms.saturating_sub(newest_ms) < protection_ms
+}
+
+fn protection_window_duration(days: u64) -> Duration {
+    Duration::from_secs(days.saturating_mul(60 * 60 * 24))
 }
 
 fn system_time_ms(time: SystemTime) -> Option<u64> {
