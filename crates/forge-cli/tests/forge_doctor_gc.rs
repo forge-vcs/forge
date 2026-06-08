@@ -4,6 +4,7 @@ use common::{forge_in, TestRepo};
 use forge_content_native::{NativeObjectStore, ObjectKind};
 use rusqlite::Connection;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 fn json_output(assert: assert_cmd::assert::Assert) -> Value {
     serde_json::from_slice(&assert.get_output().stdout).expect("valid json")
@@ -382,6 +383,46 @@ fn doctor_reports_corrupt_native_content_and_gc_reports_unreachable_objects() {
 }
 
 #[test]
+fn doctor_and_gc_treat_packed_only_reachable_native_objects_as_live() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "packed doctor gc"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("README.md"), "packed reachable\n").expect("write readme");
+    let saved = json_output(repo.forge().args(["--json", "save"]).assert().success());
+    let content_ref = saved["data"]["content_ref"].as_str().unwrap();
+    let store = NativeObjectStore::new(repo.path());
+    let reachable = store
+        .verify_content_ref(content_ref)
+        .expect("reachable native ids");
+    write_test_pack_from_loose_objects(repo.path(), "reachable", &reachable);
+    for id in &reachable {
+        std::fs::remove_file(object_path(repo.path(), id)).expect("remove loose copy");
+    }
+
+    let doctor = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(doctor["data"]["ok"], true, "packed-only doctor: {doctor}");
+
+    let gc = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--dry-run"])
+            .assert()
+            .success(),
+    );
+    for id in &reachable {
+        assert!(
+            !contains_id(&gc["data"]["unreachable_native_objects"], id),
+            "packed reachable object must not be unreachable: {id}; gc={gc}"
+        );
+    }
+}
+
+#[test]
 fn doctor_reports_malformed_native_tree_without_panicking() {
     let repo = TestRepo::new_git();
     repo.forge()
@@ -493,6 +534,52 @@ fn contains_id(value: &Value, id: &forge_content_native::ObjectId) -> bool {
         .unwrap()
         .iter()
         .any(|value| value.as_str() == Some(rendered.as_str()))
+}
+
+fn write_test_pack_from_loose_objects(
+    repo_path: &std::path::Path,
+    pack_id: &str,
+    ids: &std::collections::BTreeSet<forge_content_native::ObjectId>,
+) {
+    let packs_dir = repo_path.join(".forge/packs");
+    std::fs::create_dir_all(&packs_dir).expect("create packs dir");
+    let mut offset = 0_u64;
+    let mut data = Vec::new();
+    let mut entries = Vec::new();
+    for id in ids {
+        let frame = std::fs::read(object_path(repo_path, id)).expect("read loose frame");
+        let compressed =
+            zstd::stream::encode_all(std::io::Cursor::new(&frame), 0).expect("compress frame");
+        let compressed_len = compressed.len() as u64;
+        data.extend_from_slice(&compressed);
+        entries.push(serde_json::json!({
+            "object_id": id.to_string(),
+            "offset": offset,
+            "framed_len": frame.len(),
+            "compressed_len": compressed_len,
+            "checksum": hex_lower(&Sha256::digest(&compressed)),
+        }));
+        offset += compressed_len;
+    }
+    std::fs::write(packs_dir.join(format!("{pack_id}.fpack")), data).expect("write pack");
+    std::fs::write(
+        packs_dir.join(format!("{pack_id}.fidx")),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "pack_id": pack_id,
+            "entries": entries,
+        }))
+        .expect("serialize index"),
+    )
+    .expect("write index");
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
 }
 
 /// Drive a native repo through `init → start → save → run → propose → check → accept`
