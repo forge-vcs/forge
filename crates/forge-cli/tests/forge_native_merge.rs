@@ -254,7 +254,10 @@ fn native_merge_overlapping_changes_persists_conflict_set() {
         .expect("resolved merge commit is logged");
     assert_eq!(merge_commit["parents"].as_array().unwrap().len(), 2);
     let doctor = forge_ok(&repo, &["doctor"]);
-    assert!(doctor["data"]["issues"].as_array().unwrap().is_empty());
+    assert!(
+        doctor["data"]["issues"].as_array().unwrap().is_empty(),
+        "doctor={doctor}"
+    );
 }
 
 #[test]

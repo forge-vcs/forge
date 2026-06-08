@@ -501,14 +501,14 @@ fn concurrent_commands_against_behind_db_both_upgrade_and_succeed() {
 
     let connection = open_db(repo.path());
     // Exactly one set of version rows: the second upgrader's `INSERT OR IGNORE`
-    // is a no-op once the first commits version 10 (probe the HEAD migration, whose
+    // is a no-op once the first commits version 11 (probe the HEAD migration, whose
     // dedup the race actually exercises — code-review F5).
     let version_rows = count(
         &connection,
         "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
-        "10",
+        "11",
     );
-    assert_eq!(version_rows, 1, "exactly one version-10 row after the race");
+    assert_eq!(version_rows, 1, "exactly one version-11 row after the race");
     let head: i64 = connection
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -516,7 +516,7 @@ fn concurrent_commands_against_behind_db_both_upgrade_and_succeed() {
             |row| row.get(0),
         )
         .expect("max version");
-    assert_eq!(head, 10, "schema reached HEAD after the concurrent upgrade");
+    assert_eq!(head, 11, "schema reached HEAD after the concurrent upgrade");
     // The upgrade actually applied: 002's columns are present.
     let has_backend: i64 = connection
         .query_row(

@@ -15,6 +15,7 @@ mod error;
 mod integrity;
 mod migrations;
 mod repo_lock;
+mod signing;
 pub use error::{error_registry, ErrorCodeSpec, ForgeError, NativeHistoryCorruptKind, TamperKind};
 pub use repo_lock::{LockTimeout, RepoLock};
 
@@ -512,6 +513,29 @@ pub struct DoctorReport {
     /// Native pack/index entries that fail offset, checksum, decompression, hash, or kind
     /// verification. Empty in a healthy repo.
     pub native_pack_issues: Vec<String>,
+    /// Local Phase 9 signing findings: post-signature-migration evidence rows, decision rows,
+    /// and native accepted commit ids must carry a valid Ed25519 `locally_signed` attestation.
+    /// Empty in a healthy repo. Legacy pre-migration rows are grandfathered by rowid marker.
+    pub signature_issues: Vec<SignatureFinding>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SignatureFinding {
+    pub kind: SignatureFindingKind,
+    pub subject_kind: String,
+    pub subject_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureFindingKind {
+    MissingSignature,
+    InvalidSignature,
+    DigestMismatch,
+    SubjectMissing,
+    MalformedSignature,
 }
 
 /// One row that failed integrity verification in `doctor`'s chain pass. Carries only
@@ -1814,6 +1838,7 @@ pub fn record_evidence(
 ) -> Result<EvidenceRecord> {
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
     let mut connection = open_connection(&context.database_path)?;
     let (evidence_id, content_hash, op) = with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
@@ -1876,6 +1901,14 @@ pub fn record_evidence(
                 content_hash,
                 created
             ],
+        )?;
+        signer.sign_subject(
+            tx,
+            &context.repo_id,
+            "evidence",
+            &evidence_id,
+            &content_hash,
+            created,
         )?;
         // Fold the evidence digest into the op-log spine so a later swap of
         // evidence.content_hash (to cover a tamper) is caught by doctor's re-walk.
@@ -2333,6 +2366,7 @@ pub fn decide(
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
     let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
+    let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
     let mut connection = open_connection(&context.database_path)?;
 
     // NER-138 slice 3: a native repo is detected by routing `base_head` through the canonical
@@ -2461,6 +2495,24 @@ pub fn decide(
                 commit_id
             ],
         )?;
+        signer.sign_subject(
+            tx,
+            &context.repo_id,
+            "decision",
+            &decision_id,
+            &content_hash,
+            created,
+        )?;
+        if let Some(commit_id) = &commit_id {
+            signer.sign_subject(
+                tx,
+                &context.repo_id,
+                "commit",
+                commit_id,
+                commit_id,
+                created,
+            )?;
+        }
         tx.execute(
             "UPDATE proposals SET status = ?1 WHERE id = ?2",
             params![decision, proposal.proposal_id],
@@ -3439,6 +3491,7 @@ pub fn resolve_conflict_with_tree(
             "conflict resolution requires a forge-tree content ref"
         ));
     }
+    let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
     let mut connection = open_connection(&context.database_path)?;
     let operation_id = OperationId::new().to_string();
     let view_id = ViewId::new().to_string();
@@ -3562,6 +3615,14 @@ pub fn resolve_conflict_with_tree(
                 evidence_hash,
                 now
             ],
+        )?;
+        signer.sign_subject(
+            tx,
+            &context.repo_id,
+            "evidence",
+            &evidence_id,
+            &evidence_hash,
+            now,
         )?;
         tx.execute(
             "UPDATE proposals SET snapshot_id = ?1, content_ref = ?2, status = 'draft' WHERE id = ?3",
@@ -4417,6 +4478,13 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
     if !tampered_rows.is_empty() {
         issues.push(format!("{} tampered row(s) detected", tampered_rows.len()));
     }
+    let signature_issues = signing::verify_signatures(&connection)?;
+    if !signature_issues.is_empty() {
+        issues.push(format!(
+            "{} local signature issue(s) detected",
+            signature_issues.len()
+        ));
+    }
 
     // Native commit-DAG integrity pass (NER-138 Phase 7 slice 3): walk the DAG from the
     // authoritative tip and cross-check the ledger, REPORTING (not raising) cycles / dangling
@@ -4458,6 +4526,7 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         native_history_issues,
         ledger_view_issues,
         native_pack_issues,
+        signature_issues,
     })
 }
 

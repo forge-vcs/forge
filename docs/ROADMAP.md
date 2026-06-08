@@ -178,6 +178,8 @@ The order is three movements — **bulletproof the ledger (Phases 1–2), fund t
 ### Phase 9 — Distributed sync + tamper-evident provenance: native wire protocol and the signed trust ladder
 **Goal:** Deliver the defining distributed property absent today and seal the trust model: a Forge-native protocol exchanging native history, the object store, **and the evidence/decision/op-log ledger**, plus cryptographic signing and the PRD trust ladder.
 
+**Status:** In progress. The local signing and `doctor` verification slice is complete; native wire sync, cross-machine ledger exchange, trust-policy enforcement, key lifecycle, hosted-runner trust, and third-party attestation remain.
+
 **Features**
 - Wire protocol with object enumeration + want/have negotiation (or op-log sync) over ssh/https, implementing the stubbed `forge-sync` crate; clone/fetch/push/pull through the JSON contract with the same `--request-id` idempotency and typed-error discipline; protocol versioned from v1, shipping a minimal full-transfer clone before incremental fetch negotiation.
 - Sync the **ledger** not just content: intent, attempts, evidence, check results, decisions, and the op-log travel with the objects (today none crosses the boundary), so a reviewing agent/CI bot on another machine receives "did THIS exact tree pass THESE checks, decided by whom" as verifiable provenance.
