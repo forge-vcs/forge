@@ -216,6 +216,10 @@ fn commands_list_the_lifecycle() {
         "conflict show",
         "conflict resolve",
         "trust policy",
+        "key status",
+        "key rotate",
+        "sync export",
+        "sync inspect",
         "export branch",
         "schema",
     ] {

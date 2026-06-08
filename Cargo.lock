@@ -325,6 +325,7 @@ dependencies = [
  "forge-export-git",
  "forge-protocol",
  "forge-store",
+ "forge-sync",
  "predicates",
  "rusqlite",
  "serde_json",
@@ -430,6 +431,20 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "forge-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "forge-content-native",
+ "forge-protocol",
+ "forge-store",
+ "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 

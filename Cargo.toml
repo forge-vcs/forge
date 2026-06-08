@@ -10,6 +10,7 @@ members = [
     "crates/forge-policy",
     "crates/forge-protocol",
     "crates/forge-store",
+    "crates/forge-sync",
 ]
 resolver = "2"
 

@@ -22,6 +22,19 @@ pub(crate) struct LocalSigner {
     key_fingerprint: String,
 }
 
+pub(crate) struct LocalKeyInfo {
+    pub public_key: String,
+    pub key_fingerprint: String,
+    pub key_path: String,
+    pub exists_before_command: bool,
+}
+
+pub(crate) struct RotatedLocalKey {
+    pub previous_fingerprint: Option<String>,
+    pub previous_key_backup_path: Option<String>,
+    pub new_key: LocalKeyInfo,
+}
+
 impl LocalSigner {
     pub(crate) fn load_or_create(repo_root: &Path) -> Result<Self> {
         let path = repo_root.join(SIGNING_KEY_PATH);
@@ -85,6 +98,62 @@ impl LocalSigner {
     }
 }
 
+pub(crate) fn local_key_status(repo_root: &Path) -> Result<LocalKeyInfo> {
+    let key_path = repo_root.join(SIGNING_KEY_PATH);
+    let exists_before_command = key_path.exists();
+    let signer = LocalSigner::load_or_create(repo_root)?;
+    Ok(LocalKeyInfo {
+        public_key: signer.public_key,
+        key_fingerprint: signer.key_fingerprint,
+        key_path: SIGNING_KEY_PATH.to_string(),
+        exists_before_command,
+    })
+}
+
+pub(crate) fn rotate_local_key(repo_root: &Path) -> Result<RotatedLocalKey> {
+    let key_path = repo_root.join(SIGNING_KEY_PATH);
+    let previous = if key_path.exists() {
+        let signer = LocalSigner::load_or_create(repo_root)?;
+        let backup = rotated_key_path(repo_root, &signer.key_fingerprint);
+        if !backup.exists() {
+            fs::copy(&key_path, &backup).with_context(|| "backup previous local signing key")?;
+            set_private_file_permissions(&backup)?;
+        }
+        Some((signer.key_fingerprint, backup))
+    } else {
+        None
+    };
+
+    let rng = SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|_| anyhow!("generate rotated local Ed25519 signing key"))?;
+    if let Some(parent) = key_path.parent() {
+        fs::create_dir_all(parent).with_context(|| "create local signing key directory")?;
+        set_private_dir_permissions(parent)?;
+    }
+    fs::write(&key_path, pkcs8.as_ref()).with_context(|| "write rotated local signing key")?;
+    set_private_file_permissions(&key_path)?;
+    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+        .map_err(|_| anyhow!("parse rotated local Ed25519 signing key"))?;
+    let public_key_bytes = key_pair.public_key().as_ref();
+    let new_key = LocalKeyInfo {
+        public_key: hex_lower(public_key_bytes),
+        key_fingerprint: key_fingerprint(public_key_bytes),
+        key_path: SIGNING_KEY_PATH.to_string(),
+        exists_before_command: true,
+    };
+
+    Ok(RotatedLocalKey {
+        previous_fingerprint: previous
+            .as_ref()
+            .map(|(fingerprint, _)| fingerprint.clone()),
+        previous_key_backup_path: previous
+            .as_ref()
+            .map(|(_, path)| relative_key_path(path).unwrap_or_else(|| path.display().to_string())),
+        new_key,
+    })
+}
+
 pub(crate) fn verify_signatures(conn: &Connection) -> Result<Vec<SignatureFinding>> {
     let (valid, mut findings) = verified_signature_state(conn)?;
 
@@ -94,6 +163,22 @@ pub(crate) fn verify_signatures(conn: &Connection) -> Result<Vec<SignatureFindin
     ));
 
     Ok(findings)
+}
+
+fn rotated_key_path(repo_root: &Path, fingerprint: &str) -> std::path::PathBuf {
+    repo_root
+        .join(".forge/keys")
+        .join(format!("local-ed25519-{fingerprint}.pk8"))
+}
+
+fn relative_key_path(path: &Path) -> Option<String> {
+    let keys = path.parent()?;
+    let forge = keys.parent()?;
+    if forge.file_name()?.to_str()? != ".forge" {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    Some(format!(".forge/keys/{name}"))
 }
 
 pub(crate) fn verify_subject_signatures(
