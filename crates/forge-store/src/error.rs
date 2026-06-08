@@ -216,6 +216,19 @@ pub enum ForgeError {
         required: String,
         actual: String,
     },
+    /// A configured trust policy required a stronger rung than the selected
+    /// proposal/revision can currently prove. Deterministic and non-retryable:
+    /// re-record/sign the required subjects or lower the local policy.
+    TrustPolicyUnmet {
+        action: String,
+        required_trust: String,
+        signature_issues: Vec<crate::SignatureFinding>,
+    },
+    /// The user configured a trust level this binary does not implement.
+    UnsupportedTrustLevel {
+        level: String,
+        supported: Vec<String>,
+    },
 }
 
 impl ForgeError {
@@ -250,6 +263,8 @@ impl ForgeError {
             ForgeError::ConflictSetNotFound { .. } => "CONFLICT_SET_NOT_FOUND",
             ForgeError::GcPlanChanged { .. } => "GC_PLAN_CHANGED",
             ForgeError::UnsupportedContentBackend { .. } => "UNSUPPORTED_CONTENT_BACKEND",
+            ForgeError::TrustPolicyUnmet { .. } => "TRUST_POLICY_UNMET",
+            ForgeError::UnsupportedTrustLevel { .. } => "UNSUPPORTED_TRUST_LEVEL",
         }
     }
 
@@ -363,6 +378,18 @@ impl ForgeError {
                 required,
                 actual,
             } => json!({ "command": command, "required": required, "actual": actual }),
+            ForgeError::TrustPolicyUnmet {
+                action,
+                required_trust,
+                signature_issues,
+            } => json!({
+                "action": action,
+                "required_trust": required_trust,
+                "signature_issues": signature_issues,
+            }),
+            ForgeError::UnsupportedTrustLevel { level, supported } => {
+                json!({ "level": level, "supported": supported })
+            }
             _ => Value::Object(Default::default()),
         }
     }
@@ -504,6 +531,20 @@ impl std::fmt::Display for ForgeError {
                 required,
                 actual,
             } => write!(f, "{command} requires {required}, but found {actual}"),
+            ForgeError::TrustPolicyUnmet {
+                action,
+                required_trust,
+                signature_issues,
+            } => write!(
+                f,
+                "{action} requires trust level {required_trust}; {} signature issue(s) prevent that claim",
+                signature_issues.len()
+            ),
+            ForgeError::UnsupportedTrustLevel { level, supported } => write!(
+                f,
+                "unsupported trust level {level}; supported levels: {}",
+                supported.join(", ")
+            ),
         }
     }
 }
@@ -693,6 +734,18 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             retryable: false,
             after_ms: None,
             details_keys: &["command", "required", "actual"],
+        },
+        ErrorCodeSpec {
+            code: "TRUST_POLICY_UNMET",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["action", "required_trust", "signature_issues"],
+        },
+        ErrorCodeSpec {
+            code: "UNSUPPORTED_TRUST_LEVEL",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["level", "supported"],
         },
     ]
 }
@@ -1196,6 +1249,15 @@ mod tests {
                 required: "native".into(),
                 actual: "git".into(),
             },
+            ForgeError::TrustPolicyUnmet {
+                action: "accept".into(),
+                required_trust: "locally_signed".into(),
+                signature_issues: vec![],
+            },
+            ForgeError::UnsupportedTrustLevel {
+                level: "hosted_runner_signed".into(),
+                supported: vec!["self_reported".into(), "locally_signed".into()],
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -1228,7 +1290,9 @@ mod tests {
                 | ForgeError::NativeHistoryCorrupt { .. }
                 | ForgeError::ConflictSetNotFound { .. }
                 | ForgeError::GcPlanChanged { .. }
-                | ForgeError::UnsupportedContentBackend { .. } => {}
+                | ForgeError::UnsupportedContentBackend { .. }
+                | ForgeError::TrustPolicyUnmet { .. }
+                | ForgeError::UnsupportedTrustLevel { .. } => {}
             }
         }
 

@@ -32,7 +32,10 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "MISSING_PROVENANCE_TRAILER",
     "NATIVE_HISTORY_CORRUPT",
     "CONFLICT_SET_NOT_FOUND",
+    "GC_PLAN_CHANGED",
     "UNSUPPORTED_CONTENT_BACKEND",
+    "TRUST_POLICY_UNMET",
+    "UNSUPPORTED_TRUST_LEVEL",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.
@@ -211,6 +214,7 @@ fn commands_list_the_lifecycle() {
         "conflict list",
         "conflict show",
         "conflict resolve",
+        "trust policy",
         "export branch",
         "schema",
     ] {

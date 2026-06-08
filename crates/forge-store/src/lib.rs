@@ -237,6 +237,28 @@ pub struct PublicationRecord {
     pub operation_id: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TrustPolicy {
+    pub min_accept_trust: String,
+    pub min_export_trust: String,
+    pub supported_trust_levels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustPolicyAction {
+    Accept,
+    Export,
+}
+
+impl TrustPolicyAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrustPolicyAction::Accept => "accept",
+            TrustPolicyAction::Export => "export",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StaleBaseConflictInput {
     pub context: String,
@@ -519,7 +541,7 @@ pub struct DoctorReport {
     pub signature_issues: Vec<SignatureFinding>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SignatureFinding {
     pub kind: SignatureFindingKind,
     pub subject_kind: String,
@@ -536,6 +558,18 @@ pub enum SignatureFindingKind {
     DigestMismatch,
     SubjectMissing,
     MalformedSignature,
+}
+
+impl SignatureFindingKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignatureFindingKind::MissingSignature => "missing_signature",
+            SignatureFindingKind::InvalidSignature => "invalid_signature",
+            SignatureFindingKind::DigestMismatch => "digest_mismatch",
+            SignatureFindingKind::SubjectMissing => "subject_missing",
+            SignatureFindingKind::MalformedSignature => "malformed_signature",
+        }
+    }
 }
 
 /// One row that failed integrity verification in `doctor`'s chain pass. Carries only
@@ -726,6 +760,230 @@ fn default_storage_policy() -> StoragePolicy {
         storage_budget_bytes: DEFAULT_STORAGE_BUDGET_BYTES,
         automatic_eviction: false,
     }
+}
+
+const TRUST_SELF_REPORTED: &str = "self_reported";
+const TRUST_LOCALLY_OBSERVED: &str = "locally_observed";
+const TRUST_LOCALLY_SIGNED: &str = "locally_signed";
+
+fn supported_trust_levels() -> Vec<String> {
+    [
+        TRUST_SELF_REPORTED,
+        TRUST_LOCALLY_OBSERVED,
+        TRUST_LOCALLY_SIGNED,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+pub fn trust_policy(cwd: &Path) -> Result<TrustPolicy> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    trust_policy_on(&connection)
+}
+
+pub fn set_trust_policy(
+    cwd: &Path,
+    min_accept_trust: Option<&str>,
+    min_export_trust: Option<&str>,
+) -> Result<TrustPolicy> {
+    if let Some(level) = min_accept_trust {
+        validate_trust_level(level)?;
+    }
+    if let Some(level) = min_export_trust {
+        validate_trust_level(level)?;
+    }
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        let current = trust_policy_on(tx)?;
+        let accept = min_accept_trust.unwrap_or(&current.min_accept_trust);
+        let export = min_export_trust.unwrap_or(&current.min_export_trust);
+        tx.execute(
+            "UPDATE trust_policy
+             SET min_accept_trust = ?1, min_export_trust = ?2, updated_at_ms = ?3
+             WHERE singleton = 1",
+            params![accept, export, now_ms()],
+        )?;
+        trust_policy_on(tx)
+    })
+}
+
+fn trust_policy_on(conn: &Connection) -> Result<TrustPolicy> {
+    let row = conn
+        .query_row(
+            "SELECT min_accept_trust, min_export_trust
+             FROM trust_policy
+             WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let (min_accept_trust, min_export_trust) = row.unwrap_or_else(|| {
+        (
+            TRUST_SELF_REPORTED.to_string(),
+            TRUST_SELF_REPORTED.to_string(),
+        )
+    });
+    Ok(TrustPolicy {
+        min_accept_trust,
+        min_export_trust,
+        supported_trust_levels: supported_trust_levels(),
+    })
+}
+
+fn validate_trust_level(level: &str) -> Result<()> {
+    if trust_rank(level).is_some() {
+        Ok(())
+    } else {
+        Err(ForgeError::UnsupportedTrustLevel {
+            level: level.to_string(),
+            supported: supported_trust_levels(),
+        }
+        .into())
+    }
+}
+
+fn trust_rank(level: &str) -> Option<u8> {
+    match level {
+        TRUST_SELF_REPORTED => Some(0),
+        TRUST_LOCALLY_OBSERVED => Some(1),
+        TRUST_LOCALLY_SIGNED => Some(2),
+        _ => None,
+    }
+}
+
+fn requires_local_signatures(level: &str) -> bool {
+    trust_rank(level).is_some_and(|rank| rank >= trust_rank(TRUST_LOCALLY_SIGNED).unwrap())
+}
+
+pub fn enforce_trust_policy(
+    cwd: &Path,
+    action: TrustPolicyAction,
+    proposal_revision_id: &str,
+) -> Result<()> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let policy = trust_policy_on(&connection)?;
+    let required_trust = match action {
+        TrustPolicyAction::Accept => policy.min_accept_trust,
+        TrustPolicyAction::Export => policy.min_export_trust,
+    };
+    if !requires_local_signatures(&required_trust) {
+        return Ok(());
+    }
+
+    let mut unsigned = Vec::new();
+    let subjects = trust_subjects_for_revision(
+        &connection,
+        &context.repo_id,
+        proposal_revision_id,
+        action == TrustPolicyAction::Export,
+        &mut unsigned,
+    )?;
+    if subjects.is_empty() && unsigned.is_empty() {
+        unsigned.push(SignatureFinding {
+            kind: SignatureFindingKind::MissingSignature,
+            subject_kind: "proposal_revision".to_string(),
+            subject_id: proposal_revision_id.to_string(),
+            key_fingerprint: None,
+        });
+    }
+    let mut signature_issues = signing::verify_subject_signatures(&connection, subjects)?;
+    signature_issues.extend(unsigned);
+    signature_issues.sort_by(|left, right| {
+        left.subject_kind
+            .cmp(&right.subject_kind)
+            .then_with(|| left.subject_id.cmp(&right.subject_id))
+            .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
+    });
+    signature_issues.dedup();
+    if signature_issues.is_empty() {
+        Ok(())
+    } else {
+        Err(ForgeError::TrustPolicyUnmet {
+            action: action.as_str().to_string(),
+            required_trust,
+            signature_issues,
+        }
+        .into())
+    }
+}
+
+fn trust_subjects_for_revision(
+    conn: &Connection,
+    repo_id: &str,
+    proposal_revision_id: &str,
+    include_decision: bool,
+    unsigned: &mut Vec<SignatureFinding>,
+) -> Result<Vec<(String, String, String)>> {
+    let snapshot_id: String = conn.query_row(
+        "SELECT pr.snapshot_id
+         FROM proposal_revisions pr
+         JOIN proposals p ON p.id = pr.proposal_id
+         WHERE p.repo_id = ?1 AND pr.id = ?2",
+        params![repo_id, proposal_revision_id],
+        |row| row.get(0),
+    )?;
+    let mut subjects = Vec::new();
+    let mut evidence = conn.prepare(
+        "SELECT id, content_hash
+         FROM evidence
+         WHERE repo_id = ?1 AND snapshot_id = ?2
+         ORDER BY created_at_ms, rowid",
+    )?;
+    for row in evidence.query_map(params![repo_id, snapshot_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })? {
+        let (id, content_hash) = row?;
+        if let Some(digest) = content_hash {
+            subjects.push(("evidence".to_string(), id, digest));
+        } else {
+            unsigned.push(SignatureFinding {
+                kind: SignatureFindingKind::MissingSignature,
+                subject_kind: "evidence".to_string(),
+                subject_id: id,
+                key_fingerprint: None,
+            });
+        }
+    }
+
+    if include_decision {
+        let decision = conn
+            .query_row(
+                "SELECT id, content_hash, commit_id
+                 FROM decisions
+                 WHERE repo_id = ?1 AND proposal_revision_id = ?2 AND decision = 'accepted'
+                 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+                params![repo_id, proposal_revision_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((id, content_hash, commit_id)) = decision {
+            if let Some(digest) = content_hash {
+                subjects.push(("decision".to_string(), id, digest));
+            } else {
+                unsigned.push(SignatureFinding {
+                    kind: SignatureFindingKind::MissingSignature,
+                    subject_kind: "decision".to_string(),
+                    subject_id: id,
+                    key_fingerprint: None,
+                });
+            }
+            if let Some(commit_id) = commit_id {
+                subjects.push(("commit".to_string(), commit_id.clone(), commit_id));
+            }
+        }
+    }
+
+    Ok(subjects)
 }
 
 fn storage_budget_status_for(

@@ -51,6 +51,8 @@ enum Command {
     Checkout(CheckoutArgs),
     /// Undo the last save, restoring the prior snapshot (recorded in the op-log).
     Undo,
+    /// Inspect or update local trust policy gates.
+    Trust(TrustArgs),
     Doctor,
     Gc(GcArgs),
     Export(ExportArgs),
@@ -292,6 +294,28 @@ struct ExportBranchArgs {
     name: String,
 }
 
+#[derive(Debug, Args)]
+struct TrustArgs {
+    #[command(subcommand)]
+    command: TrustCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TrustCommand {
+    /// Show or update the local minimum trust policy.
+    Policy(TrustPolicyArgs),
+}
+
+#[derive(Debug, Args)]
+struct TrustPolicyArgs {
+    /// Minimum trust required for `forge accept`.
+    #[arg(long, value_parser = ["self_reported", "locally_observed", "locally_signed"])]
+    accept: Option<String>,
+    /// Minimum trust required for `forge export branch`.
+    #[arg(long, value_parser = ["self_reported", "locally_observed", "locally_signed"])]
+    export: Option<String>,
+}
+
 fn main() -> ExitCode {
     let raw_args: Vec<String> = env::args().collect();
     let json_mode = raw_args.iter().any(|arg| arg == "--json");
@@ -335,6 +359,7 @@ fn main() -> ExitCode {
         Command::Log(args) => log_response(request_id, args),
         Command::Checkout(args) => checkout_response(request_id, args),
         Command::Undo => undo_response(request_id),
+        Command::Trust(args) => trust_response(request_id, args),
         Command::Doctor => doctor_response(request_id),
         Command::Gc(args) if !args.dry_run && (!args.yes || args.plan_digest.is_none()) => {
             structured_error(
@@ -1002,6 +1027,11 @@ fn accept_response(request_id: Option<String>, args: AcceptArgs) -> ResponseEnve
         }
         // Evidence gate (NER-135 R6): enforced in-txn inside `decide` unless
         // --allow-unverified. On bypass, surface the non-passing status as a warning.
+        forge_store::enforce_trust_policy(
+            &cwd,
+            forge_store::TrustPolicyAction::Accept,
+            &proposal.proposal_revision_id,
+        )?;
         let record = forge_store::decide(
             &cwd,
             request_id,
@@ -1142,6 +1172,19 @@ fn doctor_response(request_id: Option<String>) -> ResponseEnvelope {
     })
 }
 
+fn trust_response(request_id: Option<String>, args: TrustArgs) -> ResponseEnvelope {
+    match args.command {
+        TrustCommand::Policy(args) => command_result("trust policy", request_id, |cwd, _| {
+            let policy = if args.accept.is_some() || args.export.is_some() {
+                forge_store::set_trust_policy(&cwd, args.accept.as_deref(), args.export.as_deref())?
+            } else {
+                forge_store::trust_policy(&cwd)?
+            };
+            Ok((None, serde_json::to_value(policy)?, Vec::new()))
+        }),
+    }
+}
+
 fn gc_response(request_id: Option<String>, args: GcArgs) -> ResponseEnvelope {
     command_result("gc", request_id, |cwd, _request_id| {
         let report = if args.dry_run {
@@ -1195,6 +1238,11 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                 // branch (NER-136 R4): a tampered decision row that forged `accepted`
                 // is refused here, under the held repo lock, so no branch is created.
                 forge_store::verify_decision_integrity(&cwd, &proposal.proposal_revision_id)?;
+                forge_store::enforce_trust_policy(
+                    &cwd,
+                    forge_store::TrustPolicyAction::Export,
+                    &proposal.proposal_revision_id,
+                )?;
                 let current_head = current_base(&cwd)?;
                 // CLI-layer stale-base pre-check mirroring `accept`: persist the
                 // divergence to `conflict_sets` under the held lock BEFORE bailing
@@ -1793,6 +1841,7 @@ fn is_mutating_command(command: &str) -> bool {
             | "export branch"
             | "checkout"
             | "undo"
+            | "trust policy"
             | "gc"
     )
 }
