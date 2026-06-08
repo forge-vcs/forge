@@ -1,6 +1,7 @@
 mod common;
 
 use common::TestRepo;
+use rusqlite::Connection;
 use serde_json::Value;
 
 fn json_output(assert: assert_cmd::assert::Assert) -> Value {
@@ -175,8 +176,127 @@ fn gc_dry_run_includes_storage_accounting_without_deleting() {
     assert_storage_reconciles(storage);
 }
 
+#[test]
+fn mutating_command_below_budget_emits_no_storage_warning() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let started = json_output(
+        repo.forge()
+            .args(["--json", "start", "below budget"])
+            .assert()
+            .success(),
+    );
+    assert!(
+        !has_storage_budget_warning(&started),
+        "unexpected budget warning: {started}"
+    );
+}
+
+#[test]
+fn mutating_command_above_budget_warns_but_succeeds_without_eviction() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    write_forge_file(repo.path(), ".forge/packs/pressure.fpack", 32);
+    set_storage_policy(repo.path(), 14, 1);
+
+    let started = json_output(
+        repo.forge()
+            .args(["--json", "start", "above budget"])
+            .assert()
+            .success(),
+    );
+    assert!(
+        has_storage_budget_warning(&started),
+        "expected budget warning: {started}"
+    );
+    assert!(
+        repo.path().join(".forge/packs/pressure.fpack").exists(),
+        "budget pressure must not trigger automatic eviction"
+    );
+}
+
+#[test]
+fn doctor_reports_storage_pressure_without_marking_repo_unhealthy() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    set_storage_policy(repo.path(), 14, 1);
+
+    let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(report["data"]["ok"], true, "doctor report: {report}");
+    assert_eq!(report["data"]["storage_budget"]["limit_bytes"], 1);
+    assert_eq!(report["data"]["storage_budget"]["over_budget"], true);
+    assert!(
+        report["data"]["storage_budget"]["over_by_bytes"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        report["data"]["storage_policy"]["automatic_eviction"],
+        false
+    );
+}
+
+#[test]
+fn gc_dry_run_reports_storage_budget_and_retention_policy() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    set_storage_policy(repo.path(), 14, 1);
+
+    let report = json_output(
+        repo.forge()
+            .args(["--json", "gc", "--dry-run"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(report["data"]["dry_run"], true);
+    assert_eq!(report["data"]["protection_window_days"], 14);
+    assert_eq!(
+        report["data"]["storage_policy"]["protection_window_days"],
+        14
+    );
+    assert_eq!(report["data"]["storage_budget"]["limit_bytes"], 1);
+    assert_eq!(report["data"]["storage_budget"]["over_budget"], true);
+}
+
 fn write_forge_file(repo: &std::path::Path, relative: &str, len: usize) {
     let path = repo.join(relative);
     std::fs::create_dir_all(path.parent().unwrap()).expect("create category dir");
     std::fs::write(path, vec![b'x'; len]).expect("write category file");
+}
+
+fn set_storage_policy(repo: &std::path::Path, protection_window_days: u64, bytes: u64) {
+    let connection = Connection::open(repo.join(".forge/forge.db")).expect("open forge db");
+    connection
+        .execute(
+            "UPDATE storage_policy
+             SET protection_window_days = ?1, storage_budget_bytes = ?2
+             WHERE singleton = 1",
+            [protection_window_days as i64, bytes as i64],
+        )
+        .expect("set storage policy");
+}
+
+fn has_storage_budget_warning(envelope: &Value) -> bool {
+    envelope["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("storage budget exceeded"))
+        })
 }

@@ -1435,12 +1435,18 @@ where
         }
     }
 
+    let warning_cwd = cwd.clone();
     let result = f(cwd, request_id.clone());
 
     match result {
         Ok((operation_id, data, warnings)) => {
             let mut envelope = ResponseEnvelope::success(command, request_id, operation_id, data);
             envelope.warnings = warnings;
+            if is_mutating_command(command) {
+                if let Some(warning) = storage_budget_warning(&warning_cwd) {
+                    envelope.warnings.push(warning);
+                }
+            }
             envelope
         }
         Err(error) => {
@@ -1499,6 +1505,17 @@ where
             )
         }
     }
+}
+
+fn storage_budget_warning(cwd: &Path) -> Option<String> {
+    let status = forge_store::storage_budget_status(cwd).ok()?;
+    if !status.over_budget {
+        return None;
+    }
+    Some(format!(
+        "storage budget exceeded: used_bytes={} limit_bytes={} over_by_bytes={}",
+        status.used_bytes, status.limit_bytes, status.over_by_bytes
+    ))
 }
 
 fn init_response(request_id: Option<String>, args: InitArgs) -> ResponseEnvelope {
