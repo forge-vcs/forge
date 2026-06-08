@@ -13,6 +13,9 @@ const SIGNING_KEY_PATH: &str = ".forge/keys/local-ed25519.pk8";
 const SIGNATURE_ALG: &str = "ed25519";
 const TRUST_LEVEL: &str = "locally_signed";
 
+type SignedSubject = (String, String, String);
+type ValidSignatureSet = BTreeSet<SignedSubject>;
+
 pub(crate) struct LocalSigner {
     key_pair: Ed25519KeyPair,
     public_key: String,
@@ -83,6 +86,37 @@ impl LocalSigner {
 }
 
 pub(crate) fn verify_signatures(conn: &Connection) -> Result<Vec<SignatureFinding>> {
+    let (valid, mut findings) = verified_signature_state(conn)?;
+
+    findings.extend(missing_signature_findings(
+        &valid,
+        expected_signed_subjects(conn)?,
+    ));
+
+    Ok(findings)
+}
+
+pub(crate) fn verify_subject_signatures(
+    conn: &Connection,
+    subjects: Vec<SignedSubject>,
+) -> Result<Vec<SignatureFinding>> {
+    let (valid, findings) = verified_signature_state(conn)?;
+    let required: BTreeSet<SignedSubject> = subjects.iter().cloned().collect();
+    let mut scoped: Vec<SignatureFinding> = findings
+        .into_iter()
+        .filter(|finding| {
+            required
+                .iter()
+                .any(|(kind, id, _)| kind == &finding.subject_kind && id == &finding.subject_id)
+        })
+        .collect();
+    scoped.extend(missing_signature_findings(&valid, subjects));
+    Ok(scoped)
+}
+
+fn verified_signature_state(
+    conn: &Connection,
+) -> Result<(ValidSignatureSet, Vec<SignatureFinding>)> {
     let mut findings = Vec::new();
     let mut valid = BTreeSet::new();
 
@@ -161,7 +195,15 @@ pub(crate) fn verify_signatures(conn: &Connection) -> Result<Vec<SignatureFindin
         }
     }
 
-    for (subject_kind, subject_id, signed_digest) in expected_signed_subjects(conn)? {
+    Ok((valid, findings))
+}
+
+fn missing_signature_findings(
+    valid: &ValidSignatureSet,
+    subjects: Vec<SignedSubject>,
+) -> Vec<SignatureFinding> {
+    let mut findings = Vec::new();
+    for (subject_kind, subject_id, signed_digest) in subjects {
         if !valid.contains(&(
             subject_kind.clone(),
             subject_id.clone(),
@@ -175,11 +217,10 @@ pub(crate) fn verify_signatures(conn: &Connection) -> Result<Vec<SignatureFindin
             ));
         }
     }
-
-    Ok(findings)
+    findings
 }
 
-fn expected_signed_subjects(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+fn expected_signed_subjects(conn: &Connection) -> Result<Vec<SignedSubject>> {
     let marker = signature_marker(conn)?;
     let mut subjects = Vec::new();
 
