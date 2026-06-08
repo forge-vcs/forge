@@ -174,6 +174,14 @@ pub enum ForgeError {
         published_digest: String,
         recomputed_digest: String,
     },
+    /// A published commit's local signature fingerprint trailer does not match the
+    /// locally verified decision signature fingerprint. This is local authenticity
+    /// only, not hosted or third-party attestation.
+    LocalSignatureMismatch {
+        proposal_id: String,
+        published_fingerprint: String,
+        recomputed_fingerprint: String,
+    },
     /// A commit handed to `verify-branch` carries no Forge provenance trailer
     /// (NER-137): it was not produced by `forge export branch` (a plain git commit, or
     /// one predating Phase 6). Distinct from `PROVENANCE_MISMATCH` (a trailer that
@@ -258,6 +266,7 @@ impl ForgeError {
             ForgeError::CheckNotPassed { .. } => "CHECK_NOT_PASSED",
             ForgeError::EvidenceTampered { .. } => "EVIDENCE_TAMPERED",
             ForgeError::ProvenanceMismatch { .. } => "PROVENANCE_MISMATCH",
+            ForgeError::LocalSignatureMismatch { .. } => "LOCAL_SIGNATURE_MISMATCH",
             ForgeError::MissingProvenanceTrailer { .. } => "MISSING_PROVENANCE_TRAILER",
             ForgeError::NativeHistoryCorrupt { .. } => "NATIVE_HISTORY_CORRUPT",
             ForgeError::ConflictSetNotFound { .. } => "CONFLICT_SET_NOT_FOUND",
@@ -352,6 +361,15 @@ impl ForgeError {
                 "proposal_id": proposal_id,
                 "published_digest": published_digest,
                 "recomputed_digest": recomputed_digest,
+            }),
+            ForgeError::LocalSignatureMismatch {
+                proposal_id,
+                published_fingerprint,
+                recomputed_fingerprint,
+            } => json!({
+                "proposal_id": proposal_id,
+                "published_fingerprint": published_fingerprint,
+                "recomputed_fingerprint": recomputed_fingerprint,
             }),
             ForgeError::MissingProvenanceTrailer {
                 branch,
@@ -494,6 +512,14 @@ impl std::fmt::Display for ForgeError {
             } => write!(
                 f,
                 "provenance mismatch for proposal {proposal_id}: published trailer digest {published_digest} does not match the digest recomputed from the local ledger ({recomputed_digest})"
+            ),
+            ForgeError::LocalSignatureMismatch {
+                proposal_id,
+                published_fingerprint,
+                recomputed_fingerprint,
+            } => write!(
+                f,
+                "local signature mismatch for proposal {proposal_id}: published fingerprint {published_fingerprint} does not match locally verified fingerprint {recomputed_fingerprint}"
             ),
             ForgeError::MissingProvenanceTrailer {
                 branch,
@@ -704,6 +730,16 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             retryable: false,
             after_ms: None,
             details_keys: &["proposal_id", "published_digest", "recomputed_digest"],
+        },
+        ErrorCodeSpec {
+            code: "LOCAL_SIGNATURE_MISMATCH",
+            retryable: false,
+            after_ms: None,
+            details_keys: &[
+                "proposal_id",
+                "published_fingerprint",
+                "recomputed_fingerprint",
+            ],
         },
         ErrorCodeSpec {
             code: "MISSING_PROVENANCE_TRAILER",
@@ -1228,6 +1264,11 @@ mod tests {
                 published_digest: "aaa".into(),
                 recomputed_digest: "bbb".into(),
             },
+            ForgeError::LocalSignatureMismatch {
+                proposal_id: "proposal_x".into(),
+                published_fingerprint: "aaa".into(),
+                recomputed_fingerprint: "bbb".into(),
+            },
             ForgeError::MissingProvenanceTrailer {
                 branch: "forge/x".into(),
                 missing_field: "provenance_digest".into(),
@@ -1286,6 +1327,7 @@ mod tests {
                 | ForgeError::CheckNotPassed { .. }
                 | ForgeError::EvidenceTampered { .. }
                 | ForgeError::ProvenanceMismatch { .. }
+                | ForgeError::LocalSignatureMismatch { .. }
                 | ForgeError::MissingProvenanceTrailer { .. }
                 | ForgeError::NativeHistoryCorrupt { .. }
                 | ForgeError::ConflictSetNotFound { .. }

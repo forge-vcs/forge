@@ -3090,6 +3090,7 @@ pub struct PublicationTrailer {
     pub intent: String,
     pub provenance_digest: String,
     pub actor: String,
+    pub local_signature_fingerprint: Option<String>,
     /// Canonical, secret-redacted `"identity=verdict"` strings, sorted.
     pub gates: Vec<String>,
 }
@@ -3117,8 +3118,10 @@ pub fn build_publication_trailer(
             evidence_hashes.push(evidence_content_hash_of(&connection, evidence_id)?);
         }
     }
-    let (decision_digest, actor) =
+    let (decision_id, decision_digest, actor) =
         decision_digest_and_actor(&connection, &context.repo_id, proposal_revision_id)?;
+    let local_signature_fingerprint =
+        decision_signature_fingerprint(&connection, &decision_id, &decision_digest)?;
 
     // Canonical, redacted gate outcomes (the commit is a published egress, so gate
     // identities go through the per-token redactor) — sorted for a stable digest.
@@ -3150,6 +3153,7 @@ pub fn build_publication_trailer(
         intent: attempt.intent,
         provenance_digest,
         actor,
+        local_signature_fingerprint,
         gates: gate_outcomes,
     })
 }
@@ -3172,6 +3176,11 @@ pub fn render_trailer_message(trailer: &PublicationTrailer) -> String {
         "Forge-Provenance-Digest: {}\n",
         trailer.provenance_digest
     ));
+    if let Some(fingerprint) = &trailer.local_signature_fingerprint {
+        message.push_str(&format!(
+            "Forge-Local-Signature-Fingerprint: {fingerprint}\n"
+        ));
+    }
     message.push_str(&format!("Forge-Decision-Actor: {}\n", trailer.actor));
     message.push_str(&format!("Forge-Gates: {}\n", trailer.gates.join("; ")));
     message
@@ -3251,23 +3260,42 @@ fn decision_digest_and_actor(
     conn: &Connection,
     repo_id: &str,
     proposal_revision_id: &str,
-) -> Result<(String, String)> {
-    let row: Option<(Option<String>, String, String)> = conn
+) -> Result<(String, String, String)> {
+    let row: Option<(String, Option<String>, String, String)> = conn
         .query_row(
-            "SELECT content_hash, actor, decision FROM decisions
+            "SELECT id, content_hash, actor, decision FROM decisions
              WHERE repo_id = ?1 AND proposal_revision_id = ?2
              ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
             params![repo_id, proposal_revision_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    let Some((hash, actor, decision)) = row else {
+    let Some((decision_id, hash, actor, decision)) = row else {
         return Err(ForgeError::NotAccepted.into());
     };
     if decision != "accepted" {
         return Err(ForgeError::NotAccepted.into());
     }
-    Ok((hash.unwrap_or_default(), actor))
+    Ok((decision_id, hash.unwrap_or_default(), actor))
+}
+
+fn decision_signature_fingerprint(
+    conn: &Connection,
+    decision_id: &str,
+    decision_digest: &str,
+) -> Result<Option<String>> {
+    let (fingerprint, issues) =
+        signing::verified_subject_fingerprint(conn, "decision", decision_id, decision_digest)?;
+    if issues.is_empty() {
+        Ok(fingerprint)
+    } else {
+        Err(ForgeError::TrustPolicyUnmet {
+            action: "export".to_string(),
+            required_trust: TRUST_LOCALLY_SIGNED.to_string(),
+            signature_issues: issues,
+        }
+        .into())
+    }
 }
 
 pub fn exportable_proposal(

@@ -114,6 +114,44 @@ pub(crate) fn verify_subject_signatures(
     Ok(scoped)
 }
 
+pub(crate) fn verified_subject_fingerprint(
+    conn: &Connection,
+    subject_kind: &str,
+    subject_id: &str,
+    signed_digest: &str,
+) -> Result<(Option<String>, Vec<SignatureFinding>)> {
+    let subject = (
+        subject_kind.to_string(),
+        subject_id.to_string(),
+        signed_digest.to_string(),
+    );
+    let issues = verify_subject_signatures(conn, vec![subject])?;
+    if issues.is_empty() {
+        let fingerprint = conn
+            .query_row(
+                "SELECT key_fingerprint
+                 FROM ledger_signatures
+                 WHERE subject_kind = ?1 AND subject_id = ?2 AND signed_digest = ?3
+                 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+                params![subject_kind, subject_id, signed_digest],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        return Ok((fingerprint, Vec::new()));
+    }
+
+    if issues.iter().all(|issue| {
+        issue.kind == SignatureFindingKind::MissingSignature
+            && issue.subject_kind == subject_kind
+            && issue.subject_id == subject_id
+    }) && legacy_subject(conn, subject_kind, subject_id)?
+    {
+        return Ok((None, Vec::new()));
+    }
+
+    Ok((None, issues))
+}
+
 fn verified_signature_state(
     conn: &Connection,
 ) -> Result<(ValidSignatureSet, Vec<SignatureFinding>)> {
@@ -196,6 +234,33 @@ fn verified_signature_state(
     }
 
     Ok((valid, findings))
+}
+
+fn legacy_subject(conn: &Connection, subject_kind: &str, subject_id: &str) -> Result<bool> {
+    let marker = signature_marker(conn)?;
+    match subject_kind {
+        "evidence" => {
+            let rowid = conn
+                .query_row(
+                    "SELECT rowid FROM evidence WHERE id = ?1",
+                    params![subject_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            Ok(rowid.is_some_and(|rowid| rowid <= marker.evidence_high_water))
+        }
+        "decision" => {
+            let rowid = conn
+                .query_row(
+                    "SELECT rowid FROM decisions WHERE id = ?1",
+                    params![subject_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            Ok(rowid.is_some_and(|rowid| rowid <= marker.decision_high_water))
+        }
+        _ => Ok(false),
+    }
 }
 
 fn missing_signature_findings(
