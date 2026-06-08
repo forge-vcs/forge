@@ -165,7 +165,9 @@ PY
     echo "benchmark save produced no changed paths; corpus was not measured" >&2
     exit 1
   fi
+  measure_capture "native_save_warm" "$OUT" "$ERR" "$FORGE" --json save
   measure "native_restore_clean" "$FORGE" --json restore "$snapshot_id" --yes
+  measure "native_diff_working_seed_cache" "$FORGE" --json diff --working --to "$content_ref"
 
   python3 - <<'PY'
 from pathlib import Path
@@ -228,11 +230,11 @@ case "$MODE" in
     run_storage_case 520 102400
     ;;
   --large-tree-smoke)
-    run_storage_case 1000 256
+    run_storage_case "${FORGE_BENCH_FILES:-1000}" "${FORGE_BENCH_BYTES_PER_FILE:-256}"
     ;;
   --large-file-smoke)
     assert_large_file_streaming_paths
-    run_storage_case 4 1048576
+    run_storage_case "${FORGE_BENCH_FILES:-4}" "${FORGE_BENCH_BYTES_PER_FILE:-1048576}"
     ;;
   *)
     echo "usage: $0 [--smoke|--full|--large-tree-smoke|--large-file-smoke]" >&2
