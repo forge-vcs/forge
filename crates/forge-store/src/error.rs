@@ -200,6 +200,13 @@ pub enum ForgeError {
     /// the local ledger. The selector is intentionally not echoed because it may
     /// be path-like user input.
     ConflictSetNotFound { conflict_set_id: String },
+    /// A real GC delete was confirmed against a stale dry-run plan digest.
+    /// Deterministic and non-retryable: rerun `forge gc --dry-run`, review the new
+    /// plan, and pass its digest back to `forge gc --yes --plan-digest`.
+    GcPlanChanged {
+        expected_digest: String,
+        actual_digest: String,
+    },
     /// A command is valid only for a specific content backend/ref family. Used when
     /// a v0 command is published but deliberately native-only for this slice, so
     /// agents can distinguish "unsupported backend" from an unexpected command
@@ -241,6 +248,7 @@ impl ForgeError {
             ForgeError::MissingProvenanceTrailer { .. } => "MISSING_PROVENANCE_TRAILER",
             ForgeError::NativeHistoryCorrupt { .. } => "NATIVE_HISTORY_CORRUPT",
             ForgeError::ConflictSetNotFound { .. } => "CONFLICT_SET_NOT_FOUND",
+            ForgeError::GcPlanChanged { .. } => "GC_PLAN_CHANGED",
             ForgeError::UnsupportedContentBackend { .. } => "UNSUPPORTED_CONTENT_BACKEND",
         }
     }
@@ -346,6 +354,10 @@ impl ForgeError {
                 "related_id": related_id,
             }),
             ForgeError::ConflictSetNotFound { .. } => json!({ "selector_present": true }),
+            ForgeError::GcPlanChanged {
+                expected_digest,
+                actual_digest,
+            } => json!({ "expected_digest": expected_digest, "actual_digest": actual_digest }),
             ForgeError::UnsupportedContentBackend {
                 command,
                 required,
@@ -480,6 +492,13 @@ impl std::fmt::Display for ForgeError {
                 ),
             },
             ForgeError::ConflictSetNotFound { .. } => write!(f, "conflict set not found"),
+            ForgeError::GcPlanChanged {
+                expected_digest,
+                actual_digest,
+            } => write!(
+                f,
+                "gc plan changed: expected {expected_digest}, recomputed {actual_digest}; rerun `forge gc --dry-run`"
+            ),
             ForgeError::UnsupportedContentBackend {
                 command,
                 required,
@@ -662,6 +681,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             retryable: false,
             after_ms: None,
             details_keys: &["selector_present"],
+        },
+        ErrorCodeSpec {
+            code: "GC_PLAN_CHANGED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["expected_digest", "actual_digest"],
         },
         ErrorCodeSpec {
             code: "UNSUPPORTED_CONTENT_BACKEND",
@@ -1162,6 +1187,10 @@ mod tests {
             ForgeError::ConflictSetNotFound {
                 conflict_set_id: "conflict_missing".into(),
             },
+            ForgeError::GcPlanChanged {
+                expected_digest: "aaa".into(),
+                actual_digest: "bbb".into(),
+            },
             ForgeError::UnsupportedContentBackend {
                 command: "merge".into(),
                 required: "native".into(),
@@ -1198,6 +1227,7 @@ mod tests {
                 | ForgeError::MissingProvenanceTrailer { .. }
                 | ForgeError::NativeHistoryCorrupt { .. }
                 | ForgeError::ConflictSetNotFound { .. }
+                | ForgeError::GcPlanChanged { .. }
                 | ForgeError::UnsupportedContentBackend { .. } => {}
             }
         }

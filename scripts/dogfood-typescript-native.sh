@@ -260,6 +260,103 @@ F gc --dry-run
 ck "gc dry-run still works after TypeScript dogfood" "$(pg "d['data']['dry_run']")" "True"
 
 echo
+echo "=== Native multi-workspace TypeScript loop and confirmed GC ==="
+mktsrepo workspaces
+F init --content-backend native >/dev/null
+echo "TOKEN=dogfood" >.env
+F start "workspace TypeScript isolation"
+intent="$(pg "d['data']['intent_id']")"
+attempt_a="$(pg "d['data']['attempt_id']")"
+workspace_a="$(pg "d['data']['workspace_path']")"
+F attempt start --intent "$intent"
+attempt_b="$(pg "d['data']['attempt_id']")"
+workspace_b="$(pg "d['data']['workspace_path']")"
+
+ck "workspace A path surfaces" "$([[ "$workspace_a" == .forge/worktrees/* ]] && echo yes || echo no)" "yes"
+ck "workspace B path surfaces" "$([[ "$workspace_b" == .forge/worktrees/* ]] && echo yes || echo no)" "yes"
+ck "workspace A has source tree" "$([ -f "$workspace_a/src/calculator.ts" ] && echo yes || echo no)" "yes"
+ck "workspace B has source tree" "$([ -f "$workspace_b/src/calculator.ts" ] && echo yes || echo no)" "yes"
+ck "workspace A filters .env" "$([ ! -e "$workspace_a/.env" ] && echo yes || echo no)" "yes"
+
+(
+  cd "$workspace_a"
+  python3 - <<'PY'
+from pathlib import Path
+p = Path("src/calculator.ts")
+s = p.read_text()
+s = s.replace('return values.reduce((sum, value) => sum + value, 0);',
+              'return values.reduce((sum, value) => sum + value, 0);\n}\n\nexport function max(values: number[]): number {\n  return values.length === 0 ? 0 : Math.max(...values);')
+p.write_text(s)
+PY
+  "$FORGE" --json save >"$OUT" 2>"$ERR"
+)
+ck "workspace A save binds to attempt A" "$(pg "d['data']['attempt_id']")" "$attempt_a"
+(
+  cd "$workspace_a"
+  "$FORGE" --json run -- tsc --noEmit >"$OUT" 2>"$ERR"
+)
+ck "workspace A TypeScript check passes" "$(pg "d['data']['exit_code']")" "0"
+(
+  cd "$workspace_a"
+  "$FORGE" --json propose >"$OUT" 2>"$ERR"
+)
+proposal_a="$(pg "d['data']['proposal_id']")"
+F check --attempt "$attempt_a" --proposal "$proposal_a" >/dev/null
+
+(
+  cd "$workspace_b"
+  cat >src/format.ts <<'TS'
+export function formatScore(value: number): string {
+  return `${value.toFixed(2)} pts`;
+}
+TS
+  "$FORGE" --json save >"$OUT" 2>"$ERR"
+)
+ck "workspace B save binds to attempt B" "$(pg "d['data']['attempt_id']")" "$attempt_b"
+ck "workspace B stayed isolated" "$([ ! -f "$workspace_a/src/format.ts" ] && echo yes || echo no)" "yes"
+ck "repo root stayed isolated from workspace edits" "$([ ! -f src/format.ts ] && echo yes || echo no)" "yes"
+(
+  cd "$workspace_b"
+  "$FORGE" --json run -- tsc --noEmit >"$OUT" 2>"$ERR"
+)
+ck "workspace B TypeScript check passes" "$(pg "d['data']['exit_code']")" "0"
+(
+  cd "$workspace_b"
+  "$FORGE" --json propose >"$OUT" 2>"$ERR"
+)
+proposal_b="$(pg "d['data']['proposal_id']")"
+
+F accept --attempt "$attempt_a" --proposal "$proposal_a" >/dev/null
+if ! git diff --quiet -- src/calculator.ts; then
+  git add src/calculator.ts
+  git commit -qm "accept workspace A"
+fi
+F merge --proposal "$proposal_b"
+ck "workspace merge returns merged=true" "$(pg "d['data']['merged']")" "True"
+
+orphan_id="$(python3 - <<'PY'
+import hashlib
+from pathlib import Path
+
+payload = b"dogfood unreachable orphan"
+preimage = b"forge-object\nblob\n1\n" + str(len(payload)).encode() + b"\n" + payload
+digest = hashlib.sha256(preimage).hexdigest()
+path = Path(".forge/objects/sha256") / digest[:2] / digest
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_bytes(preimage)
+print(f"blob:sha256:{digest}")
+PY
+)"
+orphan_digest="${orphan_id##*:}"
+orphan_path=".forge/objects/sha256/${orphan_digest:0:2}/$orphan_digest"
+touch -t 202001010000 "$orphan_path"
+F gc --dry-run
+gc_digest="$(pg "d['data']['plan_digest']")"
+ckc "gc dry-run sees dogfood orphan" "$(pg "d['data']['unreachable_native_objects']")" "$orphan_id"
+F gc --yes --plan-digest "$gc_digest"
+ck "confirmed gc deletes dogfood orphan" "$([ ! -e "$orphan_path" ] && echo yes || echo no)" "yes"
+
+echo
 echo "=== RESULT ==="
 echo "PASS=$PASS  FAIL=$FAIL"
 if [ "$FAIL" -ne 0 ]; then

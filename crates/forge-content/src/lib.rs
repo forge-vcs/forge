@@ -12,6 +12,7 @@ pub const FORGE_TREE_PREFIX: &str = "forge-tree:";
 /// `forge_store::doctor` scans for orphans by this prefix. Defined here, in the
 /// shared base crate, so both content backends exclude it identically.
 pub const RESTORE_TEMP_PREFIX: &str = ".forge-restore-";
+pub const WORKSPACE_MARKER_FILE: &str = ".forge-workspace.json";
 
 /// One file's change between two content trees. `status` uses git's name-status
 /// letter encoding (`A`/`M`/`D`, `R<score>` for renames) so git-backed and native
@@ -193,6 +194,7 @@ pub fn is_secret_risk_path(path: &str) -> bool {
 pub fn is_ignored_by_policy(path: &str) -> bool {
     path == ".forge"
         || path.starts_with(".forge/")
+        || path == WORKSPACE_MARKER_FILE
         || path == ".git"
         || path.starts_with(".git/")
         || is_restore_temp_path(path)

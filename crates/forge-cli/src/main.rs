@@ -2,7 +2,7 @@ mod schema;
 
 use anyhow::Result;
 use clap::{error::ErrorKind, Args, Parser, Subcommand};
-use forge_content::{classify_content_ref, ContentBackend, ContentRefKind};
+use forge_content::{classify_content_ref, ContentBackend, ContentRefKind, SnapshotContent};
 use forge_protocol::{
     ErrorObject, ResponseEnvelope, ResponseStatus, RetryMetadata, RETRY_BACKOFF_MS,
 };
@@ -254,6 +254,10 @@ struct RunArgs {
 struct GcArgs {
     #[arg(long)]
     dry_run: bool,
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    plan_digest: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -332,6 +336,15 @@ fn main() -> ExitCode {
         Command::Checkout(args) => checkout_response(request_id, args),
         Command::Undo => undo_response(request_id),
         Command::Doctor => doctor_response(request_id),
+        Command::Gc(args) if !args.dry_run && (!args.yes || args.plan_digest.is_none()) => {
+            structured_error(
+                "gc",
+                request_id,
+                "CONFIRMATION_REQUIRED",
+                "gc deletion requires --yes and --plan-digest from a prior dry-run",
+                json!({}),
+            )
+        }
         Command::Gc(args) => gc_response(request_id, args),
         Command::Export(args) => export_response(request_id, args),
         Command::Schema => schema_response(request_id),
@@ -412,7 +425,7 @@ fn request_id_from_args(args: &[String]) -> Option<String> {
 
 fn start_response(request_id: Option<String>, args: IntentArgs) -> ResponseEnvelope {
     command_result("start", request_id, |cwd, request_id| {
-        let base_head = selected_backend(&cwd)?.current_base(&cwd)?;
+        let base_head = current_base(&cwd)?;
         // Persist declared check gates on the intent (NER-135); competing attempts
         // under this intent inherit the same bar. None => default mode.
         let check_spec_json =
@@ -422,9 +435,11 @@ fn start_response(request_id: Option<String>, args: IntentArgs) -> ResponseEnvel
             request_id,
             args.intent
                 .unwrap_or_else(|| "local agent attempt".to_string()),
-            base_head,
+            base_head.clone(),
             check_spec_json,
         )?;
+        let content_ref = owner_base_content_ref(&cwd, &base_head)?;
+        materialize_attempt_workspace(&cwd, &started.attempt_id, &content_ref)?;
         Ok((
             Some(started.operation_id.clone()),
             serde_json::to_value(started)?,
@@ -437,13 +452,15 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
     match args.command {
         AttemptCommand::Start(args) => {
             command_result("attempt start", request_id, |cwd, request_id| {
-                let base_head = selected_backend(&cwd)?.current_base(&cwd)?;
+                let base_head = current_base(&cwd)?;
                 let started = forge_store::start_attempt_for_intent(
                     &cwd,
                     request_id,
                     args.intent,
-                    base_head,
+                    base_head.clone(),
                 )?;
+                let content_ref = owner_base_content_ref(&cwd, &base_head)?;
+                materialize_attempt_workspace(&cwd, &started.attempt_id, &content_ref)?;
                 Ok((
                     Some(started.operation_id.clone()),
                     serde_json::to_value(started)?,
@@ -472,23 +489,18 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
                 // NER-134: worktree/base materialization goes through `ContentBackend`,
                 // not `forge_content_git::` directly, so git-worktree semantics stay out
                 // of core lifecycle code (PRD §23.4). Bind the configured backend once.
-                let backend = selected_backend(&cwd)?;
                 let target_base_head = forge_store::attempt_base_head(&cwd, &attempt_id)?;
-                let current_content = backend.snapshot_worktree(&cwd)?;
+                let current_content = snapshot_effective_worktree(&cwd)?;
                 let resolved_current = forge_store::resolve_attempt(&cwd, None).ok();
                 let latest_content_ref = match resolved_current {
                     Some(resolved) => forge_store::latest_snapshot_content_ref(
                         &cwd,
                         Some(&resolved.attempt.attempt_id),
                     )?
-                    .or_else(|| {
-                        backend
-                            .base_content_ref(&cwd, &resolved.attempt.base_head)
-                            .ok()
-                    }),
+                    .or_else(|| owner_base_content_ref(&cwd, &resolved.attempt.base_head).ok()),
                     None => {
-                        let head = backend.current_base(&cwd)?;
-                        Some(backend.base_content_ref(&cwd, &head)?)
+                        let head = current_base(&cwd)?;
+                        Some(owner_base_content_ref(&cwd, &head)?)
                     }
                 };
                 if latest_content_ref.as_deref() != Some(current_content.content_ref.as_str()) {
@@ -500,12 +512,13 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
                 let content_ref = match forge_store::attempt_materialization_ref(&cwd, &attempt_id)?
                 {
                     Some(content_ref) => content_ref,
-                    None => backend.base_content_ref(&cwd, &target_base_head)?,
+                    None => owner_base_content_ref(&cwd, &target_base_head)?,
                 };
                 // Restore routes by the ref's own prefix: a `git-tree:` base ref is
                 // materialized by the git backend even in a native repo (intentional
                 // until the Phase 7 native walker; see ContentBackend::base_content_ref).
-                backend_for_content_ref(&content_ref)?.restore_snapshot(&cwd, &content_ref)?;
+                restore_effective_worktree(&cwd, &content_ref)?;
+                materialize_attempt_workspace(&cwd, &attempt_id, &content_ref)?;
                 let attached =
                     forge_store::attach_attempt(&cwd, request_id, &attempt_id, &content_ref)?;
                 Ok((
@@ -567,8 +580,14 @@ fn diff_response(request_id: Option<String>, args: DiffArgs) -> ResponseEnvelope
             if args.from.is_some() {
                 anyhow::bail!("--working cannot be combined with --from");
             }
-            let store = forge_content_native::NativeObjectStore::new(&cwd);
-            forge_content_native::diff_working_vs_tree(&store, &cwd, &args.to, &options)?
+            let context = forge_store::open_repository(&cwd)?;
+            let store = forge_content_native::NativeObjectStore::new(&context.root_path);
+            forge_content_native::diff_working_vs_tree(
+                &store,
+                &context.worktree_path,
+                &args.to,
+                &options,
+            )?
         } else {
             let from = args
                 .from
@@ -585,10 +604,9 @@ fn diff_response(request_id: Option<String>, args: DiffArgs) -> ResponseEnvelope
 fn merge_response(request_id: Option<String>, args: MergeArgs) -> ResponseEnvelope {
     command_result("merge", request_id, |cwd, request_id| {
         let proposal = forge_store::proposal_for_merge(&cwd, &args.proposal)?;
-        let backend = selected_backend(&cwd)?;
-        let base_content_ref = backend.base_content_ref(&cwd, &proposal.base_head)?;
-        let ours_head = backend.current_base(&cwd)?;
-        let ours_content_ref = backend.base_content_ref(&cwd, &ours_head)?;
+        let base_content_ref = owner_base_content_ref(&cwd, &proposal.base_head)?;
+        let ours_head = current_base(&cwd)?;
+        let ours_content_ref = owner_base_content_ref(&cwd, &ours_head)?;
         let theirs_content_ref = proposal.content_ref.clone();
         let ref_kinds = [
             classify_content_ref(&base_content_ref),
@@ -615,8 +633,7 @@ fn merge_response(request_id: Option<String>, args: MergeArgs) -> ResponseEnvelo
         )?;
         if let Some(merged_content_ref) = result.merged_content_ref {
             ensure_clean_worktree(&cwd, &merged_content_ref)?;
-            backend_for_content_ref(&merged_content_ref)?
-                .restore_snapshot(&cwd, &merged_content_ref)?;
+            restore_effective_worktree(&cwd, &merged_content_ref)?;
             let record = forge_store::record_merge_success(
                 &cwd,
                 request_id,
@@ -698,7 +715,7 @@ fn conflict_response(request_id: Option<String>, args: ConflictArgs) -> Response
         } => command_result("conflict resolve", request_id, |cwd, request_id| {
             forge_store::preflight_conflict_resolution(&cwd, &conflict_set_id, &tree)?;
             ensure_clean_worktree(&cwd, &tree)?;
-            backend_for_content_ref(&tree)?.restore_snapshot(&cwd, &tree)?;
+            restore_effective_worktree(&cwd, &tree)?;
             let record =
                 forge_store::resolve_conflict_with_tree(&cwd, request_id, &conflict_set_id, &tree)?;
             Ok((
@@ -759,7 +776,7 @@ fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> Respons
         // authoritatively on the write path; this returns the resolved attempt id, which
         // we pass back as an explicit selector.
         let resolved_attempt = forge_store::verify_save_target(&cwd, args.attempt.as_deref())?;
-        let content = selected_backend(&cwd)?.snapshot_worktree(&cwd)?;
+        let content = snapshot_effective_worktree(&cwd)?;
         // Crash boundary (NER-132 U6, debug-only): objects are now durably fsynced
         // but no content_ref row is committed. A crash here must never leave a
         // committed ref pointing at a missing object — the objects are present, the
@@ -800,7 +817,7 @@ fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> Respons
 /// passes via `worktree == target`, re-materialize is a no-op, and the record txn sets expected.
 /// A genuine unsaved edit matches NEITHER and is refused (the safety property is preserved).
 fn ensure_clean_worktree(cwd: &Path, target_content_ref: &str) -> Result<()> {
-    let current = selected_backend(cwd)?.snapshot_worktree(cwd)?;
+    let current = snapshot_effective_worktree(cwd)?;
     let expected = match forge_store::expected_content_ref(cwd)? {
         Some(expected) => Some(expected),
         None => forge_store::latest_snapshot_content_ref(cwd, None)?,
@@ -818,18 +835,17 @@ fn ensure_clean_worktree(cwd: &Path, target_content_ref: &str) -> Result<()> {
 }
 
 fn ensure_worktree_matches_expected(cwd: &Path) -> Result<()> {
-    let backend = selected_backend(cwd)?;
     let expected = match forge_store::expected_content_ref(cwd)? {
         Some(expected) => expected,
         None => match forge_store::latest_snapshot_content_ref(cwd, None)? {
             Some(content_ref) => content_ref,
             None => {
                 let attempt = forge_store::resolve_attempt(cwd, None)?.attempt;
-                backend.base_content_ref(cwd, &attempt.base_head)?
+                owner_base_content_ref(cwd, &attempt.base_head)?
             }
         },
     };
-    let current = backend.snapshot_worktree(cwd)?;
+    let current = snapshot_effective_worktree(cwd)?;
     if current.content_ref == expected {
         Ok(())
     } else {
@@ -859,7 +875,7 @@ fn restore_response(request_id: Option<String>, args: RestoreArgs) -> ResponseEn
             }
             .into());
         }
-        backend_for_content_ref(&content_ref)?.restore_snapshot(&cwd, &content_ref)?;
+        restore_effective_worktree(&cwd, &content_ref)?;
         let restored =
             forge_store::record_restore(&cwd, request_id, &args.snapshot_id, &content_ref)?;
         Ok((
@@ -880,7 +896,9 @@ fn run_response(request_id: Option<String>, args: RunArgs) -> ResponseEnvelope {
             anyhow::bail!("missing command after --");
         }
         ensure_worktree_matches_expected(&cwd)?;
-        let captured = forge_evidence::capture_with_timeout(&cwd, &args.command, args.timeout_ms)?;
+        let worktree = forge_store::effective_worktree_path(&cwd)?;
+        let captured =
+            forge_evidence::capture_with_timeout(&worktree, &args.command, args.timeout_ms)?;
         // Surface each secret redaction the capture applied as a warnings[] entry
         // (NER-136 §U4), grouped by detector kind with a count.
         let warnings = redaction_warnings(&captured.redactions);
@@ -952,8 +970,7 @@ fn accept_response(request_id: Option<String>, args: AcceptArgs) -> ResponseEnve
             args.attempt.as_deref(),
             args.proposal.as_deref(),
         )?;
-        let backend = selected_backend(&cwd)?;
-        let current_head = backend.current_base(&cwd)?;
+        let current_head = current_base(&cwd)?;
         if current_head != proposal.base_head {
             if forge_store::resolved_merge_ours_head(
                 &cwd,
@@ -967,8 +984,8 @@ fn accept_response(request_id: Option<String>, args: AcceptArgs) -> ResponseEnve
                 // head. `decide` writes the two-parent commit from the stored merge
                 // metadata, so this is not a stale-base bypass.
             } else {
-                let base_content_ref = backend.base_content_ref(&cwd, &proposal.base_head)?;
-                let ours_content_ref = backend.base_content_ref(&cwd, &current_head)?;
+                let base_content_ref = owner_base_content_ref(&cwd, &proposal.base_head)?;
+                let ours_content_ref = owner_base_content_ref(&cwd, &current_head)?;
                 return Err(forge_store::StaleBaseConflict {
                     input: forge_store::StaleBaseConflictInput {
                         context: "stale_base_accept".to_string(),
@@ -1060,7 +1077,7 @@ fn checkout_response(request_id: Option<String>, args: CheckoutArgs) -> Response
         // clobber must not run if there are unsaved changes to lose.
         ensure_clean_worktree(&cwd, &content_ref)?;
         // Materialize the historical tree (policy-excluded; symlink-aware + R15 via U9).
-        backend_for_content_ref(&content_ref)?.restore_snapshot(&cwd, &content_ref)?;
+        restore_effective_worktree(&cwd, &content_ref)?;
         // Record the checkout in the op-log (so `undo` can reverse it and gc keeps the target
         // reachable). Checkout does NOT move the base anchor — surfaced as base_unchanged so an
         // agent is not misled into expecting git's HEAD-moving checkout semantics.
@@ -1086,8 +1103,7 @@ fn undo_response(request_id: Option<String>) -> ResponseEnvelope {
         // unsaved edits.
         ensure_clean_worktree(&cwd, &target.content_ref)?;
         // Restore the prior snapshot (policy-excluded, crash-atomic, symlink-aware + R15).
-        backend_for_content_ref(&target.content_ref)?
-            .restore_snapshot(&cwd, &target.content_ref)?;
+        restore_effective_worktree(&cwd, &target.content_ref)?;
         // Record the undo as a forward op-log operation (never deletes a decisions/op row).
         let record = forge_store::record_undo(
             &cwd,
@@ -1128,10 +1144,11 @@ fn doctor_response(request_id: Option<String>) -> ResponseEnvelope {
 
 fn gc_response(request_id: Option<String>, args: GcArgs) -> ResponseEnvelope {
     command_result("gc", request_id, |cwd, _request_id| {
-        if !args.dry_run {
-            anyhow::bail!("gc only supports --dry-run in v0");
-        }
-        let report = forge_store::gc_dry_run(&cwd)?;
+        let report = if args.dry_run {
+            forge_store::gc_dry_run(&cwd)?
+        } else {
+            forge_store::gc_delete(&cwd, args.plan_digest.as_deref().unwrap_or_default())?
+        };
         Ok((None, serde_json::to_value(report)?, Vec::new()))
     })
 }
@@ -1178,8 +1195,7 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                 // branch (NER-136 R4): a tampered decision row that forged `accepted`
                 // is refused here, under the held repo lock, so no branch is created.
                 forge_store::verify_decision_integrity(&cwd, &proposal.proposal_revision_id)?;
-                let backend = selected_backend(&cwd)?;
-                let current_head = backend.current_base(&cwd)?;
+                let current_head = current_base(&cwd)?;
                 // CLI-layer stale-base pre-check mirroring `accept`: persist the
                 // divergence to `conflict_sets` under the held lock BEFORE bailing
                 // (NER-133 U7). NER-138 slice 3: after commit-on-accept the ref-store HEAD
@@ -1195,8 +1211,8 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                 )?
                 .unwrap_or_else(|| proposal.base_head.clone());
                 if current_head != expected_head {
-                    let base_content_ref = backend.base_content_ref(&cwd, &expected_head)?;
-                    let ours_content_ref = backend.base_content_ref(&cwd, &current_head)?;
+                    let base_content_ref = owner_base_content_ref(&cwd, &expected_head)?;
+                    let ours_content_ref = owner_base_content_ref(&cwd, &current_head)?;
                     return Err(forge_store::StaleBaseConflict {
                         input: forge_store::StaleBaseConflictInput {
                             context: "stale_base_export".to_string(),
@@ -1562,12 +1578,64 @@ fn selected_backend(cwd: &std::path::Path) -> anyhow::Result<Box<dyn ContentBack
     }
 }
 
-fn backend_for_content_ref(content_ref: &str) -> anyhow::Result<Box<dyn ContentBackend>> {
+fn snapshot_effective_worktree(cwd: &Path) -> anyhow::Result<SnapshotContent> {
+    let context = forge_store::open_repository(cwd)?;
+    match context.content_backend.as_str() {
+        "git" => forge_content_git::GitContentBackend.snapshot_worktree(&context.root_path),
+        "native" => forge_content_native::snapshot_worktree_into_store(
+            &context.root_path,
+            &context.worktree_path,
+        ),
+        other => anyhow::bail!("unsupported content backend {other}"),
+    }
+}
+
+fn restore_effective_worktree(cwd: &Path, content_ref: &str) -> anyhow::Result<()> {
+    let context = forge_store::open_repository(cwd)?;
     match classify_content_ref(content_ref) {
-        ContentRefKind::GitTree(_) => Ok(Box::new(forge_content_git::GitContentBackend)),
-        ContentRefKind::ForgeTree(_) => Ok(Box::new(forge_content_native::NativeContentBackend)),
+        ContentRefKind::GitTree(_) => {
+            forge_content_git::GitContentBackend.restore_snapshot(&context.root_path, content_ref)
+        }
+        ContentRefKind::ForgeTree(_) => forge_content_native::restore_content_ref_to_worktree(
+            &context.root_path,
+            &context.worktree_path,
+            content_ref,
+        ),
         ContentRefKind::Unsupported => anyhow::bail!("unsupported content ref"),
     }
+}
+
+fn current_base(cwd: &Path) -> anyhow::Result<String> {
+    let context = forge_store::open_repository(cwd)?;
+    selected_backend(cwd)?.current_base(&context.root_path)
+}
+
+fn owner_base_content_ref(cwd: &Path, base: &str) -> anyhow::Result<String> {
+    let context = forge_store::open_repository(cwd)?;
+    selected_backend(cwd)?.base_content_ref(&context.root_path, base)
+}
+
+fn materialize_attempt_workspace(
+    cwd: &Path,
+    attempt_id: &str,
+    content_ref: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let _worktree_lock = forge_store::acquire_worktree_lock(cwd, attempt_id)?;
+    let workspace = forge_store::ensure_attempt_workspace_marker(cwd, attempt_id)?;
+    match classify_content_ref(content_ref) {
+        ContentRefKind::ForgeTree(_) => {
+            let repo_root = forge_store::repository_root_path(cwd)?;
+            forge_content_native::restore_content_ref_to_worktree(
+                &repo_root,
+                &workspace,
+                content_ref,
+            )?;
+            forge_store::record_attempt_workspace_materialized(cwd, attempt_id, content_ref)?;
+        }
+        ContentRefKind::GitTree(_) => {}
+        ContentRefKind::Unsupported => anyhow::bail!("unsupported content ref"),
+    }
+    Ok(workspace)
 }
 
 fn content_backend_label(kinds: &[ContentRefKind<'_>]) -> &'static str {
@@ -1708,6 +1776,7 @@ fn is_mutating_command(command: &str) -> bool {
             | "export branch"
             | "checkout"
             | "undo"
+            | "gc"
     )
 }
 

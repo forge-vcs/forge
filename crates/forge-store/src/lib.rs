@@ -5,10 +5,11 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 mod error;
 mod integrity;
@@ -57,11 +58,19 @@ pub struct RequestIdOperation {
 pub struct RepositoryContext {
     pub repo_id: String,
     pub root_path: PathBuf,
+    pub worktree_path: PathBuf,
     pub database_path: PathBuf,
     pub content_backend: String,
     pub current_operation_id: String,
     pub current_view_id: String,
     pub attached_attempt_id: Option<String>,
+    pub workspace_attempt_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceMarker {
+    repo_root: String,
+    attempt_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +79,7 @@ pub struct StartAttempt {
     pub attempt_id: String,
     pub base_head: String,
     pub attached: bool,
+    pub workspace_path: String,
     pub operation_id: String,
     pub current_view_id: String,
 }
@@ -91,6 +101,7 @@ pub struct AttemptSummary {
     pub base_head: String,
     pub status: String,
     pub attached: bool,
+    pub workspace_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -490,6 +501,9 @@ pub struct DoctorReport {
     /// Empty in a healthy repo. This is the "DAG has no cycles/dangling parents (doctor
     /// verifies)" whole-phase exit criterion.
     pub native_history_issues: Vec<NativeHistoryFinding>,
+    /// Corrupt `views.state_json` rows that make GC's reachability root set
+    /// untrustworthy. Empty in a healthy repo.
+    pub ledger_view_issues: Vec<LedgerViewFinding>,
 }
 
 /// One row that failed integrity verification in `doctor`'s chain pass. Carries only
@@ -517,13 +531,34 @@ pub struct NativeHistoryFinding {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct LedgerViewFinding {
+    pub kind: LedgerViewFindingKind,
+    pub view_id: String,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerViewFindingKind {
+    CorruptStateJson,
+    UnparseableCommitId,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct GcDryRunReport {
     pub dry_run: bool,
     pub unreachable_snapshots: Vec<String>,
     pub unreachable_evidence: Vec<String>,
     pub unreachable_native_objects: Vec<String>,
+    pub protected_native_objects: Vec<String>,
+    pub protection_window_days: u64,
+    pub plan_digest: String,
     pub deleted: Vec<String>,
 }
+
+const GC_PROTECTION_WINDOW_DAYS: u64 = 7;
+const GC_PROTECTION_WINDOW: Duration =
+    Duration::from_secs(60 * 60 * 24 * GC_PROTECTION_WINDOW_DAYS);
 
 pub fn init_repository(
     cwd: &Path,
@@ -674,7 +709,7 @@ pub fn init_repository(
 pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     // Git-free root resolution (slice 3): walk up for `.forge/forge.db` rather than shelling
     // `git rev-parse`, so every post-init command works with git removed from PATH.
-    let root = forge_root(cwd)?;
+    let (root, worktree_path, workspace_attempt_id) = repository_location(cwd)?;
     let database_path = root.join(".forge/forge.db");
     if !database_path.exists() {
         return Err(ForgeError::NotInitialized.into());
@@ -700,12 +735,22 @@ pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     Ok(RepositoryContext {
         repo_id,
         root_path: root,
+        worktree_path,
         database_path,
         content_backend,
         current_operation_id,
         current_view_id,
         attached_attempt_id,
+        workspace_attempt_id,
     })
+}
+
+pub fn effective_worktree_path(cwd: &Path) -> Result<PathBuf> {
+    Ok(open_repository(cwd)?.worktree_path)
+}
+
+pub fn repository_root_path(cwd: &Path) -> Result<PathBuf> {
+    Ok(open_repository(cwd)?.root_path)
 }
 
 pub fn repository_content_backend(cwd: &Path) -> Result<String> {
@@ -732,6 +777,18 @@ pub fn acquire_repo_lock(cwd: &Path) -> Result<Option<RepoLock>> {
         return Ok(None);
     }
     repo_lock::acquire(&forge_dir).map(Some)
+}
+
+pub fn acquire_worktree_lock(cwd: &Path, attempt_id: &str) -> Result<RepoLock> {
+    let context = open_repository(cwd)?;
+    attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+        selector: attempt_id.to_string(),
+    })?;
+    let lock_path = context
+        .root_path
+        .join(".forge/worktree-locks")
+        .join(format!("{attempt_id}.lock"));
+    repo_lock::acquire_lock_file(&lock_path)
 }
 
 /// Bring the repository's schema up to this binary's head, acquiring the repo
@@ -948,6 +1005,18 @@ fn create_attempt(
              VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
             params![attempt_id, context.repo_id, intent_id, base_head, now],
         )?;
+        tx.execute(
+            "INSERT INTO attempt_workspaces (
+                attempt_id, repo_id, workspace_rel_path, status,
+                materialized_content_ref, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, 'active', NULL, ?4, ?4)",
+            params![
+                attempt_id,
+                context.repo_id,
+                workspace_rel_path_for_attempt(&attempt_id),
+                now
+            ],
+        )?;
 
         let op = insert_operation_view(
             tx,
@@ -976,6 +1045,7 @@ fn create_attempt(
 
     Ok(StartAttempt {
         intent_id,
+        workspace_path: workspace_rel_path_for_attempt(&attempt_id),
         attempt_id,
         base_head,
         attached: attach,
@@ -1039,8 +1109,13 @@ pub fn save_snapshot(
             },
         )?;
         // NER-143 R1: the worktree now holds exactly this snapshot's tree (save captured it),
-        // so it becomes the expected dirty-check baseline. Atomic with the op-log advance.
-        set_expected_content_ref(tx, &content_ref)?;
+        // so it becomes the expected dirty-check baseline for the worktree that issued `save`.
+        // Native attempt workspaces have independent materialized baselines; do not let a
+        // workspace save poison the owner repo's root-level dirty check.
+        set_context_expected_content_ref(tx, &context, &content_ref)?;
+        if context.workspace_attempt_id.is_some() {
+            initialize_root_expected_content_ref_if_missing(tx, &context, &attempt.base_head)?;
+        }
         Ok((snapshot_id, parent_snapshot_id, op))
     })?;
     Ok(SnapshotRecord {
@@ -1051,6 +1126,68 @@ pub fn save_snapshot(
         changed_paths,
         operation_id: op.operation_id,
         current_view_id: op.view_id,
+    })
+}
+
+fn workspace_rel_path_for_attempt(attempt_id: &str) -> String {
+    format!(".forge/worktrees/{attempt_id}")
+}
+
+fn attempt_workspace_rel_path(context: &RepositoryContext, attempt_id: &str) -> Result<String> {
+    let connection = open_connection(&context.database_path)?;
+    connection
+        .query_row(
+            "SELECT workspace_rel_path FROM attempt_workspaces
+             WHERE repo_id = ?1 AND attempt_id = ?2",
+            params![context.repo_id, attempt_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or_else(|| workspace_rel_path_for_attempt(attempt_id)))
+        .map_err(Into::into)
+}
+
+pub fn attempt_workspace_path(cwd: &Path, attempt_id: &str) -> Result<PathBuf> {
+    let context = open_repository(cwd)?;
+    attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+        selector: attempt_id.to_string(),
+    })?;
+    let rel = attempt_workspace_rel_path(&context, attempt_id)?;
+    Ok(context.root_path.join(rel))
+}
+
+pub fn ensure_attempt_workspace_marker(cwd: &Path, attempt_id: &str) -> Result<PathBuf> {
+    let context = open_repository(cwd)?;
+    attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+        selector: attempt_id.to_string(),
+    })?;
+    let path = attempt_workspace_path(cwd, attempt_id)?;
+    fs::create_dir_all(&path).map_err(|error| anyhow!("create workspace: {}", error.kind()))?;
+    let marker = WorkspaceMarker {
+        repo_root: context.root_path.to_string_lossy().into_owned(),
+        attempt_id: attempt_id.to_string(),
+    };
+    let marker_path = path.join(forge_content::WORKSPACE_MARKER_FILE);
+    fs::write(&marker_path, serde_json::to_vec(&marker)?)
+        .map_err(|error| anyhow!("write workspace marker: {}", error.kind()))?;
+    Ok(path)
+}
+
+pub fn record_attempt_workspace_materialized(
+    cwd: &Path,
+    attempt_id: &str,
+    content_ref: &str,
+) -> Result<()> {
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        tx.execute(
+            "UPDATE attempt_workspaces
+             SET materialized_content_ref = ?1, updated_at_ms = ?2
+             WHERE repo_id = ?3 AND attempt_id = ?4",
+            params![content_ref, now_ms(), context.repo_id, attempt_id],
+        )?;
+        Ok(())
     })
 }
 
@@ -1067,6 +1204,16 @@ pub fn save_snapshot(
 /// check runs only after attempt resolution succeeds, so an unqualified ambiguous
 /// selector still surfaces `AmbiguousAttempt` first.
 fn verify_worktree_binding(context: &RepositoryContext, target_attempt_id: &str) -> Result<()> {
+    if let Some(workspace_attempt_id) = context.workspace_attempt_id.as_deref() {
+        if workspace_attempt_id != target_attempt_id {
+            return Err(ForgeError::AttemptWorktreeMismatch {
+                requested_attempt: target_attempt_id.to_string(),
+                attached_attempt: workspace_attempt_id.to_string(),
+            }
+            .into());
+        }
+        return Ok(());
+    }
     if let Some(attached) = context.attached_attempt_id.as_deref() {
         if attached != target_attempt_id {
             return Err(ForgeError::AttemptWorktreeMismatch {
@@ -1127,16 +1274,31 @@ pub fn latest_snapshot_content_ref(cwd: &Path, attempt_id: Option<&str>) -> Resu
         .map(|snapshot| snapshot.content_ref))
 }
 
-/// The content ref the worktree is EXPECTED to hold — the tree the last materializing op
-/// (save/restore/checkout/undo) put there, tracked in `current_state.expected_content_ref`
-/// (migration 007, NER-143 R1). `None` for a pre-007 repo or a fresh repo before its first
-/// materialize; the dirty-check then falls back to the latest-snapshot baseline. This is the
-/// crash-safe baseline: a non-save op materializes a different tree than the latest *saved*
-/// snapshot, so comparing the worktree against "latest saved" spuriously fails chained
-/// navigation (undo twice) — comparing against "expected" does not.
+/// The content ref the effective worktree is EXPECTED to hold — the tree the last materializing
+/// op put there. Owner-root worktrees use `current_state.expected_content_ref` (migration 007,
+/// NER-143 R1). Native attempt workspaces use their own `attempt_workspaces.materialized_content_ref`
+/// so a save/run/propose loop in one isolated workspace does not poison root-level dirty checks
+/// or another attempt workspace's baseline.
+///
+/// `None` for a pre-007 repo or a fresh worktree before its first materialize; the dirty-check
+/// then falls back to the latest-snapshot baseline. This is the crash-safe baseline: a non-save
+/// op materializes a different tree than the latest *saved* snapshot, so comparing the worktree
+/// against "latest saved" spuriously fails chained navigation (undo twice) — comparing against
+/// "expected" does not.
 pub fn expected_content_ref(cwd: &Path) -> Result<Option<String>> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
+    if let Some(attempt_id) = context.workspace_attempt_id.as_deref() {
+        return Ok(connection
+            .query_row(
+                "SELECT materialized_content_ref FROM attempt_workspaces
+                 WHERE repo_id = ?1 AND attempt_id = ?2",
+                params![context.repo_id, attempt_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten());
+    }
     Ok(connection
         .query_row(
             "SELECT expected_content_ref FROM current_state WHERE singleton = 1",
@@ -1147,18 +1309,70 @@ pub fn expected_content_ref(cwd: &Path) -> Result<Option<String>> {
         .flatten())
 }
 
-/// Set `current_state.expected_content_ref` to the tree a materializing op just put in the
-/// worktree (NER-143 R1). Called inside the recorder's `IMMEDIATE` txn — atomic with the
-/// op-log advance, so a `CurrentStateChanged` CAS-loss rolls BOTH back together. DR-F2: this
-/// is a DEDICATED UPDATE in each of the four materializing recorders, never folded into the
-/// shared `insert_operation_view` CAS (which every op hits — folding it there would clobber
-/// the expected ref on a non-materializing `accept`/`run`/`propose`/`check`).
+/// Set `current_state.expected_content_ref` to the tree a root worktree materializing op just put
+/// in the owner repo (NER-143 R1). Called inside the recorder's `IMMEDIATE` txn — atomic with the
+/// op-log advance, so a `CurrentStateChanged` CAS-loss rolls BOTH back together. DR-F2: this is a
+/// DEDICATED UPDATE in each materializing recorder, never folded into the shared
+/// `insert_operation_view` CAS (which every op hits — folding it there would clobber the expected
+/// ref on a non-materializing `accept`/`run`/`propose`/`check`).
 fn set_expected_content_ref(tx: &Connection, content_ref: &str) -> Result<()> {
     tx.execute(
         "UPDATE current_state SET expected_content_ref = ?1 WHERE singleton = 1",
         params![content_ref],
     )?;
     Ok(())
+}
+
+fn set_workspace_expected_content_ref(
+    tx: &Connection,
+    context: &RepositoryContext,
+    attempt_id: &str,
+    content_ref: &str,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE attempt_workspaces
+         SET materialized_content_ref = ?1, updated_at_ms = ?2
+         WHERE repo_id = ?3 AND attempt_id = ?4",
+        params![content_ref, now_ms(), context.repo_id, attempt_id],
+    )?;
+    Ok(())
+}
+
+fn set_context_expected_content_ref(
+    tx: &Connection,
+    context: &RepositoryContext,
+    content_ref: &str,
+) -> Result<()> {
+    if let Some(attempt_id) = context.workspace_attempt_id.as_deref() {
+        set_workspace_expected_content_ref(tx, context, attempt_id, content_ref)
+    } else {
+        set_expected_content_ref(tx, content_ref)
+    }
+}
+
+fn initialize_root_expected_content_ref_if_missing(
+    tx: &Connection,
+    context: &RepositoryContext,
+    base_head: &str,
+) -> Result<()> {
+    let existing = tx.query_row(
+        "SELECT expected_content_ref FROM current_state WHERE singleton = 1",
+        [],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    if existing.is_some() || context.content_backend != "native" {
+        return Ok(());
+    }
+    let id = match forge_content_native::ObjectId::parse(base_head) {
+        Ok(id) if matches!(id.kind(), Ok(forge_content_native::ObjectKind::Commit)) => id,
+        _ => return Ok(()),
+    };
+    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let commit = store.read_commit(&id)?;
+    set_expected_content_ref(
+        tx,
+        &format!("{}{}", forge_content::FORGE_TREE_PREFIX, commit.tree),
+    )
 }
 
 pub fn record_restore(
@@ -1184,7 +1398,7 @@ pub fn record_restore(
             },
         )?;
         // NER-143 R1: restore just materialized this snapshot's tree into the worktree.
-        set_expected_content_ref(tx, content_ref)?;
+        set_context_expected_content_ref(tx, &context, content_ref)?;
         Ok(op)
     })?;
     Ok(op)
@@ -1266,7 +1480,7 @@ pub fn record_checkout(
             },
         )?;
         // NER-143 R1: checkout just materialized this commit's tree into the worktree.
-        set_expected_content_ref(tx, content_ref)?;
+        set_context_expected_content_ref(tx, &context, content_ref)?;
         Ok(op)
     })?;
     Ok(op)
@@ -1381,7 +1595,7 @@ pub fn record_undo(
             },
         )?;
         // NER-143 R1: undo just materialized the restored snapshot's tree into the worktree.
-        set_expected_content_ref(tx, content_ref)?;
+        set_context_expected_content_ref(tx, &context, content_ref)?;
         Ok(op)
     })?;
     Ok(op)
@@ -2916,7 +3130,7 @@ pub fn record_merge_success(
             "UPDATE proposals SET snapshot_id = ?1, content_ref = ?2, status = 'draft' WHERE id = ?3",
             params![snapshot_id, input.merged_content_ref, proposal.proposal_id],
         )?;
-        set_expected_content_ref(tx, &input.merged_content_ref)?;
+        set_context_expected_content_ref(tx, &context, &input.merged_content_ref)?;
         let merge_lineage_hash =
             integrity::merge_lineage_digest(&integrity::MergeLineageDigestInput {
                 proposal_id: &proposal.proposal_id,
@@ -3156,7 +3370,7 @@ pub fn resolve_conflict_with_tree(
             "UPDATE conflict_sets SET status = 'resolved' WHERE id = ?1",
             params![conflict_set_id],
         )?;
-        set_expected_content_ref(tx, resolution_ref)?;
+        set_context_expected_content_ref(tx, &context, resolution_ref)?;
         let parent_hash = op_content_hash(tx, Some(&context.current_operation_id))?;
         let content_hash = integrity::operation_link_hash(
             &parent_hash,
@@ -4007,6 +4221,13 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
             native_history_issues.len()
         ));
     }
+    let ledger_view_issues = ledger_commit_roots(&context, &connection)?.view_issues;
+    if !ledger_view_issues.is_empty() {
+        issues.push(format!(
+            "{} corrupt ledger view row(s) detected",
+            ledger_view_issues.len()
+        ));
+    }
 
     Ok(DoctorReport {
         ok: issues.is_empty(),
@@ -4017,6 +4238,7 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         half_applied_worktrees,
         tampered_rows,
         native_history_issues,
+        ledger_view_issues,
     })
 }
 
@@ -4680,6 +4902,57 @@ pub fn pr_body_for(
 }
 
 pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
+    Ok(gc_plan(cwd)?.into_report(true, Vec::new()))
+}
+
+pub fn gc_delete(cwd: &Path, expected_plan_digest: &str) -> Result<GcDryRunReport> {
+    let doctor_report = doctor(cwd)?;
+    if !doctor_report.ok {
+        bail!("gc refuses deletion while doctor reports repository issues");
+    }
+    let plan = gc_plan(cwd)?;
+    if plan.plan_digest != expected_plan_digest {
+        return Err(ForgeError::GcPlanChanged {
+            expected_digest: expected_plan_digest.to_string(),
+            actual_digest: plan.plan_digest.clone(),
+        }
+        .into());
+    }
+    let context = open_repository(cwd)?;
+    let native_store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let mut deleted = Vec::new();
+    for object in &plan.deletable_native_objects {
+        let id = forge_content_native::ObjectId::parse(object)?;
+        native_store.delete_object(&id)?;
+        deleted.push(object.clone());
+        forge_content::maybe_crash("gc_after_unlink");
+    }
+    Ok(plan.into_report(false, deleted))
+}
+
+struct GcPlan {
+    unreachable_native_objects: Vec<String>,
+    protected_native_objects: Vec<String>,
+    deletable_native_objects: Vec<String>,
+    plan_digest: String,
+}
+
+impl GcPlan {
+    fn into_report(self, dry_run: bool, deleted: Vec<String>) -> GcDryRunReport {
+        GcDryRunReport {
+            dry_run,
+            unreachable_snapshots: Vec::new(),
+            unreachable_evidence: Vec::new(),
+            unreachable_native_objects: self.unreachable_native_objects,
+            protected_native_objects: self.protected_native_objects,
+            protection_window_days: GC_PROTECTION_WINDOW_DAYS,
+            plan_digest: self.plan_digest,
+            deleted,
+        }
+    }
+}
+
+fn gc_plan(cwd: &Path) -> Result<GcPlan> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
     let native_store = forge_content_native::NativeObjectStore::new(&context.root_path);
@@ -4704,66 +4977,149 @@ pub fn gc_dry_run(cwd: &Path) -> Result<GcDryRunReport> {
     // writes NO decision row, so its commit is reachable only through the op-log). Each is
     // walked as a DAG root (commit → ancestry → trees). Best-effort: a dangling root is
     // surfaced by `doctor`, not fatal to this dry-run report. No-op for git-backend repos.
-    let mut roots: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    if let Some(tip) = native_tip(&context, &connection)? {
-        roots.insert(tip.to_string());
+    let roots = ledger_commit_roots(&context, &connection)?;
+    if roots
+        .view_issues
+        .iter()
+        .any(|finding| finding.kind == LedgerViewFindingKind::CorruptStateJson)
+    {
+        return Err(anyhow!(
+            "gc cannot read a ledger view row (corrupt views.state_json); run `forge doctor`"
+        ));
     }
-    let mut decision_stmt = connection
-        .prepare("SELECT commit_id FROM decisions WHERE repo_id = ?1 AND commit_id IS NOT NULL")?;
-    for row in decision_stmt.query_map(params![context.repo_id], |row| row.get::<_, String>(0))? {
-        roots.insert(row?);
+    if roots
+        .view_issues
+        .iter()
+        .any(|finding| finding.kind == LedgerViewFindingKind::UnparseableCommitId)
+    {
+        return Err(anyhow!(
+            "gc found an unparseable reachability root in the ledger; run `forge doctor`"
+        ));
     }
-    let mut view_stmt = connection.prepare("SELECT state_json FROM views WHERE repo_id = ?1")?;
-    for row in view_stmt.query_map(params![context.repo_id], |row| row.get::<_, String>(0))? {
-        // NER-143 R6: FAIL CLOSED when a ledger row that DETERMINES a root cannot be read.
-        // A malformed `views.state_json` means we cannot know whether this op-log entry named
-        // a live commit (a `checkout` target is reachable ONLY through the op-log), so silently
-        // skipping it under-counts the root set — harmless for this dry-run report, but a live
-        // commit marked "unreachable" would be deleted once Phase 8 (NER-139) wires real
-        // mark-sweep deletion to this scan. Propagate instead. Path-free (S1): never interpolate
-        // the row. Contrast with a *dangling object* (a determined root/ref whose object is
-        // absent) below, which stays best-effort — that is `doctor`'s domain and the established
-        // gc-tolerance contract (`doctor_reports_corrupt_native_content_and_gc_reports_unreachable_objects`).
-        // Message is honest about the remedy: `doctor` does NOT currently parse every
-        // `views.state_json`, so it would not pinpoint this row — say "the ledger is damaged"
-        // rather than dead-end the user at `forge doctor` (code-review reliability finding).
-        let value: serde_json::Value = serde_json::from_str(&row?).map_err(|_| {
-            anyhow!("gc cannot read a ledger view row (corrupt views.state_json); the ledger is damaged")
-        })?;
-        if let Some(commit_id) = value.get("commit_id").and_then(|v| v.as_str()) {
-            roots.insert(commit_id.to_string());
-        }
-    }
-    for root in &roots {
-        // NER-143 R6: FAIL CLOSED on a corrupt root id string (the ledger names a root we cannot
-        // even parse → the root set is untrustworthy). This covers EVERY root source — the
-        // native_tip, the `decisions.commit_id` set (inserted raw above), and the view-derived
-        // ids — so an unparseable accepted-commit id also fails closed here, not only a corrupt
-        // view row. The reachability WALK from a parseable root stays best-effort: a
-        // determined-but-dangling object is a `doctor` finding, not a root-enumeration failure
-        // (mirrors the `verify_content_ref` snapshot loop above and the existing corrupt-content
-        // gc-tolerance contract). Path-free (S1): never interpolate `root`.
-        let id = forge_content_native::ObjectId::parse(root).map_err(|_| {
-            anyhow!(
-                "gc found an unparseable reachability root in the ledger; the ledger is damaged"
-            )
-        })?;
-        if let Ok(ids) = native_store.reachable_from(&id) {
+    for id in &roots.roots {
+        if let Ok(ids) = native_store.reachable_from(id) {
             reachable.extend(ids);
         }
     }
     let all = native_store.all_object_ids()?;
-    let unreachable_native_objects = all
-        .difference(&reachable)
-        .map(ToString::to_string)
-        .collect();
-    Ok(GcDryRunReport {
-        dry_run: true,
-        unreachable_snapshots: Vec::new(),
-        unreachable_evidence: Vec::new(),
+    let now = SystemTime::now();
+    let mut unreachable_native_objects = Vec::new();
+    let mut protected_native_objects = Vec::new();
+    let mut deletable_native_objects = Vec::new();
+    for id in all.difference(&reachable) {
+        let rendered = id.to_string();
+        unreachable_native_objects.push(rendered.clone());
+        let protected = native_store
+            .object_modified_time(id)
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_none_or(|age| age < GC_PROTECTION_WINDOW);
+        if protected {
+            protected_native_objects.push(rendered);
+        } else {
+            deletable_native_objects.push(rendered);
+        }
+    }
+    let plan_digest = gc_plan_digest(&deletable_native_objects, &protected_native_objects);
+    Ok(GcPlan {
         unreachable_native_objects,
-        deleted: Vec::new(),
+        protected_native_objects,
+        deletable_native_objects,
+        plan_digest,
     })
+}
+
+fn gc_plan_digest(
+    deletable_native_objects: &[String],
+    protected_native_objects: &[String],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"forge-gc-plan-v1\n");
+    hasher.update(format!(
+        "protection_window_days={GC_PROTECTION_WINDOW_DAYS}\n"
+    ));
+    for id in deletable_native_objects {
+        hasher.update(b"delete ");
+        hasher.update(id.as_bytes());
+        hasher.update(b"\n");
+    }
+    for id in protected_native_objects {
+        hasher.update(b"protect ");
+        hasher.update(id.as_bytes());
+        hasher.update(b"\n");
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+struct LedgerCommitRoots {
+    roots: std::collections::BTreeSet<forge_content_native::ObjectId>,
+    view_issues: Vec<LedgerViewFinding>,
+}
+
+fn ledger_commit_roots(
+    context: &RepositoryContext,
+    connection: &Connection,
+) -> Result<LedgerCommitRoots> {
+    let mut root_strings: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut view_issues = Vec::new();
+    if let Some(tip) = native_tip(context, connection)? {
+        root_strings.insert(tip.to_string());
+    }
+    let mut decision_stmt = connection
+        .prepare("SELECT commit_id FROM decisions WHERE repo_id = ?1 AND commit_id IS NOT NULL")?;
+    for row in decision_stmt.query_map(params![context.repo_id], |row| row.get::<_, String>(0))? {
+        root_strings.insert(row?);
+    }
+    let mut view_stmt = connection.prepare(
+        "SELECT id, operation_id, state_json
+         FROM views
+         WHERE repo_id = ?1
+         ORDER BY created_at_ms, rowid",
+    )?;
+    for row in view_stmt.query_map(params![context.repo_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (view_id, operation_id, state_json) = row?;
+        let value: Value = match serde_json::from_str(&state_json) {
+            Ok(value) => value,
+            Err(_) => {
+                view_issues.push(LedgerViewFinding {
+                    kind: LedgerViewFindingKind::CorruptStateJson,
+                    view_id,
+                    operation_id,
+                });
+                continue;
+            }
+        };
+        if let Some(commit_id) = value.get("commit_id").and_then(|value| value.as_str()) {
+            if forge_content_native::ObjectId::parse(commit_id).is_err() {
+                view_issues.push(LedgerViewFinding {
+                    kind: LedgerViewFindingKind::UnparseableCommitId,
+                    view_id,
+                    operation_id,
+                });
+                continue;
+            }
+            root_strings.insert(commit_id.to_string());
+        }
+    }
+    let mut roots = std::collections::BTreeSet::new();
+    for root in root_strings {
+        let id = forge_content_native::ObjectId::parse(&root).map_err(|_| {
+            anyhow!("gc found an unparseable reachability root in the ledger; run `forge doctor`")
+        })?;
+        roots.insert(id);
+    }
+    Ok(LedgerCommitRoots { roots, view_issues })
 }
 
 pub fn record_failed_operation(
@@ -4875,6 +5231,14 @@ fn resolve_attempt_in_context(
         return Ok(ResolvedAttempt { attempt });
     }
 
+    if let Some(workspace_attempt_id) = context.workspace_attempt_id.as_deref() {
+        if let Some(attempt) = attempt_by_id(context, workspace_attempt_id)? {
+            if attempt.status == "active" {
+                return Ok(ResolvedAttempt { attempt });
+            }
+        }
+    }
+
     if let Some(attached_attempt_id) = context.attached_attempt_id.as_deref() {
         if let Some(attempt) = attempt_by_id(context, attached_attempt_id)? {
             if attempt.status == "active" {
@@ -4948,9 +5312,11 @@ pub fn list_attempts(cwd: &Path) -> Result<Vec<AttemptSummary>> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
     let mut statement = connection.prepare(
-        "SELECT a.id, a.intent_id, i.text, a.base_head, a.status
+        "SELECT a.id, a.intent_id, i.text, a.base_head, a.status,
+                COALESCE(aw.workspace_rel_path, '.forge/worktrees/' || a.id)
          FROM attempts a
          JOIN intents i ON i.id = a.intent_id
+         LEFT JOIN attempt_workspaces aw ON aw.attempt_id = a.id AND aw.repo_id = a.repo_id
          WHERE a.repo_id = ?1
          ORDER BY a.created_at_ms ASC",
     )?;
@@ -4964,6 +5330,7 @@ pub fn list_attempts(cwd: &Path) -> Result<Vec<AttemptSummary>> {
             intent: row.get(2)?,
             base_head: row.get(3)?,
             status: row.get(4)?,
+            workspace_path: row.get(5)?,
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -5407,6 +5774,7 @@ pub fn show_attempt(cwd: &Path, attempt_id: &str) -> Result<AttemptShowRecord> {
             intent: attempt.intent.clone(),
             base_head: attempt.base_head.clone(),
             status: attempt.status.clone(),
+            workspace_path: attempt_workspace_rel_path(&context, &attempt.attempt_id)?,
         },
         latest_snapshot: latest_snapshot_for_attempt(&context, &attempt.attempt_id)?,
         latest_evidence: latest_evidence_for_attempt(&context, &attempt.attempt_id)?,
@@ -5452,7 +5820,7 @@ pub fn attach_attempt(
         // baseline atomically with the attach (code-review P1: without this, an attach-then-nav
         // spuriously fails DIRTY_WORKTREE because `expected` still points at the prior attempt's
         // tree). Same dedicated-UPDATE discipline as the other recorders (DR-F2).
-        set_expected_content_ref(tx, content_ref)?;
+        set_context_expected_content_ref(tx, &context, content_ref)?;
         Ok(op)
     })?;
     Ok(op)
@@ -6210,18 +6578,35 @@ fn read_init_repository(
 /// still anchors a *git-backed* repo on the git toplevel (Forge layers on an existing git
 /// repo); a *native* repo's root is established at init without git. Returns
 /// `NotInitialized` when no `.forge/forge.db` is found up the tree.
-fn forge_root(cwd: &Path) -> Result<PathBuf> {
+fn repository_location(cwd: &Path) -> Result<(PathBuf, PathBuf, Option<String>)> {
     let start = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let mut current: &Path = &start;
     loop {
         if current.join(".forge/forge.db").exists() {
-            return Ok(current.to_path_buf());
+            return Ok((current.to_path_buf(), current.to_path_buf(), None));
+        }
+        let marker_path = current.join(forge_content::WORKSPACE_MARKER_FILE);
+        if marker_path.exists() {
+            let marker: WorkspaceMarker = serde_json::from_slice(
+                &fs::read(&marker_path)
+                    .map_err(|error| anyhow!("read workspace marker: {}", error.kind()))?,
+            )
+            .map_err(|_| anyhow!("workspace marker is corrupt"))?;
+            let root = PathBuf::from(marker.repo_root);
+            if !root.join(".forge/forge.db").exists() {
+                return Err(ForgeError::NotInitialized.into());
+            }
+            return Ok((root, current.to_path_buf(), Some(marker.attempt_id)));
         }
         match current.parent() {
             Some(parent) => current = parent,
             None => return Err(ForgeError::NotInitialized.into()),
         }
     }
+}
+
+fn forge_root(cwd: &Path) -> Result<PathBuf> {
+    repository_location(cwd).map(|(root, _, _)| root)
 }
 
 fn git_root(cwd: &Path) -> Result<PathBuf> {
