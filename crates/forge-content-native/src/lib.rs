@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
 
+mod pack;
+
 const SCHEMA_VERSION: u32 = 1;
 const HUNK_LIMIT: usize = 4096;
 const BINARY_SCAN_LIMIT: usize = 8000;
@@ -480,29 +482,53 @@ impl NativeObjectStore {
 
     pub fn read_object(&self, id: &ObjectId) -> Result<Vec<u8>> {
         let path = self.object_path(id);
-        let bytes =
-            fs::read(&path).with_context(|| format!("missing native content object {}", id))?;
-        // Slice-3 headered object: the file IS the preimage, so `hash(file) == id` and its
-        // kind is a parsed header field. The hash check disambiguates from a legacy blob
-        // that merely starts with the magic (its hash will not match) — hash-resolved, not
-        // format-guessed. A header kind that disagrees with the id's kind is corruption.
-        if let Some((kind, payload)) = parse_object_preimage(&bytes) {
-            if hex_lower(&Sha256::digest(&bytes)) == id.digest {
-                if kind != id.kind()? {
-                    bail!("native object kind header mismatch for {}", id);
-                }
-                return Ok(payload.to_vec());
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return pack::read_packed_object(&self.root, id);
             }
-        }
-        // Legacy slice-1/2 raw-payload fallback: the id hashes the framed preimage of the
-        // raw bytes. Kept alive (prove-before-delete) so existing repos stay readable.
-        let actual = ObjectId::new(id.kind()?, &bytes);
-        if &actual != id {
-            bail!("hash mismatch for native content object {}", id);
-        }
-        Ok(bytes)
+            Err(error) => return Err(error).with_context(|| format!("read native object {}", id)),
+        };
+        parse_stored_object_bytes(id, &bytes)
     }
+}
 
+fn parse_stored_object_bytes(id: &ObjectId, bytes: &[u8]) -> Result<Vec<u8>> {
+    // Slice-3 headered object: the file IS the preimage, so `hash(file) == id` and its
+    // kind is a parsed header field. The hash check disambiguates from a legacy blob
+    // that merely starts with the magic (its hash will not match) — hash-resolved, not
+    // format-guessed. A header kind that disagrees with the id's kind is corruption.
+    if let Some((kind, payload)) = parse_object_preimage(bytes) {
+        if hex_lower(&Sha256::digest(bytes)) == id.digest {
+            if kind != id.kind()? {
+                bail!("native object kind header mismatch for {}", id);
+            }
+            return Ok(payload.to_vec());
+        }
+    }
+    // Legacy slice-1/2 raw-payload fallback: the id hashes the framed preimage of the
+    // raw bytes. Kept alive (prove-before-delete) so existing repos stay readable.
+    let actual = ObjectId::new(id.kind()?, bytes);
+    if &actual != id {
+        bail!("hash mismatch for native content object {}", id);
+    }
+    Ok(bytes.to_vec())
+}
+
+fn parse_headered_object_frame(id: &ObjectId, bytes: &[u8]) -> Result<Vec<u8>> {
+    let Some((kind, payload)) = parse_object_preimage(bytes) else {
+        bail!("malformed packed native object {}", id);
+    };
+    if hex_lower(&Sha256::digest(bytes)) != id.digest {
+        bail!("hash mismatch for packed native object {}", id);
+    }
+    if kind != id.kind()? {
+        bail!("packed native object kind header mismatch for {}", id);
+    }
+    Ok(payload.to_vec())
+}
+
+impl NativeObjectStore {
     pub(crate) fn tree_fingerprints(
         &self,
         root: &ObjectId,
@@ -580,45 +606,45 @@ impl NativeObjectStore {
     pub fn all_object_ids(&self) -> Result<BTreeSet<ObjectId>> {
         let mut ids = BTreeSet::new();
         let dir = self.root.join(".forge/objects/sha256");
-        if !dir.exists() {
-            return Ok(ids);
-        }
-        for prefix in fs::read_dir(dir)? {
-            let prefix = prefix?;
-            if !prefix.file_type()?.is_dir() {
-                continue;
-            }
-            for entry in fs::read_dir(prefix.path())? {
-                let entry = entry?;
-                if !entry.file_type()?.is_file() {
+        if dir.exists() {
+            for prefix in fs::read_dir(dir)? {
+                let prefix = prefix?;
+                if !prefix.file_type()?.is_dir() {
                     continue;
                 }
-                let digest = entry.file_name().to_string_lossy().into_owned();
-                let bytes = fs::read(entry.path())?;
-                // Slice-3 headered object: read its kind from the preimage header, verified
-                // by `hash(file) == digest` — a single hash, no multi-kind re-hash. This is
-                // the primary path that kills the triple-hash scan.
-                if let Some((kind, _payload)) = parse_object_preimage(&bytes) {
-                    if hex_lower(&Sha256::digest(&bytes)) == digest {
-                        ids.insert(ObjectId {
-                            kind: kind.as_str().to_string(),
-                            digest,
-                        });
+                for entry in fs::read_dir(prefix.path())? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file() {
                         continue;
                     }
-                }
-                // Legacy slice-1/2 raw-payload fallback (prove-before-delete; kept alive so a
-                // mixed store still enumerates fully): recover the kind by re-hashing the raw
-                // bytes under every kind and matching the digest — domain separation
-                // guarantees at most one match.
-                for kind in [ObjectKind::Blob, ObjectKind::Tree, ObjectKind::Commit] {
-                    let id = ObjectId::new(kind, &bytes);
-                    if id.digest == digest {
-                        ids.insert(id);
+                    let digest = entry.file_name().to_string_lossy().into_owned();
+                    let bytes = fs::read(entry.path())?;
+                    // Slice-3 headered object: read its kind from the preimage header, verified
+                    // by `hash(file) == digest` — a single hash, no multi-kind re-hash. This is
+                    // the primary path that kills the triple-hash scan.
+                    if let Some((kind, _payload)) = parse_object_preimage(&bytes) {
+                        if hex_lower(&Sha256::digest(&bytes)) == digest {
+                            ids.insert(ObjectId {
+                                kind: kind.as_str().to_string(),
+                                digest,
+                            });
+                            continue;
+                        }
+                    }
+                    // Legacy slice-1/2 raw-payload fallback (prove-before-delete; kept alive so a
+                    // mixed store still enumerates fully): recover the kind by re-hashing the raw
+                    // bytes under every kind and matching the digest — domain separation
+                    // guarantees at most one match.
+                    for kind in [ObjectKind::Blob, ObjectKind::Tree, ObjectKind::Commit] {
+                        let id = ObjectId::new(kind, &bytes);
+                        if id.digest == digest {
+                            ids.insert(id);
+                        }
                     }
                 }
             }
         }
+        ids.extend(pack::all_packed_object_ids(&self.root)?);
         Ok(ids)
     }
 
@@ -3788,6 +3814,340 @@ mod tests {
         fs::write(&tricky_path, &tricky_payload).unwrap();
         assert_eq!(store.read_object(&tricky_id).unwrap(), tricky_payload);
         assert!(store.all_object_ids().unwrap().contains(&tricky_id));
+    }
+
+    #[test]
+    fn packed_blob_tree_and_commit_objects_are_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let blob_payload = b"packed blob".to_vec();
+        let tree_payload = serde_json::to_vec(&TreeObject {
+            schema_version: SCHEMA_VERSION,
+            entries: Vec::new(),
+        })
+        .unwrap();
+        let commit_payload = serde_json::to_vec(&CommitObject {
+            schema_version: COMMIT_SCHEMA_VERSION,
+            tree: ObjectId::new(ObjectKind::Tree, &tree_payload).to_string(),
+            parents: Vec::new(),
+            intent_id: None,
+            proposal_revision_id: None,
+            decision_id: None,
+            evidence_digest: None,
+            actor: None,
+            authored_time: None,
+        })
+        .unwrap();
+        let blob = ObjectId::new(ObjectKind::Blob, &blob_payload);
+        let tree = ObjectId::new(ObjectKind::Tree, &tree_payload);
+        let commit = ObjectId::new(ObjectKind::Commit, &commit_payload);
+
+        pack::write_test_pack(
+            temp.path(),
+            "pack-read",
+            &[
+                (
+                    blob.clone(),
+                    object_preimage(ObjectKind::Blob, &blob_payload),
+                ),
+                (
+                    tree.clone(),
+                    object_preimage(ObjectKind::Tree, &tree_payload),
+                ),
+                (
+                    commit.clone(),
+                    object_preimage(ObjectKind::Commit, &commit_payload),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(store.read_object(&blob).unwrap(), blob_payload);
+        assert_eq!(store.read_object(&tree).unwrap(), tree_payload);
+        assert_eq!(store.read_object(&commit).unwrap(), commit_payload);
+        let ids = store.all_object_ids().unwrap();
+        assert!(ids.contains(&blob));
+        assert!(ids.contains(&tree));
+        assert!(ids.contains(&commit));
+    }
+
+    #[test]
+    fn corrupt_packed_bytes_fail_closed_without_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let payload = b"packed corrupt".to_vec();
+        let id = ObjectId::new(ObjectKind::Blob, &payload);
+        pack::write_test_pack(
+            temp.path(),
+            "pack-corrupt",
+            &[(id.clone(), object_preimage(ObjectKind::Blob, &payload))],
+        )
+        .unwrap();
+        let pack_path = pack::test_pack_data_path(temp.path(), "pack-corrupt");
+        let mut bytes = fs::read(&pack_path).unwrap();
+        bytes[0] ^= 0xff;
+        fs::write(&pack_path, bytes).unwrap();
+
+        let error = store.read_object(&id).unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains(pack_path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn packed_wrong_kind_frame_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let payload = b"wrong kind".to_vec();
+        let tree_frame = object_preimage(ObjectKind::Tree, &payload);
+        let id = ObjectId {
+            kind: "blob".to_string(),
+            digest: hex_lower(&Sha256::digest(&tree_frame)),
+        };
+        pack::write_test_pack(temp.path(), "pack-kind", &[(id.clone(), tree_frame)]).unwrap();
+
+        let error = store.read_object(&id).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("packed native object kind header mismatch"));
+    }
+
+    #[test]
+    fn all_object_ids_enumerates_loose_and_packed_deduped() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let loose = store
+            .write_object(ObjectKind::Blob, b"loose and packed")
+            .unwrap();
+        let packed_only_payload = b"packed only".to_vec();
+        let packed_only = ObjectId::new(ObjectKind::Blob, &packed_only_payload);
+        pack::write_test_pack(
+            temp.path(),
+            "pack-ids",
+            &[
+                (
+                    loose.clone(),
+                    object_preimage(ObjectKind::Blob, b"loose and packed"),
+                ),
+                (
+                    packed_only.clone(),
+                    object_preimage(ObjectKind::Blob, &packed_only_payload),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let ids = store.all_object_ids().unwrap();
+        assert!(ids.contains(&loose));
+        assert!(ids.contains(&packed_only));
+        assert_eq!(
+            ids.iter().filter(|candidate| *candidate == &loose).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn corrupt_loose_duplicate_does_not_fallback_to_valid_pack() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let payload = b"duplicate".to_vec();
+        let id = store.write_object(ObjectKind::Blob, &payload).unwrap();
+        pack::write_test_pack(
+            temp.path(),
+            "pack-duplicate",
+            &[(id.clone(), object_preimage(ObjectKind::Blob, &payload))],
+        )
+        .unwrap();
+        fs::write(store.object_path(&id), b"corrupt loose").unwrap();
+
+        let error = store.read_object(&id).unwrap_err();
+        assert!(error.to_string().contains("hash mismatch"));
+    }
+
+    #[test]
+    fn pack_index_rejects_pack_id_that_does_not_match_filename() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let payload = b"pack id mismatch".to_vec();
+        let id = ObjectId::new(ObjectKind::Blob, &payload);
+        let packs_dir = temp.path().join(".forge/packs");
+        fs::create_dir_all(&packs_dir).unwrap();
+        fs::write(packs_dir.join("safe.fpack"), b"not used").unwrap();
+        fs::write(
+            packs_dir.join("safe.fidx"),
+            serde_json::to_vec(&pack::PackIndex {
+                schema_version: 1,
+                pack_id: "../escape".to_string(),
+                entries: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = store.read_object(&id).unwrap_err();
+        assert!(error.to_string().contains("malformed native pack id"));
+    }
+
+    #[test]
+    fn pack_index_range_must_fit_pack_file_before_allocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let payload = b"range".to_vec();
+        let id = ObjectId::new(ObjectKind::Blob, &payload);
+        let packs_dir = temp.path().join(".forge/packs");
+        fs::create_dir_all(&packs_dir).unwrap();
+        fs::write(packs_dir.join("range.fpack"), b"x").unwrap();
+        fs::write(
+            packs_dir.join("range.fidx"),
+            serde_json::to_vec(&pack::PackIndex {
+                schema_version: 1,
+                pack_id: "range".to_string(),
+                entries: vec![pack::PackEntry {
+                    object_id: id.to_string(),
+                    offset: 0,
+                    framed_len: 1,
+                    compressed_len: 1024,
+                    checksum: "0".repeat(64),
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = store.read_object(&id).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("native pack index range exceeds pack length"));
+    }
+
+    #[test]
+    fn malformed_pack_indexes_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let id = ObjectId::new(ObjectKind::Blob, b"missing");
+        let packs_dir = temp.path().join(".forge/packs");
+        fs::create_dir_all(&packs_dir).unwrap();
+        fs::write(packs_dir.join("bad-json.fidx"), b"{ not json").unwrap();
+
+        let error = store.read_object(&id).unwrap_err();
+        assert!(!format!("{error:#}").contains(temp.path().to_string_lossy().as_ref()));
+
+        fs::remove_file(packs_dir.join("bad-json.fidx")).unwrap();
+        fs::write(
+            packs_dir.join("future.fidx"),
+            serde_json::json!({
+                "schema_version": 99,
+                "pack_id": "future",
+                "entries": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let error = store.read_object(&id).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported native pack index schema version"));
+
+        fs::remove_file(packs_dir.join("future.fidx")).unwrap();
+        fs::write(
+            packs_dir.join("invalid-id.fidx"),
+            serde_json::json!({
+                "schema_version": 1,
+                "pack_id": "invalid-id",
+                "entries": [{
+                    "object_id": "not-an-object-id",
+                    "offset": 0,
+                    "framed_len": 0,
+                    "compressed_len": 0,
+                    "checksum": "0".repeat(64)
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let error = store.all_object_ids().unwrap_err();
+        assert!(error.to_string().contains("malformed native object id"));
+    }
+
+    #[test]
+    fn packed_data_validation_covers_decompression_length_and_frame_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = NativeObjectStore::new(temp.path());
+        let payload = b"packed branches".to_vec();
+        let id = ObjectId::new(ObjectKind::Blob, &payload);
+        let packs_dir = temp.path().join(".forge/packs");
+        fs::create_dir_all(&packs_dir).unwrap();
+
+        let invalid_compressed = b"not a zstd frame".to_vec();
+        write_raw_test_pack(
+            &packs_dir,
+            "decode",
+            &id,
+            invalid_compressed.clone(),
+            payload.len() as u64,
+        );
+        let error = store.read_object(&id).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("decompress packed native object"));
+
+        fs::remove_file(packs_dir.join("decode.fpack")).unwrap();
+        fs::remove_file(packs_dir.join("decode.fidx")).unwrap();
+        let frame = object_preimage(ObjectKind::Blob, &payload);
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(&frame), 0).unwrap();
+        write_raw_test_pack(
+            &packs_dir,
+            "length",
+            &id,
+            compressed.clone(),
+            frame.len() as u64 + 1,
+        );
+        let error = store.read_object(&id).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("packed native object length mismatch"));
+
+        fs::remove_file(packs_dir.join("length.fpack")).unwrap();
+        fs::remove_file(packs_dir.join("length.fidx")).unwrap();
+        let malformed_frame =
+            zstd::stream::encode_all(std::io::Cursor::new(b"not framed"), 0).unwrap();
+        write_raw_test_pack(
+            &packs_dir,
+            "malformed",
+            &id,
+            malformed_frame,
+            b"not framed".len() as u64,
+        );
+        let error = store.read_object(&id).unwrap_err();
+        assert!(error.to_string().contains("malformed packed native object"));
+    }
+
+    fn write_raw_test_pack(
+        packs_dir: &Path,
+        pack_id: &str,
+        id: &ObjectId,
+        compressed: Vec<u8>,
+        framed_len: u64,
+    ) {
+        fs::write(packs_dir.join(format!("{pack_id}.fpack")), &compressed).unwrap();
+        fs::write(
+            packs_dir.join(format!("{pack_id}.fidx")),
+            serde_json::json!({
+                "schema_version": 1,
+                "pack_id": pack_id,
+                "entries": [{
+                    "object_id": id.to_string(),
+                    "offset": 0,
+                    "framed_len": framed_len,
+                    "compressed_len": compressed.len(),
+                    "checksum": hex_lower(&Sha256::digest(&compressed))
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
     }
 
     #[test]
