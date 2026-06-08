@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 mod pack;
+mod status_cache;
 
 const SCHEMA_VERSION: u32 = 1;
 const HUNK_LIMIT: usize = 4096;
@@ -91,14 +92,10 @@ pub fn diff_working_vs_tree(
     options: &DiffOptions,
 ) -> Result<TreeDiff> {
     let root = object_id_from_content_ref(tree_ref)?;
-    let (worktree, overlay) = working_fingerprints(repo_root)?;
-    diff_fingerprint_maps(
-        store,
-        store.tree_fingerprints(&root)?,
-        worktree,
-        &overlay,
-        options,
-    )
+    let old = store.tree_fingerprints(&root)?;
+    let (worktree, mut overlay) = status_cache::working_fingerprints(repo_root)?;
+    hydrate_working_overlay_for_diff(repo_root, &old, &worktree, &mut overlay)?;
+    diff_fingerprint_maps(store, old, worktree, &overlay, options)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1490,25 +1487,27 @@ fn scan_worktree(repo_root: &Path) -> Result<Vec<FileEntry>> {
     Ok(files)
 }
 
-fn working_fingerprints(repo_root: &Path) -> Result<(FingerprintMap, BlobOverlay)> {
-    let mut fingerprints = BTreeMap::new();
-    let mut overlay = BTreeMap::new();
-    for file in scan_worktree(repo_root)? {
-        if is_ignored_by_policy(&file.path) {
+fn hydrate_working_overlay_for_diff(
+    repo_root: &Path,
+    old_map: &FingerprintMap,
+    new_map: &FingerprintMap,
+    overlay: &mut BlobOverlay,
+) -> Result<()> {
+    for (path, new_fp) in new_map {
+        if old_map.get(path) == Some(new_fp) || overlay.contains_key(&new_fp.0) {
             continue;
         }
-        let (bytes, mode) = match file.symlink_target {
-            Some(target) => (target.into_bytes(), SYMLINK_MODE),
-            None => {
-                let bytes = fs::read(repo_root.join(&file.path))?;
-                (bytes, if file.executable { 0o100755 } else { 0o100644 })
-            }
+        let bytes = if new_fp.1 == SYMLINK_MODE {
+            fs::read_link(repo_root.join(path))?
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes()
+        } else {
+            fs::read(repo_root.join(path))?
         };
-        let id = ObjectId::new(ObjectKind::Blob, &bytes).to_string();
-        overlay.insert(id.clone(), bytes);
-        fingerprints.insert(file.path, (id, mode));
+        overlay.insert(new_fp.0.clone(), bytes);
     }
-    Ok((fingerprints, overlay))
+    Ok(())
 }
 
 /// Enumerate snapshot-candidate worktree paths natively, without the `git` binary
