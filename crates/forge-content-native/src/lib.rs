@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,7 @@ const BINARY_SCAN_LIMIT: usize = 8000;
 const DIFF_CONTEXT_LINES: usize = 3;
 const DEFAULT_RENAME_THRESHOLD: u8 = 50;
 const DEFAULT_RENAME_LIMIT: usize = 1000;
+const LARGE_BLOB_STREAM_THRESHOLD_BYTES: u64 = 1024 * 1024;
 
 /// The on-object `CommitObject::schema_version` value to stamp when building a commit in
 /// another crate (slice 3's `forge_store::decide`). Exposed so callers need not hard-code
@@ -203,15 +204,21 @@ pub struct ObjectId {
 /// the write/read/hash paths can never disagree.
 const OBJECT_MAGIC: &[u8] = b"forge-object\n";
 
-fn object_preimage(kind: ObjectKind, payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(OBJECT_MAGIC.len() + payload.len() + 24);
+fn object_preimage_header(kind: ObjectKind, payload_len: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(OBJECT_MAGIC.len() + 24);
     buf.extend_from_slice(OBJECT_MAGIC);
     buf.extend_from_slice(kind.as_str().as_bytes());
     buf.push(b'\n');
     buf.extend_from_slice(SCHEMA_VERSION.to_string().as_bytes());
     buf.push(b'\n');
-    buf.extend_from_slice(payload.len().to_string().as_bytes());
+    buf.extend_from_slice(payload_len.to_string().as_bytes());
     buf.push(b'\n');
+    buf
+}
+
+fn object_preimage(kind: ObjectKind, payload: &[u8]) -> Vec<u8> {
+    let mut buf = object_preimage_header(kind, payload.len());
+    buf.reserve(payload.len());
     buf.extend_from_slice(payload);
     buf
 }
@@ -480,6 +487,55 @@ impl NativeObjectStore {
         Ok(id)
     }
 
+    pub fn write_blob_from_path(&self, path: &Path) -> Result<ObjectId> {
+        let metadata = fs::metadata(path)?;
+        if metadata.len() < LARGE_BLOB_STREAM_THRESHOLD_BYTES {
+            return self.write_object(ObjectKind::Blob, &fs::read(path)?);
+        }
+
+        let payload_len = usize::try_from(metadata.len())
+            .map_err(|_| anyhow!("native blob is too large for this platform"))?;
+        let header = object_preimage_header(ObjectKind::Blob, payload_len);
+        fs::create_dir_all(self.tmp_dir())?;
+        let mut source = BufReader::new(File::open(path)?);
+        let mut temp = tempfile::NamedTempFile::new_in(self.tmp_dir())?;
+        let mut hasher = Sha256::new();
+        hasher.update(&header);
+        let copied = {
+            let mut writer = BufWriter::new(temp.as_file_mut());
+            writer.write_all(&header)?;
+            let copied = copy_hashing(&mut source, &mut writer, &mut hasher)?;
+            writer.flush()?;
+            copied
+        };
+        if copied != metadata.len() {
+            bail!("native blob changed while snapshotting");
+        }
+        temp.as_file_mut().sync_all()?;
+
+        let id = ObjectId {
+            kind: ObjectKind::Blob.as_str().to_string(),
+            digest: hex_lower(&hasher.finalize()),
+        };
+        let target = self.object_path(&id);
+        if target.exists() {
+            self.read_object(&id)?;
+            return Ok(id);
+        }
+
+        let parent = target.parent().context("object path has no parent")?;
+        let newly_created = missing_dirs(parent);
+        fs::create_dir_all(parent)?;
+        temp.persist(&target).map_err(|error| error.error)?;
+        sync_dir(parent)?;
+        for dir in &newly_created {
+            if let Some(grandparent) = dir.parent() {
+                sync_dir(grandparent)?;
+            }
+        }
+        Ok(id)
+    }
+
     pub fn read_object(&self, id: &ObjectId) -> Result<Vec<u8>> {
         let path = self.object_path(id);
         let bytes = match fs::read(&path) {
@@ -491,6 +547,126 @@ impl NativeObjectStore {
         };
         parse_stored_object_bytes(id, &bytes)
     }
+
+    pub fn write_object_payload_to<W: Write>(&self, id: &ObjectId, writer: &mut W) -> Result<()> {
+        let path = self.object_path(id);
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.len() >= LARGE_BLOB_STREAM_THRESHOLD_BYTES => {
+                return stream_loose_headered_payload_to_writer(id, &path, writer);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("read native object {}", id)),
+        }
+        writer.write_all(&self.read_object(id)?)?;
+        Ok(())
+    }
+}
+
+fn copy_hashing<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    hasher: &mut Sha256,
+) -> Result<u64> {
+    let mut copied = 0;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        writer.write_all(&buffer[..read])?;
+        copied += read as u64;
+    }
+    Ok(copied)
+}
+
+fn read_header_line<R: BufRead>(
+    reader: &mut R,
+    hasher: &mut Sha256,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let mut line = Vec::new();
+    let read = reader.read_until(b'\n', &mut line)?;
+    if read == 0 || line.last() != Some(&b'\n') {
+        bail!("malformed native object header: missing {label}");
+    }
+    hasher.update(&line);
+    line.pop();
+    Ok(line)
+}
+
+fn stream_loose_headered_payload_to_writer<W: Write>(
+    id: &ObjectId,
+    path: &Path,
+    writer: &mut W,
+) -> Result<()> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut magic = vec![0_u8; OBJECT_MAGIC.len()];
+    reader.read_exact(&mut magic)?;
+    if magic != OBJECT_MAGIC {
+        return stream_legacy_payload_to_writer(id, path, writer);
+    }
+    hasher.update(&magic);
+
+    let kind = read_header_line(&mut reader, &mut hasher, "kind")?;
+    if kind.as_slice() != id.kind.as_bytes() {
+        bail!("native object kind header mismatch for {}", id);
+    }
+    let schema = read_header_line(&mut reader, &mut hasher, "schema")?;
+    if schema.as_slice() != SCHEMA_VERSION.to_string().as_bytes() {
+        bail!("unsupported native object schema version");
+    }
+    let payload_len_line = read_header_line(&mut reader, &mut hasher, "payload length")?;
+    let payload_len: u64 = std::str::from_utf8(&payload_len_line)?
+        .parse()
+        .context("malformed native object payload length")?;
+
+    let mut remaining = payload_len;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let limit = remaining.min(buffer.len() as u64) as usize;
+        let read = reader.read(&mut buffer[..limit])?;
+        if read == 0 {
+            bail!("truncated native content object {}", id);
+        }
+        hasher.update(&buffer[..read]);
+        writer.write_all(&buffer[..read])?;
+        remaining -= read as u64;
+    }
+
+    let mut trailing = [0_u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        bail!("native content object has trailing bytes {}", id);
+    }
+    if hex_lower(&hasher.finalize()) != id.digest {
+        bail!("hash mismatch for native content object {}", id);
+    }
+    Ok(())
+}
+
+fn stream_legacy_payload_to_writer<W: Write>(
+    id: &ObjectId,
+    path: &Path,
+    writer: &mut W,
+) -> Result<()> {
+    let metadata = fs::metadata(path)?;
+    let payload_len = usize::try_from(metadata.len())
+        .map_err(|_| anyhow!("native blob is too large for this platform"))?;
+    let header = object_preimage_header(id.kind()?, payload_len);
+    let mut hasher = Sha256::new();
+    hasher.update(&header);
+    let mut reader = BufReader::new(File::open(path)?);
+    let copied = copy_hashing(&mut reader, writer, &mut hasher)?;
+    if copied != metadata.len() {
+        bail!("native object changed while restoring");
+    }
+    if hex_lower(&hasher.finalize()) != id.digest {
+        bail!("hash mismatch for native content object {}", id);
+    }
+    Ok(())
 }
 
 fn parse_stored_object_bytes(id: &ObjectId, bytes: &[u8]) -> Result<Vec<u8>> {
@@ -986,8 +1162,21 @@ fn write_tree(
         let (bytes, mode) = match &file.symlink_target {
             Some(target) => (target.clone().into_bytes(), SYMLINK_MODE),
             None => {
-                let bytes = fs::read(repo_root.join(&file.path))?;
-                (bytes, if file.executable { 0o100755 } else { 0o100644 })
+                let blob = store.write_blob_from_path(&repo_root.join(&file.path))?;
+                let mode = if file.executable { 0o100755 } else { 0o100644 };
+                let name = file
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&file.path)
+                    .to_string();
+                entries.push(TreeEntry {
+                    name,
+                    kind: TreeEntryKind::File,
+                    mode,
+                    object: blob.to_string(),
+                });
+                continue;
             }
         };
         let blob = store.write_object(ObjectKind::Blob, &bytes)?;
@@ -1059,9 +1248,9 @@ fn materialize_tree(
         ensure_child_kind(&entry, &child)?;
         match entry.kind {
             TreeEntryKind::File => {
-                let bytes = store.read_object(&child)?;
                 let full = repo_root.join(&rel);
                 if entry.mode == SYMLINK_MODE {
+                    let bytes = store.read_object(&child)?;
                     // A symlink entry: the blob is the link target bytes. On Unix, recreate a
                     // symlink (R15: reject an absolute / worktree-escaping target before
                     // creating it). On non-Unix, fall through and write the target bytes as a
@@ -1101,7 +1290,11 @@ fn materialize_tree(
                     .prefix(RESTORE_TEMP_PREFIX)
                     .tempfile_in(parent)
                     .map_err(|error| anyhow!("create restore temp file: {}", error.kind()))?;
-                temp.write_all(&bytes)?;
+                {
+                    let mut writer = BufWriter::new(temp.as_file_mut());
+                    store.write_object_payload_to(&child, &mut writer)?;
+                    writer.flush()?;
+                }
                 set_file_mode(temp.path(), entry.mode)?;
                 temp.as_file().sync_all()?;
                 temp.persist(&full)
