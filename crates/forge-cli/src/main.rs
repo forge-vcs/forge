@@ -284,6 +284,8 @@ enum SyncCommand {
     Export(SyncExportArgs),
     /// Inspect a previously exported sync manifest.
     Inspect(SyncInspectArgs),
+    /// Import a previously exported native sync bundle into this repository.
+    Import(SyncImportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -294,6 +296,11 @@ struct SyncExportArgs {
 
 #[derive(Debug, Args)]
 struct SyncInspectArgs {
+    path: std::path::PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct SyncImportArgs {
     path: std::path::PathBuf,
 }
 
@@ -1277,6 +1284,10 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
                 }
             }
         }
+        SyncCommand::Import(args) => command_result("sync import", request_id, |cwd, _| {
+            let report = forge_sync::import_manifest(&cwd, &args.path)?;
+            Ok((None, serde_json::to_value(report)?, Vec::new()))
+        }),
     }
 }
 
@@ -1929,6 +1940,7 @@ fn is_mutating_command(command: &str) -> bool {
             | "key status"
             | "key rotate"
             | "gc"
+            | "sync import"
     )
 }
 

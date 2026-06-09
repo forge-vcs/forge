@@ -1,6 +1,5 @@
-//! Phase 9 native sync MVP: export and inspect a versioned sync manifest that
-//! carries native object inventory plus ledger summary signals through the JSON
-//! envelope. Applying the bundle across remotes is a later Phase 9 slice.
+//! Phase 9 native sync MVP: export, inspect, and import a versioned sync bundle
+//! carrying native object payloads plus ledger rows through the JSON envelope.
 
 mod common;
 
@@ -77,11 +76,29 @@ fn sync_export_writes_a_versioned_native_manifest_and_inspect_reads_it() {
                     .unwrap()
                     .starts_with("f1:commit:")
         }));
+    assert!(manifest["native_payloads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|object| {
+            object["kind"] == "commit"
+                && object["object_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("f1:commit:")
+                && object["payload_hex"].as_str().unwrap().len() > 2
+        }));
     assert!(manifest["ledger_counts"]
         .as_array()
         .unwrap()
         .iter()
         .any(|count| count["table"] == "ledger_signatures" && count["rows"].as_i64().unwrap() > 0));
+    assert!(manifest["ledger_rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|table| table["table"] == "ledger_signatures"
+            && !table["rows"].as_array().unwrap().is_empty()));
 
     let inspected = json(
         repo.forge()
@@ -101,8 +118,16 @@ fn sync_export_writes_a_versioned_native_manifest_and_inspect_reads_it() {
         exported["data"]["native_object_count"]
     );
     assert_eq!(
+        inspected["data"]["native_payload_count"],
+        exported["data"]["native_payload_count"]
+    );
+    assert_eq!(
         inspected["data"]["ledger_table_count"],
         exported["data"]["ledger_table_count"]
+    );
+    assert_eq!(
+        inspected["data"]["ledger_row_count"],
+        exported["data"]["ledger_row_count"]
     );
     assert_eq!(
         inspected["data"]["native_head"],
@@ -111,5 +136,106 @@ fn sync_export_writes_a_versioned_native_manifest_and_inspect_reads_it() {
     assert_eq!(
         inspected["data"]["local_key_fingerprint"],
         exported["data"]["local_key_fingerprint"]
+    );
+}
+
+#[test]
+fn sync_import_applies_native_bundle_into_fresh_native_repo() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source.path().join("target/forge-sync-bundle.json");
+
+    let exported = json(
+        source
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "export",
+                "--output",
+                bundle_path.to_str().expect("utf8 bundle path"),
+            ])
+            .assert()
+            .success(),
+    );
+
+    let target = TestRepo::new_git();
+    target
+        .forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+
+    let imported = json(
+        target
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "import",
+                bundle_path.to_str().expect("utf8 bundle path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(imported["data"]["protocol_version"], "forge-sync.v1");
+    assert_eq!(imported["data"]["content_backend"], "native");
+    assert_eq!(
+        imported["data"]["native_head"],
+        exported["data"]["native_head"]
+    );
+    assert_eq!(
+        imported["data"]["imported_native_objects"],
+        exported["data"]["native_payload_count"]
+    );
+    assert_eq!(
+        imported["data"]["local_key_fingerprint"],
+        exported["data"]["local_key_fingerprint"]
+    );
+
+    target.forge().args(["--json", "doctor"]).assert().success();
+
+    let reexport_path = target.path().join("target/reexported-sync-bundle.json");
+    let reexported = json(
+        target
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "export",
+                "--output",
+                reexport_path.to_str().expect("utf8 reexport path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        reexported["data"]["native_head"],
+        exported["data"]["native_head"]
+    );
+    assert_eq!(
+        reexported["data"]["native_object_count"],
+        exported["data"]["native_object_count"]
+    );
+    assert_eq!(
+        reexported["data"]["local_key_fingerprint"],
+        exported["data"]["local_key_fingerprint"]
+    );
+
+    let imported_again = json(
+        target
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "import",
+                bundle_path.to_str().expect("utf8 bundle path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        imported_again["data"]["native_head"],
+        exported["data"]["native_head"]
     );
 }
