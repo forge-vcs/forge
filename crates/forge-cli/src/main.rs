@@ -53,8 +53,12 @@ enum Command {
     Undo,
     /// Inspect or update local trust policy gates.
     Trust(TrustArgs),
+    /// Inspect or rotate the local Ed25519 signing key.
+    Key(KeyArgs),
     Doctor,
     Gc(GcArgs),
+    /// Export or inspect a Forge-native sync protocol bundle manifest.
+    Sync(SyncArgs),
     Export(ExportArgs),
     /// Emit the versioned machine contract (schema_version, command + error registry).
     Schema,
@@ -268,6 +272,31 @@ struct ExportArgs {
     command: ExportCommand,
 }
 
+#[derive(Debug, Args)]
+struct SyncArgs {
+    #[command(subcommand)]
+    command: SyncCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncCommand {
+    /// Export a versioned v1 sync manifest for this repository.
+    Export(SyncExportArgs),
+    /// Inspect a previously exported sync manifest.
+    Inspect(SyncInspectArgs),
+}
+
+#[derive(Debug, Args)]
+struct SyncExportArgs {
+    #[arg(long)]
+    output: std::path::PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct SyncInspectArgs {
+    path: std::path::PathBuf,
+}
+
 #[derive(Debug, Subcommand)]
 enum ExportCommand {
     Branch(ExportBranchArgs),
@@ -298,6 +327,20 @@ struct ExportBranchArgs {
 struct TrustArgs {
     #[command(subcommand)]
     command: TrustCommand,
+}
+
+#[derive(Debug, Args)]
+struct KeyArgs {
+    #[command(subcommand)]
+    command: KeyCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum KeyCommand {
+    /// Show the current local signing key fingerprint.
+    Status,
+    /// Rotate the current local signing key, preserving old public keys in signatures.
+    Rotate,
 }
 
 #[derive(Debug, Subcommand)]
@@ -360,6 +403,7 @@ fn main() -> ExitCode {
         Command::Checkout(args) => checkout_response(request_id, args),
         Command::Undo => undo_response(request_id),
         Command::Trust(args) => trust_response(request_id, args),
+        Command::Key(args) => key_response(request_id, args),
         Command::Doctor => doctor_response(request_id),
         Command::Gc(args) if !args.dry_run && (!args.yes || args.plan_digest.is_none()) => {
             structured_error(
@@ -371,6 +415,7 @@ fn main() -> ExitCode {
             )
         }
         Command::Gc(args) => gc_response(request_id, args),
+        Command::Sync(args) => sync_response(request_id, args),
         Command::Export(args) => export_response(request_id, args),
         Command::Schema => schema_response(request_id),
     };
@@ -1185,6 +1230,19 @@ fn trust_response(request_id: Option<String>, args: TrustArgs) -> ResponseEnvelo
     }
 }
 
+fn key_response(request_id: Option<String>, args: KeyArgs) -> ResponseEnvelope {
+    match args.command {
+        KeyCommand::Status => command_result("key status", request_id, |cwd, _| {
+            let status = forge_store::local_key_status(&cwd)?;
+            Ok((None, serde_json::to_value(status)?, Vec::new()))
+        }),
+        KeyCommand::Rotate => command_result("key rotate", request_id, |cwd, _| {
+            let rotation = forge_store::rotate_local_key(&cwd)?;
+            Ok((None, serde_json::to_value(rotation)?, Vec::new()))
+        }),
+    }
+}
+
 fn gc_response(request_id: Option<String>, args: GcArgs) -> ResponseEnvelope {
     command_result("gc", request_id, |cwd, _request_id| {
         let report = if args.dry_run {
@@ -1194,6 +1252,32 @@ fn gc_response(request_id: Option<String>, args: GcArgs) -> ResponseEnvelope {
         };
         Ok((None, serde_json::to_value(report)?, Vec::new()))
     })
+}
+
+fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope {
+    match args.command {
+        SyncCommand::Export(args) => command_result("sync export", request_id, |cwd, _| {
+            let report = forge_sync::export_manifest(&cwd, &args.output)?;
+            Ok((None, serde_json::to_value(report)?, Vec::new()))
+        }),
+        SyncCommand::Inspect(args) => {
+            let result = forge_sync::inspect_manifest(&args.path)
+                .and_then(|report| Ok(serde_json::to_value(report)?));
+            match result {
+                Ok(data) => ResponseEnvelope::success("sync inspect", request_id, None, data),
+                Err(error) => {
+                    let (error_object, retry) = error_to_object("sync inspect", &error);
+                    ResponseEnvelope::error_with(
+                        "sync inspect",
+                        request_id,
+                        None,
+                        error_object,
+                        retry,
+                    )
+                }
+            }
+        }
+    }
 }
 
 fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnvelope {
@@ -1842,6 +1926,8 @@ fn is_mutating_command(command: &str) -> bool {
             | "checkout"
             | "undo"
             | "trust policy"
+            | "key status"
+            | "key rotate"
             | "gc"
     )
 }

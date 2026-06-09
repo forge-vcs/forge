@@ -244,6 +244,27 @@ pub struct TrustPolicy {
     pub supported_trust_levels: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalKeyStatus {
+    pub key_fingerprint: String,
+    pub public_key: String,
+    pub key_path: String,
+    pub exists_before_command: bool,
+    pub signature_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalKeyRotation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_key_backup_path: Option<String>,
+    pub key_fingerprint: String,
+    pub public_key: String,
+    pub key_path: String,
+    pub signature_count: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustPolicyAction {
     Accept,
@@ -808,6 +829,45 @@ pub fn set_trust_policy(
         )?;
         trust_policy_on(tx)
     })
+}
+
+pub fn local_key_status(cwd: &Path) -> Result<LocalKeyStatus> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let key = signing::local_key_status(&context.root_path)?;
+    Ok(LocalKeyStatus {
+        signature_count: signature_count_for_fingerprint(&connection, &key.key_fingerprint)?,
+        key_fingerprint: key.key_fingerprint,
+        public_key: key.public_key,
+        key_path: key.key_path,
+        exists_before_command: key.exists_before_command,
+    })
+}
+
+pub fn rotate_local_key(cwd: &Path) -> Result<LocalKeyRotation> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let rotation = signing::rotate_local_key(&context.root_path)?;
+    Ok(LocalKeyRotation {
+        previous_fingerprint: rotation.previous_fingerprint,
+        previous_key_backup_path: rotation.previous_key_backup_path,
+        signature_count: signature_count_for_fingerprint(
+            &connection,
+            &rotation.new_key.key_fingerprint,
+        )?,
+        key_fingerprint: rotation.new_key.key_fingerprint,
+        public_key: rotation.new_key.public_key,
+        key_path: rotation.new_key.key_path,
+    })
+}
+
+fn signature_count_for_fingerprint(conn: &Connection, key_fingerprint: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM ledger_signatures WHERE key_fingerprint = ?1",
+        params![key_fingerprint],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 fn trust_policy_on(conn: &Connection) -> Result<TrustPolicy> {
