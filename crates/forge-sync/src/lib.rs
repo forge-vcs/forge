@@ -536,15 +536,11 @@ fn update_current_state(connection: &Connection, manifest: &SyncManifest) -> Res
         "UPDATE current_state
          SET current_operation_id = ?1,
              current_view_id = ?2,
-             attached_attempt_id = ?3,
-             expected_content_ref = ?4,
-             updated_at_ms = ?5
+             updated_at_ms = ?3
          WHERE singleton = 1",
         params![
             manifest.current_operation_id,
             manifest.current_view_id,
-            manifest.attached_attempt_id,
-            manifest.expected_content_ref,
             now_ms(),
         ],
     )?;

@@ -2033,6 +2033,47 @@ pub fn record_checkout(
     Ok(op)
 }
 
+/// Record a `forge sync import --materialize` worktree update. The bundle import first
+/// applies the remote native objects and ledger, then the CLI restores the imported HEAD's
+/// tree into the worktree. This local op records that materialization without conflating it
+/// with user-driven history navigation (`checkout`).
+pub fn record_sync_import_materialized(
+    cwd: &Path,
+    request_id: Option<String>,
+    commit_id: &str,
+    content_ref: &str,
+) -> Result<OperationViewResult> {
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    let op = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let op = insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "sync import".to_string(),
+                kind: "sync_import_materialized".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({
+                    "lifecycle": "sync_import_materialized",
+                    "commit_id": commit_id,
+                    "content_ref": content_ref
+                }),
+            },
+        )?;
+        tx.execute(
+            "UPDATE current_state
+             SET attached_attempt_id = NULL, expected_content_ref = ?1
+             WHERE singleton = 1",
+            params![content_ref],
+        )?;
+        Ok(op)
+    })?;
+    Ok(op)
+}
+
 /// What a `forge undo` will restore (NER-138 Phase 7 slice 3 / NER-143 R3+R4).
 ///
 /// **Semantics (deliberate v0 cut):** undo reverses the **last save of the attached attempt** by
