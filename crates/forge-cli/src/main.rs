@@ -11,8 +11,10 @@ use forge_protocol::{
 use forge_store::ForgeError;
 use serde_json::{json, Value};
 use std::env;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
 #[command(name = "forge", version, about = "Local agent change-control loop")]
@@ -290,6 +292,12 @@ enum SyncCommand {
     Import(SyncImportArgs),
     /// Clone a native sync bundle into an empty directory and materialize its HEAD.
     Clone(SyncCloneArgs),
+    /// Fetch a fast-forward native delta from another local Forge repository.
+    Fetch(SyncPeerArgs),
+    /// Fetch and materialize a fast-forward native delta from another local Forge repository.
+    Pull(SyncPeerArgs),
+    /// Push a fast-forward native delta into another local Forge repository.
+    Push(SyncPeerArgs),
 }
 
 #[derive(Debug, Args)]
@@ -317,6 +325,11 @@ struct SyncImportArgs {
 #[derive(Debug, Args)]
 struct SyncCloneArgs {
     path: std::path::PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct SyncPeerArgs {
+    remote: std::path::PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1404,6 +1417,185 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
                 }
             }
         }
+        SyncCommand::Fetch(args) => command_result("sync fetch", request_id, |cwd, request_id| {
+            sync_fetch_peer(&cwd, request_id, &args.remote, false)
+        }),
+        SyncCommand::Pull(args) => command_result("sync pull", request_id, |cwd, request_id| {
+            ensure_clean_for_sync_import_materialize(&cwd).context("preflight sync pull")?;
+            sync_fetch_peer(&cwd, request_id, &args.remote, true)
+        }),
+        SyncCommand::Push(args) => command_result("sync push", request_id, |cwd, _| {
+            sync_push_peer(&cwd, &args.remote)
+        }),
+    }
+}
+
+fn sync_fetch_peer(
+    cwd: &Path,
+    request_id: Option<String>,
+    remote: &Path,
+    materialize: bool,
+) -> Result<(Option<String>, Value, Vec<String>)> {
+    let (local_manifest, remote_manifest, _remote_lock) = peer_manifests(cwd, remote)?;
+    ensure_peer_fast_forward(&remote_manifest, &local_manifest, "fetch")?;
+
+    let temp = SyncTransferDir::new(cwd)?;
+    let local_base_path = temp.path().join("local-base.json");
+    write_sync_manifest(&local_base_path, &local_manifest)?;
+    let incoming_path = temp.path().join("incoming.json");
+    let export_report =
+        forge_sync::export_manifest_since(remote, &incoming_path, Some(&local_base_path))
+            .context("export remote sync delta")?;
+    let import_report =
+        forge_sync::import_manifest(cwd, &incoming_path).context("apply remote sync delta")?;
+
+    let mut operation_id = None;
+    let mut materialized_content_ref = None;
+    let mut materialized_operation_id = None;
+    let mut materialized_view_id = None;
+    if materialize {
+        let commit_id = import_report
+            .native_head
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("sync peer has no native head to materialize"))?;
+        let content_ref = forge_store::checkout_target_content_ref(cwd, commit_id)
+            .context("resolve fetched native head")?;
+        restore_effective_worktree(cwd, &content_ref).context("restore fetched native head")?;
+        let record =
+            forge_store::record_sync_import_materialized(cwd, request_id, commit_id, &content_ref)
+                .context("record sync pull materialization")?;
+        operation_id = Some(record.operation_id.clone());
+        materialized_operation_id = Some(record.operation_id);
+        materialized_view_id = Some(record.view_id);
+        materialized_content_ref = Some(content_ref);
+    }
+
+    let data = json!({
+        "protocol_version": import_report.protocol_version,
+        "direction": if materialize { "pull" } else { "fetch" },
+        "remote_path": remote.display().to_string(),
+        "base_native_head": local_manifest.native_head,
+        "remote_native_head": remote_manifest.native_head,
+        "exported_native_objects": export_report.native_object_count,
+        "exported_native_payloads": export_report.native_payload_count,
+        "exported_ledger_rows": export_report.ledger_row_count,
+        "imported_native_objects": import_report.imported_native_objects,
+        "imported_ledger_rows": import_report.imported_ledger_rows,
+        "local_key_fingerprint": import_report.local_key_fingerprint,
+        "materialized": materialize,
+        "materialized_content_ref": materialized_content_ref,
+        "materialized_operation_id": materialized_operation_id,
+        "materialized_view_id": materialized_view_id,
+    });
+    Ok((operation_id, data, Vec::new()))
+}
+
+fn sync_push_peer(cwd: &Path, remote: &Path) -> Result<(Option<String>, Value, Vec<String>)> {
+    let (local_manifest, remote_manifest, _remote_lock) = peer_manifests(cwd, remote)?;
+    ensure_peer_fast_forward(&local_manifest, &remote_manifest, "push")?;
+
+    let temp = SyncTransferDir::new(cwd)?;
+    let remote_base_path = temp.path().join("remote-base.json");
+    write_sync_manifest(&remote_base_path, &remote_manifest)?;
+    let outgoing_path = temp.path().join("outgoing.json");
+    let export_report =
+        forge_sync::export_manifest_since(cwd, &outgoing_path, Some(&remote_base_path))
+            .context("export local sync delta")?;
+    let import_report =
+        forge_sync::import_manifest(remote, &outgoing_path).context("apply local sync delta")?;
+
+    let data = json!({
+        "protocol_version": import_report.protocol_version,
+        "direction": "push",
+        "remote_path": remote.display().to_string(),
+        "base_native_head": remote_manifest.native_head,
+        "local_native_head": local_manifest.native_head,
+        "exported_native_objects": export_report.native_object_count,
+        "exported_native_payloads": export_report.native_payload_count,
+        "exported_ledger_rows": export_report.ledger_row_count,
+        "imported_native_objects": import_report.imported_native_objects,
+        "imported_ledger_rows": import_report.imported_ledger_rows,
+        "local_key_fingerprint": import_report.local_key_fingerprint,
+        "materialized": false,
+    });
+    Ok((None, data, Vec::new()))
+}
+
+fn peer_manifests(
+    cwd: &Path,
+    remote: &Path,
+) -> Result<(
+    forge_sync::SyncManifest,
+    forge_sync::SyncManifest,
+    forge_store::RepoLock,
+)> {
+    let local_context = forge_store::open_repository(cwd)?;
+    let remote_context = forge_store::open_repository(remote)?;
+    if local_context.root_path == remote_context.root_path {
+        anyhow::bail!("sync peer remote must be a different repository");
+    }
+    let remote_lock = forge_store::acquire_repository_lock(remote)?;
+    forge_store::reconcile_native_head(remote)?;
+    let local_manifest = forge_sync::build_manifest(cwd)?;
+    let remote_manifest = forge_sync::build_manifest(remote)?;
+    Ok((local_manifest, remote_manifest, remote_lock))
+}
+
+fn ensure_peer_fast_forward(
+    source: &forge_sync::SyncManifest,
+    receiver: &forge_sync::SyncManifest,
+    action: &str,
+) -> Result<()> {
+    if source.content_backend != "native" || receiver.content_backend != "native" {
+        anyhow::bail!("sync {action} requires native content repositories");
+    }
+    if source.repo_id != receiver.repo_id {
+        anyhow::bail!(
+            "sync {action} requires matching repo ids (source {}, receiver {})",
+            source.repo_id,
+            receiver.repo_id
+        );
+    }
+    if !forge_sync::manifest_head_descends_from(source, receiver.native_head.as_deref())? {
+        anyhow::bail!(
+            "sync {action} refused non-fast-forward native history (source head {:?}, receiver head {:?})",
+            source.native_head,
+            receiver.native_head
+        );
+    }
+    Ok(())
+}
+
+fn write_sync_manifest(path: &Path, manifest: &forge_sync::SyncManifest) -> Result<()> {
+    fs::write(path, serde_json::to_vec_pretty(manifest)?)?;
+    Ok(())
+}
+
+struct SyncTransferDir {
+    path: PathBuf,
+}
+
+impl SyncTransferDir {
+    fn new(cwd: &Path) -> Result<Self> {
+        let context = forge_store::open_repository(cwd)?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = context
+            .root_path
+            .join(".forge")
+            .join("tmp")
+            .join(format!("sync-peer-{}-{now}", std::process::id()));
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SyncTransferDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -2058,6 +2250,9 @@ fn is_mutating_command(command: &str) -> bool {
             | "gc"
             | "sync import"
             | "sync clone"
+            | "sync fetch"
+            | "sync pull"
+            | "sync push"
     )
 }
 

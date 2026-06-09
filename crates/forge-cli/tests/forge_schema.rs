@@ -220,6 +220,9 @@ fn commands_list_the_lifecycle() {
         "key rotate",
         "sync export",
         "sync inspect",
+        "sync fetch",
+        "sync pull",
+        "sync push",
         "export branch",
         "schema",
     ] {
