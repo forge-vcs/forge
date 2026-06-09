@@ -3,6 +3,7 @@ use forge_content_native::{NativeObjectStore, NativeRefStore, ObjectId, ObjectKi
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -61,6 +62,9 @@ pub struct SyncExportReport {
     pub protocol_version: String,
     pub output_path: String,
     pub content_backend: String,
+    pub incremental: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_path: Option<String>,
     pub native_object_count: usize,
     pub native_payload_count: usize,
     pub ledger_table_count: usize,
@@ -156,7 +160,20 @@ pub fn build_manifest(cwd: &Path) -> Result<SyncManifest> {
 }
 
 pub fn export_manifest(cwd: &Path, output_path: &Path) -> Result<SyncExportReport> {
-    let manifest = build_manifest(cwd)?;
+    export_manifest_since(cwd, output_path, None)
+}
+
+pub fn export_manifest_since(
+    cwd: &Path,
+    output_path: &Path,
+    since_path: Option<&Path>,
+) -> Result<SyncExportReport> {
+    let mut manifest = build_manifest(cwd)?;
+    let since_path_text = since_path.map(|path| path.display().to_string());
+    if let Some(path) = since_path {
+        let base = read_supported_manifest(path)?;
+        prune_manifest_since(&mut manifest, &base)?;
+    }
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -166,6 +183,8 @@ pub fn export_manifest(cwd: &Path, output_path: &Path) -> Result<SyncExportRepor
         protocol_version: manifest.protocol_version,
         output_path: output_path.display().to_string(),
         content_backend: manifest.content_backend,
+        incremental: since_path.is_some(),
+        since_path: since_path_text,
         native_object_count: manifest.native_objects.len(),
         native_payload_count: manifest.native_payloads.len(),
         ledger_table_count: manifest.ledger_counts.len(),
@@ -177,6 +196,75 @@ pub fn export_manifest(cwd: &Path, output_path: &Path) -> Result<SyncExportRepor
         native_head: manifest.native_head,
         local_key_fingerprint: manifest.local_key_fingerprint,
     })
+}
+
+fn prune_manifest_since(manifest: &mut SyncManifest, base: &SyncManifest) -> Result<()> {
+    if manifest.content_backend != base.content_backend {
+        bail!(
+            "sync incremental export requires matching content backends (source {}, base {})",
+            manifest.content_backend,
+            base.content_backend
+        );
+    }
+    if manifest.repo_id != base.repo_id {
+        bail!(
+            "sync incremental export requires matching repo ids (source {}, base {})",
+            manifest.repo_id,
+            base.repo_id
+        );
+    }
+
+    let base_objects: HashSet<&str> = base
+        .native_objects
+        .iter()
+        .map(|object| object.object_id.as_str())
+        .collect();
+    manifest
+        .native_objects
+        .retain(|object| !base_objects.contains(object.object_id.as_str()));
+    manifest
+        .native_payloads
+        .retain(|payload| !base_objects.contains(payload.object_id.as_str()));
+
+    for table in &mut manifest.ledger_rows {
+        let Some(base_table) = base
+            .ledger_rows
+            .iter()
+            .find(|base_table| base_table.table == table.table)
+        else {
+            continue;
+        };
+        let base_rows: HashSet<String> = base_table
+            .rows
+            .iter()
+            .map(|row| ledger_row_identity(&table.table, row))
+            .collect::<Result<_>>()?;
+        let mut retained = Vec::new();
+        for row in table.rows.drain(..) {
+            let identity = ledger_row_identity(&table.table, &row)?;
+            if !base_rows.contains(&identity) {
+                retained.push(row);
+            }
+        }
+        table.rows = retained;
+    }
+    Ok(())
+}
+
+fn ledger_row_identity(
+    table: &str,
+    row: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String> {
+    let column = if table == "attempt_workspaces" {
+        "attempt_id"
+    } else {
+        "id"
+    };
+    let value = row
+        .get(column)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("sync ledger row missing identity {table}.{column}"))?;
+    Ok(format!("{table}:{column}:{value}"))
 }
 
 pub fn inspect_manifest(path: &Path) -> Result<SyncInspectReport> {
