@@ -2197,6 +2197,43 @@ pub fn record_sync_import_materialized(
     Ok(op)
 }
 
+/// Claim a local request-id for a local peer sync command.
+///
+/// Some sync outcomes are natural no-ops or apply their primary side effect in
+/// a peer repo. The CLI's idempotency preflight still runs in the initiating
+/// repo, so this marker keeps the initiator's request-id namespace honest
+/// without pretending the command materialized local content.
+pub fn record_sync_request_marker(
+    cwd: &Path,
+    request_id: Option<String>,
+    command: &str,
+    direction: &str,
+    remote_path: &Path,
+    remote_operation_id: Option<&str>,
+) -> Result<OperationViewResult> {
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: command.to_string(),
+                kind: format!("sync_{direction}"),
+                view_kind: ViewKind::Initialized,
+                state: json!({
+                    "lifecycle": format!("sync_{direction}"),
+                    "remote_path": remote_path.display().to_string(),
+                    "remote_operation_id": remote_operation_id,
+                }),
+            },
+        )
+    })
+}
+
 pub fn set_sync_clone_expected_content_ref(cwd: &Path, content_ref: &str) -> Result<()> {
     let context = open_repository(cwd)?;
     let mut connection = open_connection(&context.database_path)?;
@@ -3789,6 +3826,25 @@ pub fn record_merge_conflict(
     command: &str,
     input: &MergeConflictInput,
 ) -> Result<MergeConflictRecord> {
+    record_merge_conflict_inner(cwd, request_id, command, input, false)
+}
+
+pub fn record_sync_merge_conflict(
+    cwd: &Path,
+    request_id: Option<String>,
+    command: &str,
+    input: &MergeConflictInput,
+) -> Result<MergeConflictRecord> {
+    record_merge_conflict_inner(cwd, request_id, command, input, true)
+}
+
+fn record_merge_conflict_inner(
+    cwd: &Path,
+    request_id: Option<String>,
+    command: &str,
+    input: &MergeConflictInput,
+    dedup_unrequested_sync_conflict: bool,
+) -> Result<MergeConflictRecord> {
     let context = open_repository(cwd)?;
     let mut connection = open_connection(&context.database_path)?;
     let operation_id = OperationId::new().to_string();
@@ -3797,6 +3853,11 @@ pub fn record_merge_conflict(
     let now = now_ms();
     with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        if request_id.is_none() && dedup_unrequested_sync_conflict {
+            if let Some(existing) = existing_native_merge_conflict(tx, &context.repo_id, input)? {
+                return Ok(existing);
+            }
+        }
         let prepared_conflict =
             prepare_merge_conflict(&context, &operation_id, &conflict_set_id, now, input)?;
         let parent_hash = op_content_hash(tx, Some(&context.current_operation_id))?;
@@ -3852,13 +3913,49 @@ pub fn record_merge_conflict(
             return Err(anyhow!("current operation changed"));
         }
         insert_prepared_conflict(tx, &context, &operation_id, &prepared_conflict)?;
-        Ok(())
-    })?;
-    Ok(MergeConflictRecord {
-        conflict_set_id,
-        operation_id,
-        view_id,
+        Ok(MergeConflictRecord {
+            conflict_set_id: conflict_set_id.clone(),
+            operation_id: operation_id.clone(),
+            view_id: view_id.clone(),
+        })
     })
+}
+
+fn existing_native_merge_conflict(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    input: &MergeConflictInput,
+) -> Result<Option<MergeConflictRecord>> {
+    tx.query_row(
+        "SELECT cs.id, cs.generated_by_operation_id, o.resulting_view_id
+         FROM conflict_sets cs
+         JOIN operations o ON o.id = cs.generated_by_operation_id
+         WHERE cs.repo_id = ?1
+           AND cs.context = ?2
+           AND cs.base_content_ref = ?3
+           AND cs.ours_content_ref = ?4
+           AND cs.theirs_content_ref = ?5
+           AND cs.resolver_backend = 'native_merge'
+           AND cs.status IN ('unresolved', 'partially_resolved', 'resolved')
+         ORDER BY cs.created_at_ms DESC, cs.rowid DESC
+         LIMIT 1",
+        params![
+            repo_id,
+            input.context,
+            input.base_content_ref,
+            input.ours_content_ref,
+            input.theirs_content_ref
+        ],
+        |row| {
+            Ok(MergeConflictRecord {
+                conflict_set_id: row.get(0)?,
+                operation_id: row.get(1)?,
+                view_id: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 pub fn record_merge_success(
@@ -5814,7 +5911,16 @@ fn gc_plan(cwd: &Path) -> Result<GcPlan> {
     let mut statement = connection.prepare(
         "SELECT content_ref FROM snapshots
          UNION
-         SELECT content_ref FROM proposal_revisions",
+         SELECT content_ref FROM proposal_revisions
+         UNION
+         SELECT base_content_ref AS content_ref FROM conflict_sets
+          WHERE resolver_backend = 'native_merge' AND base_content_ref IS NOT NULL
+         UNION
+         SELECT ours_content_ref AS content_ref FROM conflict_sets
+          WHERE resolver_backend = 'native_merge' AND ours_content_ref IS NOT NULL
+         UNION
+         SELECT theirs_content_ref AS content_ref FROM conflict_sets
+          WHERE resolver_backend = 'native_merge' AND theirs_content_ref IS NOT NULL",
     )?;
     let refs = statement.query_map([], |row| row.get::<_, String>(0))?;
     for content_ref in refs {

@@ -3,7 +3,7 @@ use forge_content_native::{NativeObjectStore, NativeRefStore, ObjectId, ObjectKi
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -318,6 +318,16 @@ pub fn import_manifest(cwd: &Path, path: &Path) -> Result<SyncImportReport> {
     })
 }
 
+pub fn import_native_objects(cwd: &Path, manifest: &SyncManifest) -> Result<usize> {
+    let context = forge_store::open_repository(cwd)?;
+    if context.content_backend != "native" {
+        bail!("sync object import requires a native content repository");
+    }
+    let store = NativeObjectStore::new(&context.root_path);
+    write_manifest_objects(&store, manifest)?;
+    Ok(manifest.native_payloads.len())
+}
+
 pub fn clone_manifest(cwd: &Path, path: &Path) -> Result<SyncCloneReport> {
     let manifest = read_supported_manifest(path)?;
     if manifest.native_head.is_none() {
@@ -394,22 +404,133 @@ pub fn manifest_head_content_ref(manifest: &SyncManifest) -> Result<Option<Strin
     let Some(head) = manifest.native_head.as_deref() else {
         return Ok(None);
     };
+    Ok(Some(manifest_commit_content_ref(manifest, head)?))
+}
+
+pub fn manifest_commit_content_ref(manifest: &SyncManifest, commit_id: &str) -> Result<String> {
     for payload in &manifest.native_payloads {
-        if payload.object_id != head {
+        if payload.object_id != commit_id {
             continue;
         }
         if payload.kind != "commit" {
-            bail!("sync native head does not name a commit payload");
+            bail!("sync native commit id does not name a commit payload");
         }
         let bytes = hex_decode(&payload.payload_hex)?;
         let commit: forge_content_native::CommitObject = serde_json::from_slice(&bytes)?;
-        return Ok(Some(format!(
+        return Ok(format!(
             "{}{}",
             forge_content::FORGE_TREE_PREFIX,
             commit.tree
-        )));
+        ));
     }
-    bail!("sync manifest is missing native head payload {head}");
+    bail!("sync manifest is missing native commit payload {commit_id}");
+}
+
+pub fn manifest_common_ancestor_head(
+    left: &SyncManifest,
+    right: &SyncManifest,
+) -> Result<Option<String>> {
+    let Some(left_head) = left.native_head.as_deref() else {
+        return Ok(None);
+    };
+    let Some(right_head) = right.native_head.as_deref() else {
+        return Ok(None);
+    };
+    let commits = manifest_commits([left, right])?;
+    let left_ancestors = ancestor_depths(left_head, &commits)?;
+    let right_ancestors = ancestor_depths(right_head, &commits)?;
+    let common = left_ancestors
+        .keys()
+        .copied()
+        .filter(|commit_id| right_ancestors.contains_key(commit_id))
+        .collect::<Vec<_>>();
+    let mut lowest = Vec::new();
+    for candidate in common.iter().copied() {
+        let mut dominated = false;
+        for other in common.iter().copied() {
+            if other != candidate && is_ancestor(candidate, other, &commits)? {
+                dominated = true;
+                break;
+            }
+        }
+        if !dominated {
+            lowest.push(candidate);
+        }
+    }
+    lowest.sort_by(|left_id, right_id| {
+        let left_distance = left_ancestors[*left_id] + right_ancestors[*left_id];
+        let right_distance = left_ancestors[*right_id] + right_ancestors[*right_id];
+        left_distance
+            .cmp(&right_distance)
+            .then_with(|| right_ancestors[*left_id].cmp(&right_ancestors[*right_id]))
+            .then_with(|| left_id.cmp(right_id))
+    });
+    Ok(lowest.first().map(|commit_id| (*commit_id).to_string()))
+}
+
+fn manifest_commits<'a, I>(
+    manifests: I,
+) -> Result<HashMap<&'a str, forge_content_native::CommitObject>>
+where
+    I: IntoIterator<Item = &'a SyncManifest>,
+{
+    let mut commits = HashMap::new();
+    for manifest in manifests {
+        for payload in &manifest.native_payloads {
+            if payload.kind != "commit" {
+                continue;
+            }
+            let bytes = hex_decode(&payload.payload_hex)?;
+            let commit: forge_content_native::CommitObject = serde_json::from_slice(&bytes)?;
+            commits.insert(payload.object_id.as_str(), commit);
+        }
+    }
+    Ok(commits)
+}
+
+fn ancestor_depths<'a>(
+    head: &'a str,
+    commits: &'a HashMap<&'a str, forge_content_native::CommitObject>,
+) -> Result<HashMap<&'a str, usize>> {
+    let mut depths = HashMap::new();
+    let mut queue = VecDeque::from([(head, 0usize)]);
+    while let Some((commit_id, depth)) = queue.pop_front() {
+        if depths.contains_key(commit_id) {
+            continue;
+        }
+        depths.insert(commit_id, depth);
+        let Some(commit) = commits.get(commit_id) else {
+            bail!("sync manifest is missing native commit payload {commit_id}");
+        };
+        for parent in &commit.parents {
+            queue.push_back((parent.as_str(), depth + 1));
+        }
+    }
+    Ok(depths)
+}
+
+fn is_ancestor(
+    ancestor: &str,
+    descendant: &str,
+    commits: &HashMap<&str, forge_content_native::CommitObject>,
+) -> Result<bool> {
+    let mut queue = VecDeque::from([descendant]);
+    let mut seen = HashSet::new();
+    while let Some(commit_id) = queue.pop_front() {
+        if commit_id == ancestor {
+            return Ok(true);
+        }
+        if !seen.insert(commit_id) {
+            continue;
+        }
+        let Some(commit) = commits.get(commit_id) else {
+            bail!("sync manifest is missing native commit payload {commit_id}");
+        };
+        for parent in &commit.parents {
+            queue.push_back(parent.as_str());
+        }
+    }
+    Ok(false)
 }
 
 fn read_supported_manifest(path: &Path) -> Result<SyncManifest> {
@@ -995,6 +1116,45 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    fn test_manifest(head: &str, commits: &[(&str, &[&str])]) -> SyncManifest {
+        SyncManifest {
+            protocol_version: SYNC_PROTOCOL_VERSION.to_string(),
+            cli_schema_version: forge_protocol::SCHEMA_VERSION.to_string(),
+            repo_id: "repo_test".to_string(),
+            content_backend: "native".to_string(),
+            current_operation_id: "op_test".to_string(),
+            current_view_id: "view_test".to_string(),
+            attached_attempt_id: None,
+            expected_content_ref: None,
+            native_head: Some(head.to_string()),
+            native_objects: Vec::new(),
+            native_payloads: commits
+                .iter()
+                .map(|(id, parents)| {
+                    let commit = forge_content_native::CommitObject {
+                        schema_version: forge_content_native::COMMIT_SCHEMA_VERSION,
+                        tree: format!("tree_{id}"),
+                        parents: parents.iter().map(|parent| (*parent).to_string()).collect(),
+                        intent_id: None,
+                        proposal_revision_id: None,
+                        decision_id: None,
+                        evidence_digest: None,
+                        actor: None,
+                        authored_time: None,
+                    };
+                    SyncObjectPayload {
+                        object_id: (*id).to_string(),
+                        kind: "commit".to_string(),
+                        payload_hex: hex_encode(&serde_json::to_vec(&commit).unwrap()),
+                    }
+                })
+                .collect(),
+            ledger_counts: Vec::new(),
+            ledger_rows: Vec::new(),
+            local_key_fingerprint: None,
+        }
+    }
+
     #[test]
     fn inspect_rejects_non_manifest_json() {
         let temp = tempfile::tempdir().unwrap();
@@ -1032,5 +1192,49 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported sync protocol version"));
+    }
+
+    #[test]
+    fn common_ancestor_prefers_lowest_ancestor_over_distance_tie() {
+        let left = test_manifest("L", &[("G", &[]), ("P", &["G"]), ("L", &["G", "P"])]);
+        let right = test_manifest("R", &[("G", &[]), ("P", &["G"]), ("R", &["G", "P"])]);
+
+        let base = manifest_common_ancestor_head(&left, &right).unwrap();
+
+        assert_eq!(base.as_deref(), Some("P"));
+    }
+
+    #[test]
+    fn common_ancestor_returns_none_when_native_head_is_absent() {
+        let mut left = test_manifest("L", &[("L", &[])]);
+        let right = test_manifest("R", &[("R", &[])]);
+
+        left.native_head = None;
+        assert_eq!(
+            manifest_common_ancestor_head(&left, &right)
+                .unwrap()
+                .as_deref(),
+            None
+        );
+
+        left.native_head = Some("L".to_string());
+        let mut right_without_head = right;
+        right_without_head.native_head = None;
+        assert_eq!(
+            manifest_common_ancestor_head(&left, &right_without_head)
+                .unwrap()
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn common_ancestor_returns_none_for_disjoint_histories() {
+        let left = test_manifest("L", &[("A", &[]), ("L", &["A"])]);
+        let right = test_manifest("R", &[("B", &[]), ("R", &["B"])]);
+
+        let base = manifest_common_ancestor_head(&left, &right).unwrap();
+
+        assert_eq!(base.as_deref(), None);
     }
 }
