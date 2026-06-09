@@ -47,6 +47,9 @@ const LOCAL_SIGNATURES_011: &str = include_str!("../migrations/011_local_signatu
 const TRUST_POLICY_012: &str = include_str!("../migrations/012_trust_policy.sql");
 /// The 013 signing-key-origin migration (Phase 9 remote key trust).
 const SIGNING_KEY_ORIGINS_013: &str = include_str!("../migrations/013_signing_key_origins.sql");
+/// The 014 sync-merge signature subject migration.
+const SYNC_MERGE_SIGNATURE_SUBJECT_014: &str =
+    include_str!("../migrations/014_sync_merge_signature_subject.sql");
 
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
@@ -142,6 +145,12 @@ fn apply_through_012(conn: &Connection) {
         .expect("apply 012 trust-policy");
 }
 
+fn apply_through_013(conn: &Connection) {
+    apply_through_012(conn);
+    conn.execute_batch(SIGNING_KEY_ORIGINS_013)
+        .expect("apply 013 signing-key-origins");
+}
+
 fn max_version(conn: &Connection) -> i64 {
     conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -190,6 +199,186 @@ fn signing_key_origin_backfill_labels_existing_signature_keys_as_peer() {
     assert_eq!(
         trust_origin, "peer",
         "migration must fail closed for pre-existing signature rows"
+    );
+}
+
+#[test]
+fn sync_merge_signature_subject_migration_preserves_existing_signature_rows() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .expect("enable fks");
+    apply_through_013(&conn);
+    conn.execute(
+        "INSERT INTO repositories (id, root_path, git_head, content_backend, created_at_ms)
+         VALUES ('repo_test', '/tmp/forge-test', NULL, 'native', 0)",
+        [],
+    )
+    .expect("insert repository");
+    for (id, subject_kind, subject_id, signed_digest, created_at_ms) in [
+        (
+            "sig_evidence",
+            "evidence",
+            "evidence_existing",
+            "digest_evidence",
+            40,
+        ),
+        (
+            "sig_decision",
+            "decision",
+            "decision_existing",
+            "digest_decision",
+            41,
+        ),
+        (
+            "sig_existing",
+            "commit",
+            "commit_existing",
+            "digest_existing",
+            42,
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO ledger_signatures (
+            id, repo_id, subject_kind, subject_id, signed_digest, signature_alg,
+            public_key, key_fingerprint, signature, trust_level, created_at_ms
+         ) VALUES (?1, 'repo_test', ?2, ?3, ?4, 'ed25519', 'public_key_existing',
+                   'fingerprint_existing', 'signature_existing', 'locally_signed', ?5)",
+            rusqlite::params![id, subject_kind, subject_id, signed_digest, created_at_ms],
+        )
+        .expect("insert pre-existing signature");
+    }
+
+    conn.execute_batch(SYNC_MERGE_SIGNATURE_SUBJECT_014)
+        .expect("apply 014 sync-merge signature subject");
+
+    let preserved: Vec<(String, String, String, String, i64)> = conn
+        .prepare(
+            "SELECT id, subject_kind, subject_id, signed_digest, created_at_ms
+             FROM ledger_signatures ORDER BY created_at_ms",
+        )
+        .expect("prepare preserved signatures")
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .expect("query preserved signatures")
+        .collect::<rusqlite::Result<_>>()
+        .expect("collect preserved signatures");
+    assert_eq!(
+        preserved,
+        vec![
+            (
+                "sig_evidence".to_string(),
+                "evidence".to_string(),
+                "evidence_existing".to_string(),
+                "digest_evidence".to_string(),
+                40,
+            ),
+            (
+                "sig_decision".to_string(),
+                "decision".to_string(),
+                "decision_existing".to_string(),
+                "digest_decision".to_string(),
+                41,
+            ),
+            (
+                "sig_existing".to_string(),
+                "commit".to_string(),
+                "commit_existing".to_string(),
+                "digest_existing".to_string(),
+                42,
+            ),
+        ]
+    );
+
+    conn.execute(
+        "INSERT INTO ledger_signatures (
+            id, repo_id, subject_kind, subject_id, signed_digest, signature_alg,
+            public_key, key_fingerprint, signature, trust_level, created_at_ms
+         ) VALUES (
+            'sig_sync_merge', 'repo_test', 'sync_merge_commit', 'commit_merge', 'digest_merge',
+            'ed25519', 'public_key_existing', 'fingerprint_existing', 'signature_merge',
+            'locally_signed', 43
+         )",
+        [],
+    )
+    .expect("new sync_merge_commit subject kind is accepted");
+    let rejected = conn.execute(
+        "INSERT INTO ledger_signatures (
+            id, repo_id, subject_kind, subject_id, signed_digest, signature_alg,
+            public_key, key_fingerprint, signature, trust_level, created_at_ms
+         ) VALUES (
+            'sig_bogus', 'repo_test', 'bogus', 'commit_bogus', 'digest_bogus',
+            'ed25519', 'public_key_existing', 'fingerprint_existing', 'signature_bogus',
+            'locally_signed', 44
+         )",
+        [],
+    );
+    assert!(
+        rejected.is_err(),
+        "014 must preserve the subject_kind CHECK constraint"
+    );
+    let duplicate = conn.execute(
+        "INSERT INTO ledger_signatures (
+            id, repo_id, subject_kind, subject_id, signed_digest, signature_alg,
+            public_key, key_fingerprint, signature, trust_level, created_at_ms
+         ) VALUES (
+            'sig_duplicate', 'repo_test', 'sync_merge_commit', 'commit_merge', 'digest_merge',
+            'ed25519', 'public_key_existing', 'fingerprint_existing', 'signature_duplicate',
+            'locally_signed', 45
+         )",
+        [],
+    );
+    assert!(
+        duplicate.is_err(),
+        "014 must preserve the ledger signature uniqueness constraint"
+    );
+    let orphan_repo = conn.execute(
+        "INSERT INTO ledger_signatures (
+            id, repo_id, subject_kind, subject_id, signed_digest, signature_alg,
+            public_key, key_fingerprint, signature, trust_level, created_at_ms
+         ) VALUES (
+            'sig_orphan', 'missing_repo', 'sync_merge_commit', 'commit_orphan', 'digest_orphan',
+            'ed25519', 'public_key_existing', 'fingerprint_existing', 'signature_orphan',
+            'locally_signed', 46
+         )",
+        [],
+    );
+    assert!(
+        orphan_repo.is_err(),
+        "014 must preserve the repository foreign key"
+    );
+    let bad_trust = conn.execute(
+        "INSERT INTO ledger_signatures (
+            id, repo_id, subject_kind, subject_id, signed_digest, signature_alg,
+            public_key, key_fingerprint, signature, trust_level, created_at_ms
+         ) VALUES (
+            'sig_bad_trust', 'repo_test', 'sync_merge_commit', 'commit_bad_trust', 'digest_bad_trust',
+            'ed25519', 'public_key_existing', 'fingerprint_existing', 'signature_bad_trust',
+            'peer_signed', 47
+         )",
+        [],
+    );
+    assert!(
+        bad_trust.is_err(),
+        "014 must preserve the trust_level CHECK constraint"
+    );
+    let index_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_ledger_signatures_subject'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query ledger signature index");
+    assert_eq!(
+        index_count, 1,
+        "014 must recreate the ledger signature subject index"
     );
 }
 
@@ -254,7 +443,7 @@ fn behind_db_upgrades_to_head() {
         has_column(&conn, "attempt_workspaces", "workspace_rel_path"),
         "009 created attempt_workspaces"
     );
-    assert_eq!(max_version(&conn), 13, "reached HEAD=13");
+    assert_eq!(max_version(&conn), 14, "reached HEAD=14");
 }
 
 #[test]
@@ -285,6 +474,8 @@ fn at_head_db_is_a_noop() {
             .expect("apply 012 trust-policy");
         conn.execute_batch(SIGNING_KEY_ORIGINS_013)
             .expect("apply 013 signing-key-origins");
+        conn.execute_batch(SYNC_MERGE_SIGNATURE_SUBJECT_014)
+            .expect("apply 014 sync-merge signature subject");
         stamp_versions(
             &conn,
             &[
@@ -301,15 +492,16 @@ fn at_head_db_is_a_noop() {
                 (11, "011_local_signatures"),
                 (12, "012_trust_policy"),
                 (13, "013_signing_key_origins"),
+                (14, "014_sync_merge_signature_subject"),
             ],
         );
-        assert_eq!(max_version(&conn), 13);
+        assert_eq!(max_version(&conn), 14);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 13, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 14, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -340,7 +532,9 @@ fn head_plus_one_is_refused() {
             .expect("apply 012 trust-policy");
         conn.execute_batch(SIGNING_KEY_ORIGINS_013)
             .expect("apply 013 signing-key-origins");
-        // HEAD is now 13, so the genuinely-ahead stamp is 14.
+        conn.execute_batch(SYNC_MERGE_SIGNATURE_SUBJECT_014)
+            .expect("apply 014 sync-merge signature subject");
+        // HEAD is now 14, so the genuinely-ahead stamp is 15.
         stamp_versions(
             &conn,
             &[
@@ -357,10 +551,11 @@ fn head_plus_one_is_refused() {
                 (11, "011_local_signatures"),
                 (12, "012_trust_policy"),
                 (13, "013_signing_key_origins"),
-                (14, "future"),
+                (14, "014_sync_merge_signature_subject"),
+                (15, "future"),
             ],
         );
-        assert_eq!(max_version(&conn), 14);
+        assert_eq!(max_version(&conn), 15);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -369,8 +564,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 14);
-            assert_eq!(*supported_head, 13);
+            assert_eq!(*db_version, 15);
+            assert_eq!(*supported_head, 14);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }

@@ -16,6 +16,11 @@ const TRUST_LEVEL: &str = "locally_signed";
 type SignedSubject = (String, String, String);
 type ValidSignatureSet = BTreeSet<SignedSubject>;
 
+struct ExpectedSignedSubjects {
+    any_verifiable: Vec<SignedSubject>,
+    local_only: Vec<SignedSubject>,
+}
+
 pub(crate) struct LocalSigner {
     key_pair: Ed25519KeyPair,
     public_key: String,
@@ -41,7 +46,7 @@ impl LocalSigner {
             .map_err(|_| anyhow!("parse local Ed25519 signing key"))?;
         let public_key_bytes = key_pair.public_key().as_ref();
         let public_key = hex_lower(public_key_bytes);
-        let key_fingerprint = key_fingerprint(public_key_bytes);
+        let key_fingerprint = key_fingerprint_for_public_key(public_key_bytes);
         Ok(Self {
             key_pair,
             public_key,
@@ -169,7 +174,7 @@ pub(crate) fn rotate_local_key(repo_root: &Path) -> Result<RotatedLocalKey> {
     let public_key_bytes = key_pair.public_key().as_ref();
     let new_key = LocalKeyInfo {
         public_key: hex_lower(public_key_bytes),
-        key_fingerprint: key_fingerprint(public_key_bytes),
+        key_fingerprint: key_fingerprint_for_public_key(public_key_bytes),
         key_path: SIGNING_KEY_PATH.to_string(),
         exists_before_command: true,
     };
@@ -188,10 +193,15 @@ pub(crate) fn rotate_local_key(repo_root: &Path) -> Result<RotatedLocalKey> {
 pub(crate) fn verify_signatures(conn: &Connection) -> Result<Vec<SignatureFinding>> {
     let state = verified_signature_state(conn)?;
     let mut findings = state.findings;
+    let expected = expected_signed_subjects(conn)?;
 
     findings.extend(missing_signature_findings(
         &state.valid_any,
-        expected_signed_subjects(conn)?,
+        expected.any_verifiable,
+    ));
+    findings.extend(missing_signature_findings(
+        &state.valid_local,
+        expected.local_only,
     ));
 
     Ok(findings)
@@ -317,7 +327,9 @@ fn verified_signature_state(conn: &Connection) -> Result<VerifiedSignatureState>
             COALESCE(sk.trust_origin = 'local', 0)
          FROM ledger_signatures ls
          LEFT JOIN signing_keys sk
-            ON sk.repo_id = ls.repo_id AND sk.key_fingerprint = ls.key_fingerprint
+            ON sk.repo_id = ls.repo_id
+           AND sk.key_fingerprint = ls.key_fingerprint
+           AND sk.public_key = ls.public_key
          ORDER BY ls.rowid",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -381,6 +393,16 @@ fn verified_signature_state(conn: &Connection) -> Result<VerifiedSignatureState>
                     }
                 };
                 let message = signing_message(&subject_kind, &subject_id, &signed_digest);
+                let recomputed_fingerprint = key_fingerprint_for_public_key(&public_key_bytes);
+                if recomputed_fingerprint != key_fingerprint {
+                    findings.push(finding(
+                        SignatureFindingKind::MalformedSignature,
+                        &subject_kind,
+                        &subject_id,
+                        Some(&key_fingerprint),
+                    ));
+                    continue;
+                }
                 if UnparsedPublicKey::new(&ED25519, public_key_bytes)
                     .verify(&message, &signature_bytes)
                     .is_ok()
@@ -503,9 +525,10 @@ fn missing_signature_findings(
     findings
 }
 
-fn expected_signed_subjects(conn: &Connection) -> Result<Vec<SignedSubject>> {
+fn expected_signed_subjects(conn: &Connection) -> Result<ExpectedSignedSubjects> {
     let marker = signature_marker(conn)?;
-    let mut subjects = Vec::new();
+    let mut any_verifiable = Vec::new();
+    let local_only = Vec::new();
 
     let mut evidence = conn.prepare(
         "SELECT id, content_hash FROM evidence
@@ -516,7 +539,7 @@ fn expected_signed_subjects(conn: &Connection) -> Result<Vec<SignedSubject>> {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })? {
         let (id, digest) = row?;
-        subjects.push(("evidence".to_string(), id, digest));
+        any_verifiable.push(("evidence".to_string(), id, digest));
     }
 
     let mut decisions = conn.prepare(
@@ -532,13 +555,35 @@ fn expected_signed_subjects(conn: &Connection) -> Result<Vec<SignedSubject>> {
         ))
     })? {
         let (id, digest, commit_id) = row?;
-        subjects.push(("decision".to_string(), id, digest));
+        any_verifiable.push(("decision".to_string(), id, digest));
         if let Some(commit_id) = commit_id {
-            subjects.push(("commit".to_string(), commit_id.clone(), commit_id));
+            any_verifiable.push(("commit".to_string(), commit_id.clone(), commit_id));
         }
     }
 
-    Ok(subjects)
+    let query = format!(
+        "SELECT json_extract(v.state_json, '$.commit_id')
+           FROM operations o
+           JOIN views v ON v.id = o.resulting_view_id
+          WHERE o.kind IN ({})
+            AND json_extract(v.state_json, '$.commit_id') IS NOT NULL
+          ORDER BY o.rowid",
+        crate::SYNC_MERGED_OP_KIND_SQL_IN
+    );
+    let mut sync_merges = conn.prepare(&query)?;
+    for row in sync_merges.query_map([], |row| row.get::<_, String>(0))? {
+        let commit_id = row?;
+        any_verifiable.push((
+            "sync_merge_commit".to_string(),
+            commit_id.clone(),
+            commit_id,
+        ));
+    }
+
+    Ok(ExpectedSignedSubjects {
+        any_verifiable,
+        local_only,
+    })
 }
 
 fn current_subject_digest(
@@ -572,6 +617,22 @@ fn current_subject_digest(
                     params![subject_id],
                     |_| Ok(()),
                 )
+                .optional()?
+                .is_some();
+            Ok(exists.then(|| subject_id.to_string()))
+        }
+        "sync_merge_commit" => {
+            let query = format!(
+                "SELECT 1
+                       FROM operations o
+                       JOIN views v ON v.id = o.resulting_view_id
+                      WHERE o.kind IN ({})
+                        AND json_extract(v.state_json, '$.commit_id') = ?1
+                     LIMIT 1",
+                crate::SYNC_MERGED_OP_KIND_SQL_IN
+            );
+            let exists = conn
+                .query_row(&query, params![subject_id], |_| Ok(()))
                 .optional()?
                 .is_some();
             Ok(exists.then(|| subject_id.to_string()))
@@ -621,7 +682,7 @@ fn finding(
     }
 }
 
-fn key_fingerprint(public_key: &[u8]) -> String {
+pub(crate) fn key_fingerprint_for_public_key(public_key: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"forge-ed25519-public-key-v1\n");
     hasher.update(public_key);

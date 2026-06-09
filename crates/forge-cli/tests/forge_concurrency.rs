@@ -506,9 +506,9 @@ fn concurrent_commands_against_behind_db_both_upgrade_and_succeed() {
     let version_rows = count(
         &connection,
         "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
-        "13",
+        "14",
     );
-    assert_eq!(version_rows, 1, "exactly one version-13 row after the race");
+    assert_eq!(version_rows, 1, "exactly one version-14 row after the race");
     let head: i64 = connection
         .query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -516,7 +516,7 @@ fn concurrent_commands_against_behind_db_both_upgrade_and_succeed() {
             |row| row.get(0),
         )
         .expect("max version");
-    assert_eq!(head, 13, "schema reached HEAD after the concurrent upgrade");
+    assert_eq!(head, 14, "schema reached HEAD after the concurrent upgrade");
     // The upgrade actually applied: 002's columns are present.
     let has_backend: i64 = connection
         .query_row(

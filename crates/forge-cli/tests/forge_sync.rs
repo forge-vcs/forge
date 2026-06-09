@@ -4,7 +4,7 @@
 mod common;
 
 use common::{forge_in, TestRepo};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde_json::Value;
 
 fn json(assert: assert_cmd::assert::Assert) -> Value {
@@ -131,6 +131,25 @@ fn checkout_current_native_head(repo_path: &std::path::Path, file_name: &str) ->
     exported
 }
 
+fn expected_content_ref_for_test(repo_path: &std::path::Path) -> Option<String> {
+    let conn = Connection::open(repo_path.join(".forge/forge.db")).expect("open forge db");
+    conn.query_row(
+        "SELECT expected_content_ref FROM current_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )
+    .expect("current state row")
+}
+
+fn set_expected_content_ref_for_test(repo_path: &std::path::Path, content_ref: &str) {
+    let conn = Connection::open(repo_path.join(".forge/forge.db")).expect("open forge db");
+    conn.execute(
+        "UPDATE current_state SET expected_content_ref = ?1 WHERE singleton = 1",
+        params![content_ref],
+    )
+    .expect("set expected content ref");
+}
+
 fn cloned_peer_from_bundle(bundle_path: &std::path::Path) -> tempfile::TempDir {
     let peer_dir = tempfile::tempdir().expect("peer dir");
     forge_in(peer_dir.path())
@@ -249,12 +268,6 @@ fn conflict_count(repo_path: &std::path::Path) -> usize {
         .len()
 }
 
-fn native_object_count(repo_path: &std::path::Path, file_name: &str) -> u64 {
-    export_native_head(repo_path, file_name)["data"]["native_object_count"]
-        .as_u64()
-        .expect("native object count")
-}
-
 fn operation_count_for_request_id(repo_path: &std::path::Path, request_id: &str) -> i64 {
     let connection = Connection::open(repo_path.join(".forge/forge.db")).expect("open forge db");
     connection
@@ -264,6 +277,49 @@ fn operation_count_for_request_id(repo_path: &std::path::Path, request_id: &str)
             |row| row.get(0),
         )
         .expect("count request-id operations")
+}
+
+fn operation_count_for_request_id_and_kind(
+    repo_path: &std::path::Path,
+    request_id: &str,
+    kind: &str,
+) -> i64 {
+    let connection = Connection::open(repo_path.join(".forge/forge.db")).expect("open forge db");
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM operations WHERE request_id = ?1 AND kind = ?2",
+            params![request_id, kind],
+            |row| row.get(0),
+        )
+        .expect("count request-id operations by kind")
+}
+
+fn skew_latest_decision_timestamp_for_test(repo_path: &std::path::Path, created_at_ms: i64) {
+    let connection = Connection::open(repo_path.join(".forge/forge.db")).expect("open forge db");
+    connection
+        .execute(
+            "UPDATE decisions
+             SET created_at_ms = ?1
+             WHERE rowid = (SELECT rowid FROM decisions ORDER BY rowid DESC LIMIT 1)",
+            [created_at_ms],
+        )
+        .expect("skew latest decision timestamp");
+}
+
+fn poison_latest_decision_commit_for_test(
+    repo_path: &std::path::Path,
+    commit_id: &str,
+    created_at_ms: i64,
+) {
+    let connection = Connection::open(repo_path.join(".forge/forge.db")).expect("open forge db");
+    connection
+        .execute(
+            "UPDATE decisions
+             SET commit_id = ?1, created_at_ms = ?2
+             WHERE rowid = (SELECT rowid FROM decisions ORDER BY rowid DESC LIMIT 1)",
+            params![commit_id, created_at_ms],
+        )
+        .expect("poison latest decision commit");
 }
 
 fn mark_conflict_resolved_for_test(repo_path: &std::path::Path, conflict_id: &str) {
@@ -931,6 +987,82 @@ fn sync_clone_labels_imported_signatures_as_peer_not_local_trust() {
 }
 
 #[test]
+fn sync_import_rejects_signature_row_with_spoofed_local_fingerprint() {
+    let source = TestRepo::new_git();
+    native_checked_proposal(&source);
+    let bundle_dir = tempfile::tempdir().expect("spoof bundle dir");
+    let bundle_path = bundle_dir.path().join("spoofed-fingerprint.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path.to_str().expect("utf8 spoof bundle path"),
+        ])
+        .assert()
+        .success();
+
+    let target = TestRepo::new_git();
+    target
+        .forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let target_key = json(
+        target
+            .forge()
+            .args(["--json", "key", "status"])
+            .assert()
+            .success(),
+    );
+    let target_fingerprint = target_key["data"]["key_fingerprint"]
+        .as_str()
+        .expect("target local fingerprint")
+        .to_string();
+
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&bundle_path).expect("read bundle"))
+            .expect("bundle json");
+    let signature_rows = manifest["ledger_rows"]
+        .as_array_mut()
+        .expect("ledger tables")
+        .iter_mut()
+        .find(|table| table["table"] == "ledger_signatures")
+        .expect("ledger signatures table")["rows"]
+        .as_array_mut()
+        .expect("signature rows");
+    assert!(
+        !signature_rows.is_empty(),
+        "source export must include signature rows"
+    );
+    for row in signature_rows {
+        row["key_fingerprint"] = Value::String(target_fingerprint.clone());
+    }
+    std::fs::write(
+        &bundle_path,
+        serde_json::to_vec_pretty(&manifest).expect("encode spoofed bundle"),
+    )
+    .expect("write spoofed bundle");
+
+    let imported = json(
+        target
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "import",
+                bundle_path.to_str().expect("utf8 spoofed bundle path"),
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(imported["status"], "error");
+    assert_eq!(imported["errors"][0]["code"], "COMMAND_FAILED");
+}
+
+#[test]
 fn sync_export_since_emits_delta_that_updates_a_cloned_repo() {
     let source = TestRepo::new_git();
     native_accepted_lifecycle(&source);
@@ -1246,6 +1378,93 @@ fn sync_fetch_pull_and_push_between_local_peer_repos() {
 }
 
 #[test]
+fn sync_fetch_fast_forward_request_id_replays_locally() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source.path().join("target/forge-sync-fetch-ff-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path.to_str().expect("utf8 fetch ff base path"),
+        ])
+        .assert()
+        .success();
+
+    let fetch_peer = cloned_peer_from_bundle(&bundle_path);
+    native_accept_file_change(&source, "fetch ff one", "one.txt", "one\n");
+    let first = json(
+        forge_in(fetch_peer.path())
+            .args([
+                "--json",
+                "--request-id",
+                "fetch-fast-forward",
+                "sync",
+                "fetch",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(first["data"]["direction"], "fetch");
+    assert_eq!(first["data"]["materialized"], false);
+    assert!(first["operation_id"].as_str().is_some());
+    assert_eq!(
+        operation_count_for_request_id(fetch_peer.path(), "fetch-fast-forward"),
+        1,
+        "fast-forward fetch must claim the request-id in the initiating repo"
+    );
+    let peer_after_first = export_native_head(fetch_peer.path(), "fetch-ff-after-first.json");
+    assert_eq!(
+        peer_after_first["data"]["native_head"], first["data"]["remote_native_head"],
+        "fast-forward fetch should advance native history without materializing"
+    );
+
+    native_accept_file_change(&source, "fetch ff two", "two.txt", "two\n");
+    let source_after_second =
+        export_native_head(source.path(), "source-fetch-ff-after-second.json");
+    assert_ne!(
+        source_after_second["data"]["native_head"], first["data"]["remote_native_head"],
+        "remote must advance so replay would be observable if it re-executed"
+    );
+    let replay = json(
+        forge_in(fetch_peer.path())
+            .args([
+                "--json",
+                "--request-id",
+                "fetch-fast-forward",
+                "sync",
+                "fetch",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(replay["operation_id"], first["operation_id"]);
+    assert_eq!(replay["data"]["idempotent_replay"], true);
+    assert_eq!(
+        replay["data"]["remote_native_head"], first["data"]["remote_native_head"],
+        "fast-forward fetch replay must preserve the first response"
+    );
+    let peer_after_replay = export_native_head(fetch_peer.path(), "fetch-ff-after-replay.json");
+    assert_eq!(
+        peer_after_replay["data"]["native_head"], first["data"]["remote_native_head"],
+        "request-id replay must not import a newer remote head"
+    );
+    assert!(
+        !fetch_peer.path().join("one.txt").exists(),
+        "fetch replay must not materialize fetched content"
+    );
+    assert!(
+        !fetch_peer.path().join("two.txt").exists(),
+        "fetch replay must not materialize or import the later remote worktree"
+    );
+}
+
+#[test]
 fn sync_peer_commands_record_divergent_native_heads_as_conflicts() {
     let source = TestRepo::new_git();
     native_accepted_lifecycle(&source);
@@ -1467,7 +1686,7 @@ fn sync_fetch_divergence_request_id_replays_without_duplicate_local_conflict() {
 }
 
 #[test]
-fn sync_fetch_clean_divergence_is_unsupported_without_advancing_head() {
+fn sync_fetch_clean_divergence_records_merge_commit_without_materializing() {
     let source = TestRepo::new_git();
     native_accepted_lifecycle(&source);
     let bundle_path = source.path().join("target/forge-sync-clean-base.json");
@@ -1487,8 +1706,6 @@ fn sync_fetch_clean_divergence_is_unsupported_without_advancing_head() {
     let peer = cloned_peer_from_bundle(&bundle_path);
     native_accept_file_change_in(peer.path(), "peer disjoint", "peer-only.txt", "peer\n");
     let peer_before = export_native_head(peer.path(), "clean-peer-before.json");
-    let peer_object_count_before =
-        native_object_count(peer.path(), "clean-peer-objects-before.json");
 
     let first = json(
         forge_in(peer.path())
@@ -1501,45 +1718,61 @@ fn sync_fetch_clean_divergence_is_unsupported_without_advancing_head() {
                 source.path().to_str().expect("utf8 source path"),
             ])
             .assert()
-            .failure(),
+            .success(),
     );
     assert_eq!(first["command"], "sync fetch");
-    assert_eq!(first["errors"][0]["code"], "SYNC_DIVERGENCE_UNSUPPORTED");
-    assert_eq!(first["errors"][0]["details"]["direction"], "fetch");
-    assert_eq!(
-        first["errors"][0]["details"]["reason"],
-        "clean_divergent_merge"
-    );
-    assert_eq!(first["retry"]["retryable"], false);
+    assert_eq!(first["status"], "success");
+    assert_eq!(first["data"]["merged"], true);
+    assert_eq!(first["data"]["materialized"], false);
+    assert!(first["data"]["merge_commit_id"]
+        .as_str()
+        .expect("merge commit id")
+        .starts_with("f1:commit:"));
+    assert!(first["data"]["merged_content_ref"]
+        .as_str()
+        .expect("merged content ref")
+        .starts_with("forge-tree:"));
     let first_operation_id = first["operation_id"]
         .as_str()
-        .expect("unsupported divergence operation id")
+        .expect("clean merge operation id")
         .to_string();
     assert_eq!(
         operation_count_for_request_id(peer.path(), "clean-divergence"),
         1,
-        "unsupported clean-divergence failure should replay deterministically by request-id"
+        "clean-divergence merge should replay deterministically by request-id"
     );
     assert_eq!(
         conflict_count(peer.path()),
         0,
-        "clean divergent merge is unsupported and must not record a path conflict"
-    );
-    assert_eq!(
-        native_object_count(peer.path(), "clean-peer-objects-after.json"),
-        peer_object_count_before,
-        "unsupported clean divergence must not leave staged peer objects behind"
+        "clean divergent merge must not record a path conflict"
     );
 
     let peer_after = export_native_head(peer.path(), "clean-peer-after.json");
-    assert_eq!(
+    assert_ne!(
         peer_after["data"]["native_head"], peer_before["data"]["native_head"],
-        "unsupported clean divergence must not advance the local native head"
+        "clean fetch divergence must advance the local native head to the merge commit"
+    );
+    assert_eq!(
+        peer_after["data"]["native_head"],
+        first["data"]["merge_commit_id"]
+    );
+    forge_in(peer.path())
+        .args(["--json", "doctor"])
+        .assert()
+        .success();
+    let peer_after_doctor = export_native_head(peer.path(), "clean-peer-after-doctor.json");
+    assert_eq!(
+        peer_after_doctor["data"]["native_head"], first["data"]["merge_commit_id"],
+        "reconcile must keep the clean fetch merge commit as the native tip"
     );
     assert_eq!(
         std::fs::read_to_string(peer.path().join("peer-only.txt")).expect("peer-only content"),
         "peer\n",
-        "unsupported clean divergence must not materialize over local worktree content"
+        "clean fetch divergence must not materialize over local worktree content"
+    );
+    assert!(
+        !peer.path().join("source-only.txt").exists(),
+        "fetch should not materialize the merged source-side file"
     );
 
     let replay = json(
@@ -1553,19 +1786,388 @@ fn sync_fetch_clean_divergence_is_unsupported_without_advancing_head() {
                 source.path().to_str().expect("utf8 source path"),
             ])
             .assert()
-            .failure(),
+            .success(),
     );
-    assert_eq!(replay["errors"][0]["code"], "SYNC_DIVERGENCE_UNSUPPORTED");
+    assert_eq!(replay["status"], "success");
     assert_eq!(replay["operation_id"], first_operation_id);
-    assert_eq!(replay["errors"][0]["details"]["direction"], "fetch");
+    assert_eq!(replay["data"]["idempotent_replay"], true);
+    assert_eq!(replay["data"]["merged"], true);
     assert_eq!(
-        replay["errors"][0]["details"]["reason"],
-        "clean_divergent_merge"
+        replay["data"]["protocol_version"],
+        first["data"]["protocol_version"]
+    );
+    assert_eq!(
+        replay["data"]["merge_commit_id"],
+        first["data"]["merge_commit_id"]
+    );
+    assert_eq!(
+        replay["data"]["merged_content_ref"],
+        first["data"]["merged_content_ref"]
+    );
+    assert_eq!(replay["data"]["materialized"], false);
+}
+
+#[test]
+fn sync_fetch_clean_divergence_ignores_future_peer_decision_timestamp() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source.path().join("target/forge-sync-clean-skew-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path.to_str().expect("utf8 clean skew base path"),
+        ])
+        .assert()
+        .success();
+
+    native_accept_file_change(
+        &source,
+        "source future clock",
+        "source-only.txt",
+        "source\n",
+    );
+    skew_latest_decision_timestamp_for_test(source.path(), 4_102_444_800_000);
+    let peer = cloned_peer_from_bundle(&bundle_path);
+    native_accept_file_change_in(peer.path(), "peer local clock", "peer-only.txt", "peer\n");
+
+    let fetched = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "sync",
+                "fetch",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(fetched["status"], "success");
+    assert_eq!(fetched["data"]["merged"], true);
+    forge_in(peer.path())
+        .args(["--json", "doctor"])
+        .assert()
+        .success();
+    let after_doctor = export_native_head(peer.path(), "clean-skew-after-doctor.json");
+    assert_eq!(
+        after_doctor["data"]["native_head"], fetched["data"]["merge_commit_id"],
+        "future peer decision timestamps must not outrank the receiver's merge commit"
     );
 }
 
 #[test]
-fn sync_pull_clean_divergence_is_unsupported_without_materializing() {
+fn sync_fetch_clean_divergence_skips_dangling_future_decision_tip() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source
+        .path()
+        .join("target/forge-sync-clean-dangling-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path.to_str().expect("utf8 clean dangling base path"),
+        ])
+        .assert()
+        .success();
+
+    native_accept_file_change(
+        &source,
+        "source dangling tip",
+        "source-only.txt",
+        "source\n",
+    );
+    let peer = cloned_peer_from_bundle(&bundle_path);
+    native_accept_file_change_in(peer.path(), "peer dangling tip", "peer-only.txt", "peer\n");
+
+    let fetched = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "sync",
+                "fetch",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(fetched["data"]["merged"], true);
+
+    poison_latest_decision_commit_for_test(
+        peer.path(),
+        "f1:commit:sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        4_102_444_800_000,
+    );
+
+    let exported = export_native_head(peer.path(), "clean-dangling-after-poison.json");
+    assert_eq!(
+        exported["data"]["native_head"], fetched["data"]["merge_commit_id"],
+        "dangling future decisions must not outrank the valid sync merge tip"
+    );
+    let doctor = json(
+        forge_in(peer.path())
+            .args(["--json", "doctor"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(doctor["data"]["ok"], false);
+    assert!(doctor["data"]["native_history_issues"]
+        .as_array()
+        .expect("native history findings")
+        .iter()
+        .any(|finding| finding["kind"] == "dangling_commit_id"));
+}
+
+#[test]
+fn sync_pull_after_clean_fetch_materializes_existing_merge_commit() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source
+        .path()
+        .join("target/forge-sync-clean-fetch-pull-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path
+                .to_str()
+                .expect("utf8 clean fetch-pull base path"),
+        ])
+        .assert()
+        .success();
+
+    native_accept_file_change(
+        &source,
+        "source clean fetch-pull",
+        "source-only.txt",
+        "source\n",
+    );
+    let peer = cloned_peer_from_bundle(&bundle_path);
+    native_accept_file_change_in(
+        peer.path(),
+        "peer clean fetch-pull",
+        "peer-only.txt",
+        "peer\n",
+    );
+
+    let fetched = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "sync",
+                "fetch",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(fetched["data"]["merged"], true);
+    assert_eq!(fetched["data"]["materialized"], false);
+    assert!(
+        !peer.path().join("source-only.txt").exists(),
+        "fetch should leave the merged source-side file unmaterialized"
+    );
+
+    let pulled = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "--request-id",
+                "pull-after-clean-fetch",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(pulled["command"], "sync pull");
+    assert_eq!(pulled["status"], "success");
+    assert_eq!(pulled["data"]["up_to_date"], true);
+    assert_eq!(pulled["data"]["materialized"], true);
+    assert_eq!(
+        pulled["data"]["materialized_content_ref"],
+        fetched["data"]["merged_content_ref"]
+    );
+    let pulled_operation_id = pulled["operation_id"]
+        .as_str()
+        .expect("pull materialization operation id")
+        .to_string();
+    assert_eq!(
+        operation_count_for_request_id_and_kind(
+            peer.path(),
+            "pull-after-clean-fetch",
+            "sync_pull_materialized"
+        ),
+        1,
+        "up-to-date sync pull must claim request-id under sync pull"
+    );
+    let replay = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "--request-id",
+                "pull-after-clean-fetch",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(replay["status"], "success");
+    assert_eq!(replay["operation_id"], pulled_operation_id);
+    assert_eq!(replay["data"]["idempotent_replay"], true);
+    assert_eq!(replay["data"]["up_to_date"], true);
+    assert_eq!(replay["data"]["materialized"], true);
+    assert_eq!(
+        replay["data"]["materialized_content_ref"],
+        pulled["data"]["materialized_content_ref"]
+    );
+    assert_eq!(
+        replay["data"]["materialized_operation_id"],
+        pulled["data"]["materialized_operation_id"]
+    );
+    assert_eq!(
+        replay["data"]["materialized_view_id"],
+        pulled["data"]["materialized_view_id"]
+    );
+    native_accept_file_change_in(
+        peer.path(),
+        "later clean replay state",
+        "later-clean.txt",
+        "later\n",
+    );
+    let later_head = export_native_head(peer.path(), "clean-fetch-pull-later-head.json");
+    let replay_after_later_clean = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "--request-id",
+                "pull-after-clean-fetch",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(replay_after_later_clean["status"], "success");
+    assert_eq!(
+        replay_after_later_clean["operation_id"],
+        pulled_operation_id
+    );
+    assert_eq!(replay_after_later_clean["data"]["idempotent_replay"], true);
+    assert_eq!(
+        std::fs::read_to_string(peer.path().join("later-clean.txt")).expect("later clean content"),
+        "later\n",
+        "idempotent replay must not restore an older tree over a newer clean state"
+    );
+    let after_later_replay_head =
+        export_native_head(peer.path(), "clean-fetch-pull-after-later-replay-head.json");
+    assert_eq!(
+        after_later_replay_head["data"]["native_head"], later_head["data"]["native_head"],
+        "idempotent replay must not rewind a newer native head"
+    );
+    std::fs::write(peer.path().join("after-replay-edit.txt"), "edited\n")
+        .expect("write post-success edit");
+    let replay_after_edit = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "--request-id",
+                "pull-after-clean-fetch",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(replay_after_edit["status"], "success");
+    assert_eq!(replay_after_edit["operation_id"], pulled_operation_id);
+    assert_eq!(replay_after_edit["data"]["idempotent_replay"], true);
+    assert_eq!(
+        std::fs::read_to_string(peer.path().join("after-replay-edit.txt"))
+            .expect("post-success edit content"),
+        "edited\n",
+        "idempotent replay must not revalidate or overwrite later user edits"
+    );
+    assert_eq!(
+        std::fs::read_to_string(peer.path().join("source-only.txt")).expect("source-only content"),
+        "source\n",
+        "pull after fetch must materialize the source-side merged content"
+    );
+    assert_eq!(
+        std::fs::read_to_string(peer.path().join("peer-only.txt")).expect("peer-only content"),
+        "peer\n",
+        "pull after fetch must preserve receiver-side merged content"
+    );
+    forge_in(peer.path())
+        .args(["--json", "doctor"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn sync_pull_fast_forward_refuses_dirty_worktree_before_materializing() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source.path().join("target/forge-sync-ff-dirty-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path.to_str().expect("utf8 ff dirty base path"),
+        ])
+        .assert()
+        .success();
+
+    let peer = cloned_peer_from_bundle(&bundle_path);
+    native_accept_file_change(&source, "source ff dirty", "source-only.txt", "source\n");
+    std::fs::write(peer.path().join("local-dirty.txt"), "dirty\n").expect("write dirty file");
+    let peer_before = export_native_head(peer.path(), "target/ff-dirty-peer-before.json");
+
+    let pulled = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "--request-id",
+                "ff-dirty-pull",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(pulled["status"], "error");
+    assert_eq!(pulled["errors"][0]["code"], "DIRTY_WORKTREE");
+    assert!(
+        !peer.path().join("source-only.txt").exists(),
+        "dirty fast-forward pull must not materialize remote content"
+    );
+    let peer_after = export_native_head(peer.path(), "target/ff-dirty-peer-after.json");
+    assert_eq!(
+        peer_after["data"]["native_head"], peer_before["data"]["native_head"],
+        "dirty fast-forward pull must not advance native HEAD before refusing"
+    );
+}
+
+#[test]
+fn sync_pull_clean_divergence_records_merge_commit_and_materializes() {
     let source = TestRepo::new_git();
     native_accepted_lifecycle(&source);
     let bundle_path = source.path().join("target/forge-sync-clean-pull-base.json");
@@ -1585,9 +2187,151 @@ fn sync_pull_clean_divergence_is_unsupported_without_materializing() {
     let peer = cloned_peer_from_bundle(&bundle_path);
     native_accept_file_change_in(peer.path(), "peer clean pull", "peer-only.txt", "peer\n");
     let peer_before = checkout_current_native_head(peer.path(), "clean-pull-before.json");
-    let object_count_before = native_object_count(peer.path(), "clean-pull-objects-before.json");
+    let peer_before_expected =
+        expected_content_ref_for_test(peer.path()).expect("pre-merge peer expected content ref");
 
-    let refused = json(
+    let pulled = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "--request-id",
+                "clean-pull-merge-replay",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(pulled["command"], "sync pull");
+    assert_eq!(pulled["status"], "success");
+    assert_eq!(pulled["data"]["merged"], true);
+    assert_eq!(pulled["data"]["materialized"], true);
+    let peer_after = export_native_head(peer.path(), "clean-pull-after.json");
+    assert_ne!(
+        peer_after["data"]["native_head"], peer_before["data"]["native_head"],
+        "clean pull divergence must advance the local native head"
+    );
+    assert_eq!(
+        peer_after["data"]["native_head"],
+        pulled["data"]["merge_commit_id"]
+    );
+    forge_content_native::restore_content_ref_to_worktree(
+        peer.path(),
+        peer.path(),
+        &peer_before_expected,
+    )
+    .expect("restore exact pre-merge content before replay");
+    set_expected_content_ref_for_test(peer.path(), &peer_before_expected);
+    std::fs::write(
+        peer.path().join(".forge/refs/HEAD"),
+        peer_before["data"]["native_head"]
+            .as_str()
+            .expect("prior head"),
+    )
+    .expect("rewind native HEAD for replay recovery test");
+    let replay = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "--request-id",
+                "clean-pull-merge-replay",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(replay["data"]["idempotent_replay"], true);
+    assert_eq!(
+        replay["data"]["merge_commit_id"], pulled["data"]["merge_commit_id"],
+        "sync merge replay must preserve the merge commit field"
+    );
+    assert_eq!(
+        replay["data"]["merged_content_ref"], pulled["data"]["merged_content_ref"],
+        "sync merge replay must preserve the merged content field"
+    );
+    assert_eq!(replay["data"]["merged"], true);
+    assert_eq!(replay["data"]["materialized"], true);
+    assert_eq!(
+        replay["data"]["source_native_head"], pulled["data"]["source_native_head"],
+        "sync merge replay must preserve source head"
+    );
+    assert_eq!(
+        replay["data"]["receiver_native_head"], pulled["data"]["receiver_native_head"],
+        "sync merge replay must preserve receiver head"
+    );
+    assert_eq!(
+        replay["data"]["common_ancestor_native_head"],
+        pulled["data"]["common_ancestor_native_head"],
+        "sync merge replay must preserve common ancestor"
+    );
+    let replay_head = export_native_head(peer.path(), "clean-pull-replay-head.json");
+    assert_eq!(
+        replay_head["data"]["native_head"], pulled["data"]["merge_commit_id"],
+        "same-request-id replay must reconcile a stale native sync merge HEAD"
+    );
+    forge_in(peer.path())
+        .args(["--json", "doctor"])
+        .assert()
+        .success();
+    let peer_after_doctor = export_native_head(peer.path(), "clean-pull-after-doctor.json");
+    assert_eq!(
+        peer_after_doctor["data"]["native_head"], pulled["data"]["merge_commit_id"],
+        "reconcile must keep the clean pull merge commit as the native tip"
+    );
+    assert_eq!(
+        std::fs::read_to_string(peer.path().join("peer-only.txt")).expect("peer-only content"),
+        "peer\n",
+        "clean pull divergence must preserve receiver-side content"
+    );
+    assert_eq!(
+        std::fs::read_to_string(peer.path().join("source-only.txt")).expect("source-only content"),
+        "source\n",
+        "clean pull divergence must materialize source-side content"
+    );
+    assert_eq!(conflict_count(peer.path()), 0);
+}
+
+#[test]
+fn sync_pull_clean_divergence_plain_retry_heals_torn_materialization() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source
+        .path()
+        .join("target/forge-sync-clean-pull-plain-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path
+                .to_str()
+                .expect("utf8 clean pull plain base path"),
+        ])
+        .assert()
+        .success();
+
+    native_accept_file_change(
+        &source,
+        "source clean plain pull",
+        "source-only.txt",
+        "source\n",
+    );
+    let peer = cloned_peer_from_bundle(&bundle_path);
+    native_accept_file_change_in(
+        peer.path(),
+        "peer clean plain pull",
+        "peer-only.txt",
+        "peer\n",
+    );
+    let peer_before_expected =
+        expected_content_ref_for_test(peer.path()).expect("pre-merge peer expected content ref");
+
+    let pulled = json(
         forge_in(peer.path())
             .args([
                 "--json",
@@ -1596,35 +2340,286 @@ fn sync_pull_clean_divergence_is_unsupported_without_materializing() {
                 source.path().to_str().expect("utf8 source path"),
             ])
             .assert()
-            .failure(),
+            .success(),
     );
-    assert_eq!(refused["command"], "sync pull");
-    assert_eq!(refused["errors"][0]["code"], "SYNC_DIVERGENCE_UNSUPPORTED");
-    assert_eq!(refused["errors"][0]["details"]["direction"], "pull");
-    assert_eq!(
-        refused["errors"][0]["details"]["reason"],
-        "clean_divergent_merge"
+    assert_eq!(pulled["data"]["merged"], true);
+    assert_eq!(pulled["data"]["materialized"], true);
+    let merge_commit_id = pulled["data"]["merge_commit_id"]
+        .as_str()
+        .expect("merge commit id");
+
+    forge_content_native::restore_content_ref_to_worktree(
+        peer.path(),
+        peer.path(),
+        &peer_before_expected,
+    )
+    .expect("restore exact pre-merge content before plain retry");
+    set_expected_content_ref_for_test(peer.path(), &peer_before_expected);
+    let retry_after_unrestored = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
     );
+    assert_eq!(retry_after_unrestored["status"], "success");
+    assert_eq!(retry_after_unrestored["data"]["materialized"], true);
     assert_eq!(
-        native_object_count(peer.path(), "clean-pull-objects-after.json"),
-        object_count_before,
-        "unsupported clean pull divergence must not leak staged local objects"
-    );
-    let peer_after = export_native_head(peer.path(), "clean-pull-after.json");
-    assert_eq!(
-        peer_after["data"]["native_head"], peer_before["data"]["native_head"],
-        "unsupported clean pull divergence must not advance the local native head"
+        std::fs::read_to_string(peer.path().join("source-only.txt")).expect("source-only content"),
+        "source\n",
+        "plain retry must restore source-side content after a torn clean sync merge"
     );
     assert_eq!(
         std::fs::read_to_string(peer.path().join("peer-only.txt")).expect("peer-only content"),
         "peer\n",
-        "unsupported clean pull divergence must not materialize over local worktree content"
+        "plain retry must preserve receiver-side content after a torn clean sync merge"
+    );
+
+    set_expected_content_ref_for_test(peer.path(), &peer_before_expected);
+    let retry_after_expected_lag = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(retry_after_expected_lag["status"], "success");
+    assert_eq!(retry_after_expected_lag["data"]["materialized"], true);
+    let final_head = export_native_head(peer.path(), "clean-pull-plain-retry-head.json");
+    assert_eq!(
+        final_head["data"]["native_head"], merge_commit_id,
+        "plain retry must not fork or rewind the clean sync merge commit"
+    );
+    forge_in(peer.path())
+        .args(["--json", "doctor"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn sync_pull_clean_divergence_refuses_dirty_worktree_before_recording_merge() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source
+        .path()
+        .join("target/forge-sync-clean-pull-dirty-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path
+                .to_str()
+                .expect("utf8 clean pull dirty base path"),
+        ])
+        .assert()
+        .success();
+
+    native_accept_file_change(&source, "source dirty pull", "source-only.txt", "source\n");
+    let peer = cloned_peer_from_bundle(&bundle_path);
+    native_accept_file_change_in(peer.path(), "peer dirty pull", "peer-only.txt", "peer\n");
+    std::fs::write(peer.path().join("local-dirty.txt"), "dirty\n").expect("write dirty file");
+
+    let pulled = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "--request-id",
+                "clean-dirty-pull",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(pulled["status"], "error");
+    assert_eq!(pulled["errors"][0]["code"], "DIRTY_WORKTREE");
+    assert_eq!(
+        operation_count_for_request_id_and_kind(
+            peer.path(),
+            "clean-dirty-pull",
+            "sync_pull_merged"
+        ),
+        0,
+        "dirty clean pull must fail before recording a merge operation"
+    );
+    assert!(
+        !peer.path().join("source-only.txt").exists(),
+        "dirty clean pull must not materialize source-side content"
     );
     assert_eq!(conflict_count(peer.path()), 0);
 }
 
 #[test]
-fn sync_push_clean_divergence_is_unsupported_without_advancing_remote() {
+fn doctor_reports_missing_sync_merge_commit_signature() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source
+        .path()
+        .join("target/forge-sync-missing-merge-signature-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path
+                .to_str()
+                .expect("utf8 missing signature base path"),
+        ])
+        .assert()
+        .success();
+
+    native_accept_file_change(
+        &source,
+        "source missing merge signature",
+        "source-only.txt",
+        "source\n",
+    );
+    let peer = cloned_peer_from_bundle(&bundle_path);
+    native_accept_file_change_in(
+        peer.path(),
+        "peer missing merge signature",
+        "peer-only.txt",
+        "peer\n",
+    );
+    let fetched = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "sync",
+                "fetch",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    let merge_commit_id = fetched["data"]["merge_commit_id"]
+        .as_str()
+        .expect("merge commit id");
+    Connection::open(peer.path().join(".forge/forge.db"))
+        .expect("open forge db")
+        .execute(
+            "DELETE FROM ledger_signatures
+             WHERE subject_kind = 'sync_merge_commit' AND subject_id = ?1",
+            [merge_commit_id],
+        )
+        .expect("delete sync merge signature");
+
+    let report = json(
+        forge_in(peer.path())
+            .args(["--json", "doctor"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(report["data"]["ok"], false);
+    let issues = report["data"]["signature_issues"]
+        .as_array()
+        .expect("signature issues");
+    assert!(issues.iter().any(|issue| {
+        issue["kind"] == "missing_signature"
+            && issue["subject_kind"] == "sync_merge_commit"
+            && issue["subject_id"] == merge_commit_id
+    }));
+}
+
+#[test]
+fn doctor_accepts_imported_peer_sync_merge_commit_signature() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source
+        .path()
+        .join("target/forge-sync-import-peer-merge-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path
+                .to_str()
+                .expect("utf8 imported peer merge base path"),
+        ])
+        .assert()
+        .success();
+
+    native_accept_file_change(
+        &source,
+        "source imported peer merge",
+        "source-only.txt",
+        "source\n",
+    );
+    let peer = cloned_peer_from_bundle(&bundle_path);
+    native_accept_file_change_in(
+        peer.path(),
+        "peer imported sync merge",
+        "peer-only.txt",
+        "peer\n",
+    );
+    let fetched = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "sync",
+                "fetch",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    let merge_commit_id = fetched["data"]["merge_commit_id"]
+        .as_str()
+        .expect("peer merge commit id")
+        .to_string();
+
+    let importer = cloned_peer_from_bundle(&bundle_path);
+    let imported = json(
+        forge_in(importer.path())
+            .args([
+                "--json",
+                "sync",
+                "fetch",
+                peer.path().to_str().expect("utf8 peer path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        imported["data"]["remote_native_head"].as_str(),
+        Some(merge_commit_id.as_str())
+    );
+
+    let report = json(
+        forge_in(importer.path())
+            .args(["--json", "doctor"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(report["data"]["ok"], true);
+    let issues = report["data"]["signature_issues"]
+        .as_array()
+        .expect("signature issues");
+    assert!(
+        issues.is_empty(),
+        "imported peer sync merge signatures must remain peer-verifiable without local-only noise: {report}"
+    );
+}
+
+#[test]
+fn sync_push_clean_divergence_records_remote_merge_commit_without_materializing() {
     let source = TestRepo::new_git();
     native_accepted_lifecycle(&source);
     let bundle_path = source.path().join("target/forge-sync-clean-push-base.json");
@@ -1644,48 +2639,88 @@ fn sync_push_clean_divergence_is_unsupported_without_advancing_remote() {
     let peer = cloned_peer_from_bundle(&bundle_path);
     native_accept_file_change_in(peer.path(), "peer clean push", "peer-only.txt", "peer\n");
     let source_before = export_native_head(source.path(), "target/clean-push-before.json");
-    let source_object_count_before =
-        native_object_count(source.path(), "target/clean-push-objects-before.json");
 
-    let refused = json(
+    let pushed = json(
         forge_in(peer.path())
             .args([
                 "--json",
+                "--request-id",
+                "clean-push-divergence",
                 "sync",
                 "push",
                 source.path().to_str().expect("utf8 source path"),
             ])
             .assert()
-            .failure(),
+            .success(),
     );
-    assert_eq!(refused["command"], "sync push");
-    assert_eq!(refused["errors"][0]["code"], "SYNC_DIVERGENCE_UNSUPPORTED");
-    assert_eq!(refused["errors"][0]["details"]["direction"], "push");
-    assert_eq!(
-        refused["errors"][0]["details"]["reason"],
-        "clean_divergent_merge"
-    );
-    assert_eq!(
-        native_object_count(source.path(), "target/clean-push-objects-after.json"),
-        source_object_count_before,
-        "unsupported clean push divergence must not leak staged remote objects"
-    );
+    assert_eq!(pushed["command"], "sync push");
+    assert_eq!(pushed["status"], "success");
+    assert_eq!(pushed["data"]["merged"], true);
+    assert_eq!(pushed["data"]["materialized"], false);
+    let pushed_operation_id = pushed["operation_id"]
+        .as_str()
+        .expect("clean push operation id")
+        .to_string();
     let source_after = export_native_head(source.path(), "target/clean-push-after.json");
-    assert_eq!(
+    assert_ne!(
         source_after["data"]["native_head"], source_before["data"]["native_head"],
-        "unsupported clean push divergence must not advance the remote native head"
+        "clean push divergence must advance the remote native head"
+    );
+    assert_eq!(
+        source_after["data"]["native_head"],
+        pushed["data"]["merge_commit_id"]
+    );
+    forge_in(source.path())
+        .args(["--json", "doctor"])
+        .assert()
+        .success();
+    let source_after_doctor =
+        export_native_head(source.path(), "target/clean-push-after-doctor.json");
+    assert_eq!(
+        source_after_doctor["data"]["native_head"], pushed["data"]["merge_commit_id"],
+        "reconcile must keep the clean push merge commit as the remote native tip"
     );
     assert_eq!(
         std::fs::read_to_string(source.path().join("source-only.txt"))
             .expect("source-only content"),
         "source\n",
-        "unsupported clean push divergence must not materialize over remote worktree content"
+        "clean push divergence must not materialize over remote worktree content"
+    );
+    assert!(
+        !source.path().join("peer-only.txt").exists(),
+        "push should not materialize the peer-side file in the remote worktree"
     );
     assert_eq!(conflict_count(source.path()), 0);
+
+    let replayed = json(
+        forge_in(peer.path())
+            .args([
+                "--json",
+                "--request-id",
+                "clean-push-divergence",
+                "sync",
+                "push",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(replayed["operation_id"], pushed_operation_id);
+    assert_eq!(replayed["data"]["idempotent_replay"], true);
+    assert_eq!(replayed["data"]["merged"], true);
+    assert_eq!(replayed["data"]["materialized"], false);
+    assert_eq!(
+        replayed["data"]["merge_commit_id"],
+        pushed["data"]["merge_commit_id"]
+    );
+    assert_eq!(
+        replayed["data"]["remote_operation_id"],
+        pushed["data"]["remote_operation_id"]
+    );
 }
 
 #[test]
-fn sync_fetch_clean_divergence_from_subdirectory_cleans_staged_objects() {
+fn sync_fetch_clean_divergence_from_subdirectory_records_merge_commit() {
     let source = TestRepo::new_git();
     native_accepted_lifecycle(&source);
     let bundle_path = source
@@ -1713,9 +2748,8 @@ fn sync_fetch_clean_divergence_from_subdirectory_cleans_staged_objects() {
     native_accept_file_change_in(peer.path(), "peer clean subdir", "peer-only.txt", "peer\n");
     let nested = peer.path().join("nested/leaf");
     std::fs::create_dir_all(&nested).expect("nested peer cwd");
-    let object_count_before = native_object_count(peer.path(), "clean-subdir-before.json");
 
-    let refused = json(
+    let fetched = json(
         forge_in(&nested)
             .args([
                 "--json",
@@ -1724,13 +2758,23 @@ fn sync_fetch_clean_divergence_from_subdirectory_cleans_staged_objects() {
                 source.path().to_str().expect("utf8 source path"),
             ])
             .assert()
-            .failure(),
+            .success(),
     );
-    assert_eq!(refused["errors"][0]["code"], "SYNC_DIVERGENCE_UNSUPPORTED");
+    assert_eq!(fetched["status"], "success");
+    assert_eq!(fetched["data"]["merged"], true);
+    assert_eq!(fetched["data"]["materialized"], false);
+    assert!(fetched["data"]["merge_commit_id"]
+        .as_str()
+        .expect("merge commit id")
+        .starts_with("f1:commit:"));
+    let peer_after = export_native_head(peer.path(), "clean-subdir-after.json");
     assert_eq!(
-        native_object_count(peer.path(), "clean-subdir-after.json"),
-        object_count_before,
-        "unsupported clean divergence from a subdirectory must not leak staged objects"
+        peer_after["data"]["native_head"],
+        fetched["data"]["merge_commit_id"]
+    );
+    assert!(
+        !peer.path().join("source-only.txt").exists(),
+        "subdirectory fetch should not materialize the source-side file"
     );
     assert_eq!(conflict_count(peer.path()), 0);
 }
@@ -2077,6 +3121,29 @@ fn sync_fetch_noop_request_id_replays_locally() {
     );
     assert_eq!(replay["operation_id"], first["operation_id"]);
     assert_eq!(replay["data"]["idempotent_replay"], true);
+    assert_eq!(replay["data"]["direction"], first["data"]["direction"]);
+    assert_eq!(replay["data"]["remote_path"], first["data"]["remote_path"]);
+    assert_eq!(
+        replay["data"]["base_native_head"], first["data"]["base_native_head"],
+        "sync fetch replay must preserve the base head"
+    );
+    assert_eq!(
+        replay["data"]["remote_native_head"], first["data"]["remote_native_head"],
+        "sync fetch replay must preserve the remote head"
+    );
+    assert_eq!(
+        replay["data"]["imported_native_objects"], first["data"]["imported_native_objects"],
+        "sync fetch replay must preserve import counts"
+    );
+    assert_eq!(
+        replay["data"]["imported_ledger_rows"], first["data"]["imported_ledger_rows"],
+        "sync fetch replay must preserve ledger counts"
+    );
+    assert_eq!(
+        replay["data"]["materialized"],
+        first["data"]["materialized"]
+    );
+    assert_eq!(replay["data"]["up_to_date"], first["data"]["up_to_date"]);
 
     let reused_for_save = json(
         forge_in(fetch_peer.path())
@@ -2149,6 +3216,17 @@ fn sync_push_noop_request_id_replays_locally() {
     );
     assert_eq!(replay["operation_id"], first["operation_id"]);
     assert_eq!(replay["data"]["idempotent_replay"], true);
+    assert_eq!(replay["data"]["direction"], "push");
+    assert_eq!(replay["data"]["up_to_date"], true);
+    assert_eq!(
+        replay["data"]["base_native_head"],
+        first["data"]["base_native_head"]
+    );
+    assert_eq!(
+        replay["data"]["local_native_head"],
+        first["data"]["local_native_head"]
+    );
+    assert_eq!(replay["data"]["materialized"], false);
 
     let reused_for_save = json(
         forge_in(push_peer.path())
