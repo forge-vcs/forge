@@ -1424,7 +1424,7 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
             ensure_clean_for_sync_import_materialize(&cwd).context("preflight sync pull")?;
             sync_fetch_peer(&cwd, request_id, &args.remote, true)
         }),
-        SyncCommand::Push(args) => command_result("sync push", request_id, |cwd, _| {
+        SyncCommand::Push(args) => command_result("sync push", request_id, |cwd, _request_id| {
             sync_push_peer(&cwd, &args.remote)
         }),
     }
@@ -1437,7 +1437,16 @@ fn sync_fetch_peer(
     materialize: bool,
 ) -> Result<(Option<String>, Value, Vec<String>)> {
     let (local_manifest, remote_manifest, _remote_lock) = peer_manifests(cwd, remote)?;
-    ensure_peer_fast_forward(&remote_manifest, &local_manifest, "fetch")?;
+    ensure_peer_fast_forward_or_conflict(
+        &remote_manifest,
+        &local_manifest,
+        if materialize {
+            "sync_pull_divergence"
+        } else {
+            "sync_fetch_divergence"
+        },
+        if materialize { "pull" } else { "fetch" },
+    )?;
 
     let temp = SyncTransferDir::new(cwd)?;
     let local_base_path = temp.path().join("local-base.json");
@@ -1492,7 +1501,12 @@ fn sync_fetch_peer(
 
 fn sync_push_peer(cwd: &Path, remote: &Path) -> Result<(Option<String>, Value, Vec<String>)> {
     let (local_manifest, remote_manifest, _remote_lock) = peer_manifests(cwd, remote)?;
-    ensure_peer_fast_forward(&local_manifest, &remote_manifest, "push")?;
+    ensure_peer_fast_forward_or_conflict(
+        &local_manifest,
+        &remote_manifest,
+        "sync_push_divergence",
+        "push",
+    )?;
 
     let temp = SyncTransferDir::new(cwd)?;
     let remote_base_path = temp.path().join("remote-base.json");
@@ -1541,9 +1555,10 @@ fn peer_manifests(
     Ok((local_manifest, remote_manifest, remote_lock))
 }
 
-fn ensure_peer_fast_forward(
+fn ensure_peer_fast_forward_or_conflict(
     source: &forge_sync::SyncManifest,
     receiver: &forge_sync::SyncManifest,
+    context: &str,
     action: &str,
 ) -> Result<()> {
     if source.content_backend != "native" || receiver.content_backend != "native" {
@@ -1557,11 +1572,28 @@ fn ensure_peer_fast_forward(
         );
     }
     if !forge_sync::manifest_head_descends_from(source, receiver.native_head.as_deref())? {
-        anyhow::bail!(
-            "sync {action} refused non-fast-forward native history (source head {:?}, receiver head {:?})",
-            source.native_head,
-            receiver.native_head
-        );
+        let expected_head = receiver.native_head.clone().ok_or_else(|| {
+            anyhow::anyhow!("sync {action} receiver has no native head for divergence record")
+        })?;
+        let actual_head = source.native_head.clone().ok_or_else(|| {
+            anyhow::anyhow!("sync {action} source has no native head for divergence record")
+        })?;
+        let ours_content_ref = forge_sync::manifest_head_content_ref(receiver)?
+            .ok_or_else(|| anyhow::anyhow!("sync {action} receiver head has no content ref"))?;
+        let theirs_content_ref = forge_sync::manifest_head_content_ref(source)?
+            .ok_or_else(|| anyhow::anyhow!("sync {action} source head has no content ref"))?;
+        return Err(forge_store::StaleBaseConflict {
+            input: forge_store::StaleBaseConflictInput {
+                context: context.to_string(),
+                expected_head,
+                actual_head,
+                base_content_ref: ours_content_ref.clone(),
+                ours_content_ref,
+                theirs_content_ref,
+                changed_paths: Vec::new(),
+            },
+        }
+        .into());
     }
     Ok(())
 }

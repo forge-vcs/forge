@@ -439,6 +439,7 @@ name = "forge-sync"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "forge-content",
  "forge-content-native",
  "forge-protocol",
  "forge-store",
