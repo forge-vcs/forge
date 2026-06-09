@@ -159,15 +159,14 @@ fn sync_import_applies_native_bundle_into_fresh_native_repo() {
             .success(),
     );
 
-    let target = TestRepo::new_git();
-    target
+    let plain_target = TestRepo::new_git();
+    plain_target
         .forge()
         .args(["--json", "init", "--content-backend", "native"])
         .assert()
         .success();
-
     let imported = json(
-        target
+        plain_target
             .forge()
             .args([
                 "--json",
@@ -192,10 +191,53 @@ fn sync_import_applies_native_bundle_into_fresh_native_repo() {
         imported["data"]["local_key_fingerprint"],
         exported["data"]["local_key_fingerprint"]
     );
+    assert_eq!(imported["data"]["materialized"], false);
+    assert!(
+        !plain_target.path().join("sync.txt").exists(),
+        "plain sync import must not rewrite the worktree"
+    );
+
+    let target = TestRepo::new_git();
+    target
+        .forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let materialized = json(
+        target
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "import",
+                "--materialize",
+                bundle_path.to_str().expect("utf8 bundle path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        materialized["data"]["native_head"],
+        exported["data"]["native_head"]
+    );
+    assert_eq!(materialized["data"]["materialized"], true);
+    assert!(materialized["data"]["materialized_content_ref"]
+        .as_str()
+        .unwrap()
+        .starts_with("forge-tree:"));
+    assert!(materialized["data"]["materialized_operation_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("op_"));
+    assert_eq!(
+        std::fs::read_to_string(target.path().join("sync.txt")).expect("materialized sync file"),
+        "sync\n"
+    );
 
     target.forge().args(["--json", "doctor"]).assert().success();
 
-    let reexport_path = target.path().join("target/reexported-sync-bundle.json");
+    let reexport_dir = tempfile::tempdir().expect("reexport temp dir");
+    let reexport_path = reexport_dir.path().join("reexported-sync-bundle.json");
     let reexported = json(
         target
             .forge()
@@ -229,6 +271,7 @@ fn sync_import_applies_native_bundle_into_fresh_native_repo() {
                 "--json",
                 "sync",
                 "import",
+                "--materialize",
                 bundle_path.to_str().expect("utf8 bundle path"),
             ])
             .assert()
@@ -238,4 +281,5 @@ fn sync_import_applies_native_bundle_into_fresh_native_repo() {
         imported_again["data"]["native_head"],
         exported["data"]["native_head"]
     );
+    assert_eq!(imported_again["data"]["materialized"], true);
 }

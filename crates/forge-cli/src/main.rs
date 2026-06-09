@@ -1,8 +1,10 @@
 mod schema;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{error::ErrorKind, Args, Parser, Subcommand};
-use forge_content::{classify_content_ref, ContentBackend, ContentRefKind, SnapshotContent};
+use forge_content::{
+    classify_content_ref, ContentBackend, ContentRefKind, SnapshotContent, FORGE_TREE_PREFIX,
+};
 use forge_protocol::{
     ErrorObject, ResponseEnvelope, ResponseStatus, RetryMetadata, RETRY_BACKOFF_MS,
 };
@@ -302,6 +304,9 @@ struct SyncInspectArgs {
 #[derive(Debug, Args)]
 struct SyncImportArgs {
     path: std::path::PathBuf,
+    /// Restore the imported native HEAD tree into the current worktree after applying the bundle.
+    #[arg(long)]
+    materialize: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -933,6 +938,33 @@ fn ensure_worktree_matches_expected(cwd: &Path) -> Result<()> {
     }
 }
 
+fn ensure_clean_for_sync_import_materialize(cwd: &Path) -> Result<()> {
+    let expected = match forge_store::expected_content_ref(cwd)? {
+        Some(expected) => expected,
+        None => {
+            let head = current_base(cwd)?;
+            native_commit_content_ref(cwd, &head)?
+        }
+    };
+    let current = snapshot_effective_worktree(cwd)?;
+    if current.content_ref == expected {
+        Ok(())
+    } else {
+        Err(ForgeError::DirtyWorktree {
+            paths: current.changed_paths,
+        }
+        .into())
+    }
+}
+
+fn native_commit_content_ref(cwd: &Path, commit_id: &str) -> Result<String> {
+    let context = forge_store::open_repository(cwd)?;
+    let id = forge_content_native::ObjectId::parse(commit_id)?;
+    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let commit = store.read_commit(&id)?;
+    Ok(format!("{FORGE_TREE_PREFIX}{}", commit.tree))
+}
+
 fn restore_response(request_id: Option<String>, args: RestoreArgs) -> ResponseEnvelope {
     command_result("restore", request_id, |cwd, request_id| {
         let content_ref = forge_store::snapshot_content_ref(&cwd, &args.snapshot_id)?;
@@ -1284,10 +1316,47 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
                 }
             }
         }
-        SyncCommand::Import(args) => command_result("sync import", request_id, |cwd, _| {
-            let report = forge_sync::import_manifest(&cwd, &args.path)?;
-            Ok((None, serde_json::to_value(report)?, Vec::new()))
-        }),
+        SyncCommand::Import(args) => {
+            command_result("sync import", request_id, |cwd, request_id| {
+                if args.materialize {
+                    ensure_clean_for_sync_import_materialize(&cwd)
+                        .context("preflight sync import materialize")?;
+                }
+                let report =
+                    forge_sync::import_manifest(&cwd, &args.path).context("apply sync bundle")?;
+                let mut operation_id = None;
+                let mut data = serde_json::to_value(&report)?;
+                if args.materialize {
+                    let commit_id = report.native_head.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("sync bundle has no native head to materialize")
+                    })?;
+                    let content_ref = forge_store::checkout_target_content_ref(&cwd, commit_id)
+                        .context("resolve imported native head")?;
+                    restore_effective_worktree(&cwd, &content_ref)
+                        .context("restore imported native head")?;
+                    let record = forge_store::record_sync_import_materialized(
+                        &cwd,
+                        request_id,
+                        commit_id,
+                        &content_ref,
+                    )
+                    .context("record sync import materialization")?;
+                    operation_id = Some(record.operation_id.clone());
+                    if let Some(object) = data.as_object_mut() {
+                        object.insert("materialized".to_string(), json!(true));
+                        object.insert("materialized_content_ref".to_string(), json!(content_ref));
+                        object.insert(
+                            "materialized_operation_id".to_string(),
+                            json!(record.operation_id),
+                        );
+                        object.insert("materialized_view_id".to_string(), json!(record.view_id));
+                    }
+                } else if let Some(object) = data.as_object_mut() {
+                    object.insert("materialized".to_string(), json!(false));
+                }
+                Ok((operation_id, data, Vec::new()))
+            })
+        }
     }
 }
 
