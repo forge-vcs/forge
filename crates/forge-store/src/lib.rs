@@ -260,6 +260,8 @@ pub struct LocalKeyStatus {
     pub key_path: String,
     pub exists_before_command: bool,
     pub signature_count: i64,
+    pub local_key_count: i64,
+    pub peer_key_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -272,6 +274,8 @@ pub struct LocalKeyRotation {
     pub public_key: String,
     pub key_path: String,
     pub signature_count: i64,
+    pub local_key_count: i64,
+    pub peer_key_count: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -569,6 +573,16 @@ pub struct DoctorReport {
     /// and native accepted commit ids must carry a valid Ed25519 `locally_signed` attestation.
     /// Empty in a healthy repo. Legacy pre-migration rows are grandfathered by rowid marker.
     pub signature_issues: Vec<SignatureFinding>,
+    /// Signing-key origin labels. Local keys are keys minted or used by this repository;
+    /// peer keys are valid signing keys imported through sync. A peer key may verify a
+    /// signature cryptographically, but it does not satisfy local-only trust policy.
+    pub signature_key_summary: SignatureKeySummary,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SignatureKeySummary {
+    pub local_key_fingerprints: Vec<String>,
+    pub peer_key_fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -844,12 +858,22 @@ pub fn local_key_status(cwd: &Path) -> Result<LocalKeyStatus> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
     let key = signing::local_key_status(&context.root_path)?;
+    signing::register_local_signing_key(
+        &connection,
+        &context.repo_id,
+        &key.public_key,
+        &key.key_fingerprint,
+        now_ms(),
+    )?;
+    let key_summary = signing::signature_key_summary(&connection, &context.repo_id)?;
     Ok(LocalKeyStatus {
         signature_count: signature_count_for_fingerprint(&connection, &key.key_fingerprint)?,
         key_fingerprint: key.key_fingerprint,
         public_key: key.public_key,
         key_path: key.key_path,
         exists_before_command: key.exists_before_command,
+        local_key_count: key_summary.local_key_fingerprints.len() as i64,
+        peer_key_count: key_summary.peer_key_fingerprints.len() as i64,
     })
 }
 
@@ -857,6 +881,14 @@ pub fn rotate_local_key(cwd: &Path) -> Result<LocalKeyRotation> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
     let rotation = signing::rotate_local_key(&context.root_path)?;
+    signing::register_local_signing_key(
+        &connection,
+        &context.repo_id,
+        &rotation.new_key.public_key,
+        &rotation.new_key.key_fingerprint,
+        now_ms(),
+    )?;
+    let key_summary = signing::signature_key_summary(&connection, &context.repo_id)?;
     Ok(LocalKeyRotation {
         previous_fingerprint: rotation.previous_fingerprint,
         previous_key_backup_path: rotation.previous_key_backup_path,
@@ -867,6 +899,8 @@ pub fn rotate_local_key(cwd: &Path) -> Result<LocalKeyRotation> {
         key_fingerprint: rotation.new_key.key_fingerprint,
         public_key: rotation.new_key.public_key,
         key_path: rotation.new_key.key_path,
+        local_key_count: key_summary.local_key_fingerprints.len() as i64,
+        peer_key_count: key_summary.peer_key_fingerprints.len() as i64,
     })
 }
 
@@ -959,7 +993,7 @@ pub fn enforce_trust_policy(
             key_fingerprint: None,
         });
     }
-    let mut signature_issues = signing::verify_subject_signatures(&connection, subjects)?;
+    let mut signature_issues = signing::verify_subject_local_signatures(&connection, subjects)?;
     signature_issues.extend(unsigned);
     signature_issues.sort_by(|left, right| {
         left.subject_kind
@@ -1459,6 +1493,30 @@ pub fn migrate(cwd: &Path) -> Result<()> {
     // per-command lock — never nested.
     let _lock = repo_lock::acquire(&forge_dir)?;
     migrations::apply_pending_migrations(&mut connection)?;
+    register_existing_local_key_after_migration(&root, &connection)?;
+    Ok(())
+}
+
+fn register_existing_local_key_after_migration(root: &Path, connection: &Connection) -> Result<()> {
+    let Some(key) = signing::existing_local_key_info(root)? else {
+        return Ok(());
+    };
+    let repo_id = connection
+        .query_row(
+            "SELECT id FROM repositories ORDER BY rowid LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(repo_id) = repo_id {
+        signing::register_local_signing_key(
+            connection,
+            &repo_id,
+            &key.public_key,
+            &key.key_fingerprint,
+            now_ms(),
+        )?;
+    }
     Ok(())
 }
 
@@ -4951,6 +5009,7 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
             signature_issues.len()
         ));
     }
+    let signature_key_summary = signing::signature_key_summary(&connection, &context.repo_id)?;
 
     // Native commit-DAG integrity pass (NER-138 Phase 7 slice 3): walk the DAG from the
     // authoritative tip and cross-check the ledger, REPORTING (not raising) cycles / dangling
@@ -4993,6 +5052,7 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         ledger_view_issues,
         native_pack_issues,
         signature_issues,
+        signature_key_summary,
     })
 }
 

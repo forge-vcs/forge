@@ -800,8 +800,36 @@ fn import_ledger_rows(
             imported += insert_row(&tx, spec, row, target_repo_id)?;
         }
     }
+    mark_imported_signature_keys(&tx, target_repo_id)?;
     tx.commit()?;
     Ok(imported)
+}
+
+fn mark_imported_signature_keys(conn: &Connection, repo_id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO signing_keys (
+            repo_id, key_fingerprint, public_key, trust_origin, created_at_ms, updated_at_ms
+         )
+         SELECT
+            repo_id,
+            key_fingerprint,
+            MIN(public_key),
+            'peer',
+            MIN(created_at_ms),
+            ?2
+         FROM ledger_signatures
+         WHERE repo_id = ?1
+         GROUP BY repo_id, key_fingerprint
+         ON CONFLICT(repo_id, key_fingerprint) DO UPDATE SET
+            public_key = excluded.public_key,
+            trust_origin = CASE
+                WHEN signing_keys.trust_origin = 'local' THEN 'local'
+                ELSE 'peer'
+            END,
+            updated_at_ms = excluded.updated_at_ms",
+        params![repo_id, now_ms()],
+    )?;
+    Ok(())
 }
 
 fn set_current_state(

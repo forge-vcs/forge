@@ -43,8 +43,10 @@ const ATTEMPT_WORKSPACES_009: &str = include_str!("../migrations/009_attempt_wor
 const STORAGE_POLICY_010: &str = include_str!("../migrations/010_storage_policy.sql");
 /// The 011 local-signatures migration (Phase 9 S1).
 const LOCAL_SIGNATURES_011: &str = include_str!("../migrations/011_local_signatures.sql");
-/// The 012 trust-policy migration (Phase 9 S2) — the current HEAD.
+/// The 012 trust-policy migration (Phase 9 S2).
 const TRUST_POLICY_012: &str = include_str!("../migrations/012_trust_policy.sql");
+/// The 013 signing-key-origin migration (Phase 9 remote key trust).
+const SIGNING_KEY_ORIGINS_013: &str = include_str!("../migrations/013_signing_key_origins.sql");
 
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
@@ -117,6 +119,29 @@ fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
     false
 }
 
+fn apply_through_012(conn: &Connection) {
+    conn.execute_batch(BASELINE_001).expect("apply baseline");
+    conn.execute_batch(COLUMNS_002).expect("apply 002 ALTERs");
+    conn.execute_batch(CHECK_SPEC_003).expect("apply 003 ALTER");
+    conn.execute_batch(INTEGRITY_004).expect("apply 004 ALTERs");
+    conn.execute_batch(NATIVE_HISTORY_005)
+        .expect("apply 005 native-history");
+    conn.execute_batch(NATIVE_HISTORY_COMMIT_ID_006)
+        .expect("apply 006 commit-id");
+    conn.execute_batch(EXPECTED_CONTENT_REF_007)
+        .expect("apply 007 expected-content-ref");
+    conn.execute_batch(CONFLICT_DATA_008)
+        .expect("apply 008 conflict-data");
+    conn.execute_batch(ATTEMPT_WORKSPACES_009)
+        .expect("apply 009 attempt-workspaces");
+    conn.execute_batch(STORAGE_POLICY_010)
+        .expect("apply 010 storage-policy");
+    conn.execute_batch(LOCAL_SIGNATURES_011)
+        .expect("apply 011 local-signatures");
+    conn.execute_batch(TRUST_POLICY_012)
+        .expect("apply 012 trust-policy");
+}
+
 fn max_version(conn: &Connection) -> i64 {
     conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
@@ -124,6 +149,48 @@ fn max_version(conn: &Connection) -> i64 {
         |row| row.get(0),
     )
     .expect("max version")
+}
+
+#[test]
+fn signing_key_origin_backfill_labels_existing_signature_keys_as_peer() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .expect("enable fks");
+    apply_through_012(&conn);
+    conn.execute(
+        "INSERT INTO repositories (id, root_path, git_head, content_backend, created_at_ms)
+         VALUES ('repo_test', '/tmp/forge-test', NULL, 'native', 0)",
+        [],
+    )
+    .expect("insert repository");
+    conn.execute(
+        "INSERT INTO ledger_signatures (
+            id, repo_id, subject_kind, subject_id, signed_digest, signature_alg,
+            public_key, key_fingerprint, signature, trust_level, created_at_ms
+         ) VALUES (
+            'sig_peer', 'repo_test', 'evidence', 'ev_peer', 'digest',
+            'ed25519', 'peer_public_key', 'peer_fingerprint', 'peer_signature',
+            'locally_signed', 7
+         )",
+        [],
+    )
+    .expect("insert pre-existing signature");
+
+    conn.execute_batch(SIGNING_KEY_ORIGINS_013)
+        .expect("apply 013 signing-key-origins");
+
+    let trust_origin: String = conn
+        .query_row(
+            "SELECT trust_origin FROM signing_keys
+             WHERE repo_id = 'repo_test' AND key_fingerprint = 'peer_fingerprint'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query signing key origin");
+    assert_eq!(
+        trust_origin, "peer",
+        "migration must fail closed for pre-existing signature rows"
+    );
 }
 
 #[test]
@@ -187,7 +254,7 @@ fn behind_db_upgrades_to_head() {
         has_column(&conn, "attempt_workspaces", "workspace_rel_path"),
         "009 created attempt_workspaces"
     );
-    assert_eq!(max_version(&conn), 12, "reached HEAD=12");
+    assert_eq!(max_version(&conn), 13, "reached HEAD=13");
 }
 
 #[test]
@@ -216,6 +283,8 @@ fn at_head_db_is_a_noop() {
             .expect("apply 011 local-signatures");
         conn.execute_batch(TRUST_POLICY_012)
             .expect("apply 012 trust-policy");
+        conn.execute_batch(SIGNING_KEY_ORIGINS_013)
+            .expect("apply 013 signing-key-origins");
         stamp_versions(
             &conn,
             &[
@@ -231,15 +300,16 @@ fn at_head_db_is_a_noop() {
                 (10, "010_storage_policy"),
                 (11, "011_local_signatures"),
                 (12, "012_trust_policy"),
+                (13, "013_signing_key_origins"),
             ],
         );
-        assert_eq!(max_version(&conn), 12);
+        assert_eq!(max_version(&conn), 13);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 12, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 13, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -268,7 +338,9 @@ fn head_plus_one_is_refused() {
             .expect("apply 011 local-signatures");
         conn.execute_batch(TRUST_POLICY_012)
             .expect("apply 012 trust-policy");
-        // HEAD is now 12, so the genuinely-ahead stamp is 13.
+        conn.execute_batch(SIGNING_KEY_ORIGINS_013)
+            .expect("apply 013 signing-key-origins");
+        // HEAD is now 13, so the genuinely-ahead stamp is 14.
         stamp_versions(
             &conn,
             &[
@@ -284,10 +356,11 @@ fn head_plus_one_is_refused() {
                 (10, "010_storage_policy"),
                 (11, "011_local_signatures"),
                 (12, "012_trust_policy"),
-                (13, "future"),
+                (13, "013_signing_key_origins"),
+                (14, "future"),
             ],
         );
-        assert_eq!(max_version(&conn), 13);
+        assert_eq!(max_version(&conn), 14);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -296,8 +369,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 13);
-            assert_eq!(*supported_head, 12);
+            assert_eq!(*db_version, 14);
+            assert_eq!(*supported_head, 13);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }
