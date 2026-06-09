@@ -93,6 +93,20 @@ pub struct SyncImportReport {
     pub local_key_fingerprint: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncCloneReport {
+    pub protocol_version: String,
+    pub repository_id: String,
+    pub root_path: String,
+    pub content_backend: String,
+    pub imported_native_objects: usize,
+    pub imported_ledger_rows: usize,
+    pub native_head: Option<String>,
+    pub current_operation_id: String,
+    pub current_view_id: String,
+    pub local_key_fingerprint: Option<String>,
+}
+
 pub fn build_manifest(cwd: &Path) -> Result<SyncManifest> {
     let context = forge_store::open_repository(cwd)?;
     let connection = Connection::open(&context.database_path)?;
@@ -191,6 +205,61 @@ pub fn inspect_manifest(path: &Path) -> Result<SyncInspectReport> {
 }
 
 pub fn import_manifest(cwd: &Path, path: &Path) -> Result<SyncImportReport> {
+    let manifest = read_supported_manifest(path)?;
+    let context = forge_store::open_repository(cwd)?;
+    if context.content_backend != "native" {
+        bail!("sync import requires a native content repository");
+    }
+    let imported_ledger_rows = apply_manifest(
+        &context.root_path,
+        &context.database_path,
+        &context.repo_id,
+        &manifest,
+        CurrentStateMode::Update,
+    )?;
+
+    Ok(SyncImportReport {
+        protocol_version: manifest.protocol_version,
+        content_backend: manifest.content_backend,
+        imported_native_objects: manifest.native_payloads.len(),
+        imported_ledger_rows,
+        native_head: manifest.native_head,
+        current_operation_id: manifest.current_operation_id,
+        current_view_id: manifest.current_view_id,
+        local_key_fingerprint: manifest.local_key_fingerprint,
+    })
+}
+
+pub fn clone_manifest(cwd: &Path, path: &Path) -> Result<SyncCloneReport> {
+    let manifest = read_supported_manifest(path)?;
+    if manifest.native_head.is_none() {
+        bail!("sync clone requires a native head");
+    }
+    let clone = forge_store::prepare_native_sync_clone(cwd, &manifest.repo_id)?;
+    let root_path = Path::new(&clone.root_path);
+    let database_path = Path::new(&clone.database_path);
+    let imported_ledger_rows = apply_manifest(
+        root_path,
+        database_path,
+        &manifest.repo_id,
+        &manifest,
+        CurrentStateMode::Insert,
+    )?;
+    Ok(SyncCloneReport {
+        protocol_version: manifest.protocol_version,
+        repository_id: clone.repository_id,
+        root_path: clone.root_path,
+        content_backend: clone.content_backend,
+        imported_native_objects: manifest.native_payloads.len(),
+        imported_ledger_rows,
+        native_head: manifest.native_head,
+        current_operation_id: manifest.current_operation_id,
+        current_view_id: manifest.current_view_id,
+        local_key_fingerprint: manifest.local_key_fingerprint,
+    })
+}
+
+fn read_supported_manifest(path: &Path) -> Result<SyncManifest> {
     let bytes = fs::read(path)?;
     let manifest: SyncManifest = serde_json::from_slice(&bytes)?;
     if manifest.protocol_version != SYNC_PROTOCOL_VERSION {
@@ -202,12 +271,42 @@ pub fn import_manifest(cwd: &Path, path: &Path) -> Result<SyncImportReport> {
     if manifest.content_backend != "native" {
         bail!("sync import only supports native content bundles");
     }
-    let context = forge_store::open_repository(cwd)?;
-    if context.content_backend != "native" {
-        bail!("sync import requires a native content repository");
-    }
+    Ok(manifest)
+}
 
-    let store = NativeObjectStore::new(&context.root_path);
+#[derive(Debug, Clone, Copy)]
+enum CurrentStateMode {
+    Insert,
+    Update,
+}
+
+fn apply_manifest(
+    root_path: &Path,
+    database_path: &Path,
+    repo_id: &str,
+    manifest: &SyncManifest,
+    current_state_mode: CurrentStateMode,
+) -> Result<usize> {
+    let store = NativeObjectStore::new(root_path);
+    write_manifest_objects(&store, manifest)?;
+    let mut connection = Connection::open(database_path)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    let imported_ledger_rows = import_ledger_rows(&mut connection, repo_id, manifest)?;
+    if let Some(head) = manifest.native_head.as_deref() {
+        let head_id = ObjectId::parse(head)?;
+        if head_id.kind()? != ObjectKind::Commit {
+            bail!("sync native head does not name a commit");
+        }
+        store
+            .read_object(&head_id)
+            .with_context(|| format!("sync native head object {head} is missing"))?;
+        NativeRefStore::new(root_path).set_head(&head_id)?;
+    }
+    set_current_state(&connection, repo_id, manifest, current_state_mode)?;
+    Ok(imported_ledger_rows)
+}
+
+fn write_manifest_objects(store: &NativeObjectStore, manifest: &SyncManifest) -> Result<()> {
     for payload in &manifest.native_payloads {
         let id = ObjectId::parse(&payload.object_id)?;
         let kind = object_kind_from_label(&payload.kind)?;
@@ -223,31 +322,7 @@ pub fn import_manifest(cwd: &Path, path: &Path) -> Result<SyncImportReport> {
             bail!("sync object payload does not hash to {}", payload.object_id);
         }
     }
-
-    let mut connection = Connection::open(&context.database_path)?;
-    connection.pragma_update(None, "foreign_keys", "ON")?;
-    let imported_ledger_rows = import_ledger_rows(&mut connection, &context.repo_id, &manifest)?;
-    if let Some(head) = manifest.native_head.as_deref() {
-        let head_id = ObjectId::parse(head)?;
-        if head_id.kind()? != ObjectKind::Commit {
-            bail!("sync native head does not name a commit");
-        }
-        store
-            .read_object(&head_id)
-            .with_context(|| format!("sync native head object {head} is missing"))?;
-        NativeRefStore::new(&context.root_path).set_head(&head_id)?;
-    }
-    update_current_state(&connection, &manifest)?;
-    Ok(SyncImportReport {
-        protocol_version: manifest.protocol_version,
-        content_backend: manifest.content_backend,
-        imported_native_objects: manifest.native_payloads.len(),
-        imported_ledger_rows,
-        native_head: manifest.native_head,
-        current_operation_id: manifest.current_operation_id,
-        current_view_id: manifest.current_view_id,
-        local_key_fingerprint: manifest.local_key_fingerprint,
-    })
+    Ok(())
 }
 
 fn ledger_counts(connection: &Connection) -> Result<Vec<LedgerTableCount>> {
@@ -531,19 +606,42 @@ fn import_ledger_rows(
     Ok(imported)
 }
 
-fn update_current_state(connection: &Connection, manifest: &SyncManifest) -> Result<()> {
-    connection.execute(
-        "UPDATE current_state
-         SET current_operation_id = ?1,
-             current_view_id = ?2,
-             updated_at_ms = ?3
-         WHERE singleton = 1",
-        params![
-            manifest.current_operation_id,
-            manifest.current_view_id,
-            now_ms(),
-        ],
-    )?;
+fn set_current_state(
+    connection: &Connection,
+    repo_id: &str,
+    manifest: &SyncManifest,
+    mode: CurrentStateMode,
+) -> Result<()> {
+    match mode {
+        CurrentStateMode::Insert => {
+            connection.execute(
+                "INSERT INTO current_state (
+                    singleton, repo_id, current_operation_id, current_view_id,
+                    attached_attempt_id, expected_content_ref, updated_at_ms
+                 ) VALUES (1, ?1, ?2, ?3, NULL, NULL, ?4)",
+                params![
+                    repo_id,
+                    manifest.current_operation_id,
+                    manifest.current_view_id,
+                    now_ms(),
+                ],
+            )?;
+        }
+        CurrentStateMode::Update => {
+            connection.execute(
+                "UPDATE current_state
+                 SET current_operation_id = ?1,
+                     current_view_id = ?2,
+                     updated_at_ms = ?3
+                 WHERE singleton = 1",
+                params![
+                    manifest.current_operation_id,
+                    manifest.current_view_id,
+                    now_ms(),
+                ],
+            )?;
+        }
+    }
     Ok(())
 }
 

@@ -288,6 +288,8 @@ enum SyncCommand {
     Inspect(SyncInspectArgs),
     /// Import a previously exported native sync bundle into this repository.
     Import(SyncImportArgs),
+    /// Clone a native sync bundle into an empty directory and materialize its HEAD.
+    Clone(SyncCloneArgs),
 }
 
 #[derive(Debug, Args)]
@@ -307,6 +309,11 @@ struct SyncImportArgs {
     /// Restore the imported native HEAD tree into the current worktree after applying the bundle.
     #[arg(long)]
     materialize: bool,
+}
+
+#[derive(Debug, Args)]
+struct SyncCloneArgs {
+    path: std::path::PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -481,7 +488,7 @@ fn command_from_args(args: &[String]) -> String {
         [] => "forge".to_string(),
         [command] => command.clone(),
         [command, subcommand, ..]
-            if matches!(command.as_str(), "export" | "attempt" | "proposal") =>
+            if matches!(command.as_str(), "export" | "attempt" | "proposal" | "sync") =>
         {
             format!("{command} {subcommand}")
         }
@@ -1357,6 +1364,42 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
                 Ok((operation_id, data, Vec::new()))
             })
         }
+        SyncCommand::Clone(args) => {
+            let result = env::current_dir()
+                .map_err(anyhow::Error::from)
+                .and_then(|cwd| {
+                    let report = forge_sync::clone_manifest(&cwd, &args.path)
+                        .context("clone sync bundle")?;
+                    let commit_id = report.native_head.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("sync bundle has no native head to clone")
+                    })?;
+                    let content_ref = forge_store::checkout_target_content_ref(&cwd, commit_id)
+                        .context("resolve cloned native head")?;
+                    restore_effective_worktree(&cwd, &content_ref)
+                        .context("restore cloned native head")?;
+                    forge_store::set_sync_clone_expected_content_ref(&cwd, &content_ref)
+                        .context("record cloned worktree baseline")?;
+                    let mut data = serde_json::to_value(&report)?;
+                    if let Some(object) = data.as_object_mut() {
+                        object.insert("materialized".to_string(), json!(true));
+                        object.insert("materialized_content_ref".to_string(), json!(content_ref));
+                    }
+                    Ok(data)
+                });
+            match result {
+                Ok(data) => ResponseEnvelope::success("sync clone", request_id, None, data),
+                Err(error) => {
+                    let (error_object, retry) = error_to_object("sync clone", &error);
+                    ResponseEnvelope::error_with(
+                        "sync clone",
+                        request_id,
+                        None,
+                        error_object,
+                        retry,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -2010,6 +2053,7 @@ fn is_mutating_command(command: &str) -> bool {
             | "key rotate"
             | "gc"
             | "sync import"
+            | "sync clone"
     )
 }
 
