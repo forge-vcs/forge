@@ -32,6 +32,15 @@ pub struct InitRepository {
     pub already_initialized: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SyncCloneRepository {
+    pub repository_id: String,
+    pub root_path: String,
+    pub forge_dir: String,
+    pub database_path: String,
+    pub content_backend: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct OperationViewInput {
     pub request_id: Option<String>,
@@ -1253,6 +1262,57 @@ pub fn init_repository(
     })
 }
 
+pub fn prepare_native_sync_clone(cwd: &Path, repository_id: &str) -> Result<SyncCloneRepository> {
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    if root.join(".forge/forge.db").exists() {
+        bail!("refusing to clone into an initialized forge repository");
+    }
+    let non_empty = fs::read_dir(&root)
+        .with_context(|| format!("failed to read {}", root.display()))?
+        .next()
+        .transpose()?
+        .is_some();
+    if non_empty {
+        bail!("refusing to clone into a non-empty directory");
+    }
+    {
+        let mut ancestor = root.parent();
+        while let Some(dir) = ancestor {
+            if dir.join(".forge/forge.db").exists() {
+                bail!("refusing to clone a forge repo nested inside an existing forge repo");
+            }
+            ancestor = dir.parent();
+        }
+    }
+
+    let forge_dir = root.join(".forge");
+    fs::create_dir_all(&forge_dir)
+        .with_context(|| format!("failed to create {}", forge_dir.display()))?;
+    let _init_lock = repo_lock::acquire(&forge_dir)?;
+    let database_path = forge_dir.join("forge.db");
+    let mut connection = open_connection(&database_path)
+        .with_context(|| format!("failed to open {}", database_path.display()))?;
+    migrations::apply_pending_migrations(&mut connection)?;
+    let existing: i64 =
+        connection.query_row("SELECT COUNT(*) FROM repositories", [], |row| row.get(0))?;
+    if existing != 0 {
+        bail!("refusing to clone into a non-empty forge database");
+    }
+    connection.execute(
+        "INSERT INTO repositories (id, root_path, git_head, content_backend, created_at_ms)
+         VALUES (?1, ?2, NULL, 'native', ?3)",
+        params![repository_id, root.to_string_lossy(), now_ms()],
+    )?;
+
+    Ok(SyncCloneRepository {
+        repository_id: repository_id.to_string(),
+        root_path: root.to_string_lossy().into_owned(),
+        forge_dir: forge_dir.to_string_lossy().into_owned(),
+        database_path: database_path.to_string_lossy().into_owned(),
+        content_backend: "native".to_string(),
+    })
+}
+
 pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     // Git-free root resolution (slice 3): walk up for `.forge/forge.db` rather than shelling
     // `git rev-parse`, so every post-init command works with git removed from PATH.
@@ -2072,6 +2132,20 @@ pub fn record_sync_import_materialized(
         Ok(op)
     })?;
     Ok(op)
+}
+
+pub fn set_sync_clone_expected_content_ref(cwd: &Path, content_ref: &str) -> Result<()> {
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        tx.execute(
+            "UPDATE current_state
+             SET attached_attempt_id = NULL, expected_content_ref = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![content_ref, now_ms()],
+        )?;
+        Ok(())
+    })
 }
 
 /// What a `forge undo` will restore (NER-138 Phase 7 slice 3 / NER-143 R3+R4).
