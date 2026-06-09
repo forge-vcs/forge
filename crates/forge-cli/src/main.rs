@@ -1424,8 +1424,8 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
             ensure_clean_for_sync_import_materialize(&cwd).context("preflight sync pull")?;
             sync_fetch_peer(&cwd, request_id, &args.remote, true)
         }),
-        SyncCommand::Push(args) => command_result("sync push", request_id, |cwd, _request_id| {
-            sync_push_peer(&cwd, &args.remote)
+        SyncCommand::Push(args) => command_result("sync push", request_id, |cwd, request_id| {
+            sync_push_peer(&cwd, request_id, &args.remote)
         }),
     }
 }
@@ -1436,17 +1436,72 @@ fn sync_fetch_peer(
     remote: &Path,
     materialize: bool,
 ) -> Result<(Option<String>, Value, Vec<String>)> {
-    let (local_manifest, remote_manifest, _remote_lock) = peer_manifests(cwd, remote)?;
-    ensure_peer_fast_forward_or_conflict(
+    let (local_manifest, remote_manifest, _peer_locks) = peer_manifests(cwd, remote)?;
+    ensure_peer_compatible(
         &remote_manifest,
         &local_manifest,
-        if materialize {
-            "sync_pull_divergence"
-        } else {
-            "sync_fetch_divergence"
-        },
         if materialize { "pull" } else { "fetch" },
     )?;
+    if !forge_sync::manifest_head_descends_from(
+        &remote_manifest,
+        local_manifest.native_head.as_deref(),
+    )? {
+        if forge_sync::manifest_head_descends_from(
+            &local_manifest,
+            remote_manifest.native_head.as_deref(),
+        )? {
+            let direction = if materialize { "pull" } else { "fetch" };
+            let command = if materialize {
+                "sync pull"
+            } else {
+                "sync fetch"
+            };
+            let operation_id = if request_id.is_some() {
+                Some(
+                    forge_store::record_sync_request_marker(
+                        cwd, request_id, command, direction, remote, None,
+                    )
+                    .with_context(|| format!("record local {command} request-id marker"))?
+                    .operation_id,
+                )
+            } else {
+                None
+            };
+            return Ok((
+                operation_id,
+                json!({
+                    "protocol_version": remote_manifest.protocol_version,
+                    "direction": direction,
+                    "remote_path": remote.display().to_string(),
+                    "base_native_head": local_manifest.native_head,
+                    "remote_native_head": remote_manifest.native_head,
+                    "imported_native_objects": 0,
+                    "imported_ledger_rows": 0,
+                    "materialized": false,
+                    "up_to_date": true,
+                }),
+                Vec::new(),
+            ));
+        }
+        return record_sync_peer_merge_conflict(SyncPeerMergeConflictInput {
+            receiver_cwd: cwd,
+            request_id,
+            source: &remote_manifest,
+            receiver: &local_manifest,
+            remote,
+            context: if materialize {
+                "sync_pull_divergence"
+            } else {
+                "sync_fetch_divergence"
+            },
+            command: if materialize {
+                "sync pull"
+            } else {
+                "sync fetch"
+            },
+            direction: if materialize { "pull" } else { "fetch" },
+        });
+    }
 
     let temp = SyncTransferDir::new(cwd)?;
     let local_base_path = temp.path().join("local-base.json");
@@ -1499,14 +1554,87 @@ fn sync_fetch_peer(
     Ok((operation_id, data, Vec::new()))
 }
 
-fn sync_push_peer(cwd: &Path, remote: &Path) -> Result<(Option<String>, Value, Vec<String>)> {
-    let (local_manifest, remote_manifest, _remote_lock) = peer_manifests(cwd, remote)?;
-    ensure_peer_fast_forward_or_conflict(
+fn sync_push_peer(
+    cwd: &Path,
+    request_id: Option<String>,
+    remote: &Path,
+) -> Result<(Option<String>, Value, Vec<String>)> {
+    let (local_manifest, remote_manifest, _peer_locks) = peer_manifests(cwd, remote)?;
+    ensure_peer_compatible(&local_manifest, &remote_manifest, "push")?;
+    if !forge_sync::manifest_head_descends_from(
         &local_manifest,
-        &remote_manifest,
-        "sync_push_divergence",
-        "push",
-    )?;
+        remote_manifest.native_head.as_deref(),
+    )? {
+        if forge_sync::manifest_head_descends_from(
+            &remote_manifest,
+            local_manifest.native_head.as_deref(),
+        )? {
+            let operation_id = if request_id.is_some() {
+                Some(
+                    forge_store::record_sync_request_marker(
+                        cwd,
+                        request_id,
+                        "sync push",
+                        "push",
+                        remote,
+                        None,
+                    )
+                    .context("record local sync push request-id marker")?
+                    .operation_id,
+                )
+            } else {
+                None
+            };
+            return Ok((
+                operation_id,
+                json!({
+                    "protocol_version": local_manifest.protocol_version,
+                    "direction": "push",
+                    "remote_path": remote.display().to_string(),
+                    "base_native_head": remote_manifest.native_head,
+                    "local_native_head": local_manifest.native_head,
+                    "imported_native_objects": 0,
+                    "imported_ledger_rows": 0,
+                    "materialized": false,
+                    "up_to_date": true,
+                }),
+                Vec::new(),
+            ));
+        }
+        let (remote_operation_id, mut data, warnings) =
+            record_sync_peer_merge_conflict(SyncPeerMergeConflictInput {
+                receiver_cwd: remote,
+                request_id: None,
+                source: &local_manifest,
+                receiver: &remote_manifest,
+                remote: cwd,
+                context: "sync_push_divergence",
+                command: "sync push",
+                direction: "push",
+            })?;
+        let local_operation_id = if request_id.is_some() {
+            let marker = forge_store::record_sync_request_marker(
+                cwd,
+                request_id,
+                "sync push",
+                "push",
+                remote,
+                remote_operation_id.as_deref(),
+            )
+            .context("record local sync push request-id marker")?;
+            if let Some(object) = data.as_object_mut() {
+                object.insert(
+                    "remote_operation_id".to_string(),
+                    json!(remote_operation_id),
+                );
+                object.insert("operation_id".to_string(), json!(marker.operation_id));
+            }
+            Some(marker.operation_id)
+        } else {
+            remote_operation_id
+        };
+        return Ok((local_operation_id, data, warnings));
+    }
 
     let temp = SyncTransferDir::new(cwd)?;
     let remote_base_path = temp.path().join("remote-base.json");
@@ -1518,6 +1646,7 @@ fn sync_push_peer(cwd: &Path, remote: &Path) -> Result<(Option<String>, Value, V
     let import_report =
         forge_sync::import_manifest(remote, &outgoing_path).context("apply local sync delta")?;
 
+    let mut operation_id = None;
     let data = json!({
         "protocol_version": import_report.protocol_version,
         "direction": "push",
@@ -1532,7 +1661,26 @@ fn sync_push_peer(cwd: &Path, remote: &Path) -> Result<(Option<String>, Value, V
         "local_key_fingerprint": import_report.local_key_fingerprint,
         "materialized": false,
     });
-    Ok((None, data, Vec::new()))
+    if request_id.is_some() {
+        operation_id = Some(
+            forge_store::record_sync_request_marker(
+                cwd,
+                request_id,
+                "sync push",
+                "push",
+                remote,
+                None,
+            )
+            .context("record local sync push request-id marker")?
+            .operation_id,
+        );
+    }
+    Ok((operation_id, data, Vec::new()))
+}
+
+struct PeerRepoLocks {
+    _first: forge_store::RepoLock,
+    _second: forge_store::RepoLock,
 }
 
 fn peer_manifests(
@@ -1541,24 +1689,44 @@ fn peer_manifests(
 ) -> Result<(
     forge_sync::SyncManifest,
     forge_sync::SyncManifest,
-    forge_store::RepoLock,
+    PeerRepoLocks,
 )> {
     let local_context = forge_store::open_repository(cwd)?;
     let remote_context = forge_store::open_repository(remote)?;
     if local_context.root_path == remote_context.root_path {
         anyhow::bail!("sync peer remote must be a different repository");
     }
-    let remote_lock = forge_store::acquire_repository_lock(remote)?;
-    forge_store::reconcile_native_head(remote)?;
-    let local_manifest = forge_sync::build_manifest(cwd)?;
-    let remote_manifest = forge_sync::build_manifest(remote)?;
-    Ok((local_manifest, remote_manifest, remote_lock))
+    let local_first = local_context.root_path <= remote_context.root_path;
+    let first_path = if local_first {
+        &local_context.root_path
+    } else {
+        &remote_context.root_path
+    };
+    let second_path = if local_first {
+        &remote_context.root_path
+    } else {
+        &local_context.root_path
+    };
+    let first = forge_store::acquire_repository_lock(first_path)?;
+    let second = forge_store::acquire_repository_lock(second_path)?;
+
+    forge_store::reconcile_native_head(&local_context.root_path)?;
+    forge_store::reconcile_native_head(&remote_context.root_path)?;
+    let local_manifest = forge_sync::build_manifest(&local_context.root_path)?;
+    let remote_manifest = forge_sync::build_manifest(&remote_context.root_path)?;
+    Ok((
+        local_manifest,
+        remote_manifest,
+        PeerRepoLocks {
+            _first: first,
+            _second: second,
+        },
+    ))
 }
 
-fn ensure_peer_fast_forward_or_conflict(
+fn ensure_peer_compatible(
     source: &forge_sync::SyncManifest,
     receiver: &forge_sync::SyncManifest,
-    context: &str,
     action: &str,
 ) -> Result<()> {
     if source.content_backend != "native" || receiver.content_backend != "native" {
@@ -1571,29 +1739,114 @@ fn ensure_peer_fast_forward_or_conflict(
             receiver.repo_id
         );
     }
-    if !forge_sync::manifest_head_descends_from(source, receiver.native_head.as_deref())? {
-        let expected_head = receiver.native_head.clone().ok_or_else(|| {
-            anyhow::anyhow!("sync {action} receiver has no native head for divergence record")
+    Ok(())
+}
+
+struct SyncPeerMergeConflictInput<'a> {
+    receiver_cwd: &'a Path,
+    request_id: Option<String>,
+    source: &'a forge_sync::SyncManifest,
+    receiver: &'a forge_sync::SyncManifest,
+    remote: &'a Path,
+    context: &'a str,
+    command: &'a str,
+    direction: &'a str,
+}
+
+fn record_sync_peer_merge_conflict(
+    input: SyncPeerMergeConflictInput<'_>,
+) -> Result<(Option<String>, Value, Vec<String>)> {
+    let base_head = forge_sync::manifest_common_ancestor_head(input.source, input.receiver)?
+        .ok_or_else(|| ForgeError::SyncDivergenceUnsupported {
+            direction: input.direction.to_string(),
+            reason: "no_common_native_base".to_string(),
         })?;
-        let actual_head = source.native_head.clone().ok_or_else(|| {
-            anyhow::anyhow!("sync {action} source has no native head for divergence record")
+    let base_content_ref = forge_sync::manifest_commit_content_ref(input.receiver, &base_head)
+        .or_else(|_| forge_sync::manifest_commit_content_ref(input.source, &base_head))?;
+    let ours_content_ref =
+        forge_sync::manifest_head_content_ref(input.receiver)?.ok_or_else(|| {
+            anyhow::anyhow!("sync {} receiver head has no content ref", input.direction)
         })?;
-        let ours_content_ref = forge_sync::manifest_head_content_ref(receiver)?
-            .ok_or_else(|| anyhow::anyhow!("sync {action} receiver head has no content ref"))?;
-        let theirs_content_ref = forge_sync::manifest_head_content_ref(source)?
-            .ok_or_else(|| anyhow::anyhow!("sync {action} source head has no content ref"))?;
-        return Err(forge_store::StaleBaseConflict {
-            input: forge_store::StaleBaseConflictInput {
-                context: context.to_string(),
-                expected_head,
-                actual_head,
-                base_content_ref: ours_content_ref.clone(),
-                ours_content_ref,
-                theirs_content_ref,
-                changed_paths: Vec::new(),
-            },
+    let theirs_content_ref =
+        forge_sync::manifest_head_content_ref(input.source)?.ok_or_else(|| {
+            anyhow::anyhow!("sync {} source head has no content ref", input.direction)
+        })?;
+    let receiver_context = forge_store::open_repository(input.receiver_cwd)?;
+    let store = forge_content_native::NativeObjectStore::new(&receiver_context.root_path);
+    let pre_merge_loose_objects = store.loose_object_ids()?;
+    let imported_native_objects =
+        forge_sync::import_native_objects(input.receiver_cwd, input.source)
+            .context("stage peer native objects for sync merge")?;
+    let merge = match forge_content_native::merge_native_content_refs(
+        &store,
+        &base_content_ref,
+        &ours_content_ref,
+        &theirs_content_ref,
+    ) {
+        Ok(merge) => merge,
+        Err(error) => {
+            cleanup_new_native_objects(&store, &pre_merge_loose_objects)
+                .context("remove staged native objects after failed sync merge")?;
+            return Err(error).context("merge peer native content refs");
+        }
+    };
+    if merge.merged_content_ref.is_some() {
+        cleanup_new_native_objects(&store, &pre_merge_loose_objects)
+            .context("remove staged native objects for unsupported clean sync merge")?;
+        return Err(ForgeError::SyncDivergenceUnsupported {
+            direction: input.direction.to_string(),
+            reason: "clean_divergent_merge".to_string(),
         }
         .into());
+    }
+    let conflict_input = forge_store::MergeConflictInput {
+        context: input.context.to_string(),
+        proposal_id: None,
+        base_head: Some(base_head),
+        ours_head: input.receiver.native_head.clone(),
+        base_content_ref,
+        ours_content_ref,
+        theirs_content_ref,
+        conflicts: merge.conflicts,
+    };
+    let record = match forge_store::record_sync_merge_conflict(
+        input.receiver_cwd,
+        input.request_id,
+        input.command,
+        &conflict_input,
+    ) {
+        Ok(record) => record,
+        Err(error) => {
+            cleanup_new_native_objects(&store, &pre_merge_loose_objects)
+                .context("remove staged native objects after failed sync conflict record")?;
+            return Err(error).context("record sync merge conflict");
+        }
+    };
+    Ok((
+        Some(record.operation_id.clone()),
+        json!({
+            "protocol_version": input.source.protocol_version,
+            "direction": input.direction,
+            "remote_path": input.remote.display().to_string(),
+            "merged": false,
+            "conflict_set_id": record.conflict_set_id,
+            "operation_id": record.operation_id,
+            "base_native_head": input.receiver.native_head,
+            "source_native_head": input.source.native_head,
+            "imported_native_objects": imported_native_objects,
+            "imported_ledger_rows": 0,
+            "materialized": false,
+        }),
+        Vec::new(),
+    ))
+}
+
+fn cleanup_new_native_objects(
+    store: &forge_content_native::NativeObjectStore,
+    before: &std::collections::BTreeSet<forge_content_native::ObjectId>,
+) -> Result<()> {
+    for id in store.loose_object_ids()?.difference(before) {
+        store.delete_object(id)?;
     }
     Ok(())
 }
@@ -1868,9 +2121,11 @@ where
     // Hold the repo-level advisory write lock across the whole critical section
     // (determining reads + the write), so this command's CLI-layer reads — e.g.
     // `accept`'s `current_head`/`base_head` compare — are atomic against other
-    // forge writers (NER-132). Acquired once, here; never nested. `run` and `init`
-    // are excluded (see `requires_repo_lock`). A contention timeout surfaces as the
-    // retryable `LOCK_TIMEOUT` code via the typed `LockTimeout` downcast.
+    // forge writers (NER-132). Acquired once, here; never nested. `run`, `init`,
+    // and path-peer sync are excluded (see `requires_repo_lock`). Peer sync takes
+    // both repository locks in canonical order inside its own critical section. A
+    // contention timeout surfaces as the retryable `LOCK_TIMEOUT` code via the typed
+    // `LockTimeout` downcast.
     let _repo_lock = if requires_repo_lock(command) {
         match forge_store::acquire_repo_lock(&cwd) {
             Ok(guard) => guard,
@@ -2292,8 +2547,15 @@ fn is_mutating_command(command: &str) -> bool {
 /// this command's critical section (NER-132 U2). Excludes `run` — it executes its
 /// child inside the closure and must not hold the lock (PRD §10.6) — and `init`,
 /// which acquires the lock itself inside `init_repository` (it does not route
-/// through `command_result`). The lock is acquired exactly once per command, never
-/// nested, per the std file-locking re-entrancy caveat.
+/// through `command_result`). Path-peer sync commands acquire both participating
+/// repo locks in canonical root-path order inside `peer_manifests`, avoiding
+/// opposite-direction lock inversion while keeping the same envelope/replay
+/// behavior. The lock is acquired exactly once per command, never nested, per the
+/// std file-locking re-entrancy caveat.
 fn requires_repo_lock(command: &str) -> bool {
-    is_mutating_command(command) && !matches!(command, "run" | "init")
+    is_mutating_command(command)
+        && !matches!(
+            command,
+            "run" | "init" | "sync fetch" | "sync pull" | "sync push"
+        )
 }

@@ -237,6 +237,10 @@ pub enum ForgeError {
         level: String,
         supported: Vec<String>,
     },
+    /// A divergent peer sync reached a supported detection boundary but not a
+    /// supported resolution path for this slice. Deterministic until the clean
+    /// remote merge-commit capability lands, so clients should not auto-retry it.
+    SyncDivergenceUnsupported { direction: String, reason: String },
 }
 
 impl ForgeError {
@@ -274,6 +278,7 @@ impl ForgeError {
             ForgeError::UnsupportedContentBackend { .. } => "UNSUPPORTED_CONTENT_BACKEND",
             ForgeError::TrustPolicyUnmet { .. } => "TRUST_POLICY_UNMET",
             ForgeError::UnsupportedTrustLevel { .. } => "UNSUPPORTED_TRUST_LEVEL",
+            ForgeError::SyncDivergenceUnsupported { .. } => "SYNC_DIVERGENCE_UNSUPPORTED",
         }
     }
 
@@ -407,6 +412,9 @@ impl ForgeError {
             }),
             ForgeError::UnsupportedTrustLevel { level, supported } => {
                 json!({ "level": level, "supported": supported })
+            }
+            ForgeError::SyncDivergenceUnsupported { direction, reason } => {
+                json!({ "direction": direction, "reason": reason })
             }
             _ => Value::Object(Default::default()),
         }
@@ -570,6 +578,10 @@ impl std::fmt::Display for ForgeError {
                 f,
                 "unsupported trust level {level}; supported levels: {}",
                 supported.join(", ")
+            ),
+            ForgeError::SyncDivergenceUnsupported { direction, reason } => write!(
+                f,
+                "sync {direction} divergent native merge is not supported yet ({reason})"
             ),
         }
     }
@@ -783,6 +795,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             after_ms: None,
             details_keys: &["level", "supported"],
         },
+        ErrorCodeSpec {
+            code: "SYNC_DIVERGENCE_UNSUPPORTED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["direction", "reason"],
+        },
     ]
 }
 
@@ -941,6 +959,10 @@ mod tests {
             ForgeError::StaleBase {
                 expected_head: "a".into(),
                 actual_head: "b".into(),
+            },
+            ForgeError::SyncDivergenceUnsupported {
+                direction: "fetch".into(),
+                reason: "clean_divergent_merge".into(),
             },
         ] {
             assert!(!deterministic.retryable());
@@ -1299,6 +1321,10 @@ mod tests {
                 level: "hosted_runner_signed".into(),
                 supported: vec!["self_reported".into(), "locally_signed".into()],
             },
+            ForgeError::SyncDivergenceUnsupported {
+                direction: "push".into(),
+                reason: "clean_divergent_merge".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -1334,7 +1360,8 @@ mod tests {
                 | ForgeError::GcPlanChanged { .. }
                 | ForgeError::UnsupportedContentBackend { .. }
                 | ForgeError::TrustPolicyUnmet { .. }
-                | ForgeError::UnsupportedTrustLevel { .. } => {}
+                | ForgeError::UnsupportedTrustLevel { .. }
+                | ForgeError::SyncDivergenceUnsupported { .. } => {}
             }
         }
 
