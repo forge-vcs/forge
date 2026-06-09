@@ -390,6 +390,28 @@ pub fn manifest_head_descends_from(
     Ok(false)
 }
 
+pub fn manifest_head_content_ref(manifest: &SyncManifest) -> Result<Option<String>> {
+    let Some(head) = manifest.native_head.as_deref() else {
+        return Ok(None);
+    };
+    for payload in &manifest.native_payloads {
+        if payload.object_id != head {
+            continue;
+        }
+        if payload.kind != "commit" {
+            bail!("sync native head does not name a commit payload");
+        }
+        let bytes = hex_decode(&payload.payload_hex)?;
+        let commit: forge_content_native::CommitObject = serde_json::from_slice(&bytes)?;
+        return Ok(Some(format!(
+            "{}{}",
+            forge_content::FORGE_TREE_PREFIX,
+            commit.tree
+        )));
+    }
+    bail!("sync manifest is missing native head payload {head}");
+}
+
 fn read_supported_manifest(path: &Path) -> Result<SyncManifest> {
     let bytes = fs::read(path)?;
     let manifest: SyncManifest = serde_json::from_slice(&bytes)?;
