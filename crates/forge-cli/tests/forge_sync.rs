@@ -36,6 +36,31 @@ fn native_accepted_lifecycle(repo: &TestRepo) {
     repo.forge().args(["--json", "accept"]).assert().success();
 }
 
+fn native_checked_proposal(repo: &TestRepo) {
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args([
+            "--json",
+            "start",
+            "sync trust boundary",
+            "--require",
+            "sh -c true",
+        ])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("peer-trust.txt"), "peer trust\n").expect("write feature");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    repo.forge().args(["--json", "propose"]).assert().success();
+    repo.forge().args(["--json", "check"]).assert().success();
+}
+
 fn native_accept_file_change(repo: &TestRepo, intent: &str, path: &str, contents: &str) {
     native_accept_file_change_in(repo.path(), intent, path, contents);
 }
@@ -697,6 +722,91 @@ fn sync_clone_bootstraps_empty_directory_without_extra_native_objects() {
     );
     assert_eq!(refused["command"], "sync clone");
     assert_eq!(refused["status"], "error");
+}
+
+#[test]
+fn sync_clone_labels_imported_signatures_as_peer_not_local_trust() {
+    let source = TestRepo::new_git();
+    native_checked_proposal(&source);
+    let bundle_dir = tempfile::tempdir().expect("peer trust bundle dir");
+    let bundle_path = bundle_dir.path().join("peer-trust.json");
+    let exported = json(
+        source
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "export",
+                "--output",
+                bundle_path.to_str().expect("utf8 bundle path"),
+            ])
+            .assert()
+            .success(),
+    );
+    let source_fingerprint = exported["data"]["local_key_fingerprint"]
+        .as_str()
+        .expect("source signing fingerprint")
+        .to_string();
+
+    let clone_dir = tempfile::tempdir().expect("peer trust clone");
+    forge_in(clone_dir.path())
+        .args([
+            "--json",
+            "sync",
+            "clone",
+            bundle_path.to_str().expect("utf8 bundle path"),
+        ])
+        .assert()
+        .success();
+
+    let doctor = json(
+        forge_in(clone_dir.path())
+            .args(["--json", "doctor"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        doctor["data"]["signature_key_summary"]["peer_key_fingerprints"][0],
+        source_fingerprint
+    );
+    assert!(
+        doctor["data"]["signature_key_summary"]["local_key_fingerprints"]
+            .as_array()
+            .expect("local fingerprints")
+            .is_empty()
+    );
+
+    let target_key = json(
+        forge_in(clone_dir.path())
+            .args(["--json", "key", "status"])
+            .assert()
+            .success(),
+    );
+    assert_ne!(target_key["data"]["key_fingerprint"], source_fingerprint);
+    assert_eq!(target_key["data"]["local_key_count"], 1);
+    assert_eq!(target_key["data"]["peer_key_count"], 1);
+
+    forge_in(clone_dir.path())
+        .args(["--json", "trust", "policy", "--accept", "locally_signed"])
+        .assert()
+        .success();
+    let blocked = json(
+        forge_in(clone_dir.path())
+            .args(["--json", "accept"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(blocked["errors"][0]["code"], "TRUST_POLICY_UNMET");
+    assert_eq!(blocked["errors"][0]["details"]["action"], "accept");
+    let issues = blocked["errors"][0]["details"]["signature_issues"]
+        .as_array()
+        .expect("signature issues");
+    assert!(
+        issues.iter().any(|issue| {
+            issue["kind"] == "missing_signature" && issue["subject_kind"] == "evidence"
+        }),
+        "peer signatures must not satisfy local-only trust: {blocked}"
+    );
 }
 
 #[test]

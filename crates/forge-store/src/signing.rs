@@ -1,4 +1,4 @@
-use crate::{SignatureFinding, SignatureFindingKind};
+use crate::{SignatureFinding, SignatureFindingKind, SignatureKeySummary};
 use anyhow::{anyhow, Context, Result};
 use forge_core::new_id;
 use ring::rand::SystemRandom;
@@ -36,6 +36,28 @@ pub(crate) struct RotatedLocalKey {
 }
 
 impl LocalSigner {
+    fn from_pkcs8(pkcs8: &[u8]) -> Result<Self> {
+        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8)
+            .map_err(|_| anyhow!("parse local Ed25519 signing key"))?;
+        let public_key_bytes = key_pair.public_key().as_ref();
+        let public_key = hex_lower(public_key_bytes);
+        let key_fingerprint = key_fingerprint(public_key_bytes);
+        Ok(Self {
+            key_pair,
+            public_key,
+            key_fingerprint,
+        })
+    }
+
+    pub(crate) fn load_existing(repo_root: &Path) -> Result<Option<Self>> {
+        let path = repo_root.join(SIGNING_KEY_PATH);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let pkcs8 = fs::read(&path).with_context(|| "read local signing key")?;
+        Ok(Some(Self::from_pkcs8(&pkcs8)?))
+    }
+
     pub(crate) fn load_or_create(repo_root: &Path) -> Result<Self> {
         let path = repo_root.join(SIGNING_KEY_PATH);
         let pkcs8 = if path.exists() {
@@ -52,16 +74,7 @@ impl LocalSigner {
             set_private_file_permissions(&path)?;
             pkcs8.as_ref().to_vec()
         };
-        let key_pair = Ed25519KeyPair::from_pkcs8(&pkcs8)
-            .map_err(|_| anyhow!("parse local Ed25519 signing key"))?;
-        let public_key_bytes = key_pair.public_key().as_ref();
-        let public_key = hex_lower(public_key_bytes);
-        let key_fingerprint = key_fingerprint(public_key_bytes);
-        Ok(Self {
-            key_pair,
-            public_key,
-            key_fingerprint,
-        })
+        Self::from_pkcs8(&pkcs8)
     }
 
     pub(crate) fn sign_subject(
@@ -73,6 +86,13 @@ impl LocalSigner {
         signed_digest: &str,
         created_at_ms: i64,
     ) -> Result<()> {
+        register_local_signing_key(
+            tx,
+            repo_id,
+            &self.public_key,
+            &self.key_fingerprint,
+            created_at_ms,
+        )?;
         let message = signing_message(subject_kind, subject_id, signed_digest);
         let signature = self.key_pair.sign(&message);
         tx.execute(
@@ -108,6 +128,17 @@ pub(crate) fn local_key_status(repo_root: &Path) -> Result<LocalKeyInfo> {
         key_path: SIGNING_KEY_PATH.to_string(),
         exists_before_command,
     })
+}
+
+pub(crate) fn existing_local_key_info(repo_root: &Path) -> Result<Option<LocalKeyInfo>> {
+    Ok(
+        LocalSigner::load_existing(repo_root)?.map(|signer| LocalKeyInfo {
+            public_key: signer.public_key,
+            key_fingerprint: signer.key_fingerprint,
+            key_path: SIGNING_KEY_PATH.to_string(),
+            exists_before_command: true,
+        }),
+    )
 }
 
 pub(crate) fn rotate_local_key(repo_root: &Path) -> Result<RotatedLocalKey> {
@@ -155,10 +186,11 @@ pub(crate) fn rotate_local_key(repo_root: &Path) -> Result<RotatedLocalKey> {
 }
 
 pub(crate) fn verify_signatures(conn: &Connection) -> Result<Vec<SignatureFinding>> {
-    let (valid, mut findings) = verified_signature_state(conn)?;
+    let state = verified_signature_state(conn)?;
+    let mut findings = state.findings;
 
     findings.extend(missing_signature_findings(
-        &valid,
+        &state.valid_any,
         expected_signed_subjects(conn)?,
     ));
 
@@ -185,9 +217,25 @@ pub(crate) fn verify_subject_signatures(
     conn: &Connection,
     subjects: Vec<SignedSubject>,
 ) -> Result<Vec<SignatureFinding>> {
-    let (valid, findings) = verified_signature_state(conn)?;
+    verify_subject_signatures_with_scope(conn, subjects, SignatureTrustScope::AnyVerifiable)
+}
+
+pub(crate) fn verify_subject_local_signatures(
+    conn: &Connection,
+    subjects: Vec<SignedSubject>,
+) -> Result<Vec<SignatureFinding>> {
+    verify_subject_signatures_with_scope(conn, subjects, SignatureTrustScope::LocalOnly)
+}
+
+fn verify_subject_signatures_with_scope(
+    conn: &Connection,
+    subjects: Vec<SignedSubject>,
+    scope: SignatureTrustScope,
+) -> Result<Vec<SignatureFinding>> {
+    let state = verified_signature_state(conn)?;
     let required: BTreeSet<SignedSubject> = subjects.iter().cloned().collect();
-    let mut scoped: Vec<SignatureFinding> = findings
+    let mut scoped: Vec<SignatureFinding> = state
+        .findings
         .into_iter()
         .filter(|finding| {
             required
@@ -195,7 +243,11 @@ pub(crate) fn verify_subject_signatures(
                 .any(|(kind, id, _)| kind == &finding.subject_kind && id == &finding.subject_id)
         })
         .collect();
-    scoped.extend(missing_signature_findings(&valid, subjects));
+    let valid = match scope {
+        SignatureTrustScope::AnyVerifiable => &state.valid_any,
+        SignatureTrustScope::LocalOnly => &state.valid_local,
+    };
+    scoped.extend(missing_signature_findings(valid, subjects));
     Ok(scoped)
 }
 
@@ -237,16 +289,36 @@ pub(crate) fn verified_subject_fingerprint(
     Ok((None, issues))
 }
 
-fn verified_signature_state(
-    conn: &Connection,
-) -> Result<(ValidSignatureSet, Vec<SignatureFinding>)> {
+#[derive(Debug, Clone, Copy)]
+enum SignatureTrustScope {
+    AnyVerifiable,
+    LocalOnly,
+}
+
+struct VerifiedSignatureState {
+    valid_any: ValidSignatureSet,
+    valid_local: ValidSignatureSet,
+    findings: Vec<SignatureFinding>,
+}
+
+fn verified_signature_state(conn: &Connection) -> Result<VerifiedSignatureState> {
     let mut findings = Vec::new();
-    let mut valid = BTreeSet::new();
+    let mut valid_any = BTreeSet::new();
+    let mut valid_local = BTreeSet::new();
 
     let mut stmt = conn.prepare(
-        "SELECT subject_kind, subject_id, signed_digest, public_key, key_fingerprint, signature
-         FROM ledger_signatures
-         ORDER BY rowid",
+        "SELECT
+            ls.subject_kind,
+            ls.subject_id,
+            ls.signed_digest,
+            ls.public_key,
+            ls.key_fingerprint,
+            ls.signature,
+            COALESCE(sk.trust_origin = 'local', 0)
+         FROM ledger_signatures ls
+         LEFT JOIN signing_keys sk
+            ON sk.repo_id = ls.repo_id AND sk.key_fingerprint = ls.key_fingerprint
+         ORDER BY ls.rowid",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -256,12 +328,20 @@ fn verified_signature_state(
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
+            row.get::<_, bool>(6)?,
         ))
     })?;
 
     for row in rows {
-        let (subject_kind, subject_id, signed_digest, public_key, key_fingerprint, signature) =
-            row?;
+        let (
+            subject_kind,
+            subject_id,
+            signed_digest,
+            public_key,
+            key_fingerprint,
+            signature,
+            local_key,
+        ) = row?;
         match current_subject_digest(conn, &subject_kind, &subject_id)? {
             None => findings.push(finding(
                 SignatureFindingKind::SubjectMissing,
@@ -305,7 +385,11 @@ fn verified_signature_state(
                     .verify(&message, &signature_bytes)
                     .is_ok()
                 {
-                    valid.insert((subject_kind, subject_id, signed_digest));
+                    let signed_subject = (subject_kind, subject_id, signed_digest);
+                    if local_key {
+                        valid_local.insert(signed_subject.clone());
+                    }
+                    valid_any.insert(signed_subject);
                 } else {
                     findings.push(finding(
                         SignatureFindingKind::InvalidSignature,
@@ -318,7 +402,56 @@ fn verified_signature_state(
         }
     }
 
-    Ok((valid, findings))
+    Ok(VerifiedSignatureState {
+        valid_any,
+        valid_local,
+        findings,
+    })
+}
+
+pub(crate) fn register_local_signing_key(
+    conn: &Connection,
+    repo_id: &str,
+    public_key: &str,
+    key_fingerprint: &str,
+    now_ms: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO signing_keys (
+            repo_id, key_fingerprint, public_key, trust_origin, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, 'local', ?4, ?4)
+         ON CONFLICT(repo_id, key_fingerprint) DO UPDATE SET
+            public_key = excluded.public_key,
+            trust_origin = 'local',
+            updated_at_ms = excluded.updated_at_ms",
+        params![repo_id, key_fingerprint, public_key, now_ms],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn signature_key_summary(
+    conn: &Connection,
+    repo_id: &str,
+) -> Result<SignatureKeySummary> {
+    let mut summary = SignatureKeySummary::default();
+    let mut stmt = conn.prepare(
+        "SELECT key_fingerprint, trust_origin
+         FROM signing_keys
+         WHERE repo_id = ?1
+         ORDER BY trust_origin, key_fingerprint",
+    )?;
+    let rows = stmt.query_map(params![repo_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (fingerprint, origin) = row?;
+        match origin.as_str() {
+            "local" => summary.local_key_fingerprints.push(fingerprint),
+            "peer" => summary.peer_key_fingerprints.push(fingerprint),
+            _ => {}
+        }
+    }
+    Ok(summary)
 }
 
 fn legacy_subject(conn: &Connection, subject_kind: &str, subject_id: &str) -> Result<bool> {
