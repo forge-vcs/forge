@@ -296,6 +296,9 @@ enum SyncCommand {
 struct SyncExportArgs {
     #[arg(long)]
     output: std::path::PathBuf,
+    /// Emit only native objects and ledger rows absent from this prior bundle.
+    #[arg(long)]
+    since: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -1303,7 +1306,8 @@ fn gc_response(request_id: Option<String>, args: GcArgs) -> ResponseEnvelope {
 fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope {
     match args.command {
         SyncCommand::Export(args) => command_result("sync export", request_id, |cwd, _| {
-            let report = forge_sync::export_manifest(&cwd, &args.output)?;
+            let report =
+                forge_sync::export_manifest_since(&cwd, &args.output, args.since.as_deref())?;
             Ok((None, serde_json::to_value(report)?, Vec::new()))
         }),
         SyncCommand::Inspect(args) => {

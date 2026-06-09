@@ -36,6 +36,22 @@ fn native_accepted_lifecycle(repo: &TestRepo) {
     repo.forge().args(["--json", "accept"]).assert().success();
 }
 
+fn native_accept_file_change(repo: &TestRepo, intent: &str, path: &str, contents: &str) {
+    repo.forge()
+        .args(["--json", "start", intent, "--require", "sh -c true"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join(path), contents).expect("write native change");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    repo.forge().args(["--json", "propose"]).assert().success();
+    repo.forge().args(["--json", "check"]).assert().success();
+    repo.forge().args(["--json", "accept"]).assert().success();
+}
+
 #[test]
 fn sync_export_writes_a_versioned_native_manifest_and_inspect_reads_it() {
     let repo = TestRepo::new_git();
@@ -56,6 +72,7 @@ fn sync_export_writes_a_versioned_native_manifest_and_inspect_reads_it() {
     );
     assert_eq!(exported["data"]["protocol_version"], "forge-sync.v1");
     assert_eq!(exported["data"]["content_backend"], "native");
+    assert_eq!(exported["data"]["incremental"], false);
     assert!(exported["data"]["native_head"].as_str().is_some());
     assert!(exported["data"]["native_object_count"].as_u64().unwrap() > 0);
     assert!(exported["data"]["ledger_table_count"].as_u64().unwrap() > 0);
@@ -412,4 +429,164 @@ fn sync_clone_bootstraps_empty_directory_without_extra_native_objects() {
     );
     assert_eq!(refused["command"], "sync clone");
     assert_eq!(refused["status"], "error");
+}
+
+#[test]
+fn sync_export_since_emits_delta_that_updates_a_cloned_repo() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let full_bundle_path = source.path().join("target/forge-sync-full.json");
+
+    let initial_export = json(
+        source
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "export",
+                "--output",
+                full_bundle_path.to_str().expect("utf8 full bundle path"),
+            ])
+            .assert()
+            .success(),
+    );
+
+    let clone_dir = tempfile::tempdir().expect("clone target dir");
+    json(
+        forge_in(clone_dir.path())
+            .args([
+                "--json",
+                "sync",
+                "clone",
+                full_bundle_path.to_str().expect("utf8 full bundle path"),
+            ])
+            .assert()
+            .success(),
+    );
+
+    native_accept_file_change(
+        &source,
+        "incremental sync lifecycle",
+        "sync-next.txt",
+        "next\n",
+    );
+    let source_after_path = source.path().join("target/forge-sync-after.json");
+    let source_after = json(
+        source
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "export",
+                "--output",
+                source_after_path.to_str().expect("utf8 source after path"),
+            ])
+            .assert()
+            .success(),
+    );
+    let delta_path = source.path().join("target/forge-sync-delta.json");
+    let delta = json(
+        source
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "export",
+                "--since",
+                full_bundle_path.to_str().expect("utf8 full bundle path"),
+                "--output",
+                delta_path.to_str().expect("utf8 delta path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(delta["data"]["incremental"], true);
+    assert_eq!(
+        delta["data"]["native_head"],
+        source_after["data"]["native_head"]
+    );
+    assert!(
+        delta["data"]["native_payload_count"].as_u64().unwrap()
+            < source_after["data"]["native_payload_count"]
+                .as_u64()
+                .unwrap(),
+        "delta bundle should omit objects already advertised by the base bundle"
+    );
+    assert!(
+        delta["data"]["ledger_row_count"].as_u64().unwrap()
+            < source_after["data"]["ledger_row_count"].as_u64().unwrap(),
+        "delta bundle should omit ledger rows already advertised by the base bundle"
+    );
+
+    let materialized = json(
+        forge_in(clone_dir.path())
+            .args([
+                "--json",
+                "sync",
+                "import",
+                "--materialize",
+                delta_path.to_str().expect("utf8 delta path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        materialized["data"]["native_head"],
+        source_after["data"]["native_head"]
+    );
+    assert_eq!(materialized["data"]["materialized"], true);
+    assert_eq!(
+        std::fs::read_to_string(clone_dir.path().join("sync-next.txt"))
+            .expect("delta materialized next file"),
+        "next\n"
+    );
+
+    let clone_after_dir = tempfile::tempdir().expect("clone after dir");
+    let clone_after_path = clone_after_dir.path().join("clone-after.json");
+    let clone_after = json(
+        forge_in(clone_dir.path())
+            .args([
+                "--json",
+                "sync",
+                "export",
+                "--output",
+                clone_after_path.to_str().expect("utf8 clone after path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        clone_after["data"]["native_head"],
+        source_after["data"]["native_head"]
+    );
+    assert_eq!(
+        clone_after["data"]["native_object_count"],
+        source_after["data"]["native_object_count"]
+    );
+
+    let source_manifest: Value =
+        serde_json::from_slice(&std::fs::read(&source_after_path).expect("read source after"))
+            .expect("source after json");
+    let clone_manifest: Value =
+        serde_json::from_slice(&std::fs::read(&clone_after_path).expect("read clone after"))
+            .expect("clone after json");
+    let mut source_objects: Vec<_> = source_manifest["native_objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|object| object["object_id"].as_str().unwrap().to_string())
+        .collect();
+    let mut clone_objects: Vec<_> = clone_manifest["native_objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|object| object["object_id"].as_str().unwrap().to_string())
+        .collect();
+    source_objects.sort();
+    clone_objects.sort();
+    assert_eq!(clone_objects, source_objects);
+    assert_ne!(
+        source_after["data"]["native_head"],
+        initial_export["data"]["native_head"]
+    );
 }
