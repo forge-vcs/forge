@@ -37,19 +37,40 @@ fn native_accepted_lifecycle(repo: &TestRepo) {
 }
 
 fn native_accept_file_change(repo: &TestRepo, intent: &str, path: &str, contents: &str) {
-    repo.forge()
+    native_accept_file_change_in(repo.path(), intent, path, contents);
+}
+
+fn native_accept_file_change_in(
+    repo_path: &std::path::Path,
+    intent: &str,
+    path: &str,
+    contents: &str,
+) {
+    forge_in(repo_path)
         .args(["--json", "start", intent, "--require", "sh -c true"])
         .assert()
         .success();
-    std::fs::write(repo.path().join(path), contents).expect("write native change");
-    repo.forge().args(["--json", "save"]).assert().success();
-    repo.forge()
+    std::fs::write(repo_path.join(path), contents).expect("write native change");
+    forge_in(repo_path)
+        .args(["--json", "save"])
+        .assert()
+        .success();
+    forge_in(repo_path)
         .args(["--json", "run", "--", "sh", "-c", "true"])
         .assert()
         .success();
-    repo.forge().args(["--json", "propose"]).assert().success();
-    repo.forge().args(["--json", "check"]).assert().success();
-    repo.forge().args(["--json", "accept"]).assert().success();
+    forge_in(repo_path)
+        .args(["--json", "propose"])
+        .assert()
+        .success();
+    forge_in(repo_path)
+        .args(["--json", "check"])
+        .assert()
+        .success();
+    forge_in(repo_path)
+        .args(["--json", "accept"])
+        .assert()
+        .success();
 }
 
 #[test]
@@ -589,4 +610,209 @@ fn sync_export_since_emits_delta_that_updates_a_cloned_repo() {
         source_after["data"]["native_head"],
         initial_export["data"]["native_head"]
     );
+}
+
+#[test]
+fn sync_fetch_pull_and_push_between_local_peer_repos() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source.path().join("target/forge-sync-peer-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path.to_str().expect("utf8 peer base path"),
+        ])
+        .assert()
+        .success();
+
+    let peer_dir = tempfile::tempdir().expect("peer dir");
+    forge_in(peer_dir.path())
+        .args([
+            "--json",
+            "sync",
+            "clone",
+            bundle_path.to_str().expect("utf8 peer base path"),
+        ])
+        .assert()
+        .success();
+
+    native_accept_file_change(&source, "peer fetch change", "from-source.txt", "source\n");
+    let source_after_fetch = json(
+        source
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "export",
+                "--output",
+                source
+                    .path()
+                    .join("target/source-after-fetch.json")
+                    .to_str()
+                    .expect("utf8 source after fetch path"),
+            ])
+            .assert()
+            .success(),
+    );
+
+    let fetched = json(
+        forge_in(peer_dir.path())
+            .args([
+                "--json",
+                "sync",
+                "fetch",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(fetched["data"]["direction"], "fetch");
+    assert_eq!(fetched["data"]["materialized"], false);
+    assert_eq!(
+        fetched["data"]["remote_native_head"],
+        source_after_fetch["data"]["native_head"]
+    );
+    assert!(
+        !peer_dir.path().join("from-source.txt").exists(),
+        "fetch must not materialize the peer worktree"
+    );
+
+    let pulled = json(
+        forge_in(peer_dir.path())
+            .args([
+                "--json",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(pulled["data"]["direction"], "pull");
+    assert_eq!(pulled["data"]["materialized"], true);
+    assert_eq!(
+        std::fs::read_to_string(peer_dir.path().join("from-source.txt"))
+            .expect("pulled file materialized"),
+        "source\n"
+    );
+
+    native_accept_file_change_in(
+        peer_dir.path(),
+        "peer push change",
+        "from-peer.txt",
+        "peer\n",
+    );
+    let peer_after_push = json(
+        forge_in(peer_dir.path())
+            .args([
+                "--json",
+                "sync",
+                "export",
+                "--output",
+                peer_dir
+                    .path()
+                    .join("peer-after-push.json")
+                    .to_str()
+                    .expect("utf8 peer after push path"),
+            ])
+            .assert()
+            .success(),
+    );
+
+    let pushed = json(
+        forge_in(peer_dir.path())
+            .args([
+                "--json",
+                "sync",
+                "push",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(pushed["data"]["direction"], "push");
+    assert_eq!(pushed["data"]["materialized"], false);
+    assert_eq!(
+        pushed["data"]["local_native_head"],
+        peer_after_push["data"]["native_head"]
+    );
+
+    let source_after_push_path = source.path().join("target/source-after-push.json");
+    let source_after_push = json(
+        source
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "export",
+                "--output",
+                source_after_push_path
+                    .to_str()
+                    .expect("utf8 source after push path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        source_after_push["data"]["native_head"],
+        peer_after_push["data"]["native_head"]
+    );
+    assert!(
+        !source.path().join("from-peer.txt").exists(),
+        "push applies native state to the peer repo without materializing its worktree"
+    );
+}
+
+#[test]
+fn sync_peer_commands_refuse_divergent_native_heads() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source.path().join("target/forge-sync-diverge-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path.to_str().expect("utf8 diverge base path"),
+        ])
+        .assert()
+        .success();
+
+    let peer_dir = tempfile::tempdir().expect("peer dir");
+    forge_in(peer_dir.path())
+        .args([
+            "--json",
+            "sync",
+            "clone",
+            bundle_path.to_str().expect("utf8 diverge base path"),
+        ])
+        .assert()
+        .success();
+
+    native_accept_file_change(&source, "source side", "side.txt", "source\n");
+    native_accept_file_change_in(peer_dir.path(), "peer side", "side.txt", "peer\n");
+
+    let refused = json(
+        forge_in(peer_dir.path())
+            .args([
+                "--json",
+                "sync",
+                "pull",
+                source.path().to_str().expect("utf8 source path"),
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(refused["command"], "sync pull");
+    assert_eq!(refused["status"], "error");
+    assert!(refused["errors"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("non-fast-forward"));
 }

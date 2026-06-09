@@ -347,6 +347,49 @@ pub fn clone_manifest(cwd: &Path, path: &Path) -> Result<SyncCloneReport> {
     })
 }
 
+pub fn manifest_head_descends_from(
+    manifest: &SyncManifest,
+    ancestor_head: Option<&str>,
+) -> Result<bool> {
+    let Some(ancestor_head) = ancestor_head else {
+        return Ok(true);
+    };
+    let Some(tip) = manifest.native_head.as_deref() else {
+        return Ok(false);
+    };
+    if tip == ancestor_head {
+        return Ok(true);
+    }
+
+    let mut commits = std::collections::HashMap::new();
+    for payload in &manifest.native_payloads {
+        if payload.kind != "commit" {
+            continue;
+        }
+        let bytes = hex_decode(&payload.payload_hex)?;
+        let commit: forge_content_native::CommitObject = serde_json::from_slice(&bytes)?;
+        commits.insert(payload.object_id.as_str(), commit);
+    }
+
+    let mut stack = vec![tip];
+    let mut seen = HashSet::new();
+    while let Some(commit_id) = stack.pop() {
+        if commit_id == ancestor_head {
+            return Ok(true);
+        }
+        if !seen.insert(commit_id) {
+            continue;
+        }
+        let Some(commit) = commits.get(commit_id) else {
+            bail!("sync manifest is missing native commit payload {commit_id}");
+        };
+        for parent in &commit.parents {
+            stack.push(parent.as_str());
+        }
+    }
+    Ok(false)
+}
+
 fn read_supported_manifest(path: &Path) -> Result<SyncManifest> {
     let bytes = fs::read(path)?;
     let manifest: SyncManifest = serde_json::from_slice(&bytes)?;

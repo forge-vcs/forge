@@ -1352,6 +1352,11 @@ pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     })
 }
 
+pub fn acquire_repository_lock(cwd: &Path) -> Result<RepoLock> {
+    let context = open_repository(cwd)?;
+    repo_lock::acquire(&context.root_path.join(".forge"))
+}
+
 pub fn effective_worktree_path(cwd: &Path) -> Result<PathBuf> {
     Ok(open_repository(cwd)?.worktree_path)
 }
