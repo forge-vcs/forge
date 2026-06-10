@@ -13,8 +13,48 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect docs-only change
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+            base="origin/${{ github.base_ref }}"
+            changed_files="$(git diff --name-only "$base"...HEAD)"
+          else
+            changed_files="$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")"
+          fi
+
+          if [[ -z "$changed_files" ]]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          docs_only=true
+          while IFS= read -r file; do
+            case "$file" in
+              *.md|LICENSE)
+                ;;
+              *)
+                docs_only=false
+                break
+                ;;
+            esac
+          done <<< "$changed_files"
+
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
+      - name: Skip full CI for docs-only change
+        if: steps.changes.outputs.docs_only == 'true'
+        run: echo "Docs-only change detected; skipping Rust verification."
 
       - name: Cache cargo
+        if: steps.changes.outputs.docs_only != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -24,19 +64,25 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Format check
+        if: steps.changes.outputs.docs_only != 'true'
         run: cargo fmt --all --check
 
       - name: Test
+        if: steps.changes.outputs.docs_only != 'true'
         run: cargo test --workspace
 
       - name: Clippy
+        if: steps.changes.outputs.docs_only != 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Install sqlite3 (e2e DB assertions)
+        if: steps.changes.outputs.docs_only != 'true'
         run: sudo apt-get update && sudo apt-get install -y sqlite3
 
       - name: End-to-end eval (real binary)
+        if: steps.changes.outputs.docs_only != 'true'
         run: bash scripts/e2e-eval.sh
 
       - name: Native peer sync no-git dogfood
+        if: steps.changes.outputs.docs_only != 'true'
         run: bash scripts/dogfood-native-sync-peer-nogit.sh
