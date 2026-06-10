@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Phase 9 hosted-runner trust dogfood.
+# Phase 9 hosted-runner and third-party trust dogfood.
 #
 # Exercises the real CLI path:
 # - hosted_runner_signed accept policy fails before hosted attestation
 # - trust attest hosted-runner signs proposal evidence with a non-local runner key
 # - hosted_runner_signed accept policy succeeds after attestation
-# - third_party_attested still fails closed
+# - third_party_attested export policy fails before third-party attestation
+# - trust attest third-party signs accepted proposal subjects
+# - third_party_attested export policy succeeds after third-party attestation
 
 set -euo pipefail
 
@@ -59,6 +61,7 @@ F() {
 }
 
 need cargo
+need git
 need python3
 
 echo "=== Building forge (debug) ==="
@@ -66,23 +69,27 @@ echo "=== Building forge (debug) ==="
 echo "binary: $FORGE"
 
 echo
-echo "=== Phase 9 hosted-runner attestation dogfood ==="
+echo "=== Phase 9 hosted-runner and third-party attestation dogfood ==="
 
-python3 - "$TMP/hosted-runner-ed25519.pk8" <<'PY'
+python3 - "$TMP/hosted-runner-ed25519.pk8" "$TMP/third-party-ed25519.pk8" <<'PY'
 import sys
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
-key = ed25519.Ed25519PrivateKey.generate()
-pkcs8 = key.private_bytes(
-    encoding=serialization.Encoding.DER,
-    format=serialization.PrivateFormat.PKCS8,
-    encryption_algorithm=serialization.NoEncryption(),
-)
-open(sys.argv[1], "wb").write(pkcs8)
+for path in sys.argv[1:]:
+    key = ed25519.Ed25519PrivateKey.generate()
+    pkcs8 = key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    open(path, "wb").write(pkcs8)
 PY
 
 cd "$TMP"
+git init >/dev/null
+git config user.email "forge@example.test"
+git config user.name "Forge Dogfood"
 F init --content-backend native
 ck "native init succeeds" "$(pg "d['status']")" "success"
 F start "hosted runner attest dogfood" --require "sh -c true"
@@ -123,20 +130,32 @@ ck "accepted decision" "$(pg "d['data']['decision']")" "accepted"
 
 F trust policy --export third_party_attested
 ck "third-party export policy updates" "$(pg "d['data']['min_export_trust']")" "third_party_attested"
-if F export branch hosted-third-party-should-fail; then
+if F export branch third-party-before-attest; then
   third_party_code="<exported>"
 else
   third_party_code="$(pg "d['errors'][0]['code']")"
 fi
 ck "third-party policy still fails closed" "$third_party_code" "TRUST_POLICY_UNMET"
-ck "third-party failure includes attestation gap" "$(pg "any(i['subject_kind'] == 'attestation' and i['subject_id'] == 'third_party_attested' for i in d['errors'][0]['details']['signature_issues'])")" "True"
+ck "third-party failure names decision" "$(pg "any(i['subject_kind'] == 'decision' for i in d['errors'][0]['details']['signature_issues'])")" "True"
+
+F trust attest third-party --key "$TMP/third-party-ed25519.pk8" --issuer sigstore.example/forge
+ck "third-party attestation succeeds" "$(pg "d['status']")" "success"
+ck "third-party attestation trust level" "$(pg "d['data']['trust_level']")" "third_party_attested"
+ck "third-party attestation covers accepted subjects" "$(pg "d['data']['subject_count']")" "3"
+ck "third-party attestation inserts decision and commit signatures" "$(pg "d['data']['signature_count']")" "3"
+
+F doctor
+ck "doctor reports third-party key" "$(pg "len(d['data']['signature_key_summary']['third_party_key_fingerprints'])")" "1"
+
+F export branch third-party-after-attest
+ck "third-party export succeeds after attestation" "$(pg "d['status']")" "success"
 
 echo
-echo "Hosted-runner attestation dogfood: PASS=$PASS FAIL=$FAIL"
+echo "Hosted-runner and third-party attestation dogfood: PASS=$PASS FAIL=$FAIL"
 if [ "$FAIL" -ne 0 ]; then
   printf 'Failures:\n' >&2
   printf ' - %s\n' "${FAILS[@]}" >&2
   exit 1
 fi
 
-echo "Hosted-runner attestation dogfood checks passed."
+echo "Hosted-runner and third-party attestation dogfood checks passed."

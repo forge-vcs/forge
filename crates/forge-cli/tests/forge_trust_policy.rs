@@ -43,11 +43,11 @@ fn prepare_checked_native_proposal(repo: &TestRepo) {
     repo.forge().args(["--json", "check"]).assert().success();
 }
 
-fn hosted_runner_key(repo: &TestRepo) -> PathBuf {
+fn ed25519_key(repo: &TestRepo, name: &str) -> PathBuf {
     let rng = SystemRandom::new();
-    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate hosted runner key");
-    let path = repo.path().join("hosted-runner-ed25519.pk8");
-    std::fs::write(&path, pkcs8.as_ref()).expect("write hosted runner key");
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate Ed25519 key");
+    let path = repo.path().join(name);
+    std::fs::write(&path, pkcs8.as_ref()).expect("write Ed25519 key");
     path
 }
 
@@ -139,7 +139,7 @@ fn higher_attestation_policy_is_configurable_but_fails_closed_at_accept() {
 fn hosted_runner_attestation_satisfies_hosted_runner_signed_accept_policy() {
     let repo = TestRepo::new_git();
     prepare_checked_native_proposal(&repo);
-    let key = hosted_runner_key(&repo);
+    let key = ed25519_key(&repo, "hosted-runner-ed25519.pk8");
 
     repo.forge()
         .args([
@@ -191,7 +191,7 @@ fn hosted_runner_attestation_satisfies_hosted_runner_signed_accept_policy() {
 fn hosted_runner_attestation_does_not_satisfy_third_party_policy() {
     let repo = TestRepo::new_git();
     prepare_checked_native_proposal(&repo);
-    let key = hosted_runner_key(&repo);
+    let key = ed25519_key(&repo, "hosted-runner-ed25519.pk8");
 
     repo.forge()
         .args([
@@ -221,9 +221,113 @@ fn hosted_runner_attestation_does_not_satisfy_third_party_policy() {
         .as_array()
         .expect("signature issues");
     assert!(issues.iter().any(|issue| {
-        issue["kind"] == "missing_signature"
-            && issue["subject_kind"] == "attestation"
-            && issue["subject_id"] == "third_party_attested"
+        issue["kind"] == "missing_signature" && issue["subject_kind"] == "evidence"
+    }));
+}
+
+#[test]
+fn third_party_attestation_satisfies_third_party_accept_policy() {
+    let repo = TestRepo::new_git();
+    prepare_checked_native_proposal(&repo);
+    let key = ed25519_key(&repo, "third-party-ed25519.pk8");
+
+    repo.forge()
+        .args([
+            "--json",
+            "trust",
+            "policy",
+            "--accept",
+            "third_party_attested",
+        ])
+        .assert()
+        .success();
+    let blocked = json(repo.forge().args(["--json", "accept"]).assert().failure());
+    assert_eq!(blocked["errors"][0]["code"], "TRUST_POLICY_UNMET");
+
+    let attested = json(
+        repo.forge()
+            .args([
+                "--json",
+                "trust",
+                "attest",
+                "third-party",
+                "--key",
+                key.to_str().expect("utf8 key path"),
+                "--issuer",
+                "sigstore.example/forge",
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(attested["data"]["trust_level"], "third_party_attested");
+    assert_eq!(attested["data"]["issuer"], "sigstore.example/forge");
+    assert_eq!(attested["data"]["signature_count"], 1);
+    assert_eq!(attested["data"]["subject_count"], 1);
+
+    let accepted = json(repo.forge().args(["--json", "accept"]).assert().success());
+    assert_eq!(accepted["data"]["decision"], "accepted");
+
+    let doctor = json(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert!(
+        doctor["data"]["signature_key_summary"]["third_party_key_fingerprints"]
+            .as_array()
+            .expect("third-party keys")
+            .len()
+            == 1
+    );
+}
+
+#[test]
+fn hosted_runner_signature_cannot_be_upgraded_to_third_party_trust() {
+    let repo = TestRepo::new_git();
+    prepare_checked_native_proposal(&repo);
+    let key = ed25519_key(&repo, "hosted-runner-ed25519.pk8");
+    repo.forge()
+        .args([
+            "--json",
+            "trust",
+            "attest",
+            "hosted-runner",
+            "--key",
+            key.to_str().expect("utf8 key path"),
+        ])
+        .assert()
+        .success();
+    db(&repo)
+        .execute(
+            "UPDATE signing_keys SET trust_origin = 'third_party'
+             WHERE key_fingerprint IN (
+                SELECT key_fingerprint FROM ledger_signatures WHERE subject_kind = 'evidence'
+             )",
+            [],
+        )
+        .expect("spoof third-party key origin");
+    db(&repo)
+        .execute(
+            "UPDATE ledger_signatures
+             SET trust_level = 'third_party_attested'
+             WHERE subject_kind = 'evidence'",
+            [],
+        )
+        .expect("spoof third-party trust level");
+    repo.forge()
+        .args([
+            "--json",
+            "trust",
+            "policy",
+            "--accept",
+            "third_party_attested",
+        ])
+        .assert()
+        .success();
+
+    let blocked = json(repo.forge().args(["--json", "accept"]).assert().failure());
+    assert_eq!(blocked["errors"][0]["code"], "TRUST_POLICY_UNMET");
+    let issues = blocked["errors"][0]["details"]["signature_issues"]
+        .as_array()
+        .expect("signature issues");
+    assert!(issues.iter().any(|issue| {
+        issue["kind"] == "invalid_signature" && issue["subject_kind"] == "evidence"
     }));
 }
 
@@ -305,9 +409,7 @@ fn third_party_attestation_policy_is_configurable_but_fails_closed_at_export() {
         .as_array()
         .expect("signature issues");
     assert!(issues.iter().any(|issue| {
-        issue["kind"] == "missing_signature"
-            && issue["subject_kind"] == "attestation"
-            && issue["subject_id"] == "third_party_attested"
+        issue["kind"] == "missing_signature" && issue["subject_kind"] == "decision"
     }));
     repo.forge()
         .args([

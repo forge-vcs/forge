@@ -990,11 +990,13 @@ fn mark_imported_signature_keys(conn: &Connection, repo_id: &str) -> Result<()> 
          GROUP BY repo_id, key_fingerprint
          ON CONFLICT(repo_id, key_fingerprint) DO UPDATE SET
             public_key = CASE
-                WHEN signing_keys.trust_origin = 'local' THEN signing_keys.public_key
+                WHEN signing_keys.trust_origin IN ('local', 'hosted_runner', 'third_party')
+                    THEN signing_keys.public_key
                 ELSE excluded.public_key
             END,
             trust_origin = CASE
-                WHEN signing_keys.trust_origin = 'local' THEN 'local'
+                WHEN signing_keys.trust_origin IN ('local', 'hosted_runner', 'third_party')
+                    THEN signing_keys.trust_origin
                 ELSE 'peer'
             END,
             updated_at_ms = excluded.updated_at_ms",
