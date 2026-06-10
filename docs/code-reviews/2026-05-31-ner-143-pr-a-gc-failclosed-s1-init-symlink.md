@@ -2,7 +2,7 @@
 
 - **base-sha:** `996c8a2` (merge-base with `main`)
 - **head-sha:** `9fb45c4` (the impl/test commits + this review-fix commit) on branch `ner-143a-gc-failclosed-s1-init-symlink`
-- **plan:** `docs/plans/2026-05-31-015-fix-ner-143-undo-op-restore-hardening-plan.md` (the independent-hardening half; R1–R4 + migration are PR-B)
+- **plan:** `docs/plans/completed/2026-05-31-015-fix-ner-143-undo-op-restore-hardening-plan.md` (the independent-hardening half; R1–R4 + migration are PR-B)
 - **gate:** `bash scripts/ci.sh` green (fmt `--check` · `cargo test --workspace` · clippy `-D warnings` · e2e **88/88**) before and after the fixes.
 - **personas (6):** correctness, security, reliability, testing, maintainability, adversarial (the orchestrated subagents ran inline against the committed diff; conclusions cross-checked against the Explore code map).
 

@@ -2,7 +2,7 @@
 
 - **base-sha:** `996c8a2` (merge-base with `main`)
 - **head-sha:** `2c76078` (the impl/test commits + this review-fix commit) on branch `ner-143b-expected-content-dirty-check`
-- **plan:** `docs/plans/2026-05-31-015-fix-ner-143-undo-op-restore-hardening-plan.md` (the dirty-check half; PR-A shipped the independent hardening)
+- **plan:** `docs/plans/completed/2026-05-31-015-fix-ner-143-undo-op-restore-hardening-plan.md` (the dirty-check half; PR-A shipped the independent hardening)
 - **gate:** `bash scripts/ci.sh` green (fmt `--check` · `cargo test --workspace` · clippy `-D warnings` · e2e 85/85) before and after the fixes.
 - **personas (6):** adversarial, correctness, data-migrations, testing, maintainability, reliability — the data-loss-adjacent + schema-migration weight warranted the full panel. (Inline-dispatched against the committed diff; conclusions cross-checked against the Explore code map.)
 

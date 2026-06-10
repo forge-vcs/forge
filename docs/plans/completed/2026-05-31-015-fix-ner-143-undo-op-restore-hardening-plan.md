@@ -1,7 +1,7 @@
 ---
 title: "NER-143 — forge undo/op-restore hardening (expected-current-content dirty-check + cluster)"
 type: fix
-status: draft
+status: completed
 date: 2026-05-31
 origin: docs/code-reviews/2026-05-30-ner-138-phase-7-slice-3.md
 ---
