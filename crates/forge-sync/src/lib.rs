@@ -168,23 +168,49 @@ pub fn export_manifest_since(
     output_path: &Path,
     since_path: Option<&Path>,
 ) -> Result<SyncExportReport> {
-    let mut manifest = build_manifest(cwd)?;
     let since_path_text = since_path.map(|path| path.display().to_string());
-    if let Some(path) = since_path {
-        let base = read_supported_manifest(path)?;
-        prune_manifest_since(&mut manifest, &base)?;
-    }
+    let since_manifest = since_path
+        .map(read_supported_manifest)
+        .transpose()
+        .context("read incremental sync base")?;
+    let (manifest, report) = export_manifest_delta(
+        cwd,
+        since_manifest.as_ref(),
+        output_path.display().to_string(),
+        since_path_text,
+    )?;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(&manifest)?;
     fs::write(output_path, bytes)?;
-    Ok(SyncExportReport {
-        protocol_version: manifest.protocol_version,
-        output_path: output_path.display().to_string(),
-        content_backend: manifest.content_backend,
-        incremental: since_path.is_some(),
-        since_path: since_path_text,
+    Ok(report)
+}
+
+pub fn export_manifest_for_transport_since(
+    cwd: &Path,
+    since_manifest: Option<&SyncManifest>,
+) -> Result<(SyncManifest, SyncExportReport)> {
+    export_manifest_delta(cwd, since_manifest, "<transport>".to_string(), None)
+}
+
+fn export_manifest_delta(
+    cwd: &Path,
+    since_manifest: Option<&SyncManifest>,
+    output_path: String,
+    since_path: Option<String>,
+) -> Result<(SyncManifest, SyncExportReport)> {
+    let mut manifest = build_manifest(cwd)?;
+    if let Some(base) = since_manifest {
+        ensure_supported_manifest(base)?;
+        prune_manifest_since(&mut manifest, base)?;
+    }
+    let report = SyncExportReport {
+        protocol_version: manifest.protocol_version.clone(),
+        output_path,
+        content_backend: manifest.content_backend.clone(),
+        incremental: since_manifest.is_some(),
+        since_path,
         native_object_count: manifest.native_objects.len(),
         native_payload_count: manifest.native_payloads.len(),
         ledger_table_count: manifest.ledger_counts.len(),
@@ -193,9 +219,10 @@ pub fn export_manifest_since(
             .iter()
             .map(|table| table.rows.len())
             .sum(),
-        native_head: manifest.native_head,
-        local_key_fingerprint: manifest.local_key_fingerprint,
-    })
+        native_head: manifest.native_head.clone(),
+        local_key_fingerprint: manifest.local_key_fingerprint.clone(),
+    };
+    Ok((manifest, report))
 }
 
 fn prune_manifest_since(manifest: &mut SyncManifest, base: &SyncManifest) -> Result<()> {
@@ -294,6 +321,11 @@ pub fn inspect_manifest(path: &Path) -> Result<SyncInspectReport> {
 
 pub fn import_manifest(cwd: &Path, path: &Path) -> Result<SyncImportReport> {
     let manifest = read_supported_manifest(path)?;
+    import_manifest_value(cwd, &manifest)
+}
+
+pub fn import_manifest_value(cwd: &Path, manifest: &SyncManifest) -> Result<SyncImportReport> {
+    ensure_supported_manifest(manifest)?;
     let context = forge_store::open_repository(cwd)?;
     if context.content_backend != "native" {
         bail!("sync import requires a native content repository");
@@ -302,19 +334,19 @@ pub fn import_manifest(cwd: &Path, path: &Path) -> Result<SyncImportReport> {
         &context.root_path,
         &context.database_path,
         &context.repo_id,
-        &manifest,
+        manifest,
         CurrentStateMode::Update,
     )?;
 
     Ok(SyncImportReport {
-        protocol_version: manifest.protocol_version,
-        content_backend: manifest.content_backend,
+        protocol_version: manifest.protocol_version.clone(),
+        content_backend: manifest.content_backend.clone(),
         imported_native_objects: manifest.native_payloads.len(),
         imported_ledger_rows,
-        native_head: manifest.native_head,
-        current_operation_id: manifest.current_operation_id,
-        current_view_id: manifest.current_view_id,
-        local_key_fingerprint: manifest.local_key_fingerprint,
+        native_head: manifest.native_head.clone(),
+        current_operation_id: manifest.current_operation_id.clone(),
+        current_view_id: manifest.current_view_id.clone(),
+        local_key_fingerprint: manifest.local_key_fingerprint.clone(),
     })
 }
 
@@ -546,6 +578,11 @@ fn is_ancestor(
 pub fn read_supported_manifest(path: &Path) -> Result<SyncManifest> {
     let bytes = fs::read(path)?;
     let manifest: SyncManifest = serde_json::from_slice(&bytes)?;
+    ensure_supported_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn ensure_supported_manifest(manifest: &SyncManifest) -> Result<()> {
     if manifest.protocol_version != SYNC_PROTOCOL_VERSION {
         bail!(
             "unsupported sync protocol version {}",
@@ -555,7 +592,7 @@ pub fn read_supported_manifest(path: &Path) -> Result<SyncManifest> {
     if manifest.content_backend != "native" {
         bail!("sync import only supports native content bundles");
     }
-    Ok(manifest)
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1064,9 +1101,10 @@ fn expected_content_ref(connection: &Connection) -> Result<Option<String>> {
         .query_row(
             "SELECT expected_content_ref FROM current_state WHERE singleton = 1",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, Option<String>>(0),
         )
         .optional()
+        .map(Option::flatten)
         .map_err(Into::into)
 }
 
@@ -1225,6 +1263,49 @@ mod tests {
         )
         .unwrap();
         let error = inspect_manifest(&path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unsupported sync protocol version"));
+    }
+
+    #[test]
+    fn transport_export_report_uses_transport_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        forge_store::init_repository(temp.path(), None, "native".to_string()).unwrap();
+
+        let (manifest, report) = export_manifest_for_transport_since(temp.path(), None).unwrap();
+
+        assert_eq!(manifest.protocol_version, SYNC_PROTOCOL_VERSION);
+        assert_eq!(report.protocol_version, SYNC_PROTOCOL_VERSION);
+        assert_eq!(report.output_path, "<transport>");
+        assert!(!report.incremental);
+        assert_eq!(report.since_path, None);
+        assert_eq!(report.content_backend, "native");
+    }
+
+    #[test]
+    fn transport_import_rejects_unsupported_manifest_version() {
+        let temp = tempfile::tempdir().unwrap();
+        forge_store::init_repository(temp.path(), None, "native".to_string()).unwrap();
+        let mut manifest = test_manifest("C", &[("C", &[])]);
+        manifest.protocol_version = "forge-sync.v99".to_string();
+
+        let error = import_manifest_value(temp.path(), &manifest).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unsupported sync protocol version"));
+    }
+
+    #[test]
+    fn transport_incremental_export_rejects_unsupported_base_version() {
+        let temp = tempfile::tempdir().unwrap();
+        forge_store::init_repository(temp.path(), None, "native".to_string()).unwrap();
+        let mut base = test_manifest("C", &[("C", &[])]);
+        base.protocol_version = "forge-sync.v99".to_string();
+
+        let error = export_manifest_for_transport_since(temp.path(), Some(&base)).unwrap_err();
+
         assert!(error
             .to_string()
             .contains("unsupported sync protocol version"));

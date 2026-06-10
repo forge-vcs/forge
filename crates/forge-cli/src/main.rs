@@ -12,10 +12,8 @@ use forge_store::ForgeError;
 use serde_json::{json, Value};
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Parser)]
 #[command(name = "forge", version, about = "Local agent change-control loop")]
@@ -1653,16 +1651,10 @@ fn sync_fetch_peer(
         });
     }
 
-    let temp = SyncTransferDir::new(cwd)?;
-    let local_base_path = temp.path().join("local-base.json");
-    write_sync_manifest(&local_base_path, &local_manifest)?;
-    let incoming_path = temp.path().join("incoming.json");
-    let export_report =
-        forge_sync::export_manifest_since(remote, &incoming_path, Some(&local_base_path))
+    let (incoming_manifest, export_report) =
+        forge_sync::export_manifest_for_transport_since(remote, Some(&local_manifest))
             .context("export remote sync delta")?;
     let materialized_target_ref = if materialize {
-        let incoming_manifest = forge_sync::read_supported_manifest(&incoming_path)
-            .context("read remote sync delta")?;
         let content_ref = sync_manifest_head_content_ref(cwd, &incoming_manifest)?
             .ok_or_else(|| anyhow::anyhow!("sync peer has no native head to materialize"))?;
         ensure_clean_worktree(cwd, &content_ref).context("preflight sync pull")?;
@@ -1670,8 +1662,8 @@ fn sync_fetch_peer(
     } else {
         None
     };
-    let import_report =
-        forge_sync::import_manifest(cwd, &incoming_path).context("apply remote sync delta")?;
+    let import_report = forge_sync::import_manifest_value(cwd, &incoming_manifest)
+        .context("apply remote sync delta")?;
 
     let mut operation_id = None;
     let mut materialized_content_ref = None;
@@ -1830,15 +1822,11 @@ fn sync_push_peer(
         return Ok((local_operation_id, data, warnings));
     }
 
-    let temp = SyncTransferDir::new(cwd)?;
-    let remote_base_path = temp.path().join("remote-base.json");
-    write_sync_manifest(&remote_base_path, &remote_manifest)?;
-    let outgoing_path = temp.path().join("outgoing.json");
-    let export_report =
-        forge_sync::export_manifest_since(cwd, &outgoing_path, Some(&remote_base_path))
+    let (outgoing_manifest, export_report) =
+        forge_sync::export_manifest_for_transport_since(cwd, Some(&remote_manifest))
             .context("export local sync delta")?;
-    let import_report =
-        forge_sync::import_manifest(remote, &outgoing_path).context("apply local sync delta")?;
+    let import_report = forge_sync::import_manifest_value(remote, &outgoing_manifest)
+        .context("apply local sync delta")?;
 
     let mut operation_id = None;
     let data = json!({
@@ -2133,39 +2121,6 @@ fn cleanup_new_native_objects(
         store.delete_object(id)?;
     }
     Ok(())
-}
-
-fn write_sync_manifest(path: &Path, manifest: &forge_sync::SyncManifest) -> Result<()> {
-    fs::write(path, serde_json::to_vec_pretty(manifest)?)?;
-    Ok(())
-}
-
-struct SyncTransferDir {
-    path: PathBuf,
-}
-
-impl SyncTransferDir {
-    fn new(cwd: &Path) -> Result<Self> {
-        let context = forge_store::open_repository(cwd)?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path = context
-            .root_path
-            .join(".forge")
-            .join("tmp")
-            .join(format!("sync-peer-{}-{now}", std::process::id()));
-        fs::create_dir_all(&path)?;
-        Ok(Self { path })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for SyncTransferDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
 }
 
 fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnvelope {
