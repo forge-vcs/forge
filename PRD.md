@@ -2,15 +2,15 @@
 
 ## 1. Executive Summary
 
-Forge is a Rust-native change-control system designed for the era where AI agents and humans both produce code. It is not a Git clone with friendlier commands. Its first product is an agent-native review ledger over existing Git repositories; its long-term architecture now includes an explicit native Forge content backend.
+Forge is a Rust-native source-control system designed for the era where AI agents and humans both produce code. It is not a Git clone with friendlier commands. Its current product is a local/native, agent-native control surface for checked change attempts: Forge records intent, competing attempts, content snapshots, evidence, checks, decisions, native history, sync provenance, and publication boundaries as first-class product objects.
 
 Forge's reviewable lifecycle is:
 
 Intent -> Attempt -> Snapshot -> Proposal -> Evidence -> Check Result -> Decision -> Publication
 
-The product starts as a local CLI, metadata store, evidence ledger, and Git-compatible content boundary. Git-backed snapshots remain the default adapter, and native Forge loose-object snapshots are available behind an explicit repository setting. It must later be strong enough to support a hosted collaboration platform: the next GitHub built around intents, agent attempts, evidence, policy, review, and safe publication.
+The product is a local CLI, SQLite ledger, evidence store, Forge-native content/history backend, trust policy engine, and native peer-sync surface. Git remains an interoperability boundary for existing branch/PR workflows: accepted proposals can be exported to Git branches with signed Forge provenance, but Git is not the source of truth for the native lifecycle.
 
-Forge v0 is not an independent VCS. It validates the agent-native workflow and begins proving native snapshot storage without replacing Git as the collaboration/export protocol.
+The local/native Forge surface is release-candidate complete. It supports Forge-owned blob/tree/commit objects, native diff and merge, conflict-as-data, mark-sweep GC, pack/index storage, signed evidence and decisions, trust policy enforcement, and native clone/fetch/pull/push over local paths, `file://`, SSH, and HTTPS `sync serve` endpoints. Hosted collaboration, global identity governance, revocation infrastructure, organization policy, and resumable network transfer remain product follow-ons.
 
 The current IDEA.md has the right strategic direction, but it under-specifies the dangerous parts:
 
@@ -32,17 +32,17 @@ Forge should optimize for this reality:
 - Agents need stable machine-readable commands, durable IDs, no required prompts, and safe rollback.
 - Humans need to understand why a change exists, what was tried, what passed, what failed, and what risk remains.
 - Teams need clean accepted history without preserving every exploratory state as durable project history.
-- Future hosted Forge needs first-class objects for evidence, policy, review, identity, and permissions, not a Git commit graph with side tables.
+- Hosted Forge will need first-class objects for evidence, policy, review, identity, and permissions, not a Git commit graph with side tables.
 
 The key bet: the durable reviewable unit should be a proposal with evidence, check state, and decision state, not a raw branch or commit.
 
 ## 3. Sharp Product Boundary
 
-Forge v0 must prove one wedge:
+Forge's current release-candidate product proves one wedge:
 
-A developer can let one or more agents make isolated attempts, review their resulting proposals with captured evidence, and accept or reject the best proposal without manually managing Git branches, worktrees, snapshot-style commits, and PR-body archaeology.
+A developer can let one or more agents make isolated attempts, review their resulting proposals with captured evidence, compare and rank the attempts, accept or reject the best proposal, sync native provenance to peers, and export accepted work to Git only when an existing PR workflow needs it.
 
-If v0 does not make that workflow obviously better than Git plus shell scripts, the product has failed.
+If Forge does not make that workflow obviously better than Git plus shell scripts, the product has failed.
 
 ## 4. Critical Review of IDEA.md
 
@@ -73,14 +73,14 @@ The current idea document names major components but leaves too many foundation 
 
 The document currently asks for "minimal and simple" and "maximum feature parity" at the same time. These conflict unless parity is defined narrowly.
 
-Forge should not target Git command parity in v0. It should target workflow parity where it matters:
+Forge should not target Git command parity. It should target workflow parity where it matters:
 
 - Preserve user work.
 - Compare changes.
 - Restore earlier states.
 - Exchange accepted work through Git.
 - Support branch/PR workflows through export.
-- Maintain enough internal model purity to grow beyond Git later.
+- Maintain enough internal model purity that Git remains an adapter, not the product model.
 
 The product should be brutally scoped: do less than Git at first, but do the agent workflow far better.
 
@@ -111,7 +111,7 @@ Hard rule: do not implement custom cryptography or custom compression for produc
 - Keep the CLI predictable for both humans and agents.
 - Keep local repositories usable offline.
 - Preserve Git interoperability without making Git the internal model.
-- Establish object and metadata concepts that can power a hosted Forge platform later.
+- Establish object and metadata concepts that can power a hosted Forge platform.
 
 ### 5.2 Engineering Goals
 
@@ -127,7 +127,7 @@ Hard rule: do not implement custom cryptography or custom compression for produc
 
 ## 6. Non-Goals
 
-### 6.1 v0 Non-Goals
+### 6.1 Current Non-Goals
 
 - Full Git command replacement.
 - Full Git protocol implementation.
@@ -135,20 +135,21 @@ Hard rule: do not implement custom cryptography or custom compression for produc
 - Hosted Forge service.
 - Web review UI.
 - Native IDE plugin.
-- Semantic merge engine.
-- Custom distributed synchronization protocol.
 - Enterprise auth, orgs, billing, or permissions.
 - Perfect secret redaction.
 - Large-scale monorepo virtualization.
 - GitHub feature parity.
+- Global identity governance, revocation infrastructure, and certificate authority semantics.
+- Resumable/partial network transfer.
+- Stable hosted API compatibility.
 
 ### 6.2 Permanent Non-Goals Unless Revisited
 
 - Treating every exploratory snapshot as public project history.
 - Requiring agents to understand Git internals.
-- Trusting self-reported agent provenance without later attestation.
+- Trusting self-reported agent provenance without signatures or attestation.
 - Letting Git branch semantics dictate the Forge domain model.
-- Treating v0 native loose objects as proof that Forge has solved complete native VCS storage.
+- Treating the local/native CLI as a hosted collaboration platform.
 
 ## 7. Target Users
 
@@ -269,7 +270,7 @@ Required fields:
 - Summary.
 - Changed path summary.
 
-Snapshots may be explicit or automatic. v0 should implement explicit snapshots first. Automatic snapshots must wait until retention, ignore rules, and storage pressure are solved.
+Snapshots may be explicit or automatic. The current CLI ships explicit snapshots; automatic snapshots remain deferred unless retention, ignore rules, and storage pressure policy are active for the workflow.
 
 ### 8.5 Proposal
 
@@ -405,7 +406,7 @@ The current repository state is the view referenced by the current operation. Mu
 
 ## 9. Repository Invariants
 
-Forge must define invariants before implementation. Suggested v0 invariants:
+Forge's local/native implementation is governed by these invariants:
 
 - Immutable objects are content-addressed and never modified in place.
 - Mutable references only point to existing immutable objects.
@@ -417,7 +418,7 @@ Forge must define invariants before implementation. Suggested v0 invariants:
 - Publication cannot advance a target from an unexpected previous revision without an explicit rebase/merge/apply operation.
 - Evidence can be appended but not silently rewritten.
 - Schema version is present on every persisted record.
-- Every syncable object carries `origin`, `visibility`, `sensitivity`, `trust_level`, `redaction_state`, and `remote_state` fields even if v0 only enforces them locally.
+- Every syncable object carries enough provenance, sensitivity, trust, redaction, and origin metadata for local policy and future hosted enforcement.
 - Unknown future schema versions are read-only unless an explicit upgrade is run.
 - A repository can run `forge doctor` after crash and identify orphaned temp files, incomplete operations, and dangling objects.
 
@@ -425,10 +426,10 @@ Forge must define invariants before implementation. Suggested v0 invariants:
 
 ### 10.1 Storage Strategy
 
-Forge v0 should use a hybrid local storage design:
+Forge uses a hybrid local storage design:
 
 - SQLite metadata store for repository state, operation/view records, intents, attempts, snapshots, proposals, evidence metadata, check results, decisions, publications, conflict sets, indexes, and schema migrations.
-- Content backend abstraction for file-content snapshots. Git-backed tree snapshots remain the default. Native Forge snapshots can be enabled explicitly and are stored as loose content-addressed objects under `.forge/objects`.
+- Content backend abstraction for file-content snapshots. The native backend stores Forge-owned blob/tree/commit objects under `.forge`, with pack/index storage, native history refs, diff/merge, conflict data, and peer sync. The Git backend remains an adapter for compatibility and export workflows.
 - Content-addressed file store for large evidence payloads and optional auxiliary blobs.
 - Indexes/caches for fast status, path lookup, changed-file queries, and evidence lookup.
 
@@ -436,7 +437,7 @@ The operation/view state in SQLite is the lifecycle source of truth. Git object 
 
 ### 10.2 Object Identity
 
-Forge v0 uses SHA-256 as the canonical object identity algorithm. Additional hashes may be stored as auxiliary checksums but are not canonical unless an explicit repository migration changes canonical identity.
+Forge uses SHA-256 as the canonical object identity algorithm. Additional hashes may be stored as auxiliary checksums but are not canonical unless an explicit repository migration changes canonical identity.
 
 Object IDs must be domain-separated:
 
@@ -451,11 +452,11 @@ Hash input must include:
 
 This avoids cross-type collisions and allows future hash migrations.
 
-Repositories must include a hash algorithm registry and hash mapping table from v0. BLAKE3 may later be used for fast local chunking or cache keys, but not as canonical identity without an explicit migration. Do not use Rust's `DefaultHasher` or any non-persistent hash API for object identity.
+Repositories include a hash algorithm registry and hash mapping table. BLAKE3 may be used for fast local chunking or cache keys, but not as canonical identity without an explicit migration. Do not use Rust's `DefaultHasher` or any non-persistent hash API for object identity.
 
 ### 10.3 Object Types
 
-Minimum v0 object types:
+Core object types:
 
 - `content_ref`: backend-specific reference to file content or a tree.
 - `snapshot`: root tree/content ref plus workspace metadata.
@@ -465,7 +466,7 @@ Minimum v0 object types:
 - `evidence`: command/test/provenance record.
 - `check_result`: policy result.
 - `decision`: approval/rejection/waiver record.
-- `publication`: Git export or future hosted sync record.
+- `publication`: Git export, native sync, or future hosted publication record.
 - `conflict_set`: structured conflict metadata.
 - `operation`: append-only mutation record.
 - `view`: resulting repository state after an operation.
@@ -474,7 +475,7 @@ Minimum v0 object types:
 
 The format must optimize for correctness before convenience.
 
-Recommended v0 approach:
+Current approach:
 
 - Metadata is stored in SQLite with explicit migrations, transactions, indexes, and integrity checks.
 - Large evidence payloads and optional auxiliary content blobs are stored separately as content-addressed files.
@@ -504,7 +505,7 @@ Rust std gives some useful primitives, but platform behavior differs. Forge must
 
 Forge must assume multiple agents and humans may run commands concurrently.
 
-v0 should use conservative repository-level write locking plus append-only operation records. Future versions can move toward finer-grained optimistic concurrency.
+Forge uses conservative repository-level write locking plus append-only operation records. Future versions can move toward finer-grained optimistic concurrency.
 
 Rules:
 
@@ -518,13 +519,13 @@ Rules:
 
 GC is not optional once snapshots and evidence exist.
 
-v0 must at least define:
+GC must define and enforce:
 
 - Retention policy for snapshots.
 - Retention policy for command output.
 - Protection rules for accepted proposals and published refs.
 - Protection rules for exported Git commits.
-- Dry-run cleanup.
+- Dry-run preview and explicit confirmed deletion.
 - Reachability check from refs, attempts, proposals, decisions, publications, and operation log.
 
 Without this, six months of agent use will turn `.forge` into an unbounded log dump.
@@ -542,13 +543,13 @@ Forge must be strict about paths because repository tools fail in edge cases:
 - Detect large files and require policy before storing repeated large blobs.
 - Treat generated directories and build outputs as storage hazards.
 
-Open question: whether Forge should reuse `.gitignore` syntax in v0, define `.forgeignore`, or support both. Reusing `.gitignore` is pragmatic, but it leaks Git conventions into Forge. A reasonable v0 compromise is: read `.gitignore` when present, support `.forgeignore` for Forge-specific exclusions, and document precedence.
+Forge supports Git-style ignore semantics for adoption and `.forgeignore` for Forge-specific exclusions. `.forge`, secret-risk paths, and policy-excluded material are never captured as user content.
 
 ## 12. Attempt Isolation
 
-### 12.1 v0 Isolation
+### 12.1 Current Isolation
 
-v0 can use normal filesystem workspaces and, in Git-backed repositories, Git worktrees as an implementation detail. The Forge domain model should expose attempts and workspaces, not branches.
+Forge exposes attempts and workspaces as domain concepts, not branches. The current native surface supports physical per-attempt workspaces under `.forge` with non-destructive switching and GC/retention support. Git worktrees are an adapter detail only when using Git-backed compatibility workflows.
 
 Required commands:
 
@@ -558,13 +559,7 @@ Required commands:
 - `forge attempt show <id>`
 - `forge attempt attach <id>`
 
-Deferred commands:
-
-- `forge attempt finish <id>`
-- `forge attempt abandon <id>`
-- `forge attempt compare <a> <b>`
-
-### 12.2 Future Isolation
+### 12.2 Additional Isolation Work
 
 Future Forge may support:
 
@@ -574,13 +569,13 @@ Future Forge may support:
 - Remote ephemeral workspaces.
 - Workspace snapshots that can run in CI or hosted agents.
 
-The v0 storage model must represent workspace identity and path scope even if enforcement is simple at first.
+The storage model represents workspace identity and path scope so hosted and permissioned workspace designs can build on the local/native substrate.
 
 ## 13. Snapshot Semantics
 
 Snapshots are not commits. They are private or semi-private recovery and comparison points within an attempt.
 
-v0 requirements:
+Current requirements:
 
 - Manual snapshot creation.
 - Snapshot listing.
@@ -597,13 +592,13 @@ Future automatic snapshots must include:
 - Secret/output exclusion.
 - User-visible retention controls.
 
-Automatic snapshots without retention will become operational debt quickly. No automatic snapshots may ship until retention and GC are implemented.
+Automatic snapshots without clear trigger, budget, and retention policy will become operational debt quickly. They remain a product follow-on even though the storage substrate now has GC and retention controls.
 
 ## 14. Proposal Semantics
 
 Proposals are curated change proposals.
 
-v0 requirements:
+Current requirements:
 
 - Create proposal from current attempt state or snapshot.
 - Attach evidence bundles.
@@ -632,14 +627,14 @@ Proposals must support revisions. A proposal revision changes when proposed file
 
 This is one of the largest gaps in IDEA.md.
 
-Forge must define conflicts as data from v0, not only as conflict markers in files.
+Forge defines conflicts as data, not only as conflict markers in files.
 
-v0 minimum:
+Current conflict model:
 
 - Detect when proposal base is stale relative to publication target.
 - Refuse accept/apply/publication unless the proposal is rebased, merged, or explicitly overridden by policy.
-- Use Git or a simple three-way merge through the adapter in Git-backed v0 repositories.
-- Persist `ConflictSet` and `PathConflict` records even when merge execution is delegated to Git.
+- Use the native three-way merge engine for native content, with Git delegation limited to Git-backed compatibility paths.
+- Persist `ConflictSet` and `PathConflict` records for remote-boundary and local merge conflicts.
 - Record conflict files and conflict status in the proposal/attempt.
 - Never silently resolve binary conflicts.
 
@@ -676,7 +671,7 @@ Forge should avoid implying that a command log is a security guarantee. Evidence
 
 ### 16.2 Evidence Capture Rules
 
-v0 command:
+Current command:
 
 `forge run -- <command> [args...]`
 
@@ -728,7 +723,7 @@ Redaction states:
 
 ### 16.4 Provenance
 
-v0 provenance may include self-reported:
+Provenance may include self-reported:
 
 - Actor name/email.
 - Agent name.
@@ -746,7 +741,7 @@ Trust levels:
 - `hosted_runner_signed`
 - `third_party_attested`
 
-Future hosted Forge should support:
+Hosted Forge should support:
 
 - Signed evidence records.
 - Server-side command runners.
@@ -758,7 +753,7 @@ Future hosted Forge should support:
 
 Check results are the bridge between evidence, decisions, and publication. They do not prove correctness; they record observed policy results for a specific proposal revision.
 
-v0 should support a simple policy file:
+Forge supports constrained local policy:
 
 `.forge/policy.forge`
 
@@ -780,7 +775,7 @@ Check output must include:
 - Waived checks.
 - Exact evidence IDs used.
 
-Do not build a full policy language in v0. Use a constrained declarative format.
+Do not build a full policy language into the local CLI. Use a constrained declarative format.
 
 ### 17.1 Anti-Gaming Requirements
 
@@ -840,9 +835,9 @@ Git is an adapter, not the internal model.
 
 Forge must support existing Git workflows because adoption depends on it. But Git concepts must remain at the boundary.
 
-### 19.2 v0 Git Adapter
+### 19.2 Git Adapter
 
-Recommended v0 approach:
+Current approach:
 
 - Use Git CLI as the compatibility adapter for import/export in Git-backed repositories.
 - Store Forge lifecycle state in `.forge`.
@@ -851,16 +846,16 @@ Recommended v0 approach:
 - Record Git object IDs as adapter metadata.
 - When native content mode is enabled, synthesize Git trees from Forge-native tree objects only at export time.
 
-The v0 content boundary should be expressed through a `ContentBackend` abstraction:
+The content boundary is expressed through a `ContentBackend` abstraction:
 
 - Snapshot worktree to a `TreeRef`.
 - Diff a base `TreeRef` against a proposed `TreeRef`.
 - Materialize a `TreeRef` into a workspace.
 - Export a proposal to a Git branch.
 
-This is pragmatic. Reimplementing Git protocol before validating Forge's agent-native workflow is likely a trap. Native mode keeps the boundary intact: Forge can capture and restore snapshots without Git tree objects internally, but accepted work still leaves through the Git adapter in v0.
+This keeps adoption pragmatic while protecting the core model. Native mode captures, restores, diffs, merges, signs, and syncs without Git tree objects internally; accepted work leaves through the Git adapter only when the user wants a Git branch/PR artifact.
 
-### 19.3 Future Native Git Adapter
+### 19.3 Native Git Adapter Follow-On
 
 Future versions can replace shelling out with a pure Rust Git adapter. gitoxide proves that serious pure-Rust Git infrastructure is possible, but also demonstrates the size and complexity of the domain: object database, references, transport, CLI behavior, and performance all matter.
 
@@ -918,7 +913,7 @@ Future permission design must account for:
 - Contractor/external contributor views.
 - Private command output.
 
-This means v0 objects should include sensitivity and visibility hooks even if enforcement is local-only.
+This means local objects include sensitivity and visibility hooks even while hosted enforcement remains a follow-on.
 
 Minimum hosted-ready fields for every future-syncable object:
 
@@ -1011,61 +1006,54 @@ Error objects should include:
 
 This contract is critical for AI agents. Changing it casually will break automation.
 
-## 22. MVP Scope
+## 22. Current Release-Candidate Scope
 
-### 22.1 MVP Objective
+### 22.1 Release Objective
 
-Build a single Rust CLI that works inside an existing Git repository, creates `.forge`, tracks intents/attempts/snapshots/evidence/proposals, checks proposals with simple local policy, records decisions, and exports accepted proposals to Git.
+Ship a single Rust CLI that initializes `.forge`, tracks intents/attempts/snapshots/evidence/proposals, checks proposals with local policy, records signed decisions, stores native history, syncs native provenance to peers, and exports accepted proposals to Git when existing PR workflows need it.
 
-### 22.2 Must-Haves
+### 22.2 Current Must-Haves
 
 - `forge init`
 - `.forge` schema versioning.
 - SQLite metadata store.
 - Operation log and view model.
 - Intent/attempt/snapshot/proposal/evidence/check/decision/publication objects.
-- Git-backed content snapshots through a `ContentBackend` abstraction.
+- Native content snapshots through a `ContentBackend` abstraction, with Git-backed compatibility where needed.
 - Manual snapshot create/list/diff/restore.
-- Ignore handling.
+- Ignore handling with `.gitignore`, `.forgeignore`, and secret-risk exclusions.
 - `forge run` bounded evidence capture.
 - Evidence sensitivity labels.
 - Evidence visibility, redaction state, and trust level.
 - Proposal create/show/diff.
-- Basic checks from configured commands.
+- Declarative checks from configured commands, bound to proposal revisions.
 - Decision and publication records.
 - Stale base detection.
-- Conflict set metadata.
+- Native conflict-as-data, explicit conflict resolution, and merge commits for clean divergence.
 - Git branch export.
 - PR body export.
 - Human output and JSON output.
 - `forge doctor`.
-- Basic cleanup/GC with dry-run.
+- Confirmed mark-sweep GC with dry-run preview and doctor gating.
 - Agent identity metadata.
 - Safe write protocol tests.
 - JSON golden tests.
+- Signed evidence, decisions, native accepted commits, and sync merge commits.
+- Trust policy enforcement for local, hosted-runner, and third-party attestation tiers.
+- Native sync clone/fetch/pull/push over local paths, `file://`, SSH, and HTTPS `sync serve`.
 
-### 22.3 Should-Haves
-
-- Attempt comparison.
-- Proposal revision support.
-- Git commit export.
-- Simple policy waivers.
-- Evidence payload pruning.
-
-### 22.4 Explicitly Defer
+### 22.3 Product Follow-Ons
 
 - Automatic snapshots.
 - Hosted remote.
-- Independent Forge object store for all file content.
-- Native Git protocol.
-- Native Git packfile writing.
 - Fine-grained permissions.
-- Semantic merge.
 - Server-side evidence attestation.
 - IDE integration.
 - Web UI.
 - Custom binary metadata format.
 - Monorepo sparse/lazy workspace features.
+- Resumable/partial network transfer.
+- Global identity governance, revocation, and certificate authority semantics.
 
 ## 23. Six-Month Failure Patterns to Design Against
 
@@ -1073,13 +1061,13 @@ Build a single Rust CLI that works inside an existing Git repository, creates `.
 
 Agents create hundreds of snapshots and capture large command outputs. Without retention, compression, and GC, repositories become unusable.
 
-Mitigation: retention policy, evidence truncation, storage budget warnings, dry-run GC, and large-file policy in v0.
+Mitigation: retention policy, evidence truncation, storage budget warnings, confirmed GC with dry-run preview, and large-file policy.
 
 ### 23.2 Evidence Leaks Secrets
 
 Test output, env dumps, stack traces, API responses, and config files may contain secrets.
 
-Mitigation: conservative capture defaults, sensitivity labels, explicit export gates, no full env capture, secret-scanning hooks later.
+Mitigation: conservative capture defaults, sensitivity labels, explicit export gates, no full env capture, and secret scanning before persistence/export.
 
 ### 23.3 Agent JSON Contracts Drift
 
@@ -1091,7 +1079,7 @@ Mitigation: version every JSON response, add snapshot tests, maintain compatibil
 
 The easiest path is to map everything to branches and commits. Six months later Forge is a Git wrapper with evidence sidecars.
 
-Mitigation: keep Git IDs as adapter metadata only, enforce Forge domain objects in core APIs, and test non-Git-backed repositories early.
+Mitigation: keep Git IDs as adapter metadata only, enforce Forge domain objects in core APIs, and continuously test native repositories without Git on `PATH`.
 
 ### 23.5 Accept and Publication Races Lose Work
 
@@ -1103,7 +1091,7 @@ Mitigation: optimistic target checks, stale base states, explicit rebase/merge b
 
 If conflicts are only text markers in files, hosted review and multi-agent resolution become messy.
 
-Mitigation: record conflict metadata in v0 even if conflict resolution is delegated to Git initially.
+Mitigation: record conflict metadata and typed path conflicts, route native conflicts through conflict-as-data, and keep Git delegation limited to compatibility paths.
 
 ### 23.7 No-Dependency Policy Slows the Core
 
@@ -1135,7 +1123,7 @@ Mitigation: maintain a working-tree index/cache, path filters, changed-path acce
 
 If evidence and proposals lack sensitivity/visibility fields, future hosted access control becomes a migration nightmare.
 
-Mitigation: include visibility/sensitivity metadata from v0.
+Mitigation: include visibility/sensitivity metadata from the local format.
 
 ### 23.11 Provenance Is Overtrusted
 
@@ -1198,7 +1186,7 @@ The hosted platform should not be "GitHub but Rust." It should be "review and sa
 - `forge-store`: SQLite metadata, migrations, operations, views, indexes.
 - `forge-content`: content backend traits, tree refs, blob refs, diff abstractions.
 - `forge-content-git`: Git CLI-backed content backend.
-- `forge-content-native`: Forge-native loose object backend for regular-file snapshots.
+- `forge-content-native`: Forge-native blob/tree/commit object storage, history, diff, merge, pack/index, and GC primitives.
 - `forge-worktree`: path scanning, ignore handling, snapshots, restore.
 - `forge-evidence`: command capture and evidence records.
 - `forge-policy`: check policy and results.
@@ -1241,34 +1229,34 @@ Required test categories:
 - Property tests for object roundtrips and path normalization.
 - Crash simulation tests for write protocol.
 - Concurrent command tests.
-- Git adapter integration tests.
+- Git adapter and native no-git integration tests.
 - Large-repo synthetic performance tests.
 - Evidence redaction/export tests.
 - Schema migration tests from every released version.
 
 If Forge cannot prove repository safety under tests, it should not ask users to trust it with source code.
 
-## 26. Remaining Open Questions for Deep Review
+## 26. Remaining Open Questions for Product Follow-On Review
 
 ### 26.1 Product Questions
 
 - Is intent/attempt/snapshot/proposal/evidence/check/decision/publication the right vocabulary, or should any concept collapse?
 - What is the simplest CLI workflow that hides the object model without losing power?
 - What is the strongest adoption wedge against Git plus scripts, Jujutsu, and Sapling?
-- Is Git-backed v0 too conservative, or is it the right way to prove the workflow?
+- Which hosted collaboration surface should come first: proposal review, peer sync management, policy administration, or agent-run evidence review?
 
 ### 26.2 Storage Questions
 
-- Is SQLite metadata plus Git-backed content the right v0 storage cutline?
+- Which SQLite rows should move into signed native objects, if any, before hosted sync hardens?
 - What is the minimum safe SQLite schema and migration strategy?
-- Is SHA-256 the right canonical ID for v0?
+- Is SHA-256 still the right canonical ID as pack/index and hosted-scale workloads grow?
 - Is the hash mapping table sufficient for future hash migration?
 - What should remain in SQLite versus content-addressed payload files?
 - How should indexes be rebuilt and validated?
 
 ### 26.3 Concurrency and Reliability Questions
 
-- Is repository-level write locking acceptable for v0?
+- Is repository-level write locking still acceptable as hosted/parallel workflows grow?
 - What transaction protocol is sufficient across Linux, macOS, and Windows?
 - Should Forge copy Jujutsu's operation-log concurrency model more directly?
 - How should interrupted commands and stale workspaces recover?
@@ -1279,7 +1267,7 @@ If Forge cannot prove repository safety under tests, it should not ask users to 
 - What should never be captured by default?
 - How should agents declare identity?
 - How should Forge prevent agents from gaming local check evidence?
-- Should evidence be required for accept/publication in v0?
+- Should stronger evidence be required for accept/publication by default?
 
 ### 26.5 Git and Hosted Platform Questions
 
@@ -1288,24 +1276,28 @@ If Forge cannot prove repository safety under tests, it should not ask users to 
 - What local object fields are needed now for future hosted permissions?
 - Should remote sync follow Git-like pack negotiation, operation-log sync, or a new object protocol?
 
-## 27. Launch Blocker Checklist
+## 27. Release Gate Checklist
 
-v0 cannot ship unless:
+The local/native release candidate cannot ship unless:
 
 - `forge doctor` can recover from interrupted writes.
 - Stale-base accept/publication is impossible by default.
 - Evidence export blocks `secret-risk` payloads by default.
 - JSON golden tests exist for every command.
 - Operation/view recovery tests pass.
-- GC dry-run exists.
+- GC has a dry-run preview and confirmed deletion gated on `doctor`.
 - Git export branch works.
 - Proposal evidence binds to an exact proposal revision.
 - Conflict set metadata is persisted when stale-base apply or merge conflicts occur.
 - Local checks are labeled with their trust level.
+- Native sync transfers object content and allowlisted ledger provenance.
+- Native commits, decisions, evidence, and sync merge commits are signed and verified.
+- Trust policy can enforce local, hosted-runner, and third-party tiers.
+- The aggregate release gate in `scripts/dogfood-release-gate.sh` passes.
 
 ## 28. Success Criteria
 
-Forge v0 succeeds if:
+Forge succeeds if:
 
 - A coding agent can use the CLI without interactive prompts.
 - A human can understand the intent, files changed, evidence, and check state.
@@ -1316,8 +1308,10 @@ Forge v0 succeeds if:
 - `.forge` remains bounded by retention/GC controls.
 - JSON output remains stable under tests.
 - The architecture keeps Git at the adapter boundary.
+- Native sync lets another Forge repository review the same content and provenance.
+- Trust policy can reject insufficiently signed or unattested work.
 
-Forge v0 fails if:
+Forge fails if:
 
 - Users still need to manage Git branches/worktrees manually for the core workflow.
 - Evidence is too noisy or risky to export.
