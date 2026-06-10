@@ -12,8 +12,9 @@ use forge_store::ForgeError;
 use serde_json::{json, Value};
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
 #[derive(Debug, Parser)]
 #[command(name = "forge", version, about = "Local agent change-control loop")]
@@ -297,6 +298,9 @@ enum SyncCommand {
     Pull(SyncPeerArgs),
     /// Push a fast-forward native delta into another local Forge repository.
     Push(SyncPeerArgs),
+    /// Internal transport endpoint used by remote peers.
+    #[command(hide = true)]
+    Serve(SyncServeArgs),
 }
 
 #[derive(Debug, Args)]
@@ -332,6 +336,25 @@ struct SyncPeerArgs {
     /// accepted as URL-shaped local remotes so later ssh/https transport can
     /// extend the same argument without changing the command surface.
     remote: OsString,
+}
+
+#[derive(Debug, Args)]
+struct SyncServeArgs {
+    #[command(subcommand)]
+    command: SyncServeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncServeCommand {
+    /// Export a transport manifest through the normal JSON envelope.
+    Export(SyncServeExportArgs),
+}
+
+#[derive(Debug, Args)]
+struct SyncServeExportArgs {
+    /// Read the incremental base manifest from stdin.
+    #[arg(long)]
+    stdin_since: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1451,43 +1474,94 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
         }
         SyncCommand::Fetch(args) => command_result("sync fetch", request_id, |cwd, request_id| {
             let remote = SyncPeerRemote::parse(&args.remote)?;
-            sync_fetch_peer(&cwd, request_id, &remote.path, false)
+            match remote {
+                SyncPeerRemote::Local(path) => sync_fetch_peer(&cwd, request_id, &path, false),
+                SyncPeerRemote::Ssh(remote) => {
+                    sync_fetch_ssh_peer(&cwd, request_id, &remote, false)
+                }
+            }
         }),
         SyncCommand::Pull(args) => command_result("sync pull", request_id, |cwd, request_id| {
             let remote = SyncPeerRemote::parse(&args.remote)?;
-            sync_fetch_peer(&cwd, request_id, &remote.path, true)
+            match remote {
+                SyncPeerRemote::Local(path) => sync_fetch_peer(&cwd, request_id, &path, true),
+                SyncPeerRemote::Ssh(remote) => sync_fetch_ssh_peer(&cwd, request_id, &remote, true),
+            }
         }),
         SyncCommand::Push(args) => command_result("sync push", request_id, |cwd, request_id| {
             let remote = SyncPeerRemote::parse(&args.remote)?;
-            sync_push_peer(&cwd, request_id, &remote.path)
+            match remote {
+                SyncPeerRemote::Local(path) => sync_push_peer(&cwd, request_id, &path),
+                SyncPeerRemote::Ssh(remote) => {
+                    anyhow::bail!(
+                        "ssh sync push is not supported yet; fetch or pull from {} first",
+                        remote.label()
+                    )
+                }
+            }
         }),
+        SyncCommand::Serve(args) => sync_serve_response(request_id, args),
     }
 }
 
-struct SyncPeerRemote {
+fn sync_serve_response(request_id: Option<String>, args: SyncServeArgs) -> ResponseEnvelope {
+    match args.command {
+        SyncServeCommand::Export(args) => {
+            command_result("sync serve export", request_id, |cwd, _request_id| {
+                let since_manifest = if args.stdin_since {
+                    let value: forge_sync::SyncManifest = serde_json::from_reader(std::io::stdin())
+                        .context("read sync serve export base manifest from stdin")?;
+                    Some(value)
+                } else {
+                    None
+                };
+                let (manifest, report) =
+                    forge_sync::export_manifest_for_transport_since(&cwd, since_manifest.as_ref())
+                        .context("export sync transport manifest")?;
+                Ok((
+                    None,
+                    json!({
+                        "manifest": manifest,
+                        "report": report,
+                    }),
+                    Vec::new(),
+                ))
+            })
+        }
+    }
+}
+
+enum SyncPeerRemote {
+    Local(PathBuf),
+    Ssh(SshPeerRemote),
+}
+
+struct SshPeerRemote {
+    host: String,
     path: PathBuf,
 }
 
 impl SyncPeerRemote {
     fn parse(raw: &OsStr) -> Result<Self> {
         let Some(raw) = raw.to_str() else {
-            return Ok(Self {
-                path: PathBuf::from(raw),
-            });
+            return Ok(Self::Local(PathBuf::from(raw)));
         };
         if let Some((scheme, rest)) = raw.split_once("://") {
-            if scheme != "file" {
-                anyhow::bail!(
-                    "unsupported sync remote scheme {scheme}; supported schemes: local path, file"
-                );
-            }
-            return Ok(Self {
-                path: file_url_path(rest)?,
-            });
+            return match scheme {
+                "file" => Ok(Self::Local(file_url_path(rest)?)),
+                "ssh" => Ok(Self::Ssh(ssh_url_remote(rest)?)),
+                _ => anyhow::bail!(
+                    "unsupported sync remote scheme {scheme}; supported schemes: local path, file, ssh"
+                ),
+            };
         }
-        Ok(Self {
-            path: PathBuf::from(raw),
-        })
+        Ok(Self::Local(PathBuf::from(raw)))
+    }
+}
+
+impl SshPeerRemote {
+    fn label(&self) -> String {
+        format!("ssh://{}{}", self.host, self.path.display())
     }
 }
 
@@ -1502,7 +1576,25 @@ fn file_url_path(rest: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(percent_decode_file_url_path(&path)?))
 }
 
+fn ssh_url_remote(rest: &str) -> Result<SshPeerRemote> {
+    let (host, path) = rest
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("ssh sync remote must include an absolute path"))?;
+    if host.is_empty() {
+        anyhow::bail!("ssh sync remote must include a host");
+    }
+    let path = format!("/{path}");
+    Ok(SshPeerRemote {
+        host: host.to_string(),
+        path: PathBuf::from(percent_decode_url_path(&path)?),
+    })
+}
+
 fn percent_decode_file_url_path(path: &str) -> Result<String> {
+    percent_decode_url_path(path)
+}
+
+fn percent_decode_url_path(path: &str) -> Result<String> {
     let bytes = path.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -1536,6 +1628,319 @@ fn hex_value(byte: u8) -> Result<u8> {
     }
 }
 
+fn ssh_export_manifest(
+    remote: &SshPeerRemote,
+    since_manifest: Option<&forge_sync::SyncManifest>,
+) -> Result<(forge_sync::SyncManifest, forge_sync::SyncExportReport)> {
+    let remote_forge = env::var("FORGE_SYNC_REMOTE_FORGE").unwrap_or_else(|_| "forge".to_string());
+    let script = format!(
+        "cd {} && {} --json sync serve export{}",
+        shell_quote(&remote.path.display().to_string()),
+        shell_quote(&remote_forge),
+        if since_manifest.is_some() {
+            " --stdin-since"
+        } else {
+            ""
+        }
+    );
+    let stdin = since_manifest
+        .map(serde_json::to_vec)
+        .transpose()
+        .context("serialize ssh sync base manifest")?
+        .unwrap_or_default();
+    let envelope = run_ssh_envelope(remote, &script, &stdin)?;
+    if envelope.status != ResponseStatus::Success {
+        let message = envelope
+            .errors
+            .first()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| "remote sync serve export failed".to_string());
+        anyhow::bail!("ssh sync export failed on {}: {message}", remote.label());
+    }
+    let manifest = serde_json::from_value(
+        envelope
+            .data
+            .get("manifest")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("ssh sync export response missing manifest"))?,
+    )
+    .context("decode ssh sync export manifest")?;
+    let report = serde_json::from_value(
+        envelope
+            .data
+            .get("report")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("ssh sync export response missing report"))?,
+    )
+    .context("decode ssh sync export report")?;
+    Ok((manifest, report))
+}
+
+fn run_ssh_envelope(
+    remote: &SshPeerRemote,
+    script: &str,
+    stdin: &[u8],
+) -> Result<ResponseEnvelope> {
+    let ssh_command = env::var("FORGE_SYNC_SSH_COMMAND").unwrap_or_else(|_| "ssh".to_string());
+    let mut child = ProcessCommand::new(&ssh_command)
+        .arg(&remote.host)
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn ssh sync command {ssh_command}"))?;
+    if !stdin.is_empty() {
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("ssh sync stdin unavailable"))?
+            .write_all(stdin)
+            .context("write ssh sync stdin")?;
+    }
+    drop(child.stdin.take());
+    let output = child
+        .wait_with_output()
+        .context("wait for ssh sync command")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "ssh sync command failed on {} with status {}: {}",
+            remote.label(),
+            output.status,
+            stderr.trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("decode ssh sync JSON envelope")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn sync_fetch_ssh_peer(
+    cwd: &Path,
+    request_id: Option<String>,
+    remote: &SshPeerRemote,
+    materialize: bool,
+) -> Result<(Option<String>, Value, Vec<String>)> {
+    let local_context = forge_store::open_repository(cwd)?;
+    let _local_lock = forge_store::acquire_repository_lock(&local_context.root_path)?;
+    forge_store::reconcile_native_head(&local_context.root_path)?;
+    let local_manifest = forge_sync::build_manifest(&local_context.root_path)?;
+    let (remote_manifest, _) = ssh_export_manifest(remote, None)?;
+    ensure_peer_compatible(
+        &remote_manifest,
+        &local_manifest,
+        if materialize { "pull" } else { "fetch" },
+    )?;
+    let remote_path = PathBuf::from(remote.label());
+
+    if !forge_sync::manifest_head_descends_from(
+        &remote_manifest,
+        local_manifest.native_head.as_deref(),
+    )? {
+        if forge_sync::manifest_head_descends_from(
+            &local_manifest,
+            remote_manifest.native_head.as_deref(),
+        )? {
+            return sync_fetch_up_to_date(
+                cwd,
+                request_id,
+                &local_manifest,
+                &remote_manifest,
+                &remote_path,
+                materialize,
+            );
+        }
+        return record_sync_peer_merge_conflict(SyncPeerMergeConflictInput {
+            receiver_cwd: cwd,
+            request_id,
+            source: &remote_manifest,
+            receiver: &local_manifest,
+            remote: &remote_path,
+            context: if materialize {
+                "sync_pull_divergence"
+            } else {
+                "sync_fetch_divergence"
+            },
+            command: if materialize {
+                "sync pull"
+            } else {
+                "sync fetch"
+            },
+            direction: if materialize { "pull" } else { "fetch" },
+            materialize,
+        });
+    }
+
+    let (incoming_manifest, export_report) = ssh_export_manifest(remote, Some(&local_manifest))?;
+    let materialized_target_ref = if materialize {
+        let content_ref = sync_manifest_head_content_ref(cwd, &incoming_manifest)?
+            .ok_or_else(|| anyhow::anyhow!("sync peer has no native head to materialize"))?;
+        ensure_clean_worktree(cwd, &content_ref).context("preflight sync pull")?;
+        Some(content_ref)
+    } else {
+        None
+    };
+    let import_report = forge_sync::import_manifest_value(cwd, &incoming_manifest)
+        .context("apply ssh remote sync delta")?;
+
+    let mut operation_id = None;
+    let mut materialized_content_ref = None;
+    let mut materialized_operation_id = None;
+    let mut materialized_view_id = None;
+    if materialize {
+        let content_ref = materialized_target_ref
+            .clone()
+            .expect("materialized target ref precomputed");
+        restore_effective_worktree(cwd, &content_ref).context("restore fetched native head")?;
+        let state = json!({
+            "protocol_version": import_report.protocol_version.clone(),
+            "direction": "pull",
+            "remote_path": remote.label(),
+            "base_native_head": local_manifest.native_head.clone(),
+            "remote_native_head": remote_manifest.native_head.clone(),
+            "exported_native_objects": export_report.native_object_count,
+            "exported_native_payloads": export_report.native_payload_count,
+            "exported_ledger_rows": export_report.ledger_row_count,
+            "imported_native_objects": import_report.imported_native_objects,
+            "imported_ledger_rows": import_report.imported_ledger_rows,
+            "local_key_fingerprint": import_report.local_key_fingerprint.clone(),
+            "materialized": true,
+            "materialized_content_ref": content_ref.clone(),
+        });
+        let record = forge_store::record_sync_pull_materialized(
+            cwd,
+            request_id.clone(),
+            forge_store::SyncPullMaterializedInput {
+                state,
+                content_ref: content_ref.clone(),
+            },
+        )
+        .context("record sync pull materialization")?;
+        operation_id = Some(record.operation_id.clone());
+        materialized_operation_id = Some(record.operation_id);
+        materialized_view_id = Some(record.view_id);
+        materialized_content_ref = Some(content_ref);
+    }
+
+    let data = json!({
+        "protocol_version": import_report.protocol_version,
+        "direction": if materialize { "pull" } else { "fetch" },
+        "remote_path": remote.label(),
+        "base_native_head": local_manifest.native_head,
+        "remote_native_head": remote_manifest.native_head,
+        "exported_native_objects": export_report.native_object_count,
+        "exported_native_payloads": export_report.native_payload_count,
+        "exported_ledger_rows": export_report.ledger_row_count,
+        "imported_native_objects": import_report.imported_native_objects,
+        "imported_ledger_rows": import_report.imported_ledger_rows,
+        "local_key_fingerprint": import_report.local_key_fingerprint,
+        "materialized": materialize,
+        "materialized_content_ref": materialized_content_ref,
+        "materialized_operation_id": materialized_operation_id,
+        "materialized_view_id": materialized_view_id,
+    });
+    if !materialize && request_id.is_some() {
+        let marker = forge_store::record_sync_request_marker(
+            cwd,
+            request_id,
+            "sync fetch",
+            "fetch",
+            &remote_path,
+            None,
+            Some(data.clone()),
+        )
+        .context("record local sync fetch request-id marker")?;
+        operation_id = Some(marker.operation_id);
+    }
+    Ok((operation_id, data, Vec::new()))
+}
+
+fn sync_fetch_up_to_date(
+    cwd: &Path,
+    request_id: Option<String>,
+    local_manifest: &forge_sync::SyncManifest,
+    remote_manifest: &forge_sync::SyncManifest,
+    remote_path: &Path,
+    materialize: bool,
+) -> Result<(Option<String>, Value, Vec<String>)> {
+    let direction = if materialize { "pull" } else { "fetch" };
+    let command = if materialize {
+        "sync pull"
+    } else {
+        "sync fetch"
+    };
+    let mut operation_id = None;
+    let mut materialized_content_ref = None;
+    let mut materialized_operation_id = None;
+    let mut materialized_view_id = None;
+    if materialize {
+        let commit_id = local_manifest
+            .native_head
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("sync pull has no local native head to materialize"))?;
+        let content_ref = forge_store::checkout_target_content_ref(cwd, commit_id)
+            .context("resolve current native head")?;
+        ensure_clean_worktree(cwd, &content_ref).context("preflight sync pull")?;
+        restore_effective_worktree(cwd, &content_ref).context("restore current native head")?;
+        let state = json!({
+            "protocol_version": remote_manifest.protocol_version.clone(),
+            "direction": direction,
+            "remote_path": remote_path.display().to_string(),
+            "base_native_head": local_manifest.native_head.clone(),
+            "remote_native_head": remote_manifest.native_head.clone(),
+            "imported_native_objects": 0,
+            "imported_ledger_rows": 0,
+            "materialized": true,
+            "materialized_content_ref": content_ref.clone(),
+            "up_to_date": true,
+        });
+        let record = forge_store::record_sync_pull_materialized(
+            cwd,
+            request_id.clone(),
+            forge_store::SyncPullMaterializedInput {
+                state: state.clone(),
+                content_ref: content_ref.clone(),
+            },
+        )
+        .context("record sync pull materialization")?;
+        operation_id = Some(record.operation_id.clone());
+        materialized_operation_id = Some(record.operation_id);
+        materialized_view_id = Some(record.view_id);
+        materialized_content_ref = Some(content_ref);
+    }
+    let data = json!({
+        "protocol_version": remote_manifest.protocol_version,
+        "direction": direction,
+        "remote_path": remote_path.display().to_string(),
+        "base_native_head": local_manifest.native_head,
+        "remote_native_head": remote_manifest.native_head,
+        "imported_native_objects": 0,
+        "imported_ledger_rows": 0,
+        "materialized": materialize,
+        "materialized_content_ref": materialized_content_ref,
+        "materialized_operation_id": materialized_operation_id,
+        "materialized_view_id": materialized_view_id,
+        "up_to_date": true,
+    });
+    if !materialize && request_id.is_some() {
+        let marker = forge_store::record_sync_request_marker(
+            cwd,
+            request_id,
+            command,
+            direction,
+            remote_path,
+            None,
+            Some(data.clone()),
+        )
+        .with_context(|| format!("record local {command} request-id marker"))?;
+        operation_id = Some(marker.operation_id);
+    }
+    Ok((operation_id, data, Vec::new()))
+}
+
 fn sync_fetch_peer(
     cwd: &Path,
     request_id: Option<String>,
@@ -1556,79 +1961,14 @@ fn sync_fetch_peer(
             &local_manifest,
             remote_manifest.native_head.as_deref(),
         )? {
-            let direction = if materialize { "pull" } else { "fetch" };
-            let command = if materialize {
-                "sync pull"
-            } else {
-                "sync fetch"
-            };
-            let mut operation_id = None;
-            let mut materialized_content_ref = None;
-            let mut materialized_operation_id = None;
-            let mut materialized_view_id = None;
-            if materialize {
-                let commit_id = local_manifest.native_head.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("sync pull has no local native head to materialize")
-                })?;
-                let content_ref = forge_store::checkout_target_content_ref(cwd, commit_id)
-                    .context("resolve current native head")?;
-                ensure_clean_worktree(cwd, &content_ref).context("preflight sync pull")?;
-                restore_effective_worktree(cwd, &content_ref)
-                    .context("restore current native head")?;
-                let state = json!({
-                    "protocol_version": remote_manifest.protocol_version.clone(),
-                    "direction": direction,
-                    "remote_path": remote.display().to_string(),
-                    "base_native_head": local_manifest.native_head.clone(),
-                    "remote_native_head": remote_manifest.native_head.clone(),
-                    "imported_native_objects": 0,
-                    "imported_ledger_rows": 0,
-                    "materialized": true,
-                    "materialized_content_ref": content_ref.clone(),
-                    "up_to_date": true,
-                });
-                let record = forge_store::record_sync_pull_materialized(
-                    cwd,
-                    request_id.clone(),
-                    forge_store::SyncPullMaterializedInput {
-                        state: state.clone(),
-                        content_ref: content_ref.clone(),
-                    },
-                )
-                .context("record sync pull materialization")?;
-                operation_id = Some(record.operation_id.clone());
-                materialized_operation_id = Some(record.operation_id);
-                materialized_view_id = Some(record.view_id);
-                materialized_content_ref = Some(content_ref);
-            }
-            let data = json!({
-                "protocol_version": remote_manifest.protocol_version,
-                "direction": direction,
-                "remote_path": remote.display().to_string(),
-                "base_native_head": local_manifest.native_head,
-                "remote_native_head": remote_manifest.native_head,
-                "imported_native_objects": 0,
-                "imported_ledger_rows": 0,
-                "materialized": materialize,
-                "materialized_content_ref": materialized_content_ref,
-                "materialized_operation_id": materialized_operation_id,
-                "materialized_view_id": materialized_view_id,
-                "up_to_date": true,
-            });
-            if !materialize && request_id.is_some() {
-                let marker = forge_store::record_sync_request_marker(
-                    cwd,
-                    request_id,
-                    command,
-                    direction,
-                    remote,
-                    None,
-                    Some(data.clone()),
-                )
-                .with_context(|| format!("record local {command} request-id marker"))?;
-                operation_id = Some(marker.operation_id);
-            }
-            return Ok((operation_id, data, Vec::new()));
+            return sync_fetch_up_to_date(
+                cwd,
+                request_id,
+                &local_manifest,
+                &remote_manifest,
+                remote,
+                materialize,
+            );
         }
         return record_sync_peer_merge_conflict(SyncPeerMergeConflictInput {
             receiver_cwd: cwd,
@@ -2505,10 +2845,12 @@ where
     // `accept`'s `current_head`/`base_head` compare — are atomic against other
     // forge writers (NER-132). Acquired once, here; never nested. `run`, `init`,
     // and path-peer sync are excluded (see `requires_repo_lock`). Peer sync takes
-    // both repository locks in canonical order inside its own critical section. A
-    // contention timeout surfaces as the retryable `LOCK_TIMEOUT` code via the typed
-    // `LockTimeout` downcast.
-    let _repo_lock = if requires_repo_lock(command) {
+    // both repository locks in canonical order inside its own critical section.
+    // Remote `sync serve export` is read-only, but still takes the same lock so
+    // it cannot emit a mixed DB/object-store manifest while a writer is active.
+    // A contention timeout surfaces as the retryable `LOCK_TIMEOUT` code via the
+    // typed `LockTimeout` downcast.
+    let _repo_lock = if locks_repo_for_command(command) {
         match forge_store::acquire_repo_lock(&cwd) {
             Ok(guard) => guard,
             Err(error) => {
@@ -2533,7 +2875,7 @@ where
     // body; this preflight-only reconcile holds the local repo lock briefly and drops it
     // before the sync body can acquire canonical peer locks.
     if reconciles_native_head_before_replay(command) {
-        let _sync_reconcile_lock = if !requires_repo_lock(command) {
+        let _sync_reconcile_lock = if !locks_repo_for_command(command) {
             match forge_store::acquire_repo_lock(&cwd) {
                 Ok(guard) => guard,
                 Err(error) => {
@@ -2981,6 +3323,10 @@ fn requires_repo_lock(command: &str) -> bool {
         )
 }
 
+fn locks_repo_for_command(command: &str) -> bool {
+    requires_repo_lock(command) || command == "sync serve export"
+}
+
 fn reconciles_native_head_before_replay(command: &str) -> bool {
-    requires_repo_lock(command) || matches!(command, "sync fetch" | "sync pull" | "sync push")
+    locks_repo_for_command(command) || matches!(command, "sync fetch" | "sync pull" | "sync push")
 }

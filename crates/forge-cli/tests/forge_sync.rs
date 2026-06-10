@@ -154,6 +154,30 @@ fn file_url_for_test(path: &std::path::Path) -> String {
     format!("file://{}", path.display())
 }
 
+fn ssh_url_for_test(path: &std::path::Path) -> String {
+    format!("ssh://example.test{}", path.display())
+}
+
+fn fake_ssh_command() -> tempfile::TempDir {
+    let bin = tempfile::tempdir().expect("fake ssh dir");
+    let path = bin.path().join("ssh");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\nset -eu\n_host=\"$1\"\nshift\nexec sh -lc \"$1\"\n",
+    )
+    .expect("write fake ssh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)
+            .expect("fake ssh metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod fake ssh");
+    }
+    bin
+}
+
 fn cloned_peer_from_bundle(bundle_path: &std::path::Path) -> tempfile::TempDir {
     let peer_dir = tempfile::tempdir().expect("peer dir");
     forge_in(peer_dir.path())
@@ -1585,13 +1609,78 @@ fn sync_peer_commands_accept_file_url_remotes() {
 }
 
 #[test]
-fn sync_peer_commands_reject_unsupported_remote_scheme() {
-    let repo = TestRepo::new_git();
-    native_accepted_lifecycle(&repo);
+fn sync_peer_commands_fetch_and_pull_over_fake_ssh() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source.path().join("target/forge-sync-ssh-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path.to_str().expect("utf8 ssh base path"),
+        ])
+        .assert()
+        .success();
+    native_accept_file_change(&source, "ssh source change", "ssh-source.txt", "source\n");
+
+    let fake_ssh = fake_ssh_command();
+    let fake_ssh_path = fake_ssh.path().join("ssh");
+    let forge_bin = assert_cmd::cargo::cargo_bin("forge");
+    let source_url = ssh_url_for_test(source.path());
+
+    let fetch_peer = cloned_peer_from_bundle(&bundle_path);
+    let fetched = json(
+        forge_in(fetch_peer.path())
+            .env("FORGE_SYNC_SSH_COMMAND", &fake_ssh_path)
+            .env("FORGE_SYNC_REMOTE_FORGE", &forge_bin)
+            .args(["--json", "sync", "fetch", &source_url])
+            .assert()
+            .success(),
+    );
+    assert_eq!(fetched["data"]["direction"], "fetch");
+    assert_eq!(fetched["data"]["remote_path"], source_url);
+    assert_eq!(fetched["data"]["materialized"], false);
+    assert!(
+        !fetch_peer.path().join("ssh-source.txt").exists(),
+        "ssh fetch must not materialize the fetched tree"
+    );
+    assert_eq!(
+        export_native_head(fetch_peer.path(), "ssh-fetch-head.json")["data"]["native_head"],
+        fetched["data"]["remote_native_head"],
+        "ssh fetch should advance the local native head"
+    );
+
+    let pull_peer = cloned_peer_from_bundle(&bundle_path);
+    let pulled = json(
+        forge_in(pull_peer.path())
+            .env("FORGE_SYNC_SSH_COMMAND", &fake_ssh_path)
+            .env("FORGE_SYNC_REMOTE_FORGE", &forge_bin)
+            .args(["--json", "sync", "pull", &source_url])
+            .assert()
+            .success(),
+    );
+    assert_eq!(pulled["data"]["direction"], "pull");
+    assert_eq!(pulled["data"]["remote_path"], source_url);
+    assert_eq!(pulled["data"]["materialized"], true);
+    assert_eq!(
+        std::fs::read_to_string(pull_peer.path().join("ssh-source.txt"))
+            .expect("ssh pull source content"),
+        "source\n"
+    );
+}
+
+#[test]
+fn sync_push_over_ssh_fails_until_remote_receive_transport_exists() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
 
     let failed = json(
-        repo.forge()
-            .args(["--json", "sync", "fetch", "ssh://example.test/repo"])
+        source
+            .forge()
+            .args(["--json", "sync", "push", &ssh_url_for_test(source.path())])
             .assert()
             .failure(),
     );
@@ -1601,7 +1690,29 @@ fn sync_peer_commands_reject_unsupported_remote_scheme() {
         failed["errors"][0]["message"]
             .as_str()
             .expect("error message")
-            .contains("unsupported sync remote scheme ssh"),
+            .contains("ssh sync push is not supported yet"),
+        "ssh push should fail clearly until receive transport exists"
+    );
+}
+
+#[test]
+fn sync_peer_commands_reject_unsupported_remote_scheme() {
+    let repo = TestRepo::new_git();
+    native_accepted_lifecycle(&repo);
+
+    let failed = json(
+        repo.forge()
+            .args(["--json", "sync", "fetch", "https://example.test/repo"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(failed["status"], "error");
+    assert_eq!(failed["errors"][0]["code"], "COMMAND_FAILED");
+    assert!(
+        failed["errors"][0]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("unsupported sync remote scheme https"),
         "unsupported scheme should fail clearly"
     );
 }
