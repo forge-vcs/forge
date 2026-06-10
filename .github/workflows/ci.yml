@@ -37,3 +37,6 @@ jobs:
 
       - name: End-to-end eval (real binary)
         run: bash scripts/e2e-eval.sh
+
+      - name: Native peer sync no-git dogfood
+        run: bash scripts/dogfood-native-sync-peer-nogit.sh
