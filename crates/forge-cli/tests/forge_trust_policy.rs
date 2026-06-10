@@ -4,8 +4,11 @@
 mod common;
 
 use common::TestRepo;
+use ring::rand::SystemRandom;
+use ring::signature::Ed25519KeyPair;
 use rusqlite::Connection;
 use serde_json::Value;
+use std::path::PathBuf;
 
 fn json(assert: assert_cmd::assert::Assert) -> Value {
     serde_json::from_slice(&assert.get_output().stdout).expect("valid json envelope")
@@ -38,6 +41,14 @@ fn prepare_checked_native_proposal(repo: &TestRepo) {
         .success();
     repo.forge().args(["--json", "propose"]).assert().success();
     repo.forge().args(["--json", "check"]).assert().success();
+}
+
+fn hosted_runner_key(repo: &TestRepo) -> PathBuf {
+    let rng = SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate hosted runner key");
+    let path = repo.path().join("hosted-runner-ed25519.pk8");
+    std::fs::write(&path, pkcs8.as_ref()).expect("write hosted runner key");
+    path
 }
 
 #[test]
@@ -120,9 +131,141 @@ fn higher_attestation_policy_is_configurable_but_fails_closed_at_accept() {
         .as_array()
         .expect("signature issues");
     assert!(issues.iter().any(|issue| {
+        issue["kind"] == "missing_signature" && issue["subject_kind"] == "evidence"
+    }));
+}
+
+#[test]
+fn hosted_runner_attestation_satisfies_hosted_runner_signed_accept_policy() {
+    let repo = TestRepo::new_git();
+    prepare_checked_native_proposal(&repo);
+    let key = hosted_runner_key(&repo);
+
+    repo.forge()
+        .args([
+            "--json",
+            "trust",
+            "policy",
+            "--accept",
+            "hosted_runner_signed",
+        ])
+        .assert()
+        .success();
+    let blocked = json(repo.forge().args(["--json", "accept"]).assert().failure());
+    assert_eq!(blocked["errors"][0]["code"], "TRUST_POLICY_UNMET");
+
+    let attested = json(
+        repo.forge()
+            .args([
+                "--json",
+                "trust",
+                "attest",
+                "hosted-runner",
+                "--key",
+                key.to_str().expect("utf8 key path"),
+                "--issuer",
+                "ci.example/verify",
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(attested["data"]["trust_level"], "hosted_runner_signed");
+    assert_eq!(attested["data"]["issuer"], "ci.example/verify");
+    assert_eq!(attested["data"]["signature_count"], 1);
+    assert_eq!(attested["data"]["subject_count"], 1);
+
+    let accepted = json(repo.forge().args(["--json", "accept"]).assert().success());
+    assert_eq!(accepted["data"]["decision"], "accepted");
+
+    let doctor = json(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert!(
+        doctor["data"]["signature_key_summary"]["hosted_runner_key_fingerprints"]
+            .as_array()
+            .expect("hosted runner keys")
+            .len()
+            == 1
+    );
+}
+
+#[test]
+fn hosted_runner_attestation_does_not_satisfy_third_party_policy() {
+    let repo = TestRepo::new_git();
+    prepare_checked_native_proposal(&repo);
+    let key = hosted_runner_key(&repo);
+
+    repo.forge()
+        .args([
+            "--json",
+            "trust",
+            "attest",
+            "hosted-runner",
+            "--key",
+            key.to_str().expect("utf8 key path"),
+        ])
+        .assert()
+        .success();
+    repo.forge()
+        .args([
+            "--json",
+            "trust",
+            "policy",
+            "--accept",
+            "third_party_attested",
+        ])
+        .assert()
+        .success();
+
+    let blocked = json(repo.forge().args(["--json", "accept"]).assert().failure());
+    assert_eq!(blocked["errors"][0]["code"], "TRUST_POLICY_UNMET");
+    let issues = blocked["errors"][0]["details"]["signature_issues"]
+        .as_array()
+        .expect("signature issues");
+    assert!(issues.iter().any(|issue| {
         issue["kind"] == "missing_signature"
             && issue["subject_kind"] == "attestation"
-            && issue["subject_id"] == "hosted_runner_signed"
+            && issue["subject_id"] == "third_party_attested"
+    }));
+}
+
+#[test]
+fn edited_local_signature_cannot_be_upgraded_to_hosted_runner_trust() {
+    let repo = TestRepo::new_git();
+    prepare_checked_native_proposal(&repo);
+    db(&repo)
+        .execute(
+            "UPDATE signing_keys SET trust_origin = 'hosted_runner'
+             WHERE key_fingerprint IN (
+                SELECT key_fingerprint FROM ledger_signatures WHERE subject_kind = 'evidence'
+             )",
+            [],
+        )
+        .expect("spoof hosted key origin");
+    db(&repo)
+        .execute(
+            "UPDATE ledger_signatures
+             SET trust_level = 'hosted_runner_signed'
+             WHERE subject_kind = 'evidence'",
+            [],
+        )
+        .expect("spoof hosted trust level");
+    repo.forge()
+        .args([
+            "--json",
+            "trust",
+            "policy",
+            "--accept",
+            "hosted_runner_signed",
+        ])
+        .assert()
+        .success();
+
+    let blocked = json(repo.forge().args(["--json", "accept"]).assert().failure());
+    assert_eq!(blocked["errors"][0]["code"], "TRUST_POLICY_UNMET");
+    let issues = blocked["errors"][0]["details"]["signature_issues"]
+        .as_array()
+        .expect("signature issues");
+    assert!(issues.iter().any(|issue| {
+        issue["kind"] == "invalid_signature" && issue["subject_kind"] == "evidence"
     }));
 }
 

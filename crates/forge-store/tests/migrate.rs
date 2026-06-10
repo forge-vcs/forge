@@ -53,6 +53,9 @@ const SYNC_MERGE_SIGNATURE_SUBJECT_014: &str =
 /// The 015 trust-ladder attestation-level migration.
 const TRUST_LADDER_ATTESTATION_LEVELS_015: &str =
     include_str!("../migrations/015_trust_ladder_attestation_levels.sql");
+/// The 016 hosted-runner attestation migration.
+const HOSTED_RUNNER_ATTESTATIONS_016: &str =
+    include_str!("../migrations/016_hosted_runner_attestations.sql");
 
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
@@ -482,7 +485,7 @@ fn behind_db_upgrades_to_head() {
         has_column(&conn, "attempt_workspaces", "workspace_rel_path"),
         "009 created attempt_workspaces"
     );
-    assert_eq!(max_version(&conn), 15, "reached HEAD=15");
+    assert_eq!(max_version(&conn), 16, "reached HEAD=16");
 }
 
 #[test]
@@ -517,6 +520,8 @@ fn at_head_db_is_a_noop() {
             .expect("apply 014 sync-merge signature subject");
         conn.execute_batch(TRUST_LADDER_ATTESTATION_LEVELS_015)
             .expect("apply 015 trust-ladder attestation levels");
+        conn.execute_batch(HOSTED_RUNNER_ATTESTATIONS_016)
+            .expect("apply 016 hosted-runner attestations");
         stamp_versions(
             &conn,
             &[
@@ -535,15 +540,16 @@ fn at_head_db_is_a_noop() {
                 (13, "013_signing_key_origins"),
                 (14, "014_sync_merge_signature_subject"),
                 (15, "015_trust_ladder_attestation_levels"),
+                (16, "016_hosted_runner_attestations"),
             ],
         );
-        assert_eq!(max_version(&conn), 15);
+        assert_eq!(max_version(&conn), 16);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 15, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 16, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -578,7 +584,9 @@ fn head_plus_one_is_refused() {
             .expect("apply 014 sync-merge signature subject");
         conn.execute_batch(TRUST_LADDER_ATTESTATION_LEVELS_015)
             .expect("apply 015 trust-ladder attestation levels");
-        // HEAD is now 15, so the genuinely-ahead stamp is 16.
+        conn.execute_batch(HOSTED_RUNNER_ATTESTATIONS_016)
+            .expect("apply 016 hosted-runner attestations");
+        // HEAD is now 16, so the genuinely-ahead stamp is 17.
         stamp_versions(
             &conn,
             &[
@@ -597,10 +605,11 @@ fn head_plus_one_is_refused() {
                 (13, "013_signing_key_origins"),
                 (14, "014_sync_merge_signature_subject"),
                 (15, "015_trust_ladder_attestation_levels"),
-                (16, "future"),
+                (16, "016_hosted_runner_attestations"),
+                (17, "future"),
             ],
         );
-        assert_eq!(max_version(&conn), 16);
+        assert_eq!(max_version(&conn), 17);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -609,8 +618,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 16);
-            assert_eq!(*supported_head, 15);
+            assert_eq!(*db_version, 17);
+            assert_eq!(*supported_head, 16);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }

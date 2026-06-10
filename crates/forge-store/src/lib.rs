@@ -271,6 +271,18 @@ pub struct TrustPolicy {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct HostedRunnerAttestation {
+    pub proposal_id: String,
+    pub proposal_revision_id: String,
+    pub trust_level: String,
+    pub issuer: String,
+    pub key_fingerprint: String,
+    pub public_key: String,
+    pub subject_count: i64,
+    pub signature_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct LocalKeyStatus {
     pub key_fingerprint: String,
     pub public_key: String,
@@ -600,6 +612,7 @@ pub struct DoctorReport {
 pub struct SignatureKeySummary {
     pub local_key_fingerprints: Vec<String>,
     pub peer_key_fingerprints: Vec<String>,
+    pub hosted_runner_key_fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -927,6 +940,72 @@ pub fn rotate_local_key(cwd: &Path) -> Result<LocalKeyRotation> {
     })
 }
 
+pub fn attest_hosted_runner(
+    cwd: &Path,
+    attempt_id: Option<&str>,
+    proposal_id: Option<&str>,
+    key_path: &Path,
+    issuer: &str,
+) -> Result<HostedRunnerAttestation> {
+    let context = open_repository(cwd)?;
+    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
+    let signer = signing::HostedRunnerAttestationSigner::load_from_pkcs8(key_path)?;
+    let mut connection = open_connection(&context.database_path)?;
+    let created = now_ms();
+    let mut unsigned = Vec::new();
+    let subjects = trust_subjects_for_revision(
+        &connection,
+        &context.repo_id,
+        &proposal.proposal_revision_id,
+        false,
+        &mut unsigned,
+    )?;
+    if subjects.is_empty() && unsigned.is_empty() {
+        unsigned.push(SignatureFinding {
+            kind: SignatureFindingKind::MissingSignature,
+            subject_kind: "proposal_revision".to_string(),
+            subject_id: proposal.proposal_revision_id.clone(),
+            key_fingerprint: None,
+        });
+    }
+    if !unsigned.is_empty() {
+        return Err(ForgeError::TrustPolicyUnmet {
+            action: "attest_hosted_runner".to_string(),
+            required_trust: TRUST_HOSTED_RUNNER_SIGNED.to_string(),
+            signature_issues: unsigned,
+        }
+        .into());
+    }
+    let subject_count = subjects.len() as i64;
+    let signature_count = with_immediate_retry(&mut connection, |tx| {
+        let mut inserted = 0_i64;
+        for (subject_kind, subject_id, signed_digest) in &subjects {
+            if signer.sign_subject(
+                tx,
+                &context.repo_id,
+                subject_kind,
+                subject_id,
+                signed_digest,
+                created,
+            )? {
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    })?;
+    Ok(HostedRunnerAttestation {
+        proposal_id: proposal.proposal_id,
+        proposal_revision_id: proposal.proposal_revision_id,
+        trust_level: TRUST_HOSTED_RUNNER_SIGNED.to_string(),
+        issuer: issuer.to_string(),
+        key_fingerprint: signer.key_fingerprint().to_string(),
+        public_key: signer.public_key().to_string(),
+        subject_count,
+        signature_count,
+    })
+}
+
 fn signature_count_for_fingerprint(conn: &Connection, key_fingerprint: &str) -> Result<i64> {
     conn.query_row(
         "SELECT COUNT(*) FROM ledger_signatures WHERE key_fingerprint = ?1",
@@ -987,6 +1066,10 @@ fn requires_local_signatures(level: &str) -> bool {
     trust_rank(level).is_some_and(|rank| rank >= trust_rank(TRUST_LOCALLY_SIGNED).unwrap())
 }
 
+fn requires_hosted_runner_signatures(level: &str) -> bool {
+    trust_rank(level).is_some_and(|rank| rank >= trust_rank(TRUST_HOSTED_RUNNER_OBSERVED).unwrap())
+}
+
 pub fn enforce_trust_policy(
     cwd: &Path,
     action: TrustPolicyAction,
@@ -1019,11 +1102,18 @@ pub fn enforce_trust_policy(
             key_fingerprint: None,
         });
     }
-    let mut signature_issues = signing::verify_subject_local_signatures(&connection, subjects)?;
+    let mut signature_issues =
+        signing::verify_subject_local_signatures(&connection, subjects.clone())?;
     signature_issues.extend(unsigned);
     let required_rank = trust_rank(&required_trust).unwrap_or(0);
-    let locally_signed_rank = trust_rank(TRUST_LOCALLY_SIGNED).unwrap();
-    if required_rank > locally_signed_rank {
+    if requires_hosted_runner_signatures(&required_trust) {
+        signature_issues.extend(signing::verify_subject_hosted_runner_signatures(
+            &connection,
+            subjects,
+        )?);
+    }
+    let hosted_runner_rank = trust_rank(TRUST_HOSTED_RUNNER_SIGNED).unwrap();
+    if required_rank > hosted_runner_rank {
         signature_issues.push(SignatureFinding {
             kind: SignatureFindingKind::MissingSignature,
             subject_kind: "attestation".to_string(),

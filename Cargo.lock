@@ -369,6 +369,7 @@ dependencies = [
  "forge-store",
  "forge-sync",
  "predicates",
+ "ring",
  "rusqlite",
  "serde_json",
  "sha2",

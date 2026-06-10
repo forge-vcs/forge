@@ -12,6 +12,7 @@ use std::path::Path;
 const SIGNING_KEY_PATH: &str = ".forge/keys/local-ed25519.pk8";
 const SIGNATURE_ALG: &str = "ed25519";
 const TRUST_LEVEL: &str = "locally_signed";
+const HOSTED_RUNNER_TRUST_LEVEL: &str = "hosted_runner_signed";
 
 type SignedSubject = (String, String, String);
 type ValidSignatureSet = BTreeSet<SignedSubject>;
@@ -32,6 +33,12 @@ pub(crate) struct LocalKeyInfo {
     pub key_fingerprint: String,
     pub key_path: String,
     pub exists_before_command: bool,
+}
+
+pub(crate) struct HostedRunnerAttestationSigner {
+    key_pair: Ed25519KeyPair,
+    public_key: String,
+    key_fingerprint: String,
 }
 
 pub(crate) struct RotatedLocalKey {
@@ -120,6 +127,74 @@ impl LocalSigner {
             ],
         )?;
         Ok(())
+    }
+}
+
+impl HostedRunnerAttestationSigner {
+    pub(crate) fn load_from_pkcs8(path: &Path) -> Result<Self> {
+        let pkcs8 = fs::read(path).with_context(|| "read hosted runner signing key")?;
+        let key_pair = Ed25519KeyPair::from_pkcs8(&pkcs8)
+            .or_else(|_| Ed25519KeyPair::from_pkcs8_maybe_unchecked(&pkcs8))
+            .map_err(|_| anyhow!("parse hosted runner Ed25519 signing key"))?;
+        let public_key_bytes = key_pair.public_key().as_ref().to_vec();
+        Ok(Self {
+            key_pair,
+            public_key: hex_lower(&public_key_bytes),
+            key_fingerprint: key_fingerprint_for_public_key(&public_key_bytes),
+        })
+    }
+
+    pub(crate) fn key_fingerprint(&self) -> &str {
+        &self.key_fingerprint
+    }
+
+    pub(crate) fn public_key(&self) -> &str {
+        &self.public_key
+    }
+
+    pub(crate) fn sign_subject(
+        &self,
+        tx: &Transaction<'_>,
+        repo_id: &str,
+        subject_kind: &str,
+        subject_id: &str,
+        signed_digest: &str,
+        created_at_ms: i64,
+    ) -> Result<bool> {
+        register_hosted_runner_signing_key(
+            tx,
+            repo_id,
+            &self.public_key,
+            &self.key_fingerprint,
+            created_at_ms,
+        )?;
+        let message = signing_message_for_trust(
+            HOSTED_RUNNER_TRUST_LEVEL,
+            subject_kind,
+            subject_id,
+            signed_digest,
+        );
+        let signature = self.key_pair.sign(&message);
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO ledger_signatures (
+                id, repo_id, subject_kind, subject_id, signed_digest, signature_alg,
+                public_key, key_fingerprint, signature, trust_level, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                new_id("sig"),
+                repo_id,
+                subject_kind,
+                subject_id,
+                signed_digest,
+                SIGNATURE_ALG,
+                self.public_key,
+                self.key_fingerprint,
+                hex_lower(signature.as_ref()),
+                HOSTED_RUNNER_TRUST_LEVEL,
+                created_at_ms
+            ],
+        )?;
+        Ok(inserted > 0)
     }
 }
 
@@ -237,6 +312,13 @@ pub(crate) fn verify_subject_local_signatures(
     verify_subject_signatures_with_scope(conn, subjects, SignatureTrustScope::LocalOnly)
 }
 
+pub(crate) fn verify_subject_hosted_runner_signatures(
+    conn: &Connection,
+    subjects: Vec<SignedSubject>,
+) -> Result<Vec<SignatureFinding>> {
+    verify_subject_signatures_with_scope(conn, subjects, SignatureTrustScope::HostedRunner)
+}
+
 fn verify_subject_signatures_with_scope(
     conn: &Connection,
     subjects: Vec<SignedSubject>,
@@ -256,6 +338,7 @@ fn verify_subject_signatures_with_scope(
     let valid = match scope {
         SignatureTrustScope::AnyVerifiable => &state.valid_any,
         SignatureTrustScope::LocalOnly => &state.valid_local,
+        SignatureTrustScope::HostedRunner => &state.valid_hosted_runner,
     };
     scoped.extend(missing_signature_findings(valid, subjects));
     Ok(scoped)
@@ -303,11 +386,13 @@ pub(crate) fn verified_subject_fingerprint(
 enum SignatureTrustScope {
     AnyVerifiable,
     LocalOnly,
+    HostedRunner,
 }
 
 struct VerifiedSignatureState {
     valid_any: ValidSignatureSet,
     valid_local: ValidSignatureSet,
+    valid_hosted_runner: ValidSignatureSet,
     findings: Vec<SignatureFinding>,
 }
 
@@ -315,6 +400,7 @@ fn verified_signature_state(conn: &Connection) -> Result<VerifiedSignatureState>
     let mut findings = Vec::new();
     let mut valid_any = BTreeSet::new();
     let mut valid_local = BTreeSet::new();
+    let mut valid_hosted_runner = BTreeSet::new();
 
     let mut stmt = conn.prepare(
         "SELECT
@@ -324,7 +410,8 @@ fn verified_signature_state(conn: &Connection) -> Result<VerifiedSignatureState>
             ls.public_key,
             ls.key_fingerprint,
             ls.signature,
-            COALESCE(sk.trust_origin = 'local', 0)
+            ls.trust_level,
+            COALESCE(sk.trust_origin, 'peer')
          FROM ledger_signatures ls
          LEFT JOIN signing_keys sk
             ON sk.repo_id = ls.repo_id
@@ -340,7 +427,8 @@ fn verified_signature_state(conn: &Connection) -> Result<VerifiedSignatureState>
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
-            row.get::<_, bool>(6)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
         ))
     })?;
 
@@ -352,7 +440,8 @@ fn verified_signature_state(conn: &Connection) -> Result<VerifiedSignatureState>
             public_key,
             key_fingerprint,
             signature,
-            local_key,
+            trust_level,
+            trust_origin,
         ) = row?;
         match current_subject_digest(conn, &subject_kind, &subject_id)? {
             None => findings.push(finding(
@@ -392,7 +481,12 @@ fn verified_signature_state(conn: &Connection) -> Result<VerifiedSignatureState>
                         continue;
                     }
                 };
-                let message = signing_message(&subject_kind, &subject_id, &signed_digest);
+                let message = signing_message_for_trust(
+                    &trust_level,
+                    &subject_kind,
+                    &subject_id,
+                    &signed_digest,
+                );
                 let recomputed_fingerprint = key_fingerprint_for_public_key(&public_key_bytes);
                 if recomputed_fingerprint != key_fingerprint {
                     findings.push(finding(
@@ -408,8 +502,11 @@ fn verified_signature_state(conn: &Connection) -> Result<VerifiedSignatureState>
                     .is_ok()
                 {
                     let signed_subject = (subject_kind, subject_id, signed_digest);
-                    if local_key {
+                    if trust_level == TRUST_LEVEL && trust_origin == "local" {
                         valid_local.insert(signed_subject.clone());
+                    }
+                    if trust_level == HOSTED_RUNNER_TRUST_LEVEL && trust_origin == "hosted_runner" {
+                        valid_hosted_runner.insert(signed_subject.clone());
                     }
                     valid_any.insert(signed_subject);
                 } else {
@@ -427,6 +524,7 @@ fn verified_signature_state(conn: &Connection) -> Result<VerifiedSignatureState>
     Ok(VerifiedSignatureState {
         valid_any,
         valid_local,
+        valid_hosted_runner,
         findings,
     })
 }
@@ -445,6 +543,26 @@ pub(crate) fn register_local_signing_key(
          ON CONFLICT(repo_id, key_fingerprint) DO UPDATE SET
             public_key = excluded.public_key,
             trust_origin = 'local',
+            updated_at_ms = excluded.updated_at_ms",
+        params![repo_id, key_fingerprint, public_key, now_ms],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn register_hosted_runner_signing_key(
+    conn: &Connection,
+    repo_id: &str,
+    public_key: &str,
+    key_fingerprint: &str,
+    now_ms: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO signing_keys (
+            repo_id, key_fingerprint, public_key, trust_origin, created_at_ms, updated_at_ms
+         ) VALUES (?1, ?2, ?3, 'hosted_runner', ?4, ?4)
+         ON CONFLICT(repo_id, key_fingerprint) DO UPDATE SET
+            public_key = excluded.public_key,
+            trust_origin = 'hosted_runner',
             updated_at_ms = excluded.updated_at_ms",
         params![repo_id, key_fingerprint, public_key, now_ms],
     )?;
@@ -470,6 +588,7 @@ pub(crate) fn signature_key_summary(
         match origin.as_str() {
             "local" => summary.local_key_fingerprints.push(fingerprint),
             "peer" => summary.peer_key_fingerprints.push(fingerprint),
+            "hosted_runner" => summary.hosted_runner_key_fingerprints.push(fingerprint),
             _ => {}
         }
     }
@@ -666,6 +785,21 @@ fn signing_message(subject_kind: &str, subject_id: &str, signed_digest: &str) ->
         "forge-ledger-signature-v1\nsubject_kind={subject_kind}\nsubject_id={subject_id}\nsigned_digest={signed_digest}\n"
     )
     .into_bytes()
+}
+
+fn signing_message_for_trust(
+    trust_level: &str,
+    subject_kind: &str,
+    subject_id: &str,
+    signed_digest: &str,
+) -> Vec<u8> {
+    if trust_level == HOSTED_RUNNER_TRUST_LEVEL {
+        return format!(
+            "forge-ledger-signature-v2\ntrust_level={trust_level}\nsubject_kind={subject_kind}\nsubject_id={subject_id}\nsigned_digest={signed_digest}\n"
+        )
+        .into_bytes();
+    }
+    signing_message(subject_kind, subject_id, signed_digest)
 }
 
 fn finding(
