@@ -282,6 +282,15 @@ pub struct HostedRunnerAttestation {
     pub signature_count: i64,
 }
 
+pub type ThirdPartyAttestation = HostedRunnerAttestation;
+
+#[derive(Clone, Copy)]
+struct ExternalAttestationKind<'a> {
+    trust_level: &'a str,
+    trust_origin: &'a str,
+    action: &'a str,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalKeyStatus {
     pub key_fingerprint: String,
@@ -613,6 +622,7 @@ pub struct SignatureKeySummary {
     pub local_key_fingerprints: Vec<String>,
     pub peer_key_fingerprints: Vec<String>,
     pub hosted_runner_key_fingerprints: Vec<String>,
+    pub third_party_key_fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -948,9 +958,53 @@ pub fn attest_hosted_runner(
     issuer: &str,
 ) -> Result<HostedRunnerAttestation> {
     let context = open_repository(cwd)?;
-    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
-    let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
-    let signer = signing::HostedRunnerAttestationSigner::load_from_pkcs8(key_path)?;
+    attest_external(
+        &context,
+        attempt_id,
+        proposal_id,
+        key_path,
+        issuer,
+        ExternalAttestationKind {
+            trust_level: TRUST_HOSTED_RUNNER_SIGNED,
+            trust_origin: "hosted_runner",
+            action: "attest_hosted_runner",
+        },
+    )
+}
+
+pub fn attest_third_party(
+    cwd: &Path,
+    attempt_id: Option<&str>,
+    proposal_id: Option<&str>,
+    key_path: &Path,
+    issuer: &str,
+) -> Result<ThirdPartyAttestation> {
+    let context = open_repository(cwd)?;
+    attest_external(
+        &context,
+        attempt_id,
+        proposal_id,
+        key_path,
+        issuer,
+        ExternalAttestationKind {
+            trust_level: TRUST_THIRD_PARTY_ATTESTED,
+            trust_origin: "third_party",
+            action: "attest_third_party",
+        },
+    )
+}
+
+fn attest_external(
+    context: &RepositoryContext,
+    attempt_id: Option<&str>,
+    proposal_id: Option<&str>,
+    key_path: &Path,
+    issuer: &str,
+    kind: ExternalAttestationKind<'_>,
+) -> Result<HostedRunnerAttestation> {
+    let attempt = resolve_attempt_in_context(context, attempt_id)?.attempt;
+    let proposal = resolve_proposal(context, &attempt.attempt_id, proposal_id, true)?.proposal;
+    let signer = signing::ExternalAttestationSigner::load_from_pkcs8(key_path)?;
     let mut connection = open_connection(&context.database_path)?;
     let created = now_ms();
     let mut unsigned = Vec::new();
@@ -958,7 +1012,7 @@ pub fn attest_hosted_runner(
         &connection,
         &context.repo_id,
         &proposal.proposal_revision_id,
-        false,
+        true,
         &mut unsigned,
     )?;
     if subjects.is_empty() && unsigned.is_empty() {
@@ -971,8 +1025,8 @@ pub fn attest_hosted_runner(
     }
     if !unsigned.is_empty() {
         return Err(ForgeError::TrustPolicyUnmet {
-            action: "attest_hosted_runner".to_string(),
-            required_trust: TRUST_HOSTED_RUNNER_SIGNED.to_string(),
+            action: kind.action.to_string(),
+            required_trust: kind.trust_level.to_string(),
             signature_issues: unsigned,
         }
         .into());
@@ -983,11 +1037,15 @@ pub fn attest_hosted_runner(
         for (subject_kind, subject_id, signed_digest) in &subjects {
             if signer.sign_subject(
                 tx,
-                &context.repo_id,
-                subject_kind,
-                subject_id,
-                signed_digest,
-                created,
+                signing::ExternalSignatureInput {
+                    repo_id: &context.repo_id,
+                    subject_kind,
+                    subject_id,
+                    signed_digest,
+                    trust_level: kind.trust_level,
+                    trust_origin: kind.trust_origin,
+                    created_at_ms: created,
+                },
             )? {
                 inserted += 1;
             }
@@ -997,7 +1055,7 @@ pub fn attest_hosted_runner(
     Ok(HostedRunnerAttestation {
         proposal_id: proposal.proposal_id,
         proposal_revision_id: proposal.proposal_revision_id,
-        trust_level: TRUST_HOSTED_RUNNER_SIGNED.to_string(),
+        trust_level: kind.trust_level.to_string(),
         issuer: issuer.to_string(),
         key_fingerprint: signer.key_fingerprint().to_string(),
         public_key: signer.public_key().to_string(),
@@ -1067,7 +1125,14 @@ fn requires_local_signatures(level: &str) -> bool {
 }
 
 fn requires_hosted_runner_signatures(level: &str) -> bool {
-    trust_rank(level).is_some_and(|rank| rank >= trust_rank(TRUST_HOSTED_RUNNER_OBSERVED).unwrap())
+    trust_rank(level).is_some_and(|rank| {
+        rank >= trust_rank(TRUST_HOSTED_RUNNER_OBSERVED).unwrap()
+            && rank < trust_rank(TRUST_THIRD_PARTY_ATTESTED).unwrap()
+    })
+}
+
+fn requires_third_party_signatures(level: &str) -> bool {
+    trust_rank(level).is_some_and(|rank| rank >= trust_rank(TRUST_THIRD_PARTY_ATTESTED).unwrap())
 }
 
 pub fn enforce_trust_policy(
@@ -1109,11 +1174,17 @@ pub fn enforce_trust_policy(
     if requires_hosted_runner_signatures(&required_trust) {
         signature_issues.extend(signing::verify_subject_hosted_runner_signatures(
             &connection,
+            subjects.clone(),
+        )?);
+    }
+    if requires_third_party_signatures(&required_trust) {
+        signature_issues.extend(signing::verify_subject_third_party_signatures(
+            &connection,
             subjects,
         )?);
     }
-    let hosted_runner_rank = trust_rank(TRUST_HOSTED_RUNNER_SIGNED).unwrap();
-    if required_rank > hosted_runner_rank {
+    let third_party_rank = trust_rank(TRUST_THIRD_PARTY_ATTESTED).unwrap();
+    if required_rank > third_party_rank {
         signature_issues.push(SignatureFinding {
             kind: SignatureFindingKind::MissingSignature,
             subject_kind: "attestation".to_string(),

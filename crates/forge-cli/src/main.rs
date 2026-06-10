@@ -433,6 +433,8 @@ struct TrustAttestArgs {
 enum TrustAttestCommand {
     /// Sign the proposal's evidence subjects with a hosted-runner key.
     HostedRunner(HostedRunnerAttestArgs),
+    /// Sign the proposal's evidence subjects with a third-party issuer key.
+    ThirdParty(ThirdPartyAttestArgs),
 }
 
 #[derive(Debug, Args)]
@@ -448,6 +450,22 @@ struct HostedRunnerAttestArgs {
     key: PathBuf,
     /// Human-readable hosted runner issuer, e.g. a CI workflow or runner pool.
     #[arg(long, default_value = "hosted-runner")]
+    issuer: String,
+}
+
+#[derive(Debug, Args)]
+struct ThirdPartyAttestArgs {
+    /// Scope attestation to this attempt. Omit when one attempt is active.
+    #[arg(long)]
+    attempt: Option<String>,
+    /// Scope attestation to this proposal. Omit when the attempt has one proposal.
+    #[arg(long)]
+    proposal: Option<String>,
+    /// Ed25519 PKCS#8 private key used by the third-party issuer.
+    #[arg(long)]
+    key: PathBuf,
+    /// Human-readable third-party issuer, e.g. an external transparency log or CA.
+    #[arg(long, default_value = "third-party")]
     issuer: String,
 }
 
@@ -1404,6 +1422,18 @@ fn trust_response(request_id: Option<String>, args: TrustArgs) -> ResponseEnvelo
             TrustAttestCommand::HostedRunner(args) => {
                 command_result("trust attest hosted-runner", request_id, |cwd, _| {
                     let attestation = forge_store::attest_hosted_runner(
+                        &cwd,
+                        args.attempt.as_deref(),
+                        args.proposal.as_deref(),
+                        &args.key,
+                        &args.issuer,
+                    )?;
+                    Ok((None, serde_json::to_value(attestation)?, Vec::new()))
+                })
+            }
+            TrustAttestCommand::ThirdParty(args) => {
+                command_result("trust attest third-party", request_id, |cwd, _| {
+                    let attestation = forge_store::attest_third_party(
                         &cwd,
                         args.attempt.as_deref(),
                         args.proposal.as_deref(),

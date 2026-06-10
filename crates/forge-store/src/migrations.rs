@@ -108,6 +108,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "016_hosted_runner_attestations",
         include_str!("../migrations/016_hosted_runner_attestations.sql"),
     ),
+    (
+        17,
+        "017_third_party_attestations",
+        include_str!("../migrations/017_third_party_attestations.sql"),
+    ),
 ];
 
 /// The highest migration version this binary knows how to apply.
@@ -457,7 +462,7 @@ mod tests {
 
     #[test]
     fn schema_head_is_max_version() {
-        assert_eq!(schema_head(), 16);
+        assert_eq!(schema_head(), 17);
     }
 
     #[test]
@@ -468,14 +473,14 @@ mod tests {
         assert_eq!(checksum, checksum_of("ALTER TABLE x ADD COLUMN y TEXT;"));
     }
 
-    /// Fresh apply reaches HEAD=16 with non-NULL checksums for every row.
+    /// Fresh apply reaches HEAD=17 with non-NULL checksums for every row.
     #[test]
     fn fresh_apply_reaches_head_with_checksums() {
         let mut conn = mem_conn();
         apply_pending_migrations(&mut conn).expect("apply migrations");
 
         let versions = applied_versions(&conn);
-        assert_eq!(versions.len(), 16);
+        assert_eq!(versions.len(), 17);
         assert_eq!(versions[0].0, 1);
         assert_eq!(versions[1].0, 2);
         assert_eq!(versions[2].0, 3);
@@ -492,6 +497,7 @@ mod tests {
         assert_eq!(versions[13].0, 14);
         assert_eq!(versions[14].0, 15);
         assert_eq!(versions[15].0, 16);
+        assert_eq!(versions[16].0, 17);
         assert!(versions[0].1.is_some(), "001 checksum must be non-NULL");
         assert!(versions[1].1.is_some(), "002 checksum must be non-NULL");
         assert!(versions[2].1.is_some(), "003 checksum must be non-NULL");
@@ -508,6 +514,7 @@ mod tests {
         assert!(versions[13].1.is_some(), "014 checksum must be non-NULL");
         assert!(versions[14].1.is_some(), "015 checksum must be non-NULL");
         assert!(versions[15].1.is_some(), "016 checksum must be non-NULL");
+        assert!(versions[16].1.is_some(), "017 checksum must be non-NULL");
 
         // 005 seeds one native_object_format row; 006 bumps commit_schema_version -> 2
         // (justified-commit payload epoch) and adds object_format_version = 2 (kind-header
