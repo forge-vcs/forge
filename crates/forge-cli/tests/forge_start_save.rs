@@ -327,6 +327,205 @@ fn assert_native_objects_do_not_contain(repo_path: &std::path::Path, needle: &st
     }
 }
 
+/// NER-255: an idempotent `save` replay must return the ORIGINAL result payload (the
+/// snapshot_id / content_ref / changed_paths the agent needs for crash recovery), not
+/// just {idempotent_replay, request_id}. The first response's `data` is persisted into
+/// the operation view state under `replay_data` (in the same txn that records the op);
+/// the replay merges it back plus the original operation_id.
+#[test]
+fn save_request_id_replay_returns_original_payload() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    repo.forge()
+        .args(["--json", "start", "idempotent save"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("README.md"), "saved once\n").expect("write readme");
+
+    let first = json_output(
+        repo.forge()
+            .args(["--json", "--request-id", "save-once", "save"])
+            .assert()
+            .success(),
+    );
+    let snapshot_id = first["data"]["snapshot_id"]
+        .as_str()
+        .expect("first save surfaces snapshot_id")
+        .to_string();
+    assert_eq!(first["data"]["changed_paths"][0], "README.md");
+
+    let replay = json_output(
+        repo.forge()
+            .args(["--json", "--request-id", "save-once", "save"])
+            .assert()
+            .success(),
+    );
+    // The replay is flagged AND carries the original ids byte-faithfully.
+    assert_eq!(replay["data"]["idempotent_replay"], true);
+    assert_eq!(replay["data"]["snapshot_id"], snapshot_id);
+    assert_eq!(replay["data"]["content_ref"], first["data"]["content_ref"]);
+    assert_eq!(
+        replay["data"]["changed_paths"],
+        first["data"]["changed_paths"]
+    );
+    assert_eq!(
+        replay["data"]["parent_snapshot_id"],
+        first["data"]["parent_snapshot_id"]
+    );
+    assert_eq!(replay["operation_id"], first["operation_id"]);
+    assert_eq!(replay["data"]["operation_id"], first["operation_id"]);
+
+    // The replay did NOT write a second snapshot.
+    let connection = Connection::open(repo.path().join(".forge/forge.db")).expect("open db");
+    let snapshot_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM snapshots", [], |row| row.get(0))
+        .expect("count snapshots");
+    assert_eq!(
+        snapshot_count, 1,
+        "replay must not create a second snapshot"
+    );
+
+    // Contract preserved: reusing the same request id for a DIFFERENT command still
+    // conflicts (the command-scope check runs before the replay-payload merge).
+    let conflict = json_output(
+        repo.forge()
+            .args(["--json", "--request-id", "save-once", "propose"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(conflict["errors"][0]["code"], "REQUEST_ID_CONFLICT");
+}
+
+/// NER-255 (doc-review amendment): the `start` replay must also carry its original
+/// payload — closing the coverage gap where the pre-existing
+/// `duplicate_request_id_replays_without_second_mutation` only asserts operation_id /
+/// idempotent_replay and would not catch a wrong field name in the stored replay_data.
+#[test]
+fn start_request_id_replay_returns_original_payload() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+
+    let first = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "--request-id",
+                "start-once",
+                "start",
+                "recoverable",
+            ])
+            .assert()
+            .success(),
+    );
+    let attempt_id = first["data"]["attempt_id"]
+        .as_str()
+        .expect("first start surfaces attempt_id")
+        .to_string();
+    let intent_id = first["data"]["intent_id"]
+        .as_str()
+        .expect("first start surfaces intent_id")
+        .to_string();
+
+    let replay = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "--request-id",
+                "start-once",
+                "start",
+                "recoverable",
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(replay["data"]["idempotent_replay"], true);
+    assert_eq!(replay["data"]["attempt_id"], attempt_id);
+    assert_eq!(replay["data"]["intent_id"], intent_id);
+    assert_eq!(replay["data"]["base_head"], first["data"]["base_head"]);
+    assert_eq!(replay["data"]["attached"], first["data"]["attached"]);
+    assert_eq!(
+        replay["data"]["workspace_path"],
+        first["data"]["workspace_path"]
+    );
+    assert_eq!(replay["operation_id"], first["operation_id"]);
+}
+
+/// NER-255 (code-review amendment): the `propose` replay must also carry its original
+/// payload. `propose` is listed among the covered lifecycle commands but had no test, so a
+/// typo in a stored field name (e.g. `revision_id` vs `proposal_revision_id`) would have
+/// been silently invisible. This pins every id an agent needs to recover from a crash
+/// between `propose` and reading its response.
+#[test]
+fn propose_request_id_replay_returns_original_payload() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "idempotent propose"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("README.md"), "proposed once\n").expect("write readme");
+    repo.forge().args(["--json", "save"]).assert().success();
+
+    let first = json_output(
+        repo.forge()
+            .args(["--json", "--request-id", "propose-once", "propose"])
+            .assert()
+            .success(),
+    );
+    let proposal_id = first["data"]["proposal_id"]
+        .as_str()
+        .expect("first propose surfaces proposal_id")
+        .to_string();
+
+    let replay = json_output(
+        repo.forge()
+            .args(["--json", "--request-id", "propose-once", "propose"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(replay["data"]["idempotent_replay"], true);
+    assert_eq!(replay["data"]["proposal_id"], proposal_id);
+    // Every id the implementer summary claims is covered, asserted byte-faithfully so a
+    // wrong stored field name is caught.
+    for field in [
+        "proposal_revision_id",
+        "attempt_id",
+        "snapshot_id",
+        "base_head",
+        "content_ref",
+        "changed_paths",
+    ] {
+        assert_eq!(
+            replay["data"][field], first["data"][field],
+            "replayed propose must preserve `{field}`"
+        );
+    }
+    assert_eq!(replay["operation_id"], first["operation_id"]);
+    assert_eq!(replay["data"]["operation_id"], first["operation_id"]);
+
+    // The replay did NOT write a second proposal.
+    let connection = Connection::open(repo.path().join(".forge/forge.db")).expect("open db");
+    let proposal_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM proposals", [], |row| row.get(0))
+        .expect("count proposals");
+    assert_eq!(
+        proposal_count, 1,
+        "replay must not create a second proposal"
+    );
+
+    // Reusing the same request id for a DIFFERENT command still conflicts.
+    let conflict = json_output(
+        repo.forge()
+            .args(["--json", "--request-id", "propose-once", "save"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(conflict["errors"][0]["code"], "REQUEST_ID_CONFLICT");
+}
+
 fn git(cwd: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args(args)

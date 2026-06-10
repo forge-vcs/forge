@@ -60,6 +60,8 @@ fn command_shapes() -> Value {
         ("attempt list", "Lists attempts; data carries { attempts: [...] }."),
         ("attempt show", "Shows one attempt; data carries the attempt detail."),
         ("attempt attach", "Attaches the active view to an attempt; data carries attempt_id, content_ref, current_view_id."),
+        ("intent list", "Lists intents; data carries { intents: [...] } with id, title, derived status (accepted if any linked attempt was accepted, else open), the declared gate spec ({ program, args, structured } per gate), and linked attempt ids."),
+        ("intent show", "Shows one intent; data carries intent_id, title/text, derived status, the declared gate spec ({ program, args, structured } per gate), and linked attempt ids. Unknown id -> UNKNOWN_INTENT."),
         ("save", "Snapshots the worktree; data carries the saved snapshot + operation_id."),
         ("restore", "Restores a snapshot into the worktree (requires --yes); data carries the restore result."),
         ("run", "Runs a command and captures evidence; data carries the run record + operation_id."),

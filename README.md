@@ -48,6 +48,9 @@ Forge makes those concepts first-class:
 - `forge restore`, `forge checkout`, `forge undo`, `forge attempt attach`, and
   materializing sync commands refuse unsaved dirty work before overwriting the
   worktree.
+- `.forge/worktrees/<attempt-id>/` directories are managed stash space: only the
+  attached attempt, materialized at the repo root, is editable. Edits made
+  directly inside those stash directories are discarded on the next attach.
 - Mutating `--request-id` values are scoped to the command and replay the
   original success or failure. Reusing one for a different mutating command
   returns `REQUEST_ID_CONFLICT`.
@@ -142,6 +145,7 @@ silently satisfy local, hosted-runner, or third-party policy.
   `reject`, `show`
 - attempts and review: `attempt start`, `attempt list`, `attempt show`,
   `attempt attach`, `compare`, `attempt compare`
+- intents: `intent list`, `intent show`
 - worktree/history: `restore`, `checkout`, `log`, `undo`
 - native merge: `merge`, `conflict list`, `conflict show`,
   `conflict suggest`, `conflict resolve`

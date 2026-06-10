@@ -79,8 +79,15 @@ fn compare_groups_competing_attempts_and_ranks_them() {
         // Each row echoes its proposal id so an agent can chain compare -> accept.
         assert!(a["proposal"]["proposal_id"].is_string());
         // Per-gate results + metrics fields are present.
-        assert!(a["gates"].is_array());
+        let gates = a["gates"].as_array().expect("gates array");
         assert!(a["metrics"].is_object());
+        // NER-254: the additive per-gate verdict_detail reaches compare JSON too.
+        for gate in gates {
+            assert!(
+                gate["verdict_detail"].is_string(),
+                "each compare gate carries a verdict_detail string: {gate:?}"
+            );
+        }
     }
     // The proposal ids are the ones propose returned (chainable).
     let proposal_ids: Vec<&str> = attempts
@@ -105,9 +112,29 @@ fn compare_ranks_passing_attempt_above_failing_one() {
     let rank1 = attempts.iter().find(|a| a["rank"] == 1).unwrap();
     assert_eq!(rank1["attempt_id"], attempt_b);
     assert_eq!(rank1["check_status"], "passed");
+    assert!(
+        rank1["rank_reason"]
+            .as_str()
+            .unwrap()
+            .contains("all required gates passing"),
+        "rank1 reason: {}",
+        rank1["rank_reason"]
+    );
     let rank2 = attempts.iter().find(|a| a["rank"] == 2).unwrap();
     assert_eq!(rank2["attempt_id"], attempt_a);
     assert_eq!(rank2["check_status"], "failed");
+    // NER-256: gates did NOT tie here (B passed), so the non-passing attempt's reason must
+    // say "required gates not satisfied", NOT "gates tie" — the latter would falsely claim
+    // equal gate status to a consumer parsing rank_reason.
+    let rank2_reason = rank2["rank_reason"].as_str().unwrap();
+    assert!(
+        rank2_reason.contains("required gates not satisfied"),
+        "rank2 reason should report gates-not-satisfied, not a tie: {rank2_reason}"
+    );
+    assert!(
+        !rank2_reason.contains("gates tie"),
+        "rank2 must not claim a gate tie when a passing attempt outranked it: {rank2_reason}"
+    );
 }
 
 #[test]
@@ -168,7 +195,10 @@ fn exit_criterion_compare_export_winner_and_verify_trailer() {
     assert_eq!(winner["attempt_id"], attempt_b);
     // Per-attempt diff (changed paths) + per-gate results + metrics are present.
     assert!(winner["changed_paths"].is_array());
-    assert!(!winner["gates"].as_array().unwrap().is_empty());
+    let winner_gates = winner["gates"].as_array().unwrap();
+    assert!(!winner_gates.is_empty());
+    // NER-254: per-gate verdict_detail is present in the compare winner's gates.
+    assert!(winner_gates[0]["verdict_detail"].is_string());
     assert!(winner["metrics"].is_object());
     // The loser is verified-but-failing and ranks second.
     let loser = attempts.iter().find(|a| a["rank"] == 2).unwrap();

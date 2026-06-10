@@ -241,6 +241,17 @@ pub enum ForgeError {
     /// supported resolution path for this slice. Deterministic until the clean
     /// remote merge-commit capability lands, so clients should not auto-retry it.
     SyncDivergenceUnsupported { direction: String, reason: String },
+    /// A `--require-tests-pass` (structured) gate named a program for which no
+    /// structured parser is registered (NER-259). A structured gate reads the parsed
+    /// `failed` count, which stays `None` for an unparseable program, so the gate is
+    /// structurally unsatisfiable (it could never resolve to pass) — rejected up front
+    /// at `forge start` rather than silently never passing. Deterministic and
+    /// non-retryable: use a plain `--require` exit-code gate instead, or name a program
+    /// with a parser (`cargo test`, `cargo clippy`, `python -m unittest`, `pytest`).
+    /// `program` is the user-supplied gate program token, surfaced WITHOUT execution, so
+    /// it is run through the same `key=value` secret redactor as `CheckNotPassed`'s
+    /// unmet gates in [`ForgeError::details`].
+    UnsupportedStructuredGate { program: String },
 }
 
 impl ForgeError {
@@ -279,6 +290,7 @@ impl ForgeError {
             ForgeError::TrustPolicyUnmet { .. } => "TRUST_POLICY_UNMET",
             ForgeError::UnsupportedTrustLevel { .. } => "UNSUPPORTED_TRUST_LEVEL",
             ForgeError::SyncDivergenceUnsupported { .. } => "SYNC_DIVERGENCE_UNSUPPORTED",
+            ForgeError::UnsupportedStructuredGate { .. } => "UNSUPPORTED_STRUCTURED_GATE",
         }
     }
 
@@ -415,6 +427,16 @@ impl ForgeError {
             }
             ForgeError::SyncDivergenceUnsupported { direction, reason } => {
                 json!({ "direction": direction, "reason": reason })
+            }
+            ForgeError::UnsupportedStructuredGate { program } => {
+                // `program` is the user-supplied gate program token (the first
+                // whitespace split of a `--require-tests-pass` entry), surfaced WITHOUT
+                // execution. It is already a single token, so the per-token redaction the
+                // `CheckNotPassed` arm applies collapses to a single `redact_secret_like_text`
+                // call here — `redact_secret_like_text` keys on the first `=`/`:`, which is
+                // sufficient for one token. Mirrors `CheckNotPassed` so a secret-like
+                // `key=value` program token cannot leak through error details.
+                json!({ "program": forge_content::redact_secret_like_text(program).0 })
             }
             _ => Value::Object(Default::default()),
         }
@@ -583,6 +605,20 @@ impl std::fmt::Display for ForgeError {
                 f,
                 "sync {direction} divergent native merge is not supported yet ({reason})"
             ),
+            ForgeError::UnsupportedStructuredGate { program } => {
+                // Redact the user-supplied program token before it lands in the
+                // human-readable message. `error_to_object` (forge-cli) routes this
+                // `Display` string into the JSON response `message` field and to stderr,
+                // neither of which pass through `details()`'s redaction — so a secret-like
+                // `key=value` program (e.g. `TOKEN=ghp_…`) would otherwise leak here even
+                // though `details.program` is redacted. Mirrors `details()`'s single-token
+                // `redact_secret_like_text` call so both surfaces agree.
+                let program = forge_content::redact_secret_like_text(program).0;
+                write!(
+                    f,
+                    "no structured parser is registered for `{program}`; a --require-tests-pass gate needs a program Forge can parse (cargo test, cargo clippy, python -m unittest, pytest). Use --require \"{program} …\" for a plain exit-code gate instead"
+                )
+            }
         }
     }
 }
@@ -801,6 +837,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             after_ms: None,
             details_keys: &["direction", "reason"],
         },
+        ErrorCodeSpec {
+            code: "UNSUPPORTED_STRUCTURED_GATE",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["program"],
+        },
     ]
 }
 
@@ -943,6 +985,13 @@ mod tests {
             }
             .code(),
             "NATIVE_HISTORY_CORRUPT"
+        );
+        assert_eq!(
+            ForgeError::UnsupportedStructuredGate {
+                program: "python3".into()
+            }
+            .code(),
+            "UNSUPPORTED_STRUCTURED_GATE"
         );
     }
 
@@ -1187,6 +1236,33 @@ mod tests {
         assert_eq!(object.len(), 2, "details carry exactly status + unmet");
     }
 
+    /// NER-259: the `UNSUPPORTED_STRUCTURED_GATE` details carry exactly `program`, and
+    /// that program token is run through the shared `key=value` secret redactor so a
+    /// secret-like program token in a `--require-tests-pass` gate (surfaced WITHOUT
+    /// execution) does not leak through error details. Mirrors
+    /// `details_redact_secret_like_unmet`.
+    #[test]
+    fn unsupported_structured_gate_details_redact_secret_program() {
+        let plain = ForgeError::UnsupportedStructuredGate {
+            program: "python3".into(),
+        }
+        .details();
+        assert_eq!(plain["program"], "python3");
+        let object = plain.as_object().expect("details object");
+        assert_eq!(object.len(), 1, "details carry exactly program");
+
+        let secret = ForgeError::UnsupportedStructuredGate {
+            program: "TOKEN=ghp_supersecret".into(),
+        }
+        .details();
+        let serialized = secret["program"].to_string();
+        assert!(
+            !serialized.contains("ghp_supersecret"),
+            "secret-like program token must be redacted in details"
+        );
+        assert!(serialized.contains("[REDACTED]"));
+    }
+
     #[test]
     fn dirty_worktree_details_redact_secret_paths() {
         let details = ForgeError::DirtyWorktree {
@@ -1325,6 +1401,9 @@ mod tests {
                 direction: "push".into(),
                 reason: "clean_divergent_merge".into(),
             },
+            ForgeError::UnsupportedStructuredGate {
+                program: "python3".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -1361,7 +1440,8 @@ mod tests {
                 | ForgeError::UnsupportedContentBackend { .. }
                 | ForgeError::TrustPolicyUnmet { .. }
                 | ForgeError::UnsupportedTrustLevel { .. }
-                | ForgeError::SyncDivergenceUnsupported { .. } => {}
+                | ForgeError::SyncDivergenceUnsupported { .. }
+                | ForgeError::UnsupportedStructuredGate { .. } => {}
             }
         }
 

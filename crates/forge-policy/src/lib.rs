@@ -86,6 +86,43 @@ pub enum GateVerdict {
     Stale,
 }
 
+/// A machine-readable diagnostic explaining *how* a gate's verdict was reached
+/// (NER-254). The `verdict` field carries the pass/fail/missing/stale bit; this
+/// field disambiguates the *reason*, splitting the historically overloaded `missing`
+/// verdict into "no evidence at all" vs. "evidence with exit 0 but no parser matched".
+///
+/// Additive in `forge.cli.v0`: serialized snake_case alongside `verdict` on every
+/// `GateResult`, and so reaches `check` and `compare` JSON automatically. The enum
+/// can grow new variants later additively; existing variants must not change meaning.
+///
+/// `verdict_detail` explains the *evaluation mode*, not the pass/fail bit:
+/// `exit_code_only` covers both a passing and a failing plain (non-structured) gate
+/// (the `verdict` field already distinguishes them), and `parsed` covers both a
+/// passing and a failing structured gate whose parsed count decided the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictDetail {
+    /// No matching evidence on the proposed snapshot, and none elsewhere — the
+    /// `missing`-by-absence case.
+    NoEvidence,
+    /// Matching evidence exists, but only on a *different* snapshot (verdict `stale`).
+    StaleOffSnapshot,
+    /// Decided by exit code alone, regardless of `require_structured`: a plain
+    /// (non-structured) gate, OR a structured gate whose deciding evidence has a
+    /// nonzero exit (the parsed count was never consulted because the nonzero exit
+    /// already failed it). Covers both the pass and the fail of a plain gate.
+    ExitCodeOnly,
+    /// A structured gate whose *present* parsed failure count decided the verdict:
+    /// `Some(0) => Passed` and `Some(n) => Failed` both land here (the count was
+    /// produced and used).
+    Parsed,
+    /// A structured gate whose deciding evidence has exit 0 but produced no parseable
+    /// failure count (`structured_failures == None`) — the overloaded `missing` case
+    /// the NER-254 diagnostic disambiguates: evidence exists, exit 0, no parser
+    /// matched the program's output. This is the silent-failure signal from NER-253.
+    StructuredRequiredButUnparsed,
+}
+
 /// The verdict for one gate, with the deciding evidence (when any) for traceability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GateResult {
@@ -101,6 +138,10 @@ pub struct GateResult {
     /// `check --json` and the compare output. Carried for *every* gate (not only
     /// structured ones) for observability; the verdict logic is unchanged.
     pub structured_failures: Option<u64>,
+    /// A machine-readable diagnostic explaining *how* this gate's verdict was reached
+    /// (NER-254). Additive in `forge.cli.v0`; disambiguates the overloaded `missing`
+    /// verdict. Computed in lockstep with `verdict` so there is one source of truth.
+    pub verdict_detail: VerdictDetail,
 }
 
 /// The aggregate check outcome: an overall `status` string
@@ -264,21 +305,28 @@ fn verdict_for(
             .filter(|fact| fact.snapshot_id.as_deref() == Some(proposed_snapshot_id)),
     );
 
-    let (verdict, evidence_id, exit_code, structured_failures) =
+    let (verdict, verdict_detail, evidence_id, exit_code, structured_failures) =
         if let Some(fact) = latest_on_snapshot {
-            let verdict = if fact.exit_code != 0 {
-                GateVerdict::Failed
+            // Compute verdict and its detail together so they cannot drift. A nonzero
+            // exit fails before `require_structured` is consulted, so it is reported as
+            // `ExitCodeOnly` (the parsed count never decided anything).
+            let (verdict, detail) = if fact.exit_code != 0 {
+                (GateVerdict::Failed, VerdictDetail::ExitCodeOnly)
             } else if require_structured {
                 match fact.structured_failures {
-                    Some(0) => GateVerdict::Passed,
-                    Some(_) => GateVerdict::Failed,
-                    None => GateVerdict::Missing,
+                    Some(0) => (GateVerdict::Passed, VerdictDetail::Parsed),
+                    Some(_) => (GateVerdict::Failed, VerdictDetail::Parsed),
+                    None => (
+                        GateVerdict::Missing,
+                        VerdictDetail::StructuredRequiredButUnparsed,
+                    ),
                 }
             } else {
-                GateVerdict::Passed
+                (GateVerdict::Passed, VerdictDetail::ExitCodeOnly)
             };
             (
                 verdict,
+                detail,
                 Some(fact.evidence_id.clone()),
                 Some(fact.exit_code),
                 fact.structured_failures,
@@ -289,12 +337,19 @@ fn verdict_for(
             let latest_any = latest(matching.iter().copied());
             (
                 GateVerdict::Stale,
+                VerdictDetail::StaleOffSnapshot,
                 latest_any.map(|fact| fact.evidence_id.clone()),
                 None,
                 None,
             )
         } else {
-            (GateVerdict::Missing, None, None, None)
+            (
+                GateVerdict::Missing,
+                VerdictDetail::NoEvidence,
+                None,
+                None,
+                None,
+            )
         };
 
     GateResult {
@@ -304,6 +359,7 @@ fn verdict_for(
         evidence_id,
         exit_code,
         structured_failures,
+        verdict_detail,
     }
 }
 
@@ -349,12 +405,26 @@ fn summarize(status: &str, results: &[GateResult]) -> String {
         );
     }
     let count = |verdict: GateVerdict| results.iter().filter(|r| r.verdict == verdict).count();
-    format!(
+    let mut reason = format!(
         "required gates not satisfied: {} failed, {} missing, {} stale",
         count(GateVerdict::Failed),
         count(GateVerdict::Missing),
         count(GateVerdict::Stale),
-    )
+    );
+    // Call out the NER-254 disambiguation: a `missing` that is really "evidence
+    // exists, exit 0, but no structured parser matched the program's output" — the
+    // operator needs a different fix (the named program has no registered parser)
+    // than a plain absence of evidence.
+    let unparsed = results
+        .iter()
+        .filter(|r| r.verdict_detail == VerdictDetail::StructuredRequiredButUnparsed)
+        .count();
+    if unparsed > 0 {
+        reason.push_str(&format!(
+            " ({unparsed} gate(s) need a structured result but none was parsed)"
+        ));
+    }
+    reason
 }
 
 #[cfg(test)]
@@ -431,6 +501,8 @@ mod tests {
             &facts,
         );
         assert_eq!(outcome.status, "passed");
+        // NER-254: a parsed count decided the verdict.
+        assert_eq!(outcome.gates[0].verdict_detail, VerdictDetail::Parsed);
     }
 
     #[test]
@@ -452,6 +524,8 @@ mod tests {
         );
         assert_eq!(outcome.status, "failed");
         assert_eq!(outcome.gates[0].verdict, GateVerdict::Failed);
+        // NER-254: the present count decided it, so detail is `parsed` (not exit-code).
+        assert_eq!(outcome.gates[0].verdict_detail, VerdictDetail::Parsed);
     }
 
     #[test]
@@ -471,6 +545,9 @@ mod tests {
             &facts,
         );
         assert_eq!(outcome.status, "failed");
+        // NER-254: a nonzero exit fails before the parsed count is consulted, so the
+        // detail is `exit_code_only` even though this is a structured gate.
+        assert_eq!(outcome.gates[0].verdict_detail, VerdictDetail::ExitCodeOnly);
     }
 
     #[test]
@@ -492,6 +569,18 @@ mod tests {
         );
         assert_eq!(outcome.status, "missing");
         assert_eq!(outcome.gates[0].verdict, GateVerdict::Missing);
+        // NER-254: this is the overloaded `missing` the diagnostic disambiguates —
+        // evidence exists, exit 0, but no structured parser matched the output.
+        assert_eq!(
+            outcome.gates[0].verdict_detail,
+            VerdictDetail::StructuredRequiredButUnparsed
+        );
+        // The human reason calls out the unparsed-structured case (NER-254).
+        assert!(
+            outcome.reason.contains("structured result"),
+            "reason should mention the unparsed-structured case: {}",
+            outcome.reason
+        );
     }
 
     fn spec(gates: Vec<Gate>) -> CheckSpec {
@@ -506,6 +595,18 @@ mod tests {
         assert_eq!(outcome.gates.len(), 1);
         assert_eq!(outcome.gates[0].verdict, GateVerdict::Passed);
         assert_eq!(outcome.gates[0].evidence_id.as_deref(), Some("e1"));
+        // NER-254: a plain (non-structured) pass is decided by exit code alone.
+        assert_eq!(outcome.gates[0].verdict_detail, VerdictDetail::ExitCodeOnly);
+    }
+
+    #[test]
+    fn plain_gate_failing_on_nonzero_exit_is_exit_code_only() {
+        // NER-254: a plain gate that fails on a nonzero exit still reports the
+        // evaluation mode `exit_code_only` — the `verdict` field carries the fail bit.
+        let facts = vec![fact("e1", "cargo", &["test"], 7, Some(SNAP), 1)];
+        let outcome = evaluate(&spec(vec![gate("cargo", &["test"])]), SNAP, &facts);
+        assert_eq!(outcome.gates[0].verdict, GateVerdict::Failed);
+        assert_eq!(outcome.gates[0].verdict_detail, VerdictDetail::ExitCodeOnly);
     }
 
     #[test]
@@ -514,6 +615,11 @@ mod tests {
         let outcome = evaluate(&spec(vec![gate("cargo", &["test"])]), SNAP, &facts);
         assert_eq!(outcome.status, "stale");
         assert_eq!(outcome.gates[0].verdict, GateVerdict::Stale);
+        // NER-254: stale because evidence is only off-snapshot.
+        assert_eq!(
+            outcome.gates[0].verdict_detail,
+            VerdictDetail::StaleOffSnapshot
+        );
     }
 
     #[test]
@@ -522,6 +628,8 @@ mod tests {
         let outcome = evaluate(&spec(vec![gate("cargo", &["test"])]), SNAP, &facts);
         assert_eq!(outcome.status, "missing");
         assert_eq!(outcome.gates[0].verdict, GateVerdict::Missing);
+        // NER-254: missing because no matching evidence exists at all.
+        assert_eq!(outcome.gates[0].verdict_detail, VerdictDetail::NoEvidence);
     }
 
     #[test]

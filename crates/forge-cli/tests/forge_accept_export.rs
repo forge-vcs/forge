@@ -464,3 +464,265 @@ fn native_accepted_proposal_exports_to_git_branch() {
         "exported\n"
     );
 }
+
+/// NER-260: `accept --proposal <id>` must resolve the proposal GLOBALLY by id (like the
+/// export paths already do) and accept it under its OWNING attempt — even when a
+/// DIFFERENT attempt is attached. Previously the explicit-`--proposal` branch of
+/// `resolve_proposal` cross-checked the proposal against the caller's resolved
+/// (attached) attempt and rejected with UNKNOWN_PROPOSAL, so accepting attempt A's
+/// proposal while attempt B was attached failed even though the proposal existed with a
+/// passed check. This drives two competing attempts on one intent (native backend),
+/// attaches B, then accepts A's proposal by id and asserts HEAD advanced to a commit
+/// whose tree materializes A's content (not B's).
+#[test]
+fn accept_resolves_explicit_proposal_id_across_attached_attempt() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+
+    // Attempt A (attached on start): write distinct content, then propose + check green.
+    let started = json_output(
+        repo.forge()
+            .args(["--json", "start", "compete"])
+            .assert()
+            .success(),
+    );
+    let intent_id = started["data"]["intent_id"].as_str().unwrap().to_string();
+    let attempt_a = started["data"]["attempt_id"].as_str().unwrap().to_string();
+    std::fs::write(repo.path().join("feature_a.txt"), "from-attempt-a\n").expect("write a");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    let proposed_a = json_output(repo.forge().args(["--json", "propose"]).assert().success());
+    let proposal_a = proposed_a["data"]["proposal_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let content_ref_a = proposed_a["data"]["content_ref"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let tree_a = content_ref_a
+        .strip_prefix("forge-tree:")
+        .expect("native proposal content_ref is a forge-tree ref")
+        .to_string();
+    repo.forge().args(["--json", "check"]).assert().success();
+
+    // Attempt B on the SAME intent. `attempt start` does not attach; `attempt attach`
+    // materializes B's base (reverting the worktree off A's content), then B proposes +
+    // checks its own distinct content.
+    let second = json_output(
+        repo.forge()
+            .args(["--json", "attempt", "start", "--intent", &intent_id])
+            .assert()
+            .success(),
+    );
+    let attempt_b = second["data"]["attempt_id"].as_str().unwrap().to_string();
+    assert_ne!(attempt_a, attempt_b);
+    repo.forge()
+        .args(["--json", "attempt", "attach", &attempt_b])
+        .assert()
+        .success();
+    // Attaching B reverted the worktree to the genesis base, dropping A's file.
+    assert!(!repo.path().join("feature_a.txt").exists());
+    std::fs::write(repo.path().join("feature_b.txt"), "from-attempt-b\n").expect("write b");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    let proposed_b = json_output(repo.forge().args(["--json", "propose"]).assert().success());
+    let proposal_b = proposed_b["data"]["proposal_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(proposal_a, proposal_b);
+    repo.forge().args(["--json", "check"]).assert().success();
+
+    // HEAD is still the genesis base (no accept yet); B is the attached attempt.
+    let genesis = head(repo.path()).expect("genesis HEAD after attach");
+
+    // The core assertion: accept A's proposal BY ID while B is attached. This must
+    // succeed (previously returned UNKNOWN_PROPOSAL).
+    let accepted = json_output(
+        repo.forge()
+            .args(["--json", "accept", "--proposal", &proposal_a])
+            .assert()
+            .success(),
+    );
+    assert_eq!(accepted["data"]["decision"], "accepted");
+    let commit_id = accepted["data"]["commit_id"]
+        .as_str()
+        .expect("native accept surfaces commit_id")
+        .to_string();
+
+    // HEAD advanced off genesis to A's commit, and that commit materializes A's tree —
+    // proving accept used A's proposal/owning attempt, not attached B's content.
+    assert_ne!(commit_id, genesis);
+    assert_eq!(head(repo.path()).as_deref(), Some(commit_id.as_str()));
+    let store = forge_content_native::NativeObjectStore::new(repo.path());
+    let accepted_commit = store
+        .read_commit(&forge_content_native::ObjectId::parse(&commit_id).unwrap())
+        .expect("read accepted commit");
+    assert_eq!(
+        accepted_commit.tree, tree_a,
+        "accepted commit must carry attempt A's tree, not attached attempt B's"
+    );
+
+    // Regression: a genuinely non-existent proposal id still errors UNKNOWN_PROPOSAL
+    // (the global-by-id lookup's None path is preserved).
+    let unknown = json_output(
+        repo.forge()
+            .args(["--json", "accept", "--proposal", "proposal_does_not_exist"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(unknown["errors"][0]["code"], "UNKNOWN_PROPOSAL");
+}
+
+/// NER-260 boundary: `accept --proposal <id>` resolves the proposal GLOBALLY by id —
+/// across attempts AND intents — exactly like `export pr-body`. The intended contract is
+/// that naming a proposal accepts THAT proposal under ITS OWN intent: the deciding gate is
+/// the proposal's intent's spec and the native commit is stamped with the proposal's intent
+/// id, NOT the caller's currently-attached intent. This test pins that cross-intent
+/// behavior (previously unspecified/unverified) so a future regression that re-adds an
+/// intent-scope guard — or, worse, silently accepts under the wrong intent — is caught.
+#[test]
+fn accept_proposal_id_from_unrelated_intent_commits_under_that_intent() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+
+    // Intent I1: start (attaches), propose + check green. Leave it UNACCEPTED so HEAD is
+    // still genesis — the same base_head I2 will be proposed against.
+    let started_one = json_output(
+        repo.forge()
+            .args(["--json", "start", "intent-one"])
+            .assert()
+            .success(),
+    );
+    let intent_one = started_one["data"]["intent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::write(repo.path().join("one.txt"), "from-intent-one\n").expect("write one");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    let proposed_one = json_output(repo.forge().args(["--json", "propose"]).assert().success());
+    let proposal_one = proposed_one["data"]["proposal_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let tree_one = proposed_one["data"]["content_ref"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("forge-tree:")
+        .expect("native content_ref is a forge-tree ref")
+        .to_string();
+    repo.forge().args(["--json", "check"]).assert().success();
+
+    // Intent I2: a SEPARATE `start` mints a new intent + attaches a fresh attempt. It is now
+    // the CURRENTLY-ATTACHED intent. Propose + check green so I2's proposal also has a
+    // passing check and base_head == genesis (== I1's base).
+    let started_two = json_output(
+        repo.forge()
+            .args(["--json", "start", "intent-two"])
+            .assert()
+            .success(),
+    );
+    let intent_two = started_two["data"]["intent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        intent_one, intent_two,
+        "second start mints a distinct intent"
+    );
+    // Both attempts were started from genesis (no accept ran), so they share base_head ==
+    // genesis — exactly the condition under which the stale-base guard cannot distinguish
+    // intents and the cross-intent accept must be governed by the proposal's own intent.
+    std::fs::write(repo.path().join("two.txt"), "from-intent-two\n").expect("write two");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    let proposed_two = json_output(repo.forge().args(["--json", "propose"]).assert().success());
+    let proposal_two = proposed_two["data"]["proposal_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let tree_two = proposed_two["data"]["content_ref"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("forge-tree:")
+        .expect("native content_ref is a forge-tree ref")
+        .to_string();
+    repo.forge().args(["--json", "check"]).assert().success();
+
+    assert_ne!(
+        proposal_one, proposal_two,
+        "the two intents' proposals differ"
+    );
+    assert_ne!(
+        tree_one, tree_two,
+        "the two intents propose different trees"
+    );
+    let genesis = head(repo.path()).expect("genesis HEAD before any accept");
+
+    // The cross-intent boundary: I2 is the attached intent, but accept I1's proposal BY ID.
+    // I1 and I2 share base_head == genesis, so the stale-base guard does NOT block this. The
+    // accept must resolve I1's proposal globally and record the commit under I1's OWN intent
+    // — NOT the attached I2 — proving `--proposal` is by-id (per its owning intent), exactly
+    // like `export pr-body`, and that no caller silently stamps the attached intent.
+    let accepted = json_output(
+        repo.forge()
+            .args(["--json", "accept", "--proposal", &proposal_one])
+            .assert()
+            .success(),
+    );
+    assert_eq!(accepted["data"]["decision"], "accepted");
+    assert_eq!(
+        accepted["data"]["proposal_id"], proposal_one,
+        "accept must echo the by-id proposal it resolved"
+    );
+    let commit_id = accepted["data"]["commit_id"].as_str().unwrap().to_string();
+    assert_ne!(commit_id, genesis);
+    assert_eq!(head(repo.path()).as_deref(), Some(commit_id.as_str()));
+
+    // The native commit carries I1's tree AND I1's intent id — proving the gate spec and
+    // commit metadata followed the proposal's OWN intent, not the attached I2.
+    let store = forge_content_native::NativeObjectStore::new(repo.path());
+    let commit = store
+        .read_commit(&forge_content_native::ObjectId::parse(&commit_id).unwrap())
+        .expect("read accepted commit");
+    assert_eq!(
+        commit.tree, tree_one,
+        "commit must carry I1's tree (the by-id proposal), not attached I2's"
+    );
+    assert_eq!(
+        commit.intent_id.as_deref(),
+        Some(intent_one.as_str()),
+        "commit must be stamped with I1's intent (the proposal's owner), not attached I2's"
+    );
+    assert_ne!(
+        commit.intent_id.as_deref(),
+        Some(intent_two.as_str()),
+        "the attached intent must NOT be the one recorded"
+    );
+}
+
+fn head(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path.join(".forge/refs/HEAD"))
+        .ok()
+        .map(|raw| raw.trim().to_string())
+}
