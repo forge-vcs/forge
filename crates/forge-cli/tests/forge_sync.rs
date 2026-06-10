@@ -6,6 +6,11 @@ mod common;
 use common::{forge_in, TestRepo};
 use rusqlite::{params, Connection};
 use serde_json::Value;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::Path;
+use std::process::Stdio;
+use std::thread;
 
 fn json(assert: assert_cmd::assert::Assert) -> Value {
     serde_json::from_slice(&assert.get_output().stdout).expect("valid json envelope")
@@ -176,6 +181,147 @@ fn fake_ssh_command() -> tempfile::TempDir {
         std::fs::set_permissions(&path, perms).expect("chmod fake ssh");
     }
     bin
+}
+
+struct TestHttpSyncServer {
+    url: String,
+    _handle: thread::JoinHandle<()>,
+}
+
+impl TestHttpSyncServer {
+    fn start(repo_path: &Path, request_count: usize) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind sync http server");
+        let url = format!("http://{}", listener.local_addr().expect("sync http addr"));
+        let repo_path = repo_path.to_path_buf();
+        let forge_bin = assert_cmd::cargo::cargo_bin("forge");
+        let handle = thread::spawn(move || {
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().expect("accept sync http request");
+                handle_sync_http_request(&mut stream, &repo_path, &forge_bin);
+            }
+        });
+        Self {
+            url,
+            _handle: handle,
+        }
+    }
+}
+
+fn handle_sync_http_request(stream: &mut TcpStream, repo_path: &Path, forge_bin: &Path) {
+    let (path, body) = read_http_request(stream);
+    let body_json: Value = serde_json::from_slice(&body).expect("sync http request json");
+    let output = match path.as_str() {
+        "/sync/serve/export" => {
+            let since_manifest = body_json
+                .get("since_manifest")
+                .filter(|value| !value.is_null())
+                .map(|value| serde_json::to_vec(value).expect("since manifest json"));
+            run_forge_sync_serve(
+                repo_path,
+                forge_bin,
+                if since_manifest.is_some() {
+                    &["--json", "sync", "serve", "export", "--stdin-since"][..]
+                } else {
+                    &["--json", "sync", "serve", "export"][..]
+                },
+                since_manifest.as_deref(),
+            )
+        }
+        "/sync/serve/receive" => {
+            let manifest = serde_json::to_vec(
+                body_json
+                    .get("manifest")
+                    .expect("sync http receive manifest"),
+            )
+            .expect("manifest json");
+            let remote_label = body_json
+                .get("remote_label")
+                .and_then(Value::as_str)
+                .unwrap_or("<http-test>");
+            run_forge_sync_serve(
+                repo_path,
+                forge_bin,
+                &[
+                    "--json",
+                    "sync",
+                    "serve",
+                    "receive",
+                    "--stdin-manifest",
+                    "--remote-label",
+                    remote_label,
+                ],
+                Some(&manifest),
+            )
+        }
+        other => panic!("unexpected sync http path {other}"),
+    };
+    let body = if output.stdout.is_empty() {
+        output.stderr
+    } else {
+        output.stdout
+    };
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    )
+    .expect("write sync http response headers");
+    stream
+        .write_all(&body)
+        .expect("write sync http response body");
+}
+
+fn run_forge_sync_serve(
+    repo_path: &Path,
+    forge_bin: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+) -> std::process::Output {
+    let mut child = std::process::Command::new(forge_bin)
+        .current_dir(repo_path)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn forge sync serve");
+    if let Some(stdin) = stdin {
+        child
+            .stdin
+            .as_mut()
+            .expect("forge sync serve stdin")
+            .write_all(stdin)
+            .expect("write forge sync serve stdin");
+    }
+    drop(child.stdin.take());
+    child.wait_with_output().expect("wait forge sync serve")
+}
+
+fn read_http_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+    let mut headers = Vec::new();
+    let mut byte = [0u8; 1];
+    while !headers.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("read http header");
+        headers.push(byte[0]);
+    }
+    let header_text = String::from_utf8(headers).expect("http headers utf8");
+    let mut lines = header_text.lines();
+    let request_line = lines.next().expect("http request line");
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .expect("http request path")
+        .to_string();
+    let content_length = lines
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().expect("content-length usize"))
+        })
+        .unwrap_or(0);
+    let mut body = vec![0; content_length];
+    stream.read_exact(&mut body).expect("read http body");
+    (path, body)
 }
 
 fn cloned_peer_from_bundle(bundle_path: &std::path::Path) -> tempfile::TempDir {
@@ -1860,13 +2006,163 @@ fn sync_push_over_fake_ssh_records_remote_conflicts_as_data() {
 }
 
 #[test]
+fn sync_peer_commands_round_trip_over_http_transport() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source.path().join("target/forge-sync-http-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path.to_str().expect("utf8 http base path"),
+        ])
+        .assert()
+        .success();
+    native_accept_file_change(&source, "http source change", "http-source.txt", "source\n");
+    let source_server = TestHttpSyncServer::start(source.path(), 4);
+
+    let fetch_peer = cloned_peer_from_bundle(&bundle_path);
+    let fetched = json(
+        forge_in(fetch_peer.path())
+            .env("FORGE_SYNC_ALLOW_INSECURE_HTTP", "1")
+            .args(["--json", "sync", "fetch", &source_server.url])
+            .assert()
+            .success(),
+    );
+    assert_eq!(fetched["data"]["direction"], "fetch");
+    assert_eq!(fetched["data"]["remote_path"], source_server.url);
+    assert_eq!(fetched["data"]["materialized"], false);
+    assert!(
+        !fetch_peer.path().join("http-source.txt").exists(),
+        "http fetch must not materialize the fetched tree"
+    );
+
+    let pull_peer = cloned_peer_from_bundle(&bundle_path);
+    let pulled = json(
+        forge_in(pull_peer.path())
+            .env("FORGE_SYNC_ALLOW_INSECURE_HTTP", "1")
+            .args(["--json", "sync", "pull", &source_server.url])
+            .assert()
+            .success(),
+    );
+    assert_eq!(pulled["data"]["direction"], "pull");
+    assert_eq!(pulled["data"]["remote_path"], source_server.url);
+    assert_eq!(pulled["data"]["materialized"], true);
+    assert_eq!(
+        std::fs::read_to_string(pull_peer.path().join("http-source.txt"))
+            .expect("http pull source content"),
+        "source\n"
+    );
+
+    let push_source = TestRepo::new_git();
+    native_accepted_lifecycle(&push_source);
+    let push_bundle_path = push_source
+        .path()
+        .join("target/forge-sync-http-push-base.json");
+    push_source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            push_bundle_path.to_str().expect("utf8 http push base path"),
+        ])
+        .assert()
+        .success();
+    let push_server = TestHttpSyncServer::start(push_source.path(), 2);
+    let push_peer = cloned_peer_from_bundle(&push_bundle_path);
+    native_accept_file_change_in(
+        push_peer.path(),
+        "http push fast forward",
+        "http-pushed.txt",
+        "peer\n",
+    );
+    let pushed = json(
+        forge_in(push_peer.path())
+            .env("FORGE_SYNC_ALLOW_INSECURE_HTTP", "1")
+            .args(["--json", "sync", "push", &push_server.url])
+            .assert()
+            .success(),
+    );
+    assert_eq!(pushed["data"]["direction"], "push");
+    assert_eq!(pushed["data"]["remote_path"], push_server.url);
+    assert_eq!(pushed["data"]["materialized"], false);
+    assert_eq!(
+        export_native_head(push_source.path(), "http-push-head.json")["data"]["native_head"],
+        pushed["data"]["local_native_head"],
+        "http push should advance the remote native head"
+    );
+    assert!(
+        !push_source.path().join("http-pushed.txt").exists(),
+        "http push must not materialize the remote worktree"
+    );
+
+    let conflict_source = TestRepo::new_git();
+    native_accepted_lifecycle(&conflict_source);
+    let conflict_bundle_path = conflict_source
+        .path()
+        .join("target/forge-sync-http-conflict-base.json");
+    conflict_source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            conflict_bundle_path
+                .to_str()
+                .expect("utf8 http conflict base path"),
+        ])
+        .assert()
+        .success();
+    native_accept_file_change(
+        &conflict_source,
+        "http conflict remote",
+        "side.txt",
+        "remote\n",
+    );
+    let conflict_before =
+        export_native_head(conflict_source.path(), "http-push-conflict-before.json");
+    let conflict_server = TestHttpSyncServer::start(conflict_source.path(), 2);
+    let conflict_peer = cloned_peer_from_bundle(&conflict_bundle_path);
+    native_accept_file_change_in(
+        conflict_peer.path(),
+        "http conflict peer",
+        "side.txt",
+        "peer\n",
+    );
+    let conflicted = json(
+        forge_in(conflict_peer.path())
+            .env("FORGE_SYNC_ALLOW_INSECURE_HTTP", "1")
+            .args(["--json", "sync", "push", &conflict_server.url])
+            .assert()
+            .success(),
+    );
+    assert_eq!(conflicted["data"]["direction"], "push");
+    assert_eq!(conflicted["data"]["remote_path"], conflict_server.url);
+    assert_eq!(conflicted["data"]["merged"], false);
+    assert!(conflicted["data"]["conflict_set_id"].is_string());
+    assert_eq!(
+        export_native_head(conflict_source.path(), "http-push-conflict-after.json")["data"]
+            ["native_head"],
+        conflict_before["data"]["native_head"],
+        "conflicting http push must not advance remote native head"
+    );
+    assert_single_native_sync_conflict(conflict_source.path(), "sync_push_divergence");
+}
+
+#[test]
 fn sync_peer_commands_reject_unsupported_remote_scheme() {
     let repo = TestRepo::new_git();
     native_accepted_lifecycle(&repo);
 
     let failed = json(
         repo.forge()
-            .args(["--json", "sync", "fetch", "https://example.test/repo"])
+            .args(["--json", "sync", "fetch", "ftp://example.test/repo"])
             .assert()
             .failure(),
     );
@@ -1876,7 +2172,7 @@ fn sync_peer_commands_reject_unsupported_remote_scheme() {
         failed["errors"][0]["message"]
             .as_str()
             .expect("error message")
-            .contains("unsupported sync remote scheme https"),
+            .contains("unsupported sync remote scheme ftp"),
         "unsupported scheme should fail clearly"
     );
 }
