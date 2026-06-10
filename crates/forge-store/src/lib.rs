@@ -826,12 +826,18 @@ fn default_storage_policy() -> StoragePolicy {
 const TRUST_SELF_REPORTED: &str = "self_reported";
 const TRUST_LOCALLY_OBSERVED: &str = "locally_observed";
 const TRUST_LOCALLY_SIGNED: &str = "locally_signed";
+const TRUST_HOSTED_RUNNER_OBSERVED: &str = "hosted_runner_observed";
+const TRUST_HOSTED_RUNNER_SIGNED: &str = "hosted_runner_signed";
+const TRUST_THIRD_PARTY_ATTESTED: &str = "third_party_attested";
 
 fn supported_trust_levels() -> Vec<String> {
     [
         TRUST_SELF_REPORTED,
         TRUST_LOCALLY_OBSERVED,
         TRUST_LOCALLY_SIGNED,
+        TRUST_HOSTED_RUNNER_OBSERVED,
+        TRUST_HOSTED_RUNNER_SIGNED,
+        TRUST_THIRD_PARTY_ATTESTED,
     ]
     .into_iter()
     .map(str::to_string)
@@ -970,6 +976,9 @@ fn trust_rank(level: &str) -> Option<u8> {
         TRUST_SELF_REPORTED => Some(0),
         TRUST_LOCALLY_OBSERVED => Some(1),
         TRUST_LOCALLY_SIGNED => Some(2),
+        TRUST_HOSTED_RUNNER_OBSERVED => Some(3),
+        TRUST_HOSTED_RUNNER_SIGNED => Some(4),
+        TRUST_THIRD_PARTY_ATTESTED => Some(5),
         _ => None,
     }
 }
@@ -1012,6 +1021,16 @@ pub fn enforce_trust_policy(
     }
     let mut signature_issues = signing::verify_subject_local_signatures(&connection, subjects)?;
     signature_issues.extend(unsigned);
+    let required_rank = trust_rank(&required_trust).unwrap_or(0);
+    let locally_signed_rank = trust_rank(TRUST_LOCALLY_SIGNED).unwrap();
+    if required_rank > locally_signed_rank {
+        signature_issues.push(SignatureFinding {
+            kind: SignatureFindingKind::MissingSignature,
+            subject_kind: "attestation".to_string(),
+            subject_id: required_trust.clone(),
+            key_fingerprint: None,
+        });
+    }
     signature_issues.sort_by(|left, right| {
         left.subject_kind
             .cmp(&right.subject_kind)

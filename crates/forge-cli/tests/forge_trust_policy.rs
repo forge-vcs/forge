@@ -61,6 +61,16 @@ fn trust_policy_shows_and_updates_minimum_levels() {
         .unwrap()
         .iter()
         .any(|level| level == "locally_signed"));
+    assert!(shown["data"]["supported_trust_levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|level| level == "hosted_runner_signed"));
+    assert!(shown["data"]["supported_trust_levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|level| level == "third_party_attested"));
 
     let updated = json(
         repo.forge()
@@ -78,6 +88,93 @@ fn trust_policy_shows_and_updates_minimum_levels() {
     );
     assert_eq!(updated["data"]["min_accept_trust"], "locally_signed");
     assert_eq!(updated["data"]["min_export_trust"], "locally_signed");
+}
+
+#[test]
+fn higher_attestation_policy_is_configurable_but_fails_closed_at_accept() {
+    let repo = TestRepo::new_git();
+    prepare_checked_native_proposal(&repo);
+
+    let updated = json(
+        repo.forge()
+            .args([
+                "--json",
+                "trust",
+                "policy",
+                "--accept",
+                "hosted_runner_signed",
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(updated["data"]["min_accept_trust"], "hosted_runner_signed");
+
+    let blocked = json(repo.forge().args(["--json", "accept"]).assert().failure());
+    assert_eq!(blocked["errors"][0]["code"], "TRUST_POLICY_UNMET");
+    assert_eq!(blocked["errors"][0]["details"]["action"], "accept");
+    assert_eq!(
+        blocked["errors"][0]["details"]["required_trust"],
+        "hosted_runner_signed"
+    );
+    let issues = blocked["errors"][0]["details"]["signature_issues"]
+        .as_array()
+        .expect("signature issues");
+    assert!(issues.iter().any(|issue| {
+        issue["kind"] == "missing_signature"
+            && issue["subject_kind"] == "attestation"
+            && issue["subject_id"] == "hosted_runner_signed"
+    }));
+}
+
+#[test]
+fn third_party_attestation_policy_is_configurable_but_fails_closed_at_export() {
+    let repo = TestRepo::new_git();
+    prepare_checked_native_proposal(&repo);
+    repo.forge().args(["--json", "accept"]).assert().success();
+
+    let updated = json(
+        repo.forge()
+            .args([
+                "--json",
+                "trust",
+                "policy",
+                "--export",
+                "third_party_attested",
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(updated["data"]["min_export_trust"], "third_party_attested");
+
+    let blocked = json(
+        repo.forge()
+            .args(["--json", "export", "branch", "attestation-policy-export"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(blocked["errors"][0]["code"], "TRUST_POLICY_UNMET");
+    assert_eq!(blocked["errors"][0]["details"]["action"], "export");
+    assert_eq!(
+        blocked["errors"][0]["details"]["required_trust"],
+        "third_party_attested"
+    );
+    let issues = blocked["errors"][0]["details"]["signature_issues"]
+        .as_array()
+        .expect("signature issues");
+    assert!(issues.iter().any(|issue| {
+        issue["kind"] == "missing_signature"
+            && issue["subject_kind"] == "attestation"
+            && issue["subject_id"] == "third_party_attested"
+    }));
+    repo.forge()
+        .args([
+            "--json",
+            "export",
+            "verify-branch",
+            "attestation-policy-export",
+        ])
+        .assert()
+        .failure();
 }
 
 #[test]

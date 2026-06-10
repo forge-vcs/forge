@@ -424,10 +424,24 @@ enum TrustCommand {
 #[derive(Debug, Args)]
 struct TrustPolicyArgs {
     /// Minimum trust required for `forge accept`.
-    #[arg(long, value_parser = ["self_reported", "locally_observed", "locally_signed"])]
+    #[arg(long, value_parser = [
+        "self_reported",
+        "locally_observed",
+        "locally_signed",
+        "hosted_runner_observed",
+        "hosted_runner_signed",
+        "third_party_attested",
+    ])]
     accept: Option<String>,
     /// Minimum trust required for `forge export branch`.
-    #[arg(long, value_parser = ["self_reported", "locally_observed", "locally_signed"])]
+    #[arg(long, value_parser = [
+        "self_reported",
+        "locally_observed",
+        "locally_signed",
+        "hosted_runner_observed",
+        "hosted_runner_signed",
+        "third_party_attested",
+    ])]
     export: Option<String>,
 }
 
