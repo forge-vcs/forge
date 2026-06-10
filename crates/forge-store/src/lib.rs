@@ -19,6 +19,20 @@ mod signing;
 pub use error::{error_registry, ErrorCodeSpec, ForgeError, NativeHistoryCorruptKind, TamperKind};
 pub use repo_lock::{LockTimeout, RepoLock};
 
+pub(crate) const SYNC_MERGED_OP_KIND_SQL_IN: &str =
+    "'sync_fetch_merged', 'sync_pull_merged', 'sync_push_merged'";
+
+pub fn is_sync_merged_op_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "sync_fetch_merged" | "sync_pull_merged" | "sync_push_merged"
+    )
+}
+
+pub fn signing_key_fingerprint_for_public_key(public_key: &[u8]) -> String {
+    signing::key_fingerprint_for_public_key(public_key)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct InitRepository {
     pub repository_id: String,
@@ -62,6 +76,9 @@ pub struct RequestIdOperation {
     pub command: String,
     pub status: String,
     pub error_json: Option<Value>,
+    pub kind: Option<String>,
+    pub view_id: Option<String>,
+    pub state: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -1525,18 +1542,23 @@ pub fn operation_for_request(cwd: &Path, request_id: &str) -> Result<Option<Requ
     let connection = open_connection(&context.database_path)?;
     connection
         .query_row(
-            "SELECT id, command, status, error_json
-             FROM operations
-             WHERE repo_id = ?1 AND request_id = ?2
-             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            "SELECT o.id, o.command, o.status, o.error_json, o.kind, o.resulting_view_id, v.state_json
+             FROM operations o
+             LEFT JOIN views v ON v.id = o.resulting_view_id
+             WHERE o.repo_id = ?1 AND o.request_id = ?2
+             ORDER BY o.created_at_ms DESC, o.rowid DESC LIMIT 1",
             params![context.repo_id, request_id],
             |row| {
                 let error_json: Option<String> = row.get(3)?;
+                let state_json: Option<String> = row.get(6)?;
                 Ok(RequestIdOperation {
                     operation_id: row.get(0)?,
                     command: row.get(1)?,
                     status: row.get(2)?,
                     error_json: error_json.and_then(|json| serde_json::from_str(&json).ok()),
+                    kind: row.get(4)?,
+                    view_id: row.get(5)?,
+                    state: state_json.and_then(|json| serde_json::from_str(&json).ok()),
                 })
             },
         )
@@ -2092,12 +2114,20 @@ pub fn checkout_target_content_ref(cwd: &Path, commit_id: &str) -> Result<String
     let commit = match store.read_commit(&id) {
         Ok(commit) => commit,
         Err(_) => {
+            let query = format!(
+                "SELECT 1 FROM decisions WHERE repo_id = ?1 AND commit_id = ?2
+                 UNION ALL
+                 SELECT 1
+                   FROM operations o
+                   JOIN views v ON v.id = o.resulting_view_id
+                  WHERE o.repo_id = ?1
+                    AND o.kind IN ({})
+                    AND json_extract(v.state_json, '$.commit_id') = ?2
+                 LIMIT 1",
+                SYNC_MERGED_OP_KIND_SQL_IN
+            );
             let referenced: bool = connection
-                .query_row(
-                    "SELECT 1 FROM decisions WHERE repo_id = ?1 AND commit_id = ?2 LIMIT 1",
-                    params![context.repo_id, commit_id],
-                    |_| Ok(true),
-                )
+                .query_row(&query, params![context.repo_id, commit_id], |_| Ok(true))
                 .optional()?
                 .unwrap_or(false);
             if referenced {
@@ -2197,6 +2227,173 @@ pub fn record_sync_import_materialized(
     Ok(op)
 }
 
+pub struct SyncPullMaterializedInput {
+    pub state: Value,
+    pub content_ref: String,
+}
+
+/// Record a `forge sync pull` worktree update separately from `sync import`, so
+/// command-scoped request-id replay returns the pull response instead of a
+/// REQUEST_ID_CONFLICT against the lower-level import/materialize operation.
+pub fn record_sync_pull_materialized(
+    cwd: &Path,
+    request_id: Option<String>,
+    input: SyncPullMaterializedInput,
+) -> Result<OperationViewResult> {
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    let op = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let mut state = input.state.clone();
+        if let Some(object) = state.as_object_mut() {
+            object.insert("lifecycle".to_string(), json!("sync_pull_materialized"));
+        }
+        let op = insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "sync pull".to_string(),
+                kind: "sync_pull_materialized".to_string(),
+                view_kind: ViewKind::Initialized,
+                state,
+            },
+        )?;
+        tx.execute(
+            "UPDATE current_state
+             SET attached_attempt_id = NULL, expected_content_ref = ?1
+             WHERE singleton = 1",
+            params![input.content_ref],
+        )?;
+        Ok(op)
+    })?;
+    Ok(op)
+}
+
+pub struct SyncMergeCommitInput<'a> {
+    pub protocol_version: &'a str,
+    pub direction: &'a str,
+    pub remote_path: &'a Path,
+    pub base_native_head: &'a str,
+    pub ours_native_head: &'a str,
+    pub theirs_native_head: &'a str,
+    pub merged_content_ref: &'a str,
+    pub materialized: bool,
+    pub imported_native_objects: i64,
+    pub imported_ledger_rows: i64,
+}
+
+pub struct SyncMergeCommitResult {
+    pub operation: OperationViewResult,
+    pub commit_id: String,
+}
+
+/// Record a clean divergent peer sync as a local native merge commit.
+///
+/// The merge commit object is written before the op-log row that references it. HEAD advances
+/// only after that DB row commits, matching accept's HEAD-lags-never-leads crash ordering. Fetch
+/// advances native history without claiming the worktree changed; pull updates the expected
+/// content ref only after the CLI materializes so an interrupted restore is recoverable by retry.
+pub fn record_sync_merge_commit(
+    cwd: &Path,
+    request_id: Option<String>,
+    command: &str,
+    input: SyncMergeCommitInput<'_>,
+) -> Result<SyncMergeCommitResult> {
+    let context = open_repository(cwd)?;
+    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
+    let kind = match input.direction {
+        "fetch" | "pull" | "push" => format!("sync_{}_merged", input.direction),
+        other => bail!("unsupported sync merge direction: {other}"),
+    };
+    let tree = input
+        .merged_content_ref
+        .strip_prefix(forge_content::FORGE_TREE_PREFIX)
+        .ok_or_else(|| anyhow!("sync merge produced a non-forge-tree content ref"))?
+        .to_string();
+    forge_content_native::ObjectId::parse(input.ours_native_head)?;
+    forge_content_native::ObjectId::parse(input.theirs_native_head)?;
+    let mut connection = open_connection(&context.database_path)?;
+    let created = now_ms();
+    let (op, commit_id) = with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let commit = forge_content_native::CommitObject {
+            schema_version: forge_content_native::COMMIT_SCHEMA_VERSION,
+            tree: tree.clone(),
+            parents: vec![
+                input.ours_native_head.to_string(),
+                input.theirs_native_head.to_string(),
+            ],
+            intent_id: None,
+            proposal_revision_id: None,
+            decision_id: None,
+            evidence_digest: None,
+            actor: Some("forge-sync".to_string()),
+            authored_time: Some(created),
+        };
+        let commit_id = store.write_commit(&commit)?.to_string();
+        signer.sign_subject(
+            tx,
+            &context.repo_id,
+            "sync_merge_commit",
+            &commit_id,
+            &commit_id,
+            created,
+        )?;
+        let remote_path = input.remote_path.display().to_string();
+        let sync_merge_lineage_hash =
+            integrity::sync_merge_lineage_digest(&integrity::SyncMergeLineageDigestInput {
+                protocol_version: input.protocol_version,
+                direction: input.direction,
+                remote_path: &remote_path,
+                base_native_head: input.base_native_head,
+                ours_native_head: input.ours_native_head,
+                theirs_native_head: input.theirs_native_head,
+                merged_content_ref: input.merged_content_ref,
+                commit_id: &commit_id,
+                materialized: input.materialized,
+                imported_native_objects: input.imported_native_objects,
+                imported_ledger_rows: input.imported_ledger_rows,
+            });
+        let op = insert_operation_view_chained(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: command.to_string(),
+                kind: kind.clone(),
+                view_kind: ViewKind::Initialized,
+                state: json!({
+                    "lifecycle": kind,
+                    "protocol_version": input.protocol_version,
+                    "direction": input.direction,
+                    "remote_path": input.remote_path.display().to_string(),
+                    "base_native_head": input.base_native_head,
+                    "ours_native_head": input.ours_native_head,
+                    "theirs_native_head": input.theirs_native_head,
+                    "merged_content_ref": input.merged_content_ref,
+                    "commit_id": commit_id,
+                    "materialized": input.materialized,
+                    "imported_native_objects": input.imported_native_objects,
+                    "imported_ledger_rows": input.imported_ledger_rows,
+                    "sync_merge_lineage_hash": sync_merge_lineage_hash,
+                }),
+            },
+            Some(&sync_merge_lineage_hash),
+        )?;
+        Ok((op, commit_id))
+    })?;
+    let refs = forge_content_native::NativeRefStore::new(&context.root_path);
+    refs.set_head(&forge_content_native::ObjectId::parse(&commit_id)?)?;
+    Ok(SyncMergeCommitResult {
+        operation: op,
+        commit_id,
+    })
+}
+
 /// Claim a local request-id for a local peer sync command.
 ///
 /// Some sync outcomes are natural no-ops or apply their primary side effect in
@@ -2210,6 +2407,7 @@ pub fn record_sync_request_marker(
     direction: &str,
     remote_path: &Path,
     remote_operation_id: Option<&str>,
+    replay_data: Option<Value>,
 ) -> Result<OperationViewResult> {
     let context = open_repository(cwd)?;
     let mut connection = open_connection(&context.database_path)?;
@@ -2228,6 +2426,7 @@ pub fn record_sync_request_marker(
                     "lifecycle": format!("sync_{direction}"),
                     "remote_path": remote_path.display().to_string(),
                     "remote_operation_id": remote_operation_id,
+                    "replay_data": replay_data,
                 }),
             },
         )
@@ -2245,6 +2444,14 @@ pub fn set_sync_clone_expected_content_ref(cwd: &Path, content_ref: &str) -> Res
             params![content_ref, now_ms()],
         )?;
         Ok(())
+    })
+}
+
+pub fn set_materialized_expected_content_ref(cwd: &Path, content_ref: &str) -> Result<()> {
+    let context = open_repository(cwd)?;
+    let mut connection = open_connection(&context.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        set_context_expected_content_ref(tx, &context, content_ref)
     })
 }
 
@@ -3107,18 +3314,30 @@ pub fn reconcile_native_head(cwd: &Path) -> Result<()> {
     let refs = forge_content_native::NativeRefStore::new(&context.root_path);
     let current_head = refs.read_head()?;
     let connection = open_connection(&context.database_path)?;
-    let Some(tip) = native_tip(&context, &connection)? else {
+    let tip = native_tip(&context, &connection)?;
+    let Some(tip) = tip else {
         return Ok(()); // genesis-only / git repo — nothing to reconcile
     };
     if current_head.as_ref() == Some(&tip) {
         return Ok(()); // HEAD already current
     }
+    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
     // Walk the tip's ancestry: every object must exist (a miss is the store-before-DB
     // violation), there is no cycle, and the current HEAD must be an ancestor of the tip
     // (HEAD lags, never forks). Merge history may reach the same shared ancestor more
     // than once; repeated visited commits are normal diamond ancestry, not corruption.
-    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
     let commits = walk_native_commits(&store, &tip)?;
+    for (cid, commit) in &commits {
+        let tree_ref = format!("{}{}", forge_content::FORGE_TREE_PREFIX, commit.tree);
+        if store.verify_content_ref(&tree_ref).is_err() {
+            return Err(ForgeError::NativeHistoryCorrupt {
+                kind: NativeHistoryCorruptKind::DanglingTree,
+                commit_id: cid.to_string(),
+                related_id: Some(commit.tree.clone()),
+            }
+            .into());
+        }
+    }
     let head_reached = current_head
         .as_ref()
         .map(|head| commits.iter().any(|(cid, _)| cid == head))
@@ -3137,29 +3356,69 @@ pub fn reconcile_native_head(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The authoritative native history tip: the latest accepted `decisions.commit_id` (by
-/// op-log chain order, `rowid DESC` tiebreak) if any justified commit exists, else the
-/// ref-store HEAD (the genesis), else `None`. Shared by `reconcile_native_head` (the advance
-/// target) and `native_log` (the walk origin) so the two can never disagree on the tip —
-/// `log` is read-only and never writes HEAD, so it tolerates a not-yet-reconciled HEAD by
-/// resolving the tip from the ledger directly.
+/// The authoritative native history tip: the latest native-history-producing ledger entry
+/// (accepted decisions or clean sync merge operations) that descends from the cached HEAD if any
+/// exists, else the ref-store HEAD (the genesis), else `None`. Imported peer decisions can carry
+/// divergent native commit IDs and peer wall-clock timestamps, so timestamp ordering alone is not
+/// allowed to advance the local tip across a fork.
 fn native_tip(
     context: &RepositoryContext,
     connection: &Connection,
 ) -> Result<Option<forge_content_native::ObjectId>> {
-    let latest: Option<String> = connection
-        .query_row(
-            "SELECT commit_id FROM decisions \
-             WHERE repo_id = ?1 AND commit_id IS NOT NULL \
-             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
-            params![context.repo_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match latest {
-        Some(commit) => Ok(Some(forge_content_native::ObjectId::parse(&commit)?)),
-        None => forge_content_native::NativeRefStore::new(&context.root_path).read_head(),
+    let refs = forge_content_native::NativeRefStore::new(&context.root_path);
+    let current_head = refs.read_head()?;
+    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
+    let query = format!(
+        "SELECT commit_id, source_rank FROM (
+                 SELECT d.commit_id AS commit_id,
+                        d.created_at_ms AS created_at_ms,
+                        0 AS source_rank,
+                        d.rowid AS tie_rowid
+                   FROM decisions d
+                  WHERE d.repo_id = ?1
+                    AND d.commit_id IS NOT NULL
+                 UNION ALL
+                 SELECT json_extract(v.state_json, '$.commit_id') AS commit_id,
+                        o.created_at_ms AS created_at_ms,
+                        1 AS source_rank,
+                        o.rowid AS tie_rowid
+                  FROM operations o
+                   JOIN views v ON v.id = o.resulting_view_id
+                  WHERE o.repo_id = ?1
+                    AND o.kind IN ({})
+                    AND json_extract(v.state_json, '$.commit_id') IS NOT NULL
+             )
+             ORDER BY created_at_ms DESC, source_rank DESC, tie_rowid DESC, commit_id DESC",
+        SYNC_MERGED_OP_KIND_SQL_IN
+    );
+    let mut statement = connection.prepare(&query)?;
+    let candidates = statement
+        .query_map(params![context.repo_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if let (Some(head), Some(candidate)) = (current_head.as_ref(), candidates.first()) {
+        if candidate == &head.to_string() {
+            return Ok(current_head);
+        }
     }
+    for candidate in candidates {
+        let candidate = forge_content_native::ObjectId::parse(&candidate)?;
+        let Some(head) = current_head.as_ref() else {
+            return Ok(Some(candidate));
+        };
+        if &candidate == head {
+            return Ok(Some(candidate));
+        }
+        match walk_native_commits(&store, &candidate) {
+            Ok(commits) if commits.iter().any(|(cid, _)| cid == head) => {
+                return Ok(Some(candidate));
+            }
+            Ok(_) => {}
+            // Tip selection only trusts candidates whose objects can be walked; doctor still
+            // reports dangling decision/op commit ids independently via verify_native_history.
+            Err(_) => {}
+        }
+    }
+    Ok(current_head)
 }
 
 /// One commit in the native history, as surfaced by `forge log` through the JSON contract
@@ -5155,13 +5414,27 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
 
 /// `doctor`'s native commit-DAG integrity pass (NER-138 Phase 7 slice 3): walk the DAG from
 /// the authoritative tip detecting cycles (visited set), dangling parents, and dangling trees,
-/// then cross-check every `decisions.commit_id` resolves to an existing commit object. Reports
-/// findings (does not raise) — fail-closed at the call sites that raise. Findings are deduped
-/// by (kind, commit_id, related_id).
+/// then cross-check every ledger-referenced native commit resolves to an existing commit object.
+/// Reports findings (does not raise) — fail-closed at the call sites that raise. Findings are
+/// deduped by (kind, commit_id, related_id).
 fn verify_native_history(
     context: &RepositoryContext,
     connection: &Connection,
     store: &forge_content_native::NativeObjectStore,
+) -> Result<Vec<NativeHistoryFinding>> {
+    verify_native_history_from_tip(
+        &context.repo_id,
+        connection,
+        store,
+        native_tip(context, connection)?,
+    )
+}
+
+fn verify_native_history_from_tip(
+    repo_id: &str,
+    connection: &Connection,
+    store: &forge_content_native::NativeObjectStore,
+    tip: Option<forge_content_native::ObjectId>,
 ) -> Result<Vec<NativeHistoryFinding>> {
     let mut findings: Vec<NativeHistoryFinding> = Vec::new();
     let mut push = |finding: NativeHistoryFinding| {
@@ -5174,7 +5447,7 @@ fn verify_native_history(
         }
     };
 
-    if let Some(tip) = native_tip(context, connection)? {
+    if let Some(tip) = tip {
         let mut states = std::collections::BTreeMap::new();
         let mut stack = vec![(tip, false)];
         while let Some((commit_id, expanded)) = stack.pop() {
@@ -5230,21 +5503,40 @@ fn verify_native_history(
         }
     }
 
-    // Cross-check every accepted decisions.commit_id resolves to a commit object — catches a
-    // dangling commit_id even if it is off the tip's ancestry (the store-before-DB violation).
-    let mut statement = connection
-        .prepare("SELECT commit_id FROM decisions WHERE repo_id = ?1 AND commit_id IS NOT NULL")?;
-    let rows = statement.query_map(params![context.repo_id], |row| row.get::<_, String>(0))?;
-    for row in rows {
-        let commit_id = row?;
-        match forge_content_native::ObjectId::parse(&commit_id) {
+    let mut check_commit =
+        |commit_id: String| match forge_content_native::ObjectId::parse(&commit_id) {
             Ok(id) if store.read_commit(&id).is_ok() => {}
             _ => push(NativeHistoryFinding {
                 kind: NativeHistoryCorruptKind::DanglingCommitId,
                 commit_id,
                 related_id: None,
             }),
-        }
+        };
+
+    // Cross-check every accepted decisions.commit_id resolves to a commit object — catches a
+    // dangling commit_id even if it is off the tip's ancestry (the store-before-DB violation).
+    let mut decision_commits = connection
+        .prepare("SELECT commit_id FROM decisions WHERE repo_id = ?1 AND commit_id IS NOT NULL")?;
+    let rows = decision_commits.query_map(params![repo_id], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        check_commit(row?);
+    }
+
+    // Sync merge operations also introduce native commit ids. Check them independently so an
+    // imported or corrupted off-tip sync_*_merged view cannot claim a phantom signed commit.
+    let query = format!(
+        "SELECT json_extract(v.state_json, '$.commit_id')
+           FROM operations o
+           JOIN views v ON v.id = o.resulting_view_id
+          WHERE o.repo_id = ?1
+            AND o.kind IN ({})
+            AND json_extract(v.state_json, '$.commit_id') IS NOT NULL",
+        SYNC_MERGED_OP_KIND_SQL_IN
+    );
+    let mut sync_merge_commits = connection.prepare(&query)?;
+    let rows = sync_merge_commits.query_map(params![repo_id], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        check_commit(row?);
     }
 
     Ok(findings)
@@ -5572,6 +5864,24 @@ struct StoredOp {
     rowid: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct StoredSyncMergeState {
+    lifecycle: String,
+    #[allow(dead_code)]
+    protocol_version: String,
+    direction: String,
+    remote_path: String,
+    base_native_head: String,
+    ours_native_head: String,
+    theirs_native_head: String,
+    merged_content_ref: String,
+    commit_id: String,
+    materialized: bool,
+    imported_native_objects: i64,
+    imported_ledger_rows: i64,
+    sync_merge_lineage_hash: String,
+}
+
 /// The recorded `operations` rowid high-water mark (the legacy/tampered boundary for
 /// operation rows).
 fn op_high_water(conn: &Connection) -> Result<i64> {
@@ -5627,6 +5937,37 @@ fn op_domain_digest(conn: &Connection, view_id: Option<&str>) -> Result<Option<S
             .optional()
             .map(Option::flatten)
             .map_err(Into::into);
+    }
+    if state
+        .get("lifecycle")
+        .and_then(Value::as_str)
+        .is_some_and(is_sync_merged_op_kind)
+    {
+        let Ok(sync_state) = serde_json::from_value::<StoredSyncMergeState>(state.clone()) else {
+            return Ok(None);
+        };
+        if !is_sync_merged_op_kind(&sync_state.lifecycle) {
+            return Ok(None);
+        }
+        let recomputed =
+            integrity::sync_merge_lineage_digest(&integrity::SyncMergeLineageDigestInput {
+                protocol_version: &sync_state.protocol_version,
+                direction: &sync_state.direction,
+                remote_path: &sync_state.remote_path,
+                base_native_head: &sync_state.base_native_head,
+                ours_native_head: &sync_state.ours_native_head,
+                theirs_native_head: &sync_state.theirs_native_head,
+                merged_content_ref: &sync_state.merged_content_ref,
+                commit_id: &sync_state.commit_id,
+                materialized: sync_state.materialized,
+                imported_native_objects: sync_state.imported_native_objects,
+                imported_ledger_rows: sync_state.imported_ledger_rows,
+            });
+        return Ok(Some(if sync_state.sync_merge_lineage_hash == recomputed {
+            sync_state.sync_merge_lineage_hash
+        } else {
+            recomputed
+        }));
     }
     if let Some(stored) = state.get("merge_lineage_hash").and_then(Value::as_str) {
         let recomputed = integrity::merge_lineage_digest(&integrity::MergeLineageDigestInput {
@@ -7585,18 +7926,23 @@ fn replay_guard(tx: &Transaction<'_>, repo_id: &str, request_id: Option<&str>) -
     };
     let existing = tx
         .query_row(
-            "SELECT id, command, status, error_json
-             FROM operations
-             WHERE repo_id = ?1 AND request_id = ?2
-             ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
+            "SELECT o.id, o.command, o.status, o.error_json, o.kind, o.resulting_view_id, v.state_json
+             FROM operations o
+             LEFT JOIN views v ON v.id = o.resulting_view_id
+             WHERE o.repo_id = ?1 AND o.request_id = ?2
+             ORDER BY o.created_at_ms DESC, o.rowid DESC LIMIT 1",
             params![repo_id, request_id],
             |row| {
                 let error_json: Option<String> = row.get(3)?;
+                let state_json: Option<String> = row.get(6)?;
                 Ok(RequestIdOperation {
                     operation_id: row.get(0)?,
                     command: row.get(1)?,
                     status: row.get(2)?,
                     error_json: error_json.and_then(|json| serde_json::from_str(&json).ok()),
+                    kind: row.get(4)?,
+                    view_id: row.get(5)?,
+                    state: state_json.and_then(|json| serde_json::from_str(&json).ok()),
                 })
             },
         )
@@ -8001,6 +8347,9 @@ mod tests {
                     command: "save".to_string(),
                     status: "succeeded".to_string(),
                     error_json: None,
+                    kind: None,
+                    view_id: None,
+                    state: None,
                 },
             }
             .into()

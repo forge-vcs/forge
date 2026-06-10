@@ -951,13 +951,30 @@ fn ensure_worktree_matches_expected(cwd: &Path) -> Result<()> {
         },
     };
     let current = snapshot_effective_worktree(cwd)?;
-    if current.content_ref == expected {
+    if current.content_ref == expected
+        || heal_expected_ref_to_current_native_head(cwd, &current.content_ref)?
+    {
         Ok(())
     } else {
         Err(ForgeError::DirtyWorktree {
             paths: current.changed_paths,
         }
         .into())
+    }
+}
+
+fn heal_expected_ref_to_current_native_head(cwd: &Path, current_content_ref: &str) -> Result<bool> {
+    let Ok(head) = current_base(cwd) else {
+        return Ok(false);
+    };
+    let Ok(head_content_ref) = native_commit_content_ref(cwd, &head) else {
+        return Ok(false);
+    };
+    if head_content_ref == current_content_ref {
+        forge_store::set_materialized_expected_content_ref(cwd, current_content_ref)?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -986,6 +1003,19 @@ fn native_commit_content_ref(cwd: &Path, commit_id: &str) -> Result<String> {
     let store = forge_content_native::NativeObjectStore::new(&context.root_path);
     let commit = store.read_commit(&id)?;
     Ok(format!("{FORGE_TREE_PREFIX}{}", commit.tree))
+}
+
+fn sync_manifest_head_content_ref(
+    cwd: &Path,
+    manifest: &forge_sync::SyncManifest,
+) -> Result<Option<String>> {
+    let Some(head) = manifest.native_head.as_deref() else {
+        return Ok(None);
+    };
+    match native_commit_content_ref(cwd, head) {
+        Ok(content_ref) => Ok(Some(content_ref)),
+        Err(_) => forge_sync::manifest_head_content_ref(manifest),
+    }
 }
 
 fn restore_response(request_id: Option<String>, args: RestoreArgs) -> ResponseEnvelope {
@@ -1421,7 +1451,6 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
             sync_fetch_peer(&cwd, request_id, &args.remote, false)
         }),
         SyncCommand::Pull(args) => command_result("sync pull", request_id, |cwd, request_id| {
-            ensure_clean_for_sync_import_materialize(&cwd).context("preflight sync pull")?;
             sync_fetch_peer(&cwd, request_id, &args.remote, true)
         }),
         SyncCommand::Push(args) => command_result("sync push", request_id, |cwd, request_id| {
@@ -1456,32 +1485,73 @@ fn sync_fetch_peer(
             } else {
                 "sync fetch"
             };
-            let operation_id = if request_id.is_some() {
-                Some(
-                    forge_store::record_sync_request_marker(
-                        cwd, request_id, command, direction, remote, None,
-                    )
-                    .with_context(|| format!("record local {command} request-id marker"))?
-                    .operation_id,
-                )
-            } else {
-                None
-            };
-            return Ok((
-                operation_id,
-                json!({
-                    "protocol_version": remote_manifest.protocol_version,
+            let mut operation_id = None;
+            let mut materialized_content_ref = None;
+            let mut materialized_operation_id = None;
+            let mut materialized_view_id = None;
+            if materialize {
+                let commit_id = local_manifest.native_head.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("sync pull has no local native head to materialize")
+                })?;
+                let content_ref = forge_store::checkout_target_content_ref(cwd, commit_id)
+                    .context("resolve current native head")?;
+                ensure_clean_worktree(cwd, &content_ref).context("preflight sync pull")?;
+                restore_effective_worktree(cwd, &content_ref)
+                    .context("restore current native head")?;
+                let state = json!({
+                    "protocol_version": remote_manifest.protocol_version.clone(),
                     "direction": direction,
                     "remote_path": remote.display().to_string(),
-                    "base_native_head": local_manifest.native_head,
-                    "remote_native_head": remote_manifest.native_head,
+                    "base_native_head": local_manifest.native_head.clone(),
+                    "remote_native_head": remote_manifest.native_head.clone(),
                     "imported_native_objects": 0,
                     "imported_ledger_rows": 0,
-                    "materialized": false,
+                    "materialized": true,
+                    "materialized_content_ref": content_ref.clone(),
                     "up_to_date": true,
-                }),
-                Vec::new(),
-            ));
+                });
+                let record = forge_store::record_sync_pull_materialized(
+                    cwd,
+                    request_id.clone(),
+                    forge_store::SyncPullMaterializedInput {
+                        state: state.clone(),
+                        content_ref: content_ref.clone(),
+                    },
+                )
+                .context("record sync pull materialization")?;
+                operation_id = Some(record.operation_id.clone());
+                materialized_operation_id = Some(record.operation_id);
+                materialized_view_id = Some(record.view_id);
+                materialized_content_ref = Some(content_ref);
+            }
+            let data = json!({
+                "protocol_version": remote_manifest.protocol_version,
+                "direction": direction,
+                "remote_path": remote.display().to_string(),
+                "base_native_head": local_manifest.native_head,
+                "remote_native_head": remote_manifest.native_head,
+                "imported_native_objects": 0,
+                "imported_ledger_rows": 0,
+                "materialized": materialize,
+                "materialized_content_ref": materialized_content_ref,
+                "materialized_operation_id": materialized_operation_id,
+                "materialized_view_id": materialized_view_id,
+                "up_to_date": true,
+            });
+            if !materialize && request_id.is_some() {
+                let marker = forge_store::record_sync_request_marker(
+                    cwd,
+                    request_id,
+                    command,
+                    direction,
+                    remote,
+                    None,
+                    Some(data.clone()),
+                )
+                .with_context(|| format!("record local {command} request-id marker"))?;
+                operation_id = Some(marker.operation_id);
+            }
+            return Ok((operation_id, data, Vec::new()));
         }
         return record_sync_peer_merge_conflict(SyncPeerMergeConflictInput {
             receiver_cwd: cwd,
@@ -1500,6 +1570,7 @@ fn sync_fetch_peer(
                 "sync fetch"
             },
             direction: if materialize { "pull" } else { "fetch" },
+            materialize,
         });
     }
 
@@ -1510,6 +1581,16 @@ fn sync_fetch_peer(
     let export_report =
         forge_sync::export_manifest_since(remote, &incoming_path, Some(&local_base_path))
             .context("export remote sync delta")?;
+    let materialized_target_ref = if materialize {
+        let incoming_manifest = forge_sync::read_supported_manifest(&incoming_path)
+            .context("read remote sync delta")?;
+        let content_ref = sync_manifest_head_content_ref(cwd, &incoming_manifest)?
+            .ok_or_else(|| anyhow::anyhow!("sync peer has no native head to materialize"))?;
+        ensure_clean_worktree(cwd, &content_ref).context("preflight sync pull")?;
+        Some(content_ref)
+    } else {
+        None
+    };
     let import_report =
         forge_sync::import_manifest(cwd, &incoming_path).context("apply remote sync delta")?;
 
@@ -1518,16 +1599,34 @@ fn sync_fetch_peer(
     let mut materialized_operation_id = None;
     let mut materialized_view_id = None;
     if materialize {
-        let commit_id = import_report
-            .native_head
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("sync peer has no native head to materialize"))?;
-        let content_ref = forge_store::checkout_target_content_ref(cwd, commit_id)
-            .context("resolve fetched native head")?;
+        let content_ref = materialized_target_ref
+            .clone()
+            .expect("materialized target ref precomputed");
         restore_effective_worktree(cwd, &content_ref).context("restore fetched native head")?;
-        let record =
-            forge_store::record_sync_import_materialized(cwd, request_id, commit_id, &content_ref)
-                .context("record sync pull materialization")?;
+        let state = json!({
+            "protocol_version": import_report.protocol_version.clone(),
+            "direction": "pull",
+            "remote_path": remote.display().to_string(),
+            "base_native_head": local_manifest.native_head.clone(),
+            "remote_native_head": remote_manifest.native_head.clone(),
+            "exported_native_objects": export_report.native_object_count,
+            "exported_native_payloads": export_report.native_payload_count,
+            "exported_ledger_rows": export_report.ledger_row_count,
+            "imported_native_objects": import_report.imported_native_objects,
+            "imported_ledger_rows": import_report.imported_ledger_rows,
+            "local_key_fingerprint": import_report.local_key_fingerprint.clone(),
+            "materialized": true,
+            "materialized_content_ref": content_ref.clone(),
+        });
+        let record = forge_store::record_sync_pull_materialized(
+            cwd,
+            request_id.clone(),
+            forge_store::SyncPullMaterializedInput {
+                state,
+                content_ref: content_ref.clone(),
+            },
+        )
+        .context("record sync pull materialization")?;
         operation_id = Some(record.operation_id.clone());
         materialized_operation_id = Some(record.operation_id);
         materialized_view_id = Some(record.view_id);
@@ -1551,6 +1650,19 @@ fn sync_fetch_peer(
         "materialized_operation_id": materialized_operation_id,
         "materialized_view_id": materialized_view_id,
     });
+    if !materialize && request_id.is_some() {
+        let marker = forge_store::record_sync_request_marker(
+            cwd,
+            request_id,
+            "sync fetch",
+            "fetch",
+            remote,
+            None,
+            Some(data.clone()),
+        )
+        .context("record local sync fetch request-id marker")?;
+        operation_id = Some(marker.operation_id);
+    }
     Ok((operation_id, data, Vec::new()))
 }
 
@@ -1569,37 +1681,36 @@ fn sync_push_peer(
             &remote_manifest,
             local_manifest.native_head.as_deref(),
         )? {
+            let mut data = json!({
+                "protocol_version": local_manifest.protocol_version,
+                "direction": "push",
+                "remote_path": remote.display().to_string(),
+                "base_native_head": remote_manifest.native_head,
+                "local_native_head": local_manifest.native_head,
+                "imported_native_objects": 0,
+                "imported_ledger_rows": 0,
+                "materialized": false,
+                "up_to_date": true,
+            });
             let operation_id = if request_id.is_some() {
-                Some(
-                    forge_store::record_sync_request_marker(
-                        cwd,
-                        request_id,
-                        "sync push",
-                        "push",
-                        remote,
-                        None,
-                    )
-                    .context("record local sync push request-id marker")?
-                    .operation_id,
+                let marker = forge_store::record_sync_request_marker(
+                    cwd,
+                    request_id,
+                    "sync push",
+                    "push",
+                    remote,
+                    None,
+                    Some(data.clone()),
                 )
+                .context("record local sync push request-id marker")?;
+                if let Some(object) = data.as_object_mut() {
+                    object.insert("operation_id".to_string(), json!(marker.operation_id));
+                }
+                Some(marker.operation_id)
             } else {
                 None
             };
-            return Ok((
-                operation_id,
-                json!({
-                    "protocol_version": local_manifest.protocol_version,
-                    "direction": "push",
-                    "remote_path": remote.display().to_string(),
-                    "base_native_head": remote_manifest.native_head,
-                    "local_native_head": local_manifest.native_head,
-                    "imported_native_objects": 0,
-                    "imported_ledger_rows": 0,
-                    "materialized": false,
-                    "up_to_date": true,
-                }),
-                Vec::new(),
-            ));
+            return Ok((operation_id, data, Vec::new()));
         }
         let (remote_operation_id, mut data, warnings) =
             record_sync_peer_merge_conflict(SyncPeerMergeConflictInput {
@@ -1611,8 +1722,15 @@ fn sync_push_peer(
                 context: "sync_push_divergence",
                 command: "sync push",
                 direction: "push",
+                materialize: false,
             })?;
         let local_operation_id = if request_id.is_some() {
+            if let Some(object) = data.as_object_mut() {
+                object.insert(
+                    "remote_operation_id".to_string(),
+                    json!(remote_operation_id),
+                );
+            }
             let marker = forge_store::record_sync_request_marker(
                 cwd,
                 request_id,
@@ -1620,13 +1738,10 @@ fn sync_push_peer(
                 "push",
                 remote,
                 remote_operation_id.as_deref(),
+                Some(data.clone()),
             )
             .context("record local sync push request-id marker")?;
             if let Some(object) = data.as_object_mut() {
-                object.insert(
-                    "remote_operation_id".to_string(),
-                    json!(remote_operation_id),
-                );
                 object.insert("operation_id".to_string(), json!(marker.operation_id));
             }
             Some(marker.operation_id)
@@ -1662,6 +1777,7 @@ fn sync_push_peer(
         "materialized": false,
     });
     if request_id.is_some() {
+        let replay_data = data.clone();
         operation_id = Some(
             forge_store::record_sync_request_marker(
                 cwd,
@@ -1670,6 +1786,7 @@ fn sync_push_peer(
                 "push",
                 remote,
                 None,
+                Some(replay_data),
             )
             .context("record local sync push request-id marker")?
             .operation_id,
@@ -1751,6 +1868,7 @@ struct SyncPeerMergeConflictInput<'a> {
     context: &'a str,
     command: &'a str,
     direction: &'a str,
+    materialize: bool,
 }
 
 fn record_sync_peer_merge_conflict(
@@ -1790,14 +1908,101 @@ fn record_sync_peer_merge_conflict(
             return Err(error).context("merge peer native content refs");
         }
     };
-    if merge.merged_content_ref.is_some() {
-        cleanup_new_native_objects(&store, &pre_merge_loose_objects)
-            .context("remove staged native objects for unsupported clean sync merge")?;
-        return Err(ForgeError::SyncDivergenceUnsupported {
-            direction: input.direction.to_string(),
-            reason: "clean_divergent_merge".to_string(),
+    if let Some(merged_content_ref) = merge.merged_content_ref {
+        if input.materialize {
+            if let Err(error) = ensure_clean_worktree(input.receiver_cwd, &merged_content_ref) {
+                cleanup_new_native_objects(&store, &pre_merge_loose_objects)
+                    .context("remove staged native objects after dirty sync merge preflight")?;
+                return Err(error).context("preflight clean sync merge restore");
+            }
         }
-        .into());
+        let imported_ledger_rows =
+            match forge_sync::import_ledger_rows_from_manifest(input.receiver_cwd, input.source) {
+                Ok(count) => count,
+                Err(error) => {
+                    cleanup_new_native_objects(&store, &pre_merge_loose_objects)
+                        .context("remove staged native objects after failed sync ledger import")?;
+                    return Err(error).context("import peer ledger rows for clean sync merge");
+                }
+            };
+        let imported_native_objects_i64 = match i64::try_from(imported_native_objects) {
+            Ok(count) => count,
+            Err(error) => {
+                cleanup_new_native_objects(&store, &pre_merge_loose_objects)
+                    .context("remove staged native objects after invalid native object count")?;
+                return Err(error).context("sync merge imported native object count exceeds i64");
+            }
+        };
+        let imported_ledger_rows_i64 = match i64::try_from(imported_ledger_rows) {
+            Ok(count) => count,
+            Err(error) => {
+                cleanup_new_native_objects(&store, &pre_merge_loose_objects)
+                    .context("remove staged native objects after invalid ledger row count")?;
+                return Err(error).context("sync merge imported ledger row count exceeds i64");
+            }
+        };
+        let record = match forge_store::record_sync_merge_commit(
+            input.receiver_cwd,
+            input.request_id,
+            input.command,
+            forge_store::SyncMergeCommitInput {
+                protocol_version: &input.source.protocol_version,
+                direction: input.direction,
+                remote_path: input.remote,
+                base_native_head: &base_head,
+                ours_native_head: input
+                    .receiver
+                    .native_head
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("sync receiver has no native head"))?,
+                theirs_native_head: input
+                    .source
+                    .native_head
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("sync source has no native head"))?,
+                merged_content_ref: &merged_content_ref,
+                materialized: input.materialize,
+                imported_native_objects: imported_native_objects_i64,
+                imported_ledger_rows: imported_ledger_rows_i64,
+            },
+        ) {
+            Ok(record) => record,
+            Err(error) => {
+                // Peer ledger rows are already durable here. Keep the imported native objects so
+                // those rows cannot reference commits that cleanup just deleted; reconcile filters
+                // divergent peer decisions from the local native tip until a merge op lands.
+                return Err(error).context("record clean sync merge commit");
+            }
+        };
+        if input.materialize {
+            restore_effective_worktree(input.receiver_cwd, &merged_content_ref)
+                .context("restore clean sync merge tree")?;
+            forge_store::set_materialized_expected_content_ref(
+                input.receiver_cwd,
+                &merged_content_ref,
+            )
+            .context("record clean sync merge materialized content")?;
+        }
+        return Ok((
+            Some(record.operation.operation_id.clone()),
+            json!({
+                "protocol_version": input.source.protocol_version,
+                "direction": input.direction,
+                "remote_path": input.remote.display().to_string(),
+                "merged": true,
+                "operation_id": record.operation.operation_id,
+                "merge_commit_id": record.commit_id,
+                "base_native_head": input.receiver.native_head,
+                "receiver_native_head": input.receiver.native_head,
+                "common_ancestor_native_head": base_head,
+                "source_native_head": input.source.native_head,
+                "merged_content_ref": merged_content_ref,
+                "imported_native_objects": imported_native_objects,
+                "imported_ledger_rows": imported_ledger_rows,
+                "materialized": input.materialize,
+            }),
+            secret_export_warnings(&merge.dropped_secret_paths),
+        ));
     }
     let conflict_input = forge_store::MergeConflictInput {
         context: input.context.to_string(),
@@ -2069,12 +2274,155 @@ fn replay_response(
         );
     }
     let request_id_value = request_id.as_deref().unwrap_or_default().to_string();
-    ResponseEnvelope::success(
-        command,
-        request_id,
-        Some(existing.operation_id),
-        json!({ "idempotent_replay": true, "request_id": request_id_value }),
-    )
+    let mut data = json!({ "idempotent_replay": true, "request_id": request_id_value });
+    if matches!(command, "sync fetch" | "sync push")
+        && matches!(existing.kind.as_deref(), Some("sync_fetch" | "sync_push"))
+    {
+        if let Some(replay_data) = existing
+            .state
+            .as_ref()
+            .and_then(|state| state.get("replay_data"))
+            .and_then(Value::as_object)
+        {
+            if let Some(object) = data.as_object_mut() {
+                for (key, value) in replay_data {
+                    object.insert(key.clone(), value.clone());
+                }
+                object.insert(
+                    "operation_id".to_string(),
+                    json!(existing.operation_id.clone()),
+                );
+            }
+        }
+    }
+    if command == "sync pull" && existing.kind.as_deref() == Some("sync_pull_materialized") {
+        if let Some(state) = existing.state.as_ref() {
+            if let Some(object) = data.as_object_mut() {
+                if let Some(state_object) = state.as_object() {
+                    for (key, value) in state_object {
+                        if key != "lifecycle" {
+                            object.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+                object.insert(
+                    "materialized_operation_id".to_string(),
+                    json!(existing.operation_id.clone()),
+                );
+                if let Some(view_id) = existing.view_id.as_ref() {
+                    object.insert("materialized_view_id".to_string(), json!(view_id));
+                }
+            }
+        }
+    }
+    if matches!(command, "sync fetch" | "sync pull" | "sync push")
+        && existing
+            .kind
+            .as_deref()
+            .is_some_and(forge_store::is_sync_merged_op_kind)
+    {
+        if let Some(state) = existing.state.as_ref() {
+            if let Some(object) = data.as_object_mut() {
+                object.insert("merged".to_string(), json!(true));
+                object.insert(
+                    "operation_id".to_string(),
+                    json!(existing.operation_id.clone()),
+                );
+                for key in [
+                    "protocol_version",
+                    "direction",
+                    "remote_path",
+                    "merged_content_ref",
+                    "materialized",
+                    "imported_native_objects",
+                    "imported_ledger_rows",
+                ] {
+                    if let Some(value) = state.get(key) {
+                        object.insert(key.to_string(), value.clone());
+                    }
+                }
+                if let Some(value) = state.get("commit_id") {
+                    object.insert("merge_commit_id".to_string(), value.clone());
+                }
+                if let Some(value) = state.get("ours_native_head") {
+                    object.insert("base_native_head".to_string(), value.clone());
+                    object.insert("receiver_native_head".to_string(), value.clone());
+                }
+                if let Some(value) = state.get("base_native_head") {
+                    object.insert("common_ancestor_native_head".to_string(), value.clone());
+                }
+                if let Some(value) = state.get("theirs_native_head") {
+                    object.insert("source_native_head".to_string(), value.clone());
+                }
+            }
+        }
+    }
+    ResponseEnvelope::success(command, request_id, Some(existing.operation_id), data)
+}
+
+fn reassert_materialized_replay(
+    cwd: &Path,
+    existing: &forge_store::RequestIdOperation,
+) -> anyhow::Result<()> {
+    if existing.command != "sync pull" {
+        return Ok(());
+    }
+    let Some(state) = existing.state.as_ref() else {
+        return Ok(());
+    };
+    if !state
+        .get("materialized")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let Some(content_ref) = state
+        .get("merged_content_ref")
+        .or_else(|| state.get("materialized_content_ref"))
+        .or_else(|| state.get("content_ref"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    let expected = forge_store::expected_content_ref(cwd)?;
+    if expected.as_deref() == Some(content_ref) {
+        return Ok(());
+    }
+    let current = snapshot_effective_worktree(cwd).context("snapshot replayed sync pull")?;
+    if current.content_ref != content_ref {
+        let context = forge_store::open_repository(cwd)?;
+        if context.current_operation_id != existing.operation_id {
+            return Ok(());
+        }
+        if expected.as_deref() != Some(current.content_ref.as_str()) {
+            return Err(ForgeError::DirtyWorktree {
+                paths: current.changed_paths,
+            }
+            .into());
+        }
+        restore_effective_worktree(cwd, content_ref)
+            .context("restore replayed sync pull materialized content")?;
+    }
+    forge_store::set_materialized_expected_content_ref(cwd, content_ref)
+        .context("record replayed sync pull materialized content")?;
+    Ok(())
+}
+
+fn reassert_materialized_replay_locked(
+    cwd: &Path,
+    command: &str,
+    existing: &forge_store::RequestIdOperation,
+) -> anyhow::Result<()> {
+    if existing.command != "sync pull" {
+        return Ok(());
+    }
+    let _replay_lock = if !requires_repo_lock(command) {
+        Some(forge_store::acquire_repo_lock(cwd)?)
+    } else {
+        None
+    };
+    reassert_materialized_replay(cwd, existing)
 }
 
 /// Format dropped secret-risk export paths as top-level `warnings[]` entries
@@ -2144,14 +2492,30 @@ where
         None
     };
 
-    // NER-138 slice 3: heal a torn commit-on-accept (a committed decision whose ref-store
-    // HEAD advance was lost to a crash) BEFORE the base anchor is read this command, and
-    // BEFORE the preflight-replay short-circuit — so a same-`request_id` replay of a torn
-    // accept still advances HEAD. Runs only for lock-holding commands (serialized, never
-    // racing `run`); a no-op on git repos and before any justified commit. A dangling
-    // ledger `commit_id` (the store-before-DB violation) surfaces here as
-    // `NATIVE_HISTORY_CORRUPT`.
-    if requires_repo_lock(command) {
+    // NER-138 slice 3: heal a torn native-history commit whose ref-store HEAD advance was
+    // lost to a crash BEFORE the base anchor is read, and BEFORE the preflight-replay
+    // short-circuit — so a same-`request_id` replay of a torn accept or sync merge still
+    // advances HEAD. Path-peer sync commands take both repository locks inside the command
+    // body; this preflight-only reconcile holds the local repo lock briefly and drops it
+    // before the sync body can acquire canonical peer locks.
+    if reconciles_native_head_before_replay(command) {
+        let _sync_reconcile_lock = if !requires_repo_lock(command) {
+            match forge_store::acquire_repo_lock(&cwd) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let (error_object, retry) = error_to_object(command, &error);
+                    return ResponseEnvelope::error_with(
+                        command,
+                        request_id,
+                        None,
+                        error_object,
+                        retry,
+                    );
+                }
+            }
+        } else {
+            None
+        };
         if let Err(error) = forge_store::reconcile_native_head(&cwd) {
             let (error_object, retry) = error_to_object(command, &error);
             return ResponseEnvelope::error_with(command, request_id, None, error_object, retry);
@@ -2168,6 +2532,16 @@ where
                 .ok()
                 .flatten()
             {
+                if let Err(error) = reassert_materialized_replay_locked(&cwd, command, &existing) {
+                    let (error_object, retry) = error_to_object(command, &error);
+                    return ResponseEnvelope::error_with(
+                        command,
+                        request_id,
+                        None,
+                        error_object,
+                        retry,
+                    );
+                }
                 return replay_response(command, request_id, existing);
             }
         }
@@ -2192,7 +2566,20 @@ where
             // `replay_guard` rolled this attempt back. Replay the committed
             // operation instead of reporting a failure (U5, option a).
             if let Some(replay) = error.downcast_ref::<forge_store::RequestIdReplay>() {
-                return replay_response(command, request_id, replay.operation.clone());
+                let existing = replay.operation.clone();
+                if let Err(error) =
+                    reassert_materialized_replay_locked(&warning_cwd, command, &existing)
+                {
+                    let (error_object, retry) = error_to_object(command, &error);
+                    return ResponseEnvelope::error_with(
+                        command,
+                        request_id,
+                        None,
+                        error_object,
+                        retry,
+                    );
+                }
+                return replay_response(command, request_id, existing);
             }
             let (error_object, retry) = error_to_object(command, &error);
             // Transient errors (the singleton CAS `CONFLICT`, `LOCK_TIMEOUT`) must
@@ -2558,4 +2945,8 @@ fn requires_repo_lock(command: &str) -> bool {
             command,
             "run" | "init" | "sync fetch" | "sync pull" | "sync push"
         )
+}
+
+fn reconciles_native_head_before_replay(command: &str) -> bool {
+    requires_repo_lock(command) || matches!(command, "sync fetch" | "sync pull" | "sync push")
 }

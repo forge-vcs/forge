@@ -37,6 +37,8 @@ const PUBLICATION_TAG: &[u8] = b"forge.publication.v0\0";
 const CONFLICT_SET_TAG: &[u8] = b"forge.conflict_set.v0\0";
 /// Domain-separation tag for clean native merge lineage folded into the op chain.
 const MERGE_LINEAGE_TAG: &[u8] = b"forge.merge_lineage.v0\0";
+/// Domain-separation tag for clean sync merge provenance folded into the op chain.
+const SYNC_MERGE_LINEAGE_TAG: &[u8] = b"forge.sync_merge_lineage.v0\0";
 /// Domain-separation tag for an opaque, non-reversible path identifier emitted in
 /// conflict JSON instead of raw paths.
 const PATH_FINGERPRINT_TAG: &[u8] = b"forge.path_fingerprint.v0\0";
@@ -295,6 +297,20 @@ pub struct MergeLineageDigestInput<'a> {
     pub merged_content_ref: &'a str,
 }
 
+pub struct SyncMergeLineageDigestInput<'a> {
+    pub protocol_version: &'a str,
+    pub direction: &'a str,
+    pub remote_path: &'a str,
+    pub base_native_head: &'a str,
+    pub ours_native_head: &'a str,
+    pub theirs_native_head: &'a str,
+    pub merged_content_ref: &'a str,
+    pub commit_id: &'a str,
+    pub materialized: bool,
+    pub imported_native_objects: i64,
+    pub imported_ledger_rows: i64,
+}
+
 pub fn path_fingerprint(path: &str) -> String {
     let mut writer = DigestWriter::new(PATH_FINGERPRINT_TAG);
     writer.str(path);
@@ -313,6 +329,23 @@ pub fn merge_lineage_digest(input: &MergeLineageDigestInput) -> String {
         .str(input.ours_content_ref)
         .str(input.theirs_content_ref)
         .str(input.merged_content_ref);
+    writer.finish()
+}
+
+pub fn sync_merge_lineage_digest(input: &SyncMergeLineageDigestInput) -> String {
+    let mut writer = DigestWriter::new(SYNC_MERGE_LINEAGE_TAG);
+    writer
+        .str(input.protocol_version)
+        .str(input.direction)
+        .str(input.remote_path)
+        .str(input.base_native_head)
+        .str(input.ours_native_head)
+        .str(input.theirs_native_head)
+        .str(input.merged_content_ref)
+        .str(input.commit_id)
+        .bool(input.materialized)
+        .i64(input.imported_native_objects)
+        .i64(input.imported_ledger_rows);
     writer.finish()
 }
 

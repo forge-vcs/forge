@@ -328,6 +328,13 @@ pub fn import_native_objects(cwd: &Path, manifest: &SyncManifest) -> Result<usiz
     Ok(manifest.native_payloads.len())
 }
 
+pub fn import_ledger_rows_from_manifest(cwd: &Path, manifest: &SyncManifest) -> Result<usize> {
+    let context = forge_store::open_repository(cwd)?;
+    let mut connection = Connection::open(&context.database_path)?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    import_ledger_rows(&mut connection, &context.repo_id, manifest)
+}
+
 pub fn clone_manifest(cwd: &Path, path: &Path) -> Result<SyncCloneReport> {
     let manifest = read_supported_manifest(path)?;
     if manifest.native_head.is_none() {
@@ -533,7 +540,10 @@ fn is_ancestor(
     Ok(false)
 }
 
-fn read_supported_manifest(path: &Path) -> Result<SyncManifest> {
+/// Read a sync manifest from disk and fail closed unless it is the current native
+/// Forge sync protocol. Public so the CLI can preflight materialized pulls before
+/// importing a peer bundle.
+pub fn read_supported_manifest(path: &Path) -> Result<SyncManifest> {
     let bytes = fs::read(path)?;
     let manifest: SyncManifest = serde_json::from_slice(&bytes)?;
     if manifest.protocol_version != SYNC_PROTOCOL_VERSION {
@@ -942,7 +952,10 @@ fn mark_imported_signature_keys(conn: &Connection, repo_id: &str) -> Result<()> 
          WHERE repo_id = ?1
          GROUP BY repo_id, key_fingerprint
          ON CONFLICT(repo_id, key_fingerprint) DO UPDATE SET
-            public_key = excluded.public_key,
+            public_key = CASE
+                WHEN signing_keys.trust_origin = 'local' THEN signing_keys.public_key
+                ELSE excluded.public_key
+            END,
             trust_origin = CASE
                 WHEN signing_keys.trust_origin = 'local' THEN 'local'
                 ELSE 'peer'
@@ -998,6 +1011,9 @@ fn insert_row(
     row: &serde_json::Map<String, serde_json::Value>,
     target_repo_id: &str,
 ) -> Result<usize> {
+    if spec.table == "ledger_signatures" {
+        validate_ledger_signature_key(row)?;
+    }
     let placeholders = std::iter::repeat_n("?", spec.columns.len())
         .collect::<Vec<_>>()
         .join(", ");
@@ -1021,6 +1037,26 @@ fn insert_row(
     connection
         .execute(&sql, params_from_iter(values.iter()))
         .map_err(Into::into)
+}
+
+fn validate_ledger_signature_key(row: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let public_key = row
+        .get("public_key")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("sync ledger row missing ledger_signatures.public_key"))?;
+    let key_fingerprint = row
+        .get("key_fingerprint")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("sync ledger row missing ledger_signatures.key_fingerprint"))?;
+    let public_key_bytes = hex_decode(public_key)
+        .with_context(|| "sync ledger signature public_key must be lowercase hex")?;
+    let recomputed = forge_store::signing_key_fingerprint_for_public_key(&public_key_bytes);
+    if recomputed != key_fingerprint {
+        bail!(
+            "sync ledger signature key_fingerprint does not match public_key: expected {recomputed}, got {key_fingerprint}"
+        );
+    }
+    Ok(())
 }
 
 fn expected_content_ref(connection: &Connection) -> Result<Option<String>> {

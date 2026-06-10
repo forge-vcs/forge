@@ -804,15 +804,16 @@ fn doctor_detects_a_dangling_tree() {
 }
 
 #[test]
-fn dangling_ledger_commit_id_surfaces_native_history_corrupt() {
+fn dangling_off_tip_ledger_commit_id_is_doctor_only() {
     let repo = TestRepo::new_git();
     prepare_native_proposal(&repo);
     let genesis = head(repo.path()).expect("genesis HEAD");
     repo.forge().args(["--json", "accept"]).assert().success();
 
-    // Corrupt the store: point the ledger tip at a commit whose object does not exist, and
-    // rewind HEAD so reconcile must walk to it. This is the store-before-DB violation the
-    // typed NativeHistoryCorrupt error makes agent-distinguishable from transient IO.
+    // Corrupt an accepted ledger row so it references a commit object that does not exist,
+    // then rewind HEAD. The dangling row is not selected as the native tip because it is not
+    // walkable, so command-boundary reconcile leaves it to doctor instead of bricking every
+    // mutating command.
     let missing = format!("f1:commit:sha256:{}", "f".repeat(64));
     db(repo.path())
         .execute(
@@ -822,19 +823,29 @@ fn dangling_ledger_commit_id_surfaces_native_history_corrupt() {
         .expect("plant dangling commit_id");
     std::fs::write(repo.path().join(".forge/refs/HEAD"), &genesis).expect("rewind HEAD");
 
-    let output = json_output(
-        repo.forge()
-            .args(["--json", "start", "after corruption"])
-            .assert()
-            .failure(),
-    );
-    assert_eq!(output["errors"][0]["code"], "NATIVE_HISTORY_CORRUPT");
-    assert_eq!(output["errors"][0]["details"]["kind"], "dangling_commit_id");
-    // S1: the error carries only the opaque commit id, no filesystem path.
-    let message = output["errors"][0]["message"].as_str().unwrap();
+    repo.forge()
+        .args(["--json", "start", "after corruption"])
+        .assert()
+        .success();
+
+    let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(report["data"]["ok"], false);
+    let issues = report["data"]["native_history_issues"]
+        .as_array()
+        .expect("native history issues");
+    assert!(issues
+        .iter()
+        .any(|issue| { issue["kind"] == "dangling_commit_id" && issue["commit_id"] == missing }));
+    // S1: the finding carries only the opaque commit id, no filesystem path.
+    let message = issues
+        .iter()
+        .find(|issue| issue["commit_id"] == missing)
+        .unwrap()["commit_id"]
+        .as_str()
+        .unwrap();
     assert!(
         !message.contains('/'),
-        "error message leaked a path: {message}"
+        "doctor finding leaked a path: {message}"
     );
 }
 
