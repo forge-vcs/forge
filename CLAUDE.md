@@ -4,21 +4,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What Forge is
 
-Forge is an agent-first local change-control CLI for existing Git repositories, written in Rust. It records the lifecycle of agent-produced changes in `.forge/forge.db` (SQLite) so they can be reviewed and published safely, without replacing Git. v0 is scoped to the solo-developer local loop; the broader vision lives in `PRD.md`.
+Forge is an agent-native source-control CLI for checked change attempts, written in Rust. It records the lifecycle of agent- or human-produced changes in `.forge/forge.db` (SQLite) and Forge-native content objects so attempts can be reviewed, verified, synced, and published safely. The local/native surface is release-candidate complete; Git remains an interop/export boundary for existing PR workflows. The broader vision lives in `PRD.md`, `docs/ROADMAP.md`, and `docs/P9_RELEASE_AUDIT.md`.
 
-Lifecycle: `init → start <intent> → save → run -- <cmd> → propose → check → accept → export branch <name>`.
+Core lifecycle: `init → start <intent> → save → run -- <cmd> → propose → check → accept → sync/export`.
 
 ## Verify before done
 
 Run all three and make sure they pass before considering any change complete (or use `/verify`):
 
 ```
-cargo fmt --all --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+rtk cargo fmt --all --check
+rtk cargo test --workspace
+rtk cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Clippy runs with `-D warnings` — warnings are hard failures. Format with `cargo fmt --all`. To mirror CI exactly in one shot — the trio **plus** the end-to-end eval that drives the real `forge` binary — run `bash scripts/ci.sh` before pushing; `scripts/e2e-eval.sh` runs that eval on its own. GitHub Actions CI (`.github/workflows/ci.yml`) runs these same checks (fmt, test, clippy, then the e2e eval) on every push to `main` and every pull request; there is no Makefile or justfile — Cargo is the only build system.
+Clippy runs with `-D warnings` — warnings are hard failures. Format with `rtk cargo fmt --all`. To mirror CI exactly in one shot — the trio **plus** the end-to-end eval that drives the real `forge` binary — run `rtk bash scripts/ci.sh` before pushing; `scripts/e2e-eval.sh` runs that eval on its own. GitHub Actions CI (`.github/workflows/ci.yml`) runs these same checks (fmt, test, clippy, then the e2e eval) on every push to `main` and every pull request; there is no Makefile or justfile — Cargo is the only build system.
+
+For release/P9 closeout work, run the aggregate dogfood gate:
+
+```
+rtk bash scripts/dogfood-release-gate.sh
+```
+
+That gate runs fmt, clippy, workspace tests, binary e2e, hosted/third-party attestation dogfood, no-git native sync litmus, peer sync, TypeScript multi-workspace dogfood, and native storage-scale smoke. The latest audited release run is recorded in `docs/P9_RELEASE_AUDIT.md`.
 
 ## Engineering workflow
 
@@ -41,7 +49,7 @@ Work is tracked in the **Forge** Linear project (id `2b5e82f7-7a78-4354-af7d-686
 
 ## Layout
 
-Single Cargo workspace. The binary is `forge` (`crates/forge-cli`). Library crates under `crates/` are split by concern: `forge-core` (ID types), `forge-store` (SQLite persistence + `migrations/`), `forge-content` (backend trait + secret-risk helpers), `forge-content-git` / `forge-content-native` (the two backends), `forge-evidence` (command capture), `forge-policy` (check evaluation), `forge-protocol` (JSON envelope), `forge-export-git`. Integration tests live in `crates/forge-cli/tests/` and use `assert_cmd` + `tempfile` against the compiled binary in real temp Git repos.
+Single Cargo workspace. The binary is `forge` (`crates/forge-cli`). Library crates under `crates/` are split by concern: `forge-core` (ID types), `forge-store` (SQLite persistence, migrations, operations/views, trust/signature policy), `forge-content` (backend trait + secret-risk helpers), `forge-content-git` / `forge-content-native` (Git interop and Forge-native object storage/history/diff/merge/pack primitives), `forge-evidence` (command capture and parsers), `forge-policy` (check evaluation), `forge-protocol` (JSON envelope), `forge-export-git` (Git branch/PR-body/provenance export), and `forge-sync` (versioned native sync manifests plus local/file/SSH/HTTPS peer transport). Integration tests live in `crates/forge-cli/tests/` and use `assert_cmd` + `tempfile` against the compiled binary in real temp repos.
 
 ## Conventions
 
@@ -52,15 +60,17 @@ Single Cargo workspace. The binary is `forge` (`crates/forge-cli`). Library crat
 
 ## Gotchas
 
-- `.forge/forge.db` (gitignored) must exist for every command except `init`.
+- `.forge/forge.db` (gitignored) must exist for every repository command except `init`, `schema`, and sync commands that explicitly bootstrap from a bundle.
 - `rusqlite` uses the `bundled` feature — SQLite is statically linked, no system SQLite needed.
-- `FORGE_CONTENT_BACKEND` (`git` default, or `native`) selects the backend when `--content-backend` is not passed to `forge init`.
+- `FORGE_CONTENT_BACKEND` (`git` or `native`) selects the backend when `--content-backend` is not passed to `forge init`. For release-candidate native workflows, prefer `forge init --content-backend native` explicitly.
 - Mutating commands accept `--request-id <id>` for idempotency: replaying the same id returns the original result; reusing it for a different command errors `REQUEST_ID_CONFLICT`.
-- Behavioral invariants that intentionally error: `restore` refuses a dirty worktree (`DIRTY_WORKTREE`); `accept` requires HEAD to still match the proposal's `base_head` (`STALE_BASE`); `gc` only supports `--dry-run` in v0; `export branch` requires an accepted proposal and a non-existent branch name.
+- Behavioral invariants that intentionally error: materializing commands (`restore`, `checkout`, `undo`, `attempt attach`, and `sync pull`) refuse a dirty worktree (`DIRTY_WORKTREE`); `accept` requires HEAD to still match the proposal's `base_head` (`STALE_BASE`); `gc` deletion requires a clean `doctor`, `--yes`, and `--plan-digest` from a prior dry-run; `export branch` requires an accepted proposal and a non-existent branch name.
 
 ## Security defaults (do not weaken without asking)
 
-Snapshots and exports exclude `.forge`, `.env`, `.env.*`, private-key files, and credential paths. Evidence stdout/stderr is capped at 4096 bytes (`EXCERPT_LIMIT`) and redacted when secret-like `key=value` patterns are detected before being stored.
+Snapshots and exports exclude `.forge`, `.env`, `.env.*`, private-key files, and credential paths. Evidence stdout/stderr is capped at 4096 bytes (`EXCERPT_LIMIT`) and redacted when secret-like assignments, high-entropy tokens, PEM blocks, JSON secrets, or credential URLs are detected before being stored.
+
+Evidence, decisions, native accepted commits, and sync merge commits carry local Ed25519 signatures. `forge doctor` verifies the tamper-evident ledger chain, native history, packs, and signatures. `forge trust policy` can require `locally_signed`, hosted-runner, or third-party trust before accept/export. Peer-imported signatures remain cryptographically verifiable but do not silently satisfy local, hosted-runner, or third-party policy.
 
 ## Plans, handoffs, and solutions
 
@@ -73,4 +83,4 @@ These conventions make the `ce-*` lifecycle's outputs durable so knowledge compo
 
 ## Memory directory
 
-Persistent agent memory lives at `/Users/skolte/.claude/projects/-Users-skolte-Github-Private-forge/memory/`; `MEMORY.md` is the index loaded into context each session.
+Persistent agent memory lives under `~/.claude/projects/<project-path-slug>/memory/`; `MEMORY.md` is the index loaded into context each session. Claude derives `<project-path-slug>` from the absolute repository path by replacing path separators with `-`, so the exact directory is machine/user specific and should not be hard-coded in repo docs.
