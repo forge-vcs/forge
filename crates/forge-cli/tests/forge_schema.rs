@@ -37,6 +37,7 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "UNSUPPORTED_CONTENT_BACKEND",
     "TRUST_POLICY_UNMET",
     "UNSUPPORTED_TRUST_LEVEL",
+    "UNSUPPORTED_STRUCTURED_GATE",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.

@@ -32,6 +32,8 @@ enum Command {
     Init(InitArgs),
     Start(IntentArgs),
     Attempt(AttemptArgs),
+    /// List intents or show one intent's declared gate spec + linked attempts.
+    Intent(IntentCommandArgs),
     Save(AttemptScopedArgs),
     Restore(RestoreArgs),
     Run(RunArgs),
@@ -220,6 +222,20 @@ enum AttemptCommand {
     },
     /// Compare competing attempts (per intent) on verified evidence + rank them.
     Compare(CompareArgs),
+}
+
+#[derive(Debug, Args)]
+struct IntentCommandArgs {
+    #[command(subcommand)]
+    command: IntentCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum IntentCommand {
+    /// List every intent with its title, derived status, gate spec, and attempt ids.
+    List,
+    /// Show one intent's title/text, derived status, declared gate spec, and attempt ids.
+    Show { intent_id: String },
 }
 
 #[derive(Debug, Args)]
@@ -513,6 +529,7 @@ fn main() -> ExitCode {
         Command::Init(args) => init_response(request_id, args),
         Command::Start(args) => start_response(request_id, args),
         Command::Attempt(args) => attempt_response(request_id, args),
+        Command::Intent(args) => intent_response(request_id, args),
         Command::Save(args) => save_response(request_id, args),
         Command::Restore(args) if !args.yes => structured_error(
             "restore",
@@ -603,7 +620,10 @@ fn command_from_args(args: &[String]) -> String {
         [] => "forge".to_string(),
         [command] => command.clone(),
         [command, subcommand, ..]
-            if matches!(command.as_str(), "export" | "attempt" | "proposal" | "sync") =>
+            if matches!(
+                command.as_str(),
+                "export" | "attempt" | "proposal" | "sync" | "intent"
+            ) =>
         {
             format!("{command} {subcommand}")
         }
@@ -629,6 +649,30 @@ fn request_id_from_args(args: &[String]) -> Option<String> {
 
 fn start_response(request_id: Option<String>, args: IntentArgs) -> ResponseEnvelope {
     command_result("start", request_id, |cwd, request_id| {
+        // Fail fast (NER-259) before any persistence: a `--require-tests-pass`
+        // (structured) gate reads the parsed `failed` count, so a program with no
+        // structured parser makes the gate structurally unsatisfiable (it could never
+        // resolve to pass). Tokenize each entry with the SAME `split_whitespace` rule the
+        // gate builder uses (`check_spec_json_from_requires`/`parse_gate`,
+        // forge-store/src/lib.rs) — first token = program, rest = args, whitespace-only
+        // entries dropped (no first token), so we never error on an entry the builder
+        // silently skips. Plain `--require` (exit-code) gates accept any program and are
+        // intentionally NOT validated here. Returning before persistence means no
+        // attempt/intent/worktree is created (a failed-operation row is still recorded by
+        // `command_result`'s mutating-error path — fail-fast, not side-effect-free).
+        for raw in &args.require_tests_pass {
+            let mut tokens = raw.split_whitespace();
+            let Some(program) = tokens.next() else {
+                continue;
+            };
+            let gate_args: Vec<String> = tokens.map(str::to_string).collect();
+            if !forge_evidence::parsers::has_structured_parser(program, &gate_args) {
+                return Err(ForgeError::UnsupportedStructuredGate {
+                    program: program.to_string(),
+                }
+                .into());
+            }
+        }
         let base_head = current_base(&cwd)?;
         // Persist declared check gates on the intent (NER-135); competing attempts
         // under this intent inherit the same bar. None => default mode.
@@ -737,6 +781,29 @@ fn attempt_response(request_id: Option<String>, args: AttemptArgs) -> ResponseEn
             })
         }
         AttemptCommand::Compare(args) => compare_response(request_id, "attempt compare", args),
+    }
+}
+
+/// `forge intent list` / `forge intent show <id>` (NER-257) — read-only views of an
+/// intent's declared gate spec + linked attempts, sourced from store accessors (no SQL
+/// in the CLI). `show` of an unknown id surfaces the typed `UnknownIntent`
+/// (`UNKNOWN_INTENT`). Gate program/args are already secret-redacted by the store.
+fn intent_response(request_id: Option<String>, args: IntentCommandArgs) -> ResponseEnvelope {
+    match args.command {
+        IntentCommand::List => command_result("intent list", request_id, |cwd, _| {
+            Ok((
+                None,
+                json!({ "intents": forge_store::intents_list(&cwd)? }),
+                Vec::new(),
+            ))
+        }),
+        IntentCommand::Show { intent_id } => command_result("intent show", request_id, |cwd, _| {
+            Ok((
+                None,
+                serde_json::to_value(forge_store::intent_detail(&cwd, &intent_id)?)?,
+                Vec::new(),
+            ))
+        }),
     }
 }
 

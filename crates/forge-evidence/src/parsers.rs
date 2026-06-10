@@ -8,13 +8,21 @@
 //! names a tool. When no parser matches or parsing fails, the result is `None` and
 //! the gate degrades to the exit-code verdict.
 //!
-//! **Scope (v0):** `cargo test` (libtest summary), `cargo clippy`, and
-//! `python -m unittest` (the unittest `TextTestRunner` summary) only. `pytest` is
-//! explicitly out of scope: its summary line has many variants (passed/failed/
-//! skipped/xfailed/xpassed/errors, plugin output, ANSI color) and is not a trivial
-//! single-regex parser — deferred to a follow-up (NER-258). A `python3` invocation
-//! that does NOT name `-m unittest` (e.g. `python3 script.py`, `python3 -m mymodule`)
-//! has no registered parser and degrades gracefully to `None` (exit-code verdict).
+//! **Scope (v0):** `cargo test` (libtest summary), `cargo clippy`,
+//! `python -m unittest` (the unittest `TextTestRunner` summary), and `pytest`
+//! (the bracketed `==== N passed, M failed … ====` summary line, NER-258) —
+//! either as the `pytest` basename or as `python -m pytest`. The pytest summary
+//! has many variants (passed/failed/skipped/xfailed/xpassed/errors, plugin
+//! output, ANSI color); it is parsed numeric-only by stripping ANSI codes and
+//! anchoring on the LAST bracketed summary line. A `python3` invocation that
+//! does NOT name `-m unittest`/`-m pytest` (e.g. `python3 script.py`,
+//! `python3 -m mymodule`) has no registered parser and degrades gracefully to
+//! `None` (exit-code verdict).
+//!
+//! [`has_structured_parser`] exposes the dispatch identity as a pure predicate
+//! (NER-259) so callers can reject a structurally-unsatisfiable structured gate
+//! before any command runs; it shares the same private classifier as
+//! [`parse_structured`] so the two cannot drift.
 //!
 //! The outcome is intentionally **numeric-only** — string fields (test names, file
 //! paths) could carry secrets and would have to route through the redactor, so they
@@ -47,6 +55,49 @@ pub struct StructuredOutcome {
     pub findings: Option<u64>,
 }
 
+/// The concrete parser a `(program, args)` identity dispatches to. Used as the single
+/// source of truth shared by [`parse_structured`] (which runs the matched parser) and
+/// [`has_structured_parser`] (which only needs to know one exists), so the predicate and
+/// the dispatcher can never disagree about which gates are structured-parseable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParserKind {
+    CargoTest,
+    CargoClippy,
+    PythonUnittest,
+    Pytest,
+}
+
+/// Classify a `(program, args)` invocation into a [`ParserKind`], or `None` when no
+/// structured parser is registered for it. This is the dispatch identity both
+/// [`parse_structured`] and [`has_structured_parser`] build on; keep it the only place
+/// that decides which invocations are structured-parseable.
+fn structured_dispatch(program: &str, args: &[String]) -> Option<ParserKind> {
+    let prog = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    if prog == "cargo" {
+        match args.first().map(String::as_str) {
+            Some("test") => return Some(ParserKind::CargoTest),
+            Some("clippy") => return Some(ParserKind::CargoClippy),
+            _ => {}
+        }
+    }
+    // A bare `pytest` basename routes to the pytest parser regardless of args.
+    if prog == "pytest" {
+        return Some(ParserKind::Pytest);
+    }
+    if is_python_interpreter(prog) {
+        // `python -m unittest` must be checked before `python -m pytest`; they are
+        // mutually exclusive in practice (a single `-m <tool>`), but ordering keeps the
+        // intent explicit. `python -m mymodule` / `python script.py` match neither.
+        if invokes_unittest(args) {
+            return Some(ParserKind::PythonUnittest);
+        }
+        if invokes_pytest(args) {
+            return Some(ParserKind::Pytest);
+        }
+    }
+    None
+}
+
 /// Dispatch to a tool-specific parser by `(program, args)` identity. Returns `None`
 /// when no parser matches or parsing fails (the gate then degrades to exit code).
 pub fn parse_structured(
@@ -55,18 +106,22 @@ pub fn parse_structured(
     stdout: &str,
     stderr: &str,
 ) -> Option<StructuredOutcome> {
-    let prog = program.rsplit(['/', '\\']).next().unwrap_or(program);
-    if prog == "cargo" {
-        match args.first().map(String::as_str) {
-            Some("test") => return parse_cargo_test(stdout, stderr),
-            Some("clippy") => return parse_cargo_clippy(stdout, stderr),
-            _ => {}
-        }
+    match structured_dispatch(program, args)? {
+        ParserKind::CargoTest => parse_cargo_test(stdout, stderr),
+        ParserKind::CargoClippy => parse_cargo_clippy(stdout, stderr),
+        ParserKind::PythonUnittest => parse_python_unittest(stdout, stderr),
+        ParserKind::Pytest => parse_python_pytest(stdout, stderr),
     }
-    if is_python_interpreter(prog) && invokes_unittest(args) {
-        return parse_python_unittest(stdout, stderr);
-    }
-    None
+}
+
+/// True iff a structured parser is registered for this `(program, args)` identity —
+/// i.e. [`parse_structured`] could (given recognizable output) return `Some`. Pure,
+/// numeric-only, and runs no command: it only inspects argv, so the same secret-safety
+/// scope as the rest of this module applies. Used at `forge start` (NER-259) to reject a
+/// `--require-tests-pass` gate whose program has no parser, which would otherwise be
+/// structurally unsatisfiable (the gate reads `failed`, which stays `None`).
+pub fn has_structured_parser(program: &str, args: &[String]) -> bool {
+    structured_dispatch(program, args).is_some()
 }
 
 /// A python interpreter basename: `python`, `python3`, or `python3.<minor>`
@@ -84,6 +139,13 @@ fn is_python_interpreter(prog: &str) -> bool {
 fn invokes_unittest(args: &[String]) -> bool {
     args.windows(2)
         .any(|pair| pair[0] == "-m" && pair[1] == "unittest")
+}
+
+/// True when the argv invokes pytest via an adjacent `["-m", "pytest"]` pair.
+/// `python3 -m mymodule` or `python3 script.py` do NOT match (no parser → `None`).
+fn invokes_pytest(args: &[String]) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == "-m" && pair[1] == "pytest")
 }
 
 fn cargo_test_regex() -> &'static Regex {
@@ -276,6 +338,143 @@ fn parse_unittest_stream(text: &str) -> Option<StructuredOutcome> {
     }
     // Footer present but no recognized OK/FAILED status line (truncated/garbled).
     None
+}
+
+/// Strip ANSI SGR/CSI escape sequences (`\x1b[…<letter>`) so a color-wrapped pytest
+/// summary line still matches. pytest emits color on a TTY (and some CI shims force it);
+/// the bracketed summary can be wrapped in `\x1b[32m…\x1b[0m`. No repo-wide ANSI helper
+/// exists, so this is local to the pytest path.
+fn ansi_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("valid ansi escape regex"))
+}
+
+/// Match a pytest final summary line: a body bracketed by runs of `=`, e.g.
+/// `==== 3 passed, 1 failed in 0.12s ====` or `==== no tests ran in 0.01s ====`.
+/// Captures the inner body (between the leading/trailing `=` runs) in group 1.
+///
+/// NOTE: this matches the *shape* of a bracketed line only. pytest emits many section
+/// headers with the same shape (`==== test session starts ====`, `==== FAILURES ====`,
+/// `==== warnings summary ====`, `==== short test summary info ====`). Those are NOT
+/// result summaries; [`parse_pytest_summary_body`] returns `None` for them so they
+/// cannot overwrite the real result line with all-zero counts (NER-258 adversarial).
+fn pytest_summary_line_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^=+\s+(.*?)\s+=+\s*$").expect("valid pytest summary line regex"))
+}
+
+/// Match the `no tests ran` body variant (pytest's summary when zero tests were
+/// collected, e.g. `no tests ran in 0.01s`). This is a *recognized* summary that
+/// carries no count words, so it must be distinguished from a section header (which is
+/// also count-word-free) when deciding whether a bracketed line is a real result line.
+fn pytest_no_tests_ran_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\bno tests ran\b").expect("valid pytest no-tests regex"))
+}
+
+/// Tolerant count scan over a pytest summary body: `(\d+) <word>` for each outcome word.
+/// pytest writes singular/plural (`1 error`/`2 errors`, `1 warning`/`2 warnings`), so the
+/// alternation covers both. Numeric-only — never captures node ids / test names.
+fn pytest_count_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(\d+)\s+(passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)")
+            .expect("valid pytest count regex")
+    })
+}
+
+/// Numeric outcome counts parsed from a single pytest summary body.
+#[derive(Default)]
+struct PytestCounts {
+    passed: u64,
+    failed: u64,
+    errors: u64,
+    skipped: u64,
+    xfailed: u64,
+    xpassed: u64,
+}
+
+/// Parse a `pytest` (or `python -m pytest`) run's structured outcome (NER-258).
+///
+/// pytest writes its real result summary to STDOUT, so STDOUT is authoritative: we take
+/// the LAST recognized result line on stdout and only fall back to stderr when stdout has
+/// none (a wrapper that merged/redirected streams). Scanning stderr as an equal stream
+/// would let any pytest-shaped line on stderr — a child subprocess's summary, a CI banner,
+/// a `pytest_terminal_summary` hook writing to stderr — shadow the real stdout result
+/// (NER-258 adversarial/correctness review). Within a stream we still keep the LAST
+/// recognized result line, because a child pytest can print its summary before the real
+/// one on the same stream (lesson a from the unittest parser).
+///
+/// Critically, only *result* lines update `last`: section headers (`==== FAILURES ====`,
+/// `==== warnings summary ====`, …) share the bracketed shape but carry no count words, so
+/// [`parse_pytest_summary_body`] returns `None` for them and they cannot overwrite a real
+/// result with all-zero counts. Returns `None` when neither stream has a recognizable
+/// result line — never a spoofable `failed: 0`.
+fn parse_python_pytest(stdout: &str, stderr: &str) -> Option<StructuredOutcome> {
+    let counts = last_pytest_result_counts(stdout).or_else(|| last_pytest_result_counts(stderr))?;
+    // Mapping (NER-258): a collection/setup error counts as a failure for the gate;
+    // skipped + xfailed are ignored; xpassed folds into passed best-effort.
+    let failed = counts.failed + counts.errors;
+    let passed = counts.passed + counts.xpassed;
+    let ignored = counts.skipped + counts.xfailed;
+    Some(StructuredOutcome {
+        passed: Some(passed),
+        failed: Some(failed),
+        ignored: (ignored > 0).then_some(ignored),
+        findings: None,
+    })
+}
+
+/// The counts from the LAST *recognized result* summary line in a single stream, or `None`
+/// when the stream has no result line. Strips ANSI first (lesson b) so a colored summary
+/// still matches; rejects section headers via [`parse_pytest_summary_body`].
+fn last_pytest_result_counts(raw: &str) -> Option<PytestCounts> {
+    let cleaned = ansi_re().replace_all(raw, "");
+    let summary_re = pytest_summary_line_regex();
+    let mut last: Option<PytestCounts> = None;
+    for line in cleaned.lines() {
+        if let Some(caps) = summary_re.captures(line.trim_end()) {
+            if let Some(counts) = parse_pytest_summary_body(&caps[1]) {
+                last = Some(counts);
+            }
+        }
+    }
+    last
+}
+
+/// Parse the count words out of a single bracketed pytest line's body, returning `Some`
+/// only when the body is a real *result* summary and `None` for a section header.
+///
+/// A real result line either carries at least one count word (`3 passed`, `1 failed`, …)
+/// or is the `no tests ran` variant. pytest's section headers (`test session starts`,
+/// `FAILURES`, `ERRORS`, `warnings summary`, `short test summary info`) share the
+/// bracketed shape but have neither, so they return `None` and never overwrite a real
+/// result with all-zero counts (NER-258 adversarial review).
+fn parse_pytest_summary_body(body: &str) -> Option<PytestCounts> {
+    let mut counts = PytestCounts::default();
+    let mut saw_count = false;
+    for caps in pytest_count_regex().captures_iter(body) {
+        let n = caps[1].parse::<u64>().unwrap_or(0);
+        match &caps[2] {
+            "passed" => counts.passed += n,
+            "failed" => counts.failed += n,
+            "error" | "errors" => counts.errors += n,
+            "skipped" => counts.skipped += n,
+            "xfailed" => counts.xfailed += n,
+            "xpassed" => counts.xpassed += n,
+            // `deselected` / `warnings` are recognized by the count regex but carry no
+            // pass/fail meaning, so they are intentionally not accumulated.
+            _ => {}
+        }
+        saw_count = true;
+    }
+    if saw_count {
+        return Some(counts);
+    }
+    // No count words: only the `no tests ran` variant is still a valid (all-zero) result;
+    // anything else with this shape is a section header → reject so it cannot clobber a
+    // real result line.
+    pytest_no_tests_ran_regex().is_match(body).then_some(counts)
 }
 
 #[cfg(test)]
@@ -535,5 +734,248 @@ mod tests {
         let summary = "Ran 1 test in 0.001s\n\nOK\n";
         assert!(parse_structured("python3", &args(&["script.py"]), "", summary).is_none());
         assert!(parse_structured("python3", &args(&["-m", "mymodule"]), "", summary).is_none());
+    }
+
+    // ---- pytest (NER-258) ----
+
+    #[test]
+    fn parses_all_passed_pytest_summary_via_basename_and_module() {
+        let out = "===================== 3 passed in 0.05s ======================\n";
+        // bare `pytest` basename
+        let outcome = parse_structured("pytest", &args(&[]), out, "").expect("parsed");
+        assert_eq!(outcome.passed, Some(3));
+        assert_eq!(outcome.failed, Some(0));
+        assert_eq!(outcome.ignored, None);
+        // `python3 -m pytest`
+        let outcome =
+            parse_structured("python3", &args(&["-m", "pytest"]), out, "").expect("parsed");
+        assert_eq!(outcome.passed, Some(3));
+        assert_eq!(outcome.failed, Some(0));
+        assert_eq!(outcome.ignored, None);
+    }
+
+    #[test]
+    fn parses_pytest_failures() {
+        let out = "================= 2 passed, 1 failed in 0.1s =================\n";
+        let outcome = parse_structured("pytest", &args(&[]), out, "").expect("parsed");
+        assert_eq!(outcome.failed, Some(1));
+        assert_eq!(outcome.passed, Some(2));
+    }
+
+    #[test]
+    fn pytest_errors_count_as_failures() {
+        // A collection/setup error must count as a failure for the gate.
+        let plural = "============= 1 passed, 2 errors in 0.1s ==============\n";
+        let outcome = parse_structured("pytest", &args(&[]), plural, "").expect("parsed");
+        assert_eq!(outcome.failed, Some(2));
+        assert_eq!(outcome.passed, Some(1));
+        // singular `1 error`
+        let singular = "============= 1 passed, 1 error in 0.1s ==============\n";
+        let outcome = parse_structured("pytest", &args(&[]), singular, "").expect("parsed");
+        assert_eq!(outcome.failed, Some(1));
+    }
+
+    #[test]
+    fn pytest_skipped_and_xfailed_are_ignored() {
+        let out = "========= 1 passed, 2 skipped, 1 xfailed in 0.1s =========\n";
+        let outcome = parse_structured("pytest", &args(&[]), out, "").expect("parsed");
+        assert_eq!(outcome.ignored, Some(3));
+        assert_eq!(outcome.passed, Some(1));
+        assert_eq!(outcome.failed, Some(0));
+    }
+
+    #[test]
+    fn pytest_xpassed_folds_into_passed() {
+        let out = "============= 1 passed, 1 xpassed in 0.1s ==============\n";
+        let outcome = parse_structured("pytest", &args(&[]), out, "").expect("parsed");
+        assert_eq!(outcome.passed, Some(2));
+        assert_eq!(outcome.failed, Some(0));
+    }
+
+    #[test]
+    fn pytest_no_tests_ran_is_recognized_and_distinct_from_none() {
+        let out = "==================== no tests ran in 0.01s ====================\n";
+        let outcome = parse_structured("pytest", &args(&[]), out, "").expect("parsed");
+        assert_eq!(outcome.passed, Some(0));
+        assert_eq!(outcome.failed, Some(0));
+        assert_eq!(outcome.ignored, None);
+    }
+
+    #[test]
+    fn pytest_ansi_colored_summary_still_parses() {
+        // pytest wraps the summary in color on a TTY; strip ANSI before matching.
+        let out = "\x1b[32m=========== 3 passed, 1 failed in 0.12s ===========\x1b[0m\n";
+        let outcome = parse_structured("pytest", &args(&[]), out, "").expect("parsed");
+        assert_eq!(outcome.passed, Some(3));
+        assert_eq!(outcome.failed, Some(1));
+    }
+
+    #[test]
+    fn pytest_unrecognized_output_degrades_to_none() {
+        // A traceback with no bracketed summary line → None (never a spoofable failed=0).
+        let out = "Traceback (most recent call last):\n  File \"x.py\", line 1\nSyntaxError\n";
+        assert!(parse_structured("pytest", &args(&[]), out, "").is_none());
+    }
+
+    #[test]
+    fn pytest_last_summary_wins_across_stream() {
+        // A child pytest subprocess prints its own FAILED summary before the real PASSED
+        // summary on the shared stream; the parser must read the LAST one.
+        let out = "==================== 1 failed in 0.01s ====================\n\
+                   ...more output...\n\
+                   ==================== 3 passed in 0.05s ====================\n";
+        let outcome = parse_structured("pytest", &args(&[]), out, "").expect("parsed");
+        assert_eq!(outcome.failed, Some(0));
+        assert_eq!(outcome.passed, Some(3));
+    }
+
+    #[test]
+    fn pytest_stdout_is_authoritative_over_stderr() {
+        // pytest writes its real result to stdout. A pytest-shaped summary on stderr
+        // (a child subprocess, a CI banner, a `pytest_terminal_summary` hook writing to
+        // stderr) must NOT shadow the real stdout result — stdout is authoritative, and
+        // stderr is consulted only when stdout has no result line. Here stdout reports the
+        // real FAILED result; an innocent PASSED summary on stderr must not override it
+        // (NER-258 adversarial/correctness review).
+        let stdout = "==================== 2 failed in 0.5s ====================\n";
+        let stderr = "==================== 5 passed in 0.1s ====================\n";
+        let outcome = parse_structured("pytest", &args(&[]), stdout, stderr).expect("parsed");
+        assert_eq!(
+            outcome.failed,
+            Some(2),
+            "real stdout failures must not be shadowed by a stderr summary"
+        );
+        assert_eq!(outcome.passed, Some(0));
+    }
+
+    #[test]
+    fn pytest_falls_back_to_stderr_when_stdout_has_no_summary() {
+        // A wrapper that redirects pytest's summary onto stderr (stdout carries no result
+        // line) must still be parsed — stderr is the fallback, not ignored.
+        let stdout = "collected 3 items\n";
+        let stderr = "==================== 3 passed in 0.05s ====================\n";
+        let outcome = parse_structured("pytest", &args(&[]), stdout, stderr).expect("parsed");
+        assert_eq!(outcome.failed, Some(0));
+        assert_eq!(outcome.passed, Some(3));
+    }
+
+    #[test]
+    fn pytest_section_header_after_result_does_not_clobber_to_zero() {
+        // NER-258 adversarial/high: pytest emits bracketed *section headers* (FAILURES,
+        // warnings summary, short test summary info) that share the summary line shape but
+        // carry no count words. If one appears AFTER the real result line — e.g. a
+        // `pytest_terminal_summary` hook or a plugin re-prints a header last — it must NOT
+        // overwrite the real result with all-zero counts (a silent failed=0 false pass).
+        let out = "===================== 3 failed in 0.52s =====================\n\
+                   ===================== warnings summary ======================\n\
+                   some warning text\n\
+                   ================== short test summary info ===================\n\
+                   FAILED test_x.py::test_a\n";
+        let outcome = parse_structured("pytest", &args(&[]), out, "").expect("parsed");
+        assert_eq!(
+            outcome.failed,
+            Some(3),
+            "a trailing section header must not clobber the real result to failed=0"
+        );
+    }
+
+    #[test]
+    fn pytest_section_header_on_stderr_does_not_clobber_stdout_result() {
+        // The most direct over-block path from the review: the real failing result is on
+        // stdout; a bracketed section header (count-word-free) lands on stderr after it.
+        // Because stdout is authoritative AND section headers are rejected, the real
+        // result survives either way.
+        let stdout = "===================== 3 failed in 0.52s =====================\n";
+        let stderr = "===================== warnings summary ======================\n";
+        let outcome = parse_structured("pytest", &args(&[]), stdout, stderr).expect("parsed");
+        assert_eq!(outcome.failed, Some(3));
+    }
+
+    #[test]
+    fn pytest_session_start_header_is_not_a_result() {
+        // `==== test session starts ====` is a header, not a result. On its own (no real
+        // result line anywhere) it must degrade to None, never a spoofable failed=0.
+        let out = "================= test session starts =================\n\
+                   collected 0 items\n";
+        assert!(parse_structured("pytest", &args(&[]), out, "").is_none());
+    }
+
+    #[test]
+    fn pytest_shaped_output_under_unittest_or_plain_python_does_not_route_to_pytest() {
+        // `python3 -m unittest …` routes to the unittest arm even if pytest-shaped text
+        // is present; `python3 script.py` with pytest-shaped output has no parser → None.
+        let unittest_out = "Ran 2 tests in 0.001s\n\nOK\n";
+        let outcome = parse_structured(
+            "python3",
+            &args(&["-m", "unittest", "test_mod"]),
+            "",
+            unittest_out,
+        )
+        .expect("unittest parsed");
+        assert_eq!(outcome.failed, Some(0));
+        let pytest_shaped = "==================== 5 passed in 0.05s ====================\n";
+        assert!(parse_structured("python3", &args(&["script.py"]), pytest_shaped, "").is_none());
+    }
+
+    // ---- has_structured_parser predicate (NER-259) ----
+
+    #[test]
+    fn has_structured_parser_true_for_registered_gates() {
+        assert!(has_structured_parser("cargo", &args(&["test"])));
+        assert!(has_structured_parser("cargo", &args(&["clippy"])));
+        assert!(has_structured_parser(
+            "python3",
+            &args(&["-m", "unittest", "m"])
+        ));
+        assert!(has_structured_parser("pytest", &args(&[])));
+        assert!(has_structured_parser("python3", &args(&["-m", "pytest"])));
+        // basename is taken from the path, so a fully-qualified path still routes.
+        assert!(has_structured_parser(
+            "/usr/bin/python3.11",
+            &args(&["-m", "pytest"])
+        ));
+        assert!(has_structured_parser("/usr/local/bin/pytest", &args(&[])));
+    }
+
+    #[test]
+    fn has_structured_parser_false_for_unregistered_gates() {
+        assert!(!has_structured_parser("python3", &args(&["script.py"])));
+        assert!(!has_structured_parser(
+            "python3",
+            &args(&["-m", "mymodule"])
+        ));
+        assert!(!has_structured_parser("cargo", &args(&["build"])));
+        assert!(!has_structured_parser("./my_script", &args(&["--run"])));
+        assert!(!has_structured_parser("python3", &args(&[])));
+    }
+
+    #[test]
+    fn predicate_agrees_with_dispatcher_on_a_matrix() {
+        // The predicate must never claim a parser the dispatcher lacks, nor vice-versa.
+        // A representative matrix of (program, args); for each, `has_structured_parser`
+        // must equal `structured_dispatch(...).is_some()` (the dispatch identity both are
+        // built on). We assert against the underlying classifier directly.
+        let cases: &[(&str, Vec<String>)] = &[
+            ("cargo", args(&["test"])),
+            ("cargo", args(&["clippy"])),
+            ("cargo", args(&["build"])),
+            ("cargo", args(&[])),
+            ("pytest", args(&[])),
+            ("pytest", args(&["-q"])),
+            ("python3", args(&["-m", "unittest", "m"])),
+            ("python3", args(&["-m", "pytest"])),
+            ("python3", args(&["-m", "mymodule"])),
+            ("python3", args(&["script.py"])),
+            ("python3", args(&[])),
+            ("/usr/bin/python3.11", args(&["-m", "pytest"])),
+            ("./my_script", args(&["--run"])),
+        ];
+        for (program, argv) in cases {
+            assert_eq!(
+                has_structured_parser(program, argv),
+                structured_dispatch(program, argv).is_some(),
+                "predicate/dispatcher disagree for {program} {argv:?}"
+            );
+        }
     }
 }
