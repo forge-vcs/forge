@@ -1,7 +1,7 @@
 # Phase 9 Release Audit
 
 Date: 2026-06-10
-Audited commit: `d53986a docs: prepare P9 release dogfood gate`
+Audited commit: `9d7a33c docs: add public release notes`
 
 This document maps the Phase 9 roadmap exit criteria to current executable
 evidence. It is intentionally stricter than a status note: an item is marked
@@ -15,7 +15,7 @@ The release gate is:
 rtk bash scripts/dogfood-release-gate.sh
 ```
 
-Latest local run on `d53986a` passed:
+Latest local run on `9d7a33c` passed:
 
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
