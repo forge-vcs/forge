@@ -11,6 +11,7 @@ use forge_protocol::{
 use forge_store::ForgeError;
 use serde_json::{json, Value};
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -329,7 +330,10 @@ struct SyncCloneArgs {
 
 #[derive(Debug, Args)]
 struct SyncPeerArgs {
-    remote: std::path::PathBuf,
+    /// Peer repository locator. Supports a local path today; file:// URLs are
+    /// accepted as URL-shaped local remotes so later ssh/https transport can
+    /// extend the same argument without changing the command surface.
+    remote: OsString,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1448,14 +1452,89 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
             }
         }
         SyncCommand::Fetch(args) => command_result("sync fetch", request_id, |cwd, request_id| {
-            sync_fetch_peer(&cwd, request_id, &args.remote, false)
+            let remote = SyncPeerRemote::parse(&args.remote)?;
+            sync_fetch_peer(&cwd, request_id, &remote.path, false)
         }),
         SyncCommand::Pull(args) => command_result("sync pull", request_id, |cwd, request_id| {
-            sync_fetch_peer(&cwd, request_id, &args.remote, true)
+            let remote = SyncPeerRemote::parse(&args.remote)?;
+            sync_fetch_peer(&cwd, request_id, &remote.path, true)
         }),
         SyncCommand::Push(args) => command_result("sync push", request_id, |cwd, request_id| {
-            sync_push_peer(&cwd, request_id, &args.remote)
+            let remote = SyncPeerRemote::parse(&args.remote)?;
+            sync_push_peer(&cwd, request_id, &remote.path)
         }),
+    }
+}
+
+struct SyncPeerRemote {
+    path: PathBuf,
+}
+
+impl SyncPeerRemote {
+    fn parse(raw: &OsStr) -> Result<Self> {
+        let Some(raw) = raw.to_str() else {
+            return Ok(Self {
+                path: PathBuf::from(raw),
+            });
+        };
+        if let Some((scheme, rest)) = raw.split_once("://") {
+            if scheme != "file" {
+                anyhow::bail!(
+                    "unsupported sync remote scheme {scheme}; supported schemes: local path, file"
+                );
+            }
+            return Ok(Self {
+                path: file_url_path(rest)?,
+            });
+        }
+        Ok(Self {
+            path: PathBuf::from(raw),
+        })
+    }
+}
+
+fn file_url_path(rest: &str) -> Result<PathBuf> {
+    let path = if let Some(path) = rest.strip_prefix("localhost/") {
+        format!("/{path}")
+    } else if rest.starts_with('/') {
+        rest.to_string()
+    } else {
+        anyhow::bail!("file sync remote must use an absolute path");
+    };
+    Ok(PathBuf::from(percent_decode_file_url_path(&path)?))
+}
+
+fn percent_decode_file_url_path(path: &str) -> Result<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hi = bytes
+                .get(index + 1)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("file sync remote has incomplete percent escape"))?;
+            let lo = bytes
+                .get(index + 2)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("file sync remote has incomplete percent escape"))?;
+            let value = (hex_value(hi)? << 4) | hex_value(lo)?;
+            out.push(value);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).context("file sync remote path is not valid UTF-8")
+}
+
+fn hex_value(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => anyhow::bail!("file sync remote has invalid percent escape"),
     }
 }
 

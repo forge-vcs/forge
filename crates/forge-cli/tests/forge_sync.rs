@@ -150,6 +150,10 @@ fn set_expected_content_ref_for_test(repo_path: &std::path::Path, content_ref: &
     .expect("set expected content ref");
 }
 
+fn file_url_for_test(path: &std::path::Path) -> String {
+    format!("file://{}", path.display())
+}
+
 fn cloned_peer_from_bundle(bundle_path: &std::path::Path) -> tempfile::TempDir {
     let peer_dir = tempfile::tempdir().expect("peer dir");
     forge_in(peer_dir.path())
@@ -1461,6 +1465,144 @@ fn sync_fetch_fast_forward_request_id_replays_locally() {
     assert!(
         !fetch_peer.path().join("two.txt").exists(),
         "fetch replay must not materialize or import the later remote worktree"
+    );
+}
+
+#[test]
+fn sync_peer_commands_accept_file_url_remotes() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source.path().join("target/forge-sync-file-url-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path.to_str().expect("utf8 file url base path"),
+        ])
+        .assert()
+        .success();
+    let source_url = file_url_for_test(source.path());
+
+    native_accept_file_change(
+        &source,
+        "file url fetch source",
+        "source-ff.txt",
+        "source\n",
+    );
+    let fetch_peer = cloned_peer_from_bundle(&bundle_path);
+    let fetched = json(
+        forge_in(fetch_peer.path())
+            .args(["--json", "sync", "fetch", &source_url])
+            .assert()
+            .success(),
+    );
+    assert_eq!(fetched["data"]["direction"], "fetch");
+    assert_eq!(fetched["data"]["materialized"], false);
+    assert_eq!(
+        export_native_head(fetch_peer.path(), "file-url-fetch-head.json")["data"]["native_head"],
+        fetched["data"]["remote_native_head"],
+        "file-url fetch should advance native history"
+    );
+
+    let clean_source = TestRepo::new_git();
+    native_accepted_lifecycle(&clean_source);
+    let clean_bundle_path = clean_source
+        .path()
+        .join("target/forge-sync-file-url-clean-base.json");
+    clean_source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            clean_bundle_path.to_str().expect("utf8 clean base path"),
+        ])
+        .assert()
+        .success();
+    let clean_source_url = file_url_for_test(clean_source.path());
+    native_accept_file_change(
+        &clean_source,
+        "file url pull source",
+        "source-only.txt",
+        "source\n",
+    );
+
+    let pull_peer = cloned_peer_from_bundle(&clean_bundle_path);
+    native_accept_file_change_in(
+        pull_peer.path(),
+        "file url pull peer",
+        "peer-only.txt",
+        "peer\n",
+    );
+    let pulled = json(
+        forge_in(pull_peer.path())
+            .args(["--json", "sync", "pull", &clean_source_url])
+            .assert()
+            .success(),
+    );
+    assert_eq!(pulled["data"]["merged"], true);
+    assert_eq!(pulled["data"]["materialized"], true);
+    assert_eq!(
+        std::fs::read_to_string(pull_peer.path().join("source-only.txt"))
+            .expect("file-url pull source content"),
+        "source\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(pull_peer.path().join("peer-only.txt"))
+            .expect("file-url pull peer content"),
+        "peer\n"
+    );
+
+    let push_peer = cloned_peer_from_bundle(&clean_bundle_path);
+    native_accept_file_change_in(
+        push_peer.path(),
+        "file url push peer",
+        "pushed-only.txt",
+        "peer\n",
+    );
+    let pushed = json(
+        forge_in(push_peer.path())
+            .args(["--json", "sync", "push", &clean_source_url])
+            .assert()
+            .success(),
+    );
+    assert_eq!(pushed["data"]["direction"], "push");
+    assert_eq!(pushed["data"]["merged"], true);
+    assert_eq!(pushed["data"]["materialized"], false);
+    assert_eq!(
+        export_native_head(clean_source.path(), "file-url-push-head.json")["data"]["native_head"],
+        pushed["data"]["merge_commit_id"],
+        "file-url push should advance the remote native head to the merge commit"
+    );
+    assert!(
+        !clean_source.path().join("pushed-only.txt").exists(),
+        "file-url push should not materialize the remote worktree"
+    );
+}
+
+#[test]
+fn sync_peer_commands_reject_unsupported_remote_scheme() {
+    let repo = TestRepo::new_git();
+    native_accepted_lifecycle(&repo);
+
+    let failed = json(
+        repo.forge()
+            .args(["--json", "sync", "fetch", "ssh://example.test/repo"])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(failed["status"], "error");
+    assert_eq!(failed["errors"][0]["code"], "COMMAND_FAILED");
+    assert!(
+        failed["errors"][0]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("unsupported sync remote scheme ssh"),
+        "unsupported scheme should fail clearly"
     );
 }
 
