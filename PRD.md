@@ -480,7 +480,7 @@ Recommended v0 approach:
 - Large evidence payloads and optional auxiliary content blobs are stored separately as content-addressed files.
 - Diagnostic commands render objects as JSON for humans and agents.
 - A small line-based text format may be used for local config and policy if it remains simple and versioned.
-- Native snapshot content uses deterministic versioned loose blob/tree payloads with SHA-256 identity. A canonical binary object format, packfiles, compression, and remote sync are deferred until the loose-object boundary is proven.
+- Native snapshot content uses deterministic versioned blob/tree/commit payloads with SHA-256 identity. The current native backend includes history refs, diff/merge, pack/index storage, garbage collection, and Forge sync; Git export remains an interop adapter.
 
 Human-readable `.forge` is less important than inspectable `.forge`. `forge inspect` can provide human-readable views without making the storage format fragile.
 
@@ -1203,7 +1203,7 @@ The hosted platform should not be "GitHub but Rust." It should be "review and sa
 - `forge-evidence`: command capture and evidence records.
 - `forge-policy`: check policy and results.
 - `forge-export-git`: Git branch/commit/PR-body export boundary.
-- `forge-sync`: reserved for future remote protocol shape; stubbed in v0.
+- `forge-sync`: versioned native sync manifests and peer clone/fetch/pull/push transport for native content plus allowlisted ledger rows.
 - `forge-test-support`: crash/recovery and fixture helpers.
 
 Keep core domain types independent from the Git adapter.

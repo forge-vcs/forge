@@ -1,86 +1,179 @@
 # Forge
 
-Agent-first local change control for existing Git repositories.
+Agent-native source control for checked change attempts.
 
-Forge v0 is a Rust CLI that records a local agent-work lifecycle:
+Forge is a Rust CLI that records the lifecycle around an agent or human change:
 
 ```text
-init -> start -> save -> run -> propose -> check -> accept -> export branch
+init -> start -> save -> run -> propose -> check -> accept -> sync/export
 ```
 
-The current implementation stores lifecycle metadata in `.forge/forge.db` and
-emits stable JSON envelopes for agent use with `--json`. Repositories default to
-Git tree objects as the content backend, but `forge init --content-backend native`
-stores snapshots as Forge-native loose objects under `.forge/objects` while
-still exporting accepted proposals to Git branches for existing PR workflows.
+It keeps source snapshots, evidence, policy checks, decisions, native history,
+and publication provenance in a local `.forge` repository. Every command can
+emit a stable JSON envelope with `--json`, so agents can branch on typed data
+instead of scraping terminal text.
+
+Forge still interoperates with Git: accepted proposals can be exported to Git
+branches with structured `Forge-*` provenance trailers. The native backend now
+also supports Forge-owned content storage, history, diff/merge, garbage
+collection, pack/index storage, and native peer sync.
+
+## Why Forge Exists
+
+Git is excellent at storing commits. It is not designed around agent workflows
+where several attempts compete under one intent, each attempt carries command
+evidence, and a reviewer wants to accept or publish only the checked proposal.
+
+Forge makes those concepts first-class:
+
+- intents, attempts, snapshots, proposals, evidence, checks, decisions, and
+  publications are durable ledger records
+- checks are bound to the exact proposal revision they evaluated
+- compare/rank surfaces competing attempts by evidence and diff, not by branch
+  naming convention
+- accepted native commits carry the proposal, decision, actor, and evidence
+  digest that justified them
+- sync transfers native content plus the ledger rows needed to review the same
+  evidence on another machine
 
 ## Safety Defaults
 
 - Snapshots and exported branches exclude `.forge`, `.env`, `.env.*`, private
   keys, credential files, and obvious secret-risk paths.
-- Evidence excerpts redact common token, password, secret, and key assignments
-  before JSON output or SQLite persistence. Redacted evidence is marked
-  `secret_risk`.
+- Evidence excerpts redact common token, password, secret, key, PEM, credential
+  URL, and high-entropy values before JSON output or SQLite persistence.
 - `forge run` caps captured stdout/stderr excerpts and defaults to a 30 second
   timeout. Use `forge run --timeout-ms <n> -- <command>` for a shorter local
   bound.
-- `forge restore <snapshot-id> --yes` refuses unsaved dirty work. Restoring
-  between saved snapshots materializes the target snapshot and removes files
-  absent from that snapshot, except protected Forge/secret-risk paths.
-- `forge attempt attach <attempt-id>` uses the same dirty-worktree refusal and
-  materializes the attempt's latest snapshot, or its base revision if it has no
-  snapshots yet.
+- `forge restore`, `forge checkout`, `forge undo`, `forge attempt attach`, and
+  materializing sync commands refuse unsaved dirty work before overwriting the
+  worktree.
 - Mutating `--request-id` values are scoped to the command and replay the
   original success or failure. Reusing one for a different mutating command
   returns `REQUEST_ID_CONFLICT`.
-- Checks, decisions, branch exports, and PR body context are bound to the exact
-  proposal revision being reviewed or published.
-- When multiple active attempts or proposals are possible, pass explicit
-  `--attempt <id>` and `--proposal <id>`. Ambiguous commands return typed JSON
-  errors instead of choosing global latest state.
+- Repository writes use a local advisory lock, SQLite WAL, typed errors, and
+  crash-tested store-before-ledger ordering.
+- Evidence, decisions, and native commits are tamper-evident and locally signed;
+  `forge doctor` verifies the ledger chain, native DAG, object store, packs, and
+  signatures.
+- Trust policy can require `locally_signed`, `hosted_runner_signed`, or
+  `third_party_attested` signatures before accept/export.
 
-## Current Commands
+## Common Workflow
 
-- `forge init`
-- `forge init --content-backend native`
-- `forge start <intent>`
-- `forge attempt start --intent <intent-id>`
-- `forge attempt list`
-- `forge attempt show <attempt-id>`
-- `forge attempt attach <attempt-id>`
-- `forge save [--attempt <id>]`
-- `forge restore <snapshot-id> --yes`
-- `forge run [--attempt <id>] [--timeout-ms <n>] -- <command>`
-- `forge propose [--attempt <id>]`
-- `forge show [--attempt <id>]`
-- `forge proposal list [--attempt <id>]`
-- `forge check [--attempt <id>] [--proposal <id>]`
-- `forge accept [--attempt <id>] [--proposal <id>]`
-- `forge reject [--attempt <id>] [--proposal <id>]`
-- `forge doctor`
-- `forge gc --dry-run`
-- `forge export branch [--attempt <id>] [--proposal <id>] <name>`
-- `forge export pr-body [--attempt <id>] [--proposal <id>]`
+```bash
+forge init --content-backend native
+forge start "implement the billing retry fix" --require "cargo test"
 
-`forge start <intent>` remains the simple path: it creates a new intent, creates
-one attempt, and attaches it to the current checkout. `forge attempt start
---intent <intent-id>` creates another attempt under an existing intent without
-materializing it; use `forge attempt attach <attempt-id>` to move the checkout
-between competing attempts.
+# edit files
+forge save
+forge run -- cargo test
+forge propose
+forge check
+forge accept
+```
 
-## Native Content Backend
+To publish into an existing Git workflow:
 
-Native mode writes immutable `f1:<type>:sha256:<digest>` blob and tree objects
-under `.forge/objects/sha256`. It supports regular files, directory structure,
-executable bits where available, exact restore, doctor integrity checks, and
-`forge gc --dry-run` reachability reporting. It intentionally does not implement
-packfiles, compression, remote sync, semantic merge, symlink/submodule handling,
-or automatic snapshots yet.
+```bash
+forge export branch forge/billing-retry
+forge export verify-branch forge/billing-retry
+```
+
+To compare competing attempts under one intent:
+
+```bash
+forge attempt start --intent <intent-id>
+forge attempt attach <attempt-id>
+# edit, save, run, propose
+forge compare --intent <intent-id>
+```
+
+## Native Sync
+
+Native sync moves Forge history and ledger provenance between Forge repositories:
+
+```bash
+forge sync clone ./bundle.forge-sync.json
+forge sync fetch /path/to/peer
+forge sync pull file:///absolute/path/to/peer
+forge sync push ssh://host/absolute/path/to/peer
+```
+
+Supported transports:
+
+- local paths
+- `file://` URLs
+- `ssh://host/absolute/path`
+- `https://` endpoints exposing `forge sync serve`
+
+Fast-forward sync imports native object payloads and allowlisted ledger rows.
+Clean divergent peers create native merge commits. True conflicts are persisted
+as typed conflict-as-data records that can be inspected and resolved through the
+Forge contract instead of being flattened into a text-only merge failure.
+
+## Trust and Attestation
+
+Forge records local Ed25519 signatures for new evidence, accepted decisions, and
+native accepted commits. The trust ladder exposed by `forge trust policy` is:
+
+- `self_reported`
+- `locally_observed`
+- `locally_signed`
+- `hosted_runner_observed`
+- `hosted_runner_signed`
+- `third_party_attested`
+
+Hosted-runner and third-party trust are explicit issuer-key attestations over a
+proposal's current evidence subjects:
+
+```bash
+forge trust attest hosted-runner --proposal <proposal-id> --key runner.pk8
+forge trust attest third-party --proposal <proposal-id> --key auditor.pk8
+forge trust policy --accept locally_signed --export third_party_attested
+```
+
+Peer-imported signatures remain cryptographically verifiable, but they do not
+silently satisfy local, hosted-runner, or third-party policy.
+
+## Current Command Groups
+
+- lifecycle: `init`, `start`, `save`, `run`, `propose`, `check`, `accept`,
+  `reject`, `show`
+- attempts and review: `attempt start`, `attempt list`, `attempt show`,
+  `attempt attach`, `compare`, `attempt compare`
+- worktree/history: `restore`, `checkout`, `log`, `undo`
+- native merge: `merge`, `conflict list`, `conflict show`,
+  `conflict suggest`, `conflict resolve`
+- maintenance: `doctor`, `gc`
+- trust: `key status`, `key rotate`, `trust policy`,
+  `trust attest hosted-runner`, `trust attest third-party`
+- sync: `sync export`, `sync inspect`, `sync import`, `sync clone`,
+  `sync fetch`, `sync pull`, `sync push`, `sync serve`
+- Git interop: `export branch`, `export pr-body`, `export verify-branch`
+- contract: `schema`
+
+Run `forge schema --json` for the machine-readable command shapes, error
+registry, and provenance notes.
 
 ## Development
+
+The repository uses `rtk` in local automation. Public contributors can run the
+same commands directly if `rtk` is not installed.
 
 ```bash
 rtk cargo fmt --all --check
 rtk cargo test --workspace
 rtk cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+The release dogfood gate aggregates the core local, native, sync, storage, and
+attestation checks:
+
+```bash
+rtk bash scripts/dogfood-release-gate.sh
+```
+
+## License
+
+Forge is licensed under the MIT License. See [LICENSE](LICENSE).
