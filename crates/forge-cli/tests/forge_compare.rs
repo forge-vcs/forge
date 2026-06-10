@@ -112,9 +112,29 @@ fn compare_ranks_passing_attempt_above_failing_one() {
     let rank1 = attempts.iter().find(|a| a["rank"] == 1).unwrap();
     assert_eq!(rank1["attempt_id"], attempt_b);
     assert_eq!(rank1["check_status"], "passed");
+    assert!(
+        rank1["rank_reason"]
+            .as_str()
+            .unwrap()
+            .contains("all required gates passing"),
+        "rank1 reason: {}",
+        rank1["rank_reason"]
+    );
     let rank2 = attempts.iter().find(|a| a["rank"] == 2).unwrap();
     assert_eq!(rank2["attempt_id"], attempt_a);
     assert_eq!(rank2["check_status"], "failed");
+    // NER-256: gates did NOT tie here (B passed), so the non-passing attempt's reason must
+    // say "required gates not satisfied", NOT "gates tie" — the latter would falsely claim
+    // equal gate status to a consumer parsing rank_reason.
+    let rank2_reason = rank2["rank_reason"].as_str().unwrap();
+    assert!(
+        rank2_reason.contains("required gates not satisfied"),
+        "rank2 reason should report gates-not-satisfied, not a tie: {rank2_reason}"
+    );
+    assert!(
+        !rank2_reason.contains("gates tie"),
+        "rank2 must not claim a gate tie when a passing attempt outranked it: {rank2_reason}"
+    );
 }
 
 #[test]

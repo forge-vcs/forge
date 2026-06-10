@@ -569,6 +569,14 @@ pub struct ResolvedAttempt {
 #[derive(Debug, Clone)]
 pub struct ResolvedProposal {
     pub proposal: ProposalSummary,
+    /// The attempt that OWNS this proposal. When an explicit `--proposal` id is
+    /// supplied, the proposal is resolved globally by id and this attempt is derived
+    /// from `proposal.attempt_id` (NER-260) — it is NOT necessarily the caller's
+    /// currently-attached/resolved attempt. Downstream gate evaluation and commit
+    /// metadata MUST use this attempt so a cross-attempt `--proposal` is judged and
+    /// recorded under its own intent. For the no-`--proposal` default branch this is
+    /// the caller-resolved attempt, unchanged.
+    pub attempt: AttemptRecord,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1002,8 +1010,11 @@ fn attest_external(
     issuer: &str,
     kind: ExternalAttestationKind<'_>,
 ) -> Result<HostedRunnerAttestation> {
-    let attempt = resolve_attempt_in_context(context, attempt_id)?.attempt;
-    let proposal = resolve_proposal(context, &attempt.attempt_id, proposal_id, true)?.proposal;
+    let resolved_attempt = resolve_attempt_in_context(context, attempt_id)?.attempt;
+    // NER-260: derive the owning attempt from an explicit `--proposal` (the proposal's
+    // revision is what gets attested), mirroring the other resolve_proposal callers.
+    let resolved = resolve_proposal(context, &resolved_attempt, proposal_id, true)?;
+    let proposal = resolved.proposal;
     let signer = signing::ExternalAttestationSigner::load_from_pkcs8(key_path)?;
     let mut connection = open_connection(&context.database_path)?;
     let created = now_ms();
@@ -1899,10 +1910,21 @@ fn create_attempt(
                 command: command.to_string(),
                 kind: "attempt_started".to_string(),
                 view_kind: ViewKind::Initialized,
+                // NER-255: mirror the success `data` into the op view state for
+                // idempotent replay (see save_snapshot for the rationale). `operation_id`
+                // is overlaid on replay; `current_view_id` is omitted (minted by this
+                // insert). The lifecycle/id keys stay siblings for existing json_extracts.
                 state: json!({
                     "lifecycle": "attempt_active",
                     "attempt_id": attempt_id,
-                    "intent_id": intent_id
+                    "intent_id": intent_id,
+                    "replay_data": {
+                        "intent_id": intent_id,
+                        "attempt_id": attempt_id,
+                        "base_head": base_head,
+                        "attached": attach,
+                        "workspace_path": workspace_rel_path_for_attempt(&attempt_id),
+                    }
                 }),
             },
         )?;
@@ -1973,10 +1995,26 @@ pub fn save_snapshot(
                 command: "save".to_string(),
                 kind: "snapshot_saved".to_string(),
                 view_kind: ViewKind::Initialized,
+                // NER-255: persist the success `data` payload (minus operation_id /
+                // current_view_id, which are minted by this very insert) into the op
+                // view state so an idempotent replay can return the ORIGINAL ids instead
+                // of just {idempotent_replay, request_id}. The existing lifecycle/id keys
+                // are kept as siblings (other code json_extracts $.lifecycle,
+                // $.snapshot_id, $.attempt_id) — `replay_data` is added alongside, never
+                // nesting them. `operation_id` is overlaid on replay from the op row;
+                // `current_view_id` is intentionally omitted (not known until after this
+                // insert, and not crash-recovery-critical).
                 state: json!({
                     "lifecycle": "snapshot_saved",
                     "attempt_id": attempt.attempt_id,
-                    "snapshot_id": snapshot_id
+                    "snapshot_id": snapshot_id,
+                    "replay_data": {
+                        "snapshot_id": snapshot_id,
+                        "attempt_id": attempt.attempt_id,
+                        "parent_snapshot_id": parent_snapshot_id,
+                        "content_ref": content_ref,
+                        "changed_paths": changed_paths,
+                    }
                 }),
             },
         )?;
@@ -2921,7 +2959,22 @@ pub fn propose(
                 command: "propose".to_string(),
                 kind: "proposal_created".to_string(),
                 view_kind: ViewKind::Initialized,
-                state: json!({ "lifecycle": "proposal_draft", "proposal_id": proposal_id }),
+                // NER-255: persist the success `data` payload for idempotent replay
+                // (operation_id is overlaid on replay). The lifecycle/proposal_id keys
+                // stay siblings for existing readers; `replay_data` is added alongside.
+                state: json!({
+                    "lifecycle": "proposal_draft",
+                    "proposal_id": proposal_id,
+                    "replay_data": {
+                        "proposal_id": proposal_id,
+                        "proposal_revision_id": revision_id,
+                        "attempt_id": attempt.attempt_id,
+                        "snapshot_id": snapshot.snapshot_id,
+                        "base_head": attempt.base_head,
+                        "content_ref": snapshot.content_ref,
+                        "changed_paths": snapshot.changed_paths,
+                    }
+                }),
             },
         )?;
         Ok((proposal_id, revision_id, snapshot, op))
@@ -2945,8 +2998,13 @@ pub fn record_check(
     proposal_id: Option<&str>,
 ) -> Result<CheckRecord> {
     let context = open_repository(cwd)?;
-    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
-    let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
+    let resolved_attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    // NER-260: an explicit `--proposal` checks the proposal under its OWNING attempt's
+    // intent (evidence is read from that attempt's snapshot), not the caller's attached
+    // attempt — so the verdict matches the intent the proposal targets.
+    let resolved = resolve_proposal(&context, &resolved_attempt, proposal_id, true)?;
+    let proposal = resolved.proposal;
+    let attempt = resolved.attempt;
     let mut connection = open_connection(&context.database_path)?;
     let (check_result_id, outcome, evidence_id, op) = with_immediate_retry(
         &mut connection,
@@ -3284,8 +3342,15 @@ pub fn decide(
     actor: &str,
 ) -> Result<DecisionRecord> {
     let context = open_repository(cwd)?;
-    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
-    let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
+    let resolved_attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    // NER-260: with an explicit `--proposal`, the OWNING attempt (and thus the intent
+    // whose gate spec is evaluated and whose id is stamped into the native commit) is
+    // derived from the proposal, NOT the caller's attached attempt. Rebind `attempt` to
+    // the proposal's owning attempt so `evaluate_check_on` and `CommitObject.intent_id`
+    // below use the correct intent.
+    let resolved = resolve_proposal(&context, &resolved_attempt, proposal_id, true)?;
+    let proposal = resolved.proposal;
+    let attempt = resolved.attempt;
     let signer = signing::LocalSigner::load_or_create(&context.root_path)?;
     let mut connection = open_connection(&context.database_path)?;
 
@@ -4019,7 +4084,9 @@ pub fn exportable_proposal(
 ) -> Result<ProposalSummary> {
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
-    Ok(resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal)
+    // NER-260: resolve globally by id and return the proposal; the owning attempt is
+    // derived inside resolve_proposal so a cross-attempt `--proposal` resolves here.
+    Ok(resolve_proposal(&context, &attempt, proposal_id, true)?.proposal)
 }
 
 pub fn latest_decision(cwd: &Path) -> Result<Option<String>> {
@@ -6256,8 +6323,13 @@ pub fn pr_body_for(
     proposal_id: Option<&str>,
 ) -> Result<(String, Vec<String>)> {
     let context = open_repository(cwd)?;
-    let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
-    let proposal = resolve_proposal(&context, &attempt.attempt_id, proposal_id, true)?.proposal;
+    let resolved_attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    // NER-260: render the PR body for the proposal's OWNING attempt (intent text,
+    // evidence, competing-attempt comparison) so an explicit cross-attempt `--proposal`
+    // describes the right intent rather than the caller's attached one.
+    let resolved = resolve_proposal(&context, &resolved_attempt, proposal_id, true)?;
+    let proposal = resolved.proposal;
+    let attempt = resolved.attempt;
     let evidence = latest_evidence_for_attempt(&context, &attempt.attempt_id)?;
     let check = latest_check_for_proposal_revision(&context, &proposal.proposal_revision_id)?;
     let decision = latest_decision_for_proposal_revision(&context, &proposal.proposal_revision_id)?;
@@ -7252,6 +7324,70 @@ fn add_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
+/// Which of the two adjacent rows the caller is describing: the higher-ranked `Above`
+/// (phrase the discriminator as its advantage) or the lower-ranked `Below` (phrase it as
+/// the reason it landed lower).
+enum TieSide {
+    Above,
+    Below,
+}
+
+/// Name the FIRST sort-key field (after the gate tier, assumed equal here) on which the
+/// higher-ranked `above` strictly beats `below` — i.e. the tie-break that actually placed
+/// `below` after `above`. The label is phrased from `side`'s perspective: `Above` reads as
+/// the winner's advantage, `Below` as why the loser ranked lower. Returns `None` only when
+/// the two rows are equal on every tie-break field (a stable-order tie), so the caller can
+/// fall back to a neutral phrasing rather than claim a discriminator that did not apply
+/// (NER-256).
+fn tie_break_discriminator(
+    above: &AttemptCompareRow,
+    below: &AttemptCompareRow,
+    side: TieSide,
+) -> Option<String> {
+    let integrity_rank = |row: &AttemptCompareRow| match row.integrity.as_str() {
+        INTEGRITY_VERIFIED => 0u8,
+        INTEGRITY_LEGACY => 1,
+        _ => 2,
+    };
+    if integrity_rank(below) != integrity_rank(above) {
+        let target = match side {
+            TieSide::Above => above,
+            TieSide::Below => below,
+        };
+        let label = match target.integrity.as_str() {
+            INTEGRITY_VERIFIED => "verified evidence",
+            INTEGRITY_LEGACY => "legacy_unverified evidence",
+            _ => "no-evidence integrity",
+        };
+        return Some(label.to_string());
+    }
+    let empty = |row: &AttemptCompareRow| row.changed_count == 0;
+    if empty(below) != empty(above) {
+        // The winner has the non-empty diff; the loser has the empty one.
+        return Some(match side {
+            TieSide::Above => "non-empty diff".to_string(),
+            TieSide::Below => "empty diff".to_string(),
+        });
+    }
+    let below_failed = below.metrics.tests_failed.unwrap_or(u64::MAX);
+    let above_failed = above.metrics.tests_failed.unwrap_or(u64::MAX);
+    if below_failed != above_failed {
+        return Some(match side {
+            TieSide::Above => format!("fewer failing tests ({above_failed} vs {below_failed})"),
+            TieSide::Below => format!("more failing tests ({below_failed} vs {above_failed})"),
+        });
+    }
+    let below_passed = below.metrics.tests_passed.unwrap_or(0);
+    let above_passed = above.metrics.tests_passed.unwrap_or(0);
+    if below_passed != above_passed {
+        return Some(match side {
+            TieSide::Above => format!("more passing tests ({above_passed} vs {below_passed})"),
+            TieSide::Below => format!("fewer passing tests ({below_passed} vs {above_passed})"),
+        });
+    }
+    None
+}
+
 /// Assign a deterministic total-order rank to the rankable rows of one intent group
 /// (NER-137 R3/R4). Rankable = has a proposal AND not `tampered`. Order: all-required-
 /// gates-passing first; within a tier fewer parsed test failures, then more parsed
@@ -7270,42 +7406,103 @@ fn rank_compare_rows(rows: &mut Vec<AttemptCompareRow>) {
             unranked.push(row);
         }
     }
-    ranked.sort_by_key(|row| {
+    // NER-256 tie-break, applied ONLY after gates_passing so a passing gate still
+    // strictly outranks a non-passing one. When the gate status ties (e.g. all gates
+    // missing/unmet), prefer (a) higher-integrity evidence, then (b) a non-empty diff,
+    // then (c) fewer test failures / more passes — so a zero-change, no-evidence attempt
+    // can no longer outrank a verified attempt with a real diff purely on created order.
+    // Tampered rows never reach this sort (partitioned into `unranked`), so integrity
+    // here is only verified / legacy_unverified / no_evidence.
+    let sort_key = |row: &AttemptCompareRow| {
         let gates_passing = if row.check_status.as_deref() == Some("passed") {
-            0
+            0u8
         } else {
             1
         };
+        let integrity_rank = match row.integrity.as_str() {
+            INTEGRITY_VERIFIED => 0u8,
+            INTEGRITY_LEGACY => 1,
+            _ => 2, // INTEGRITY_NO_EVIDENCE
+        };
+        let empty_diff = if row.changed_count > 0 { 0u8 } else { 1 };
         (
             gates_passing,
+            integrity_rank,
+            empty_diff,
             row.metrics.tests_failed.unwrap_or(u64::MAX),
             std::cmp::Reverse(row.metrics.tests_passed.unwrap_or(0)),
         )
-    });
-    for (index, row) in ranked.iter_mut().enumerate() {
+    };
+    ranked.sort_by_key(sort_key);
+    // Did EVERY ranked attempt land in the same gate tier? Only then is "gates tie" an
+    // honest description for a non-passing row: if any attempt passed its gates, the
+    // non-passing remainder did not tie on gates — they lost on `gates_passing` (NER-256
+    // correctness review). When the gate tier truly ties, the per-row reason names the
+    // discriminator that actually separated THIS row from the one ranked just above it
+    // (integrity, diff, or test counts) rather than a fixed integrity+diff label that may
+    // not have differentiated anything (NER-256 adversarial review).
+    let gates_truly_tie = ranked
+        .first()
+        .map(|first| {
+            let first_gate = sort_key(first).0;
+            ranked.iter().all(|row| sort_key(row).0 == first_gate)
+        })
+        .unwrap_or(true);
+    for index in 0..ranked.len() {
         let rank = (index + 1) as u32;
-        row.rank = Some(rank);
-        let mut reason = if row.check_status.as_deref() == Some("passed") {
+        let passed = ranked[index].check_status.as_deref() == Some("passed");
+        let mut reason = if passed {
             format!(
                 "rank {rank}: all required gates passing ({} failing tests, {} passing)",
-                row.metrics.tests_failed.unwrap_or(0),
-                row.metrics.tests_passed.unwrap_or(0)
+                ranked[index].metrics.tests_failed.unwrap_or(0),
+                ranked[index].metrics.tests_passed.unwrap_or(0)
             )
         } else {
-            format!(
-                "rank {rank}: required gates not satisfied (check status: {})",
-                row.check_status.as_deref().unwrap_or("unknown")
-            )
+            let status = ranked[index]
+                .check_status
+                .as_deref()
+                .unwrap_or("unknown")
+                .to_string();
+            if !gates_truly_tie {
+                // A passing-gate attempt outranked this one: gates were NOT tied, this row
+                // simply lost. Keep the old, accurate phrasing for the non-passing remainder.
+                format!("rank {rank}: required gates not satisfied (check status: {status})")
+            } else {
+                // Genuine gate tie. Name the field that actually broke the tie. For a
+                // non-winner, compare against the row ranked immediately above (why it
+                // landed below). For the rank-1 winner, compare against the row below it
+                // (why it ranked first). The discriminator is phrased from THIS row's
+                // perspective so a rank-only consumer reads the real differentiator —
+                // integrity, diff, or test counts — not a fixed integrity+diff label.
+                let label = match index.checked_sub(1) {
+                    Some(prev) => {
+                        tie_break_discriminator(&ranked[prev], &ranked[index], TieSide::Below)
+                    }
+                    None => ranked.get(index + 1).and_then(|next| {
+                        tie_break_discriminator(&ranked[index], next, TieSide::Above)
+                    }),
+                };
+                match label {
+                    Some(label) => format!(
+                        "rank {rank}: gates tie (check status: {status}); ranked by {label}"
+                    ),
+                    // No neighbour differed (stable-order tie) or single-row group.
+                    None => format!(
+                        "rank {rank}: gates tie (check status: {status}); ranked by created order"
+                    ),
+                }
+            }
         };
         // A legacy_unverified attempt is rankable (its deciding evidence predates
         // Phase 5 and was never hash-verified), so a rank-only consumer must still see
         // that caveat in the explanation (NER-137 code-review).
-        if row.integrity == INTEGRITY_LEGACY {
+        if ranked[index].integrity == INTEGRITY_LEGACY {
             reason.push_str(
                 " — NOTE: deciding evidence is legacy_unverified (pre-Phase-5, not hash-verified)",
             );
         }
-        row.rank_reason = reason;
+        ranked[index].rank = Some(rank);
+        ranked[index].rank_reason = reason;
     }
     for row in &mut unranked {
         row.rank = None;
@@ -7513,9 +7710,25 @@ fn latest_evidence_on(
         .map_err(Into::into)
 }
 
+/// Resolve a proposal under a caller-resolved `attempt`.
+///
+/// NER-260: when an explicit `proposal_id` is supplied, the proposal is resolved
+/// GLOBALLY by id (across every attempt/intent in the repo) and the OWNING attempt is
+/// derived from `proposal.attempt_id`, exactly mirroring how `proposal_by_id` already
+/// works for the export paths. The previous hard cross-check (`proposal.attempt_id !=
+/// attempt.attempt_id => UnknownProposal`) is removed so `accept --proposal <id>`
+/// succeeds even when a DIFFERENT attempt is attached. A genuinely non-existent id
+/// still yields `UnknownProposal`. The returned `attempt` is the owning one — callers
+/// MUST use it for gate evaluation and commit metadata so a cross-attempt `--proposal`
+/// is judged and recorded under its own intent.
+///
+/// The no-`--proposal` default branch (single-default / ambiguity) is byte-for-byte
+/// unchanged and reuses the passed `attempt` directly, so `--attempt A` and the no-arg
+/// "current/attached attempt" behavior are preserved (and no extra DB connection is
+/// opened on that path).
 fn resolve_proposal(
     context: &RepositoryContext,
-    attempt_id: &str,
+    attempt: &AttemptRecord,
     proposal_id: Option<&str>,
     allow_single_default: bool,
 ) -> Result<ResolvedProposal> {
@@ -7524,20 +7737,32 @@ fn resolve_proposal(
             proposal_by_id(context, proposal_id)?.ok_or_else(|| ForgeError::UnknownProposal {
                 selector: proposal_id.to_string(),
             })?;
-        if proposal.attempt_id != attempt_id {
-            return Err(ForgeError::UnknownProposal {
-                selector: proposal_id.to_string(),
-            }
-            .into());
-        }
-        return Ok(ResolvedProposal { proposal });
+        // Derive the OWNING attempt from the globally-resolved proposal rather than
+        // cross-checking against the caller's attempt (NER-260). Reuse the passed
+        // record when it already is the owner to avoid an extra DB open.
+        let owning_attempt = if proposal.attempt_id == attempt.attempt_id {
+            attempt.clone()
+        } else {
+            attempt_by_id(context, &proposal.attempt_id)?.ok_or_else(|| {
+                // The proposal references an attempt that no longer exists; treat the
+                // selector as unresolvable rather than panicking.
+                ForgeError::UnknownProposal {
+                    selector: proposal_id.to_string(),
+                }
+            })?
+        };
+        return Ok(ResolvedProposal {
+            proposal,
+            attempt: owning_attempt,
+        });
     }
 
-    let proposals = proposals_for_attempt(context, attempt_id)?;
+    let proposals = proposals_for_attempt(context, &attempt.attempt_id)?;
     match proposals.as_slice() {
         [] => Err(ForgeError::NoProposal.into()),
         [proposal] if allow_single_default => Ok(ResolvedProposal {
             proposal: proposal.clone(),
+            attempt: attempt.clone(),
         }),
         _ => Err(ForgeError::AmbiguousProposal {
             candidate_ids: proposals
@@ -8263,6 +8488,27 @@ mod tests {
         tests_failed: Option<u64>,
         tests_passed: Option<u64>,
     ) -> AttemptCompareRow {
+        compare_row_with_changes(
+            attempt_id,
+            has_proposal,
+            integrity,
+            check_status,
+            tests_failed,
+            tests_passed,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compare_row_with_changes(
+        attempt_id: &str,
+        has_proposal: bool,
+        integrity: &str,
+        check_status: Option<&str>,
+        tests_failed: Option<u64>,
+        tests_passed: Option<u64>,
+        changed_count: usize,
+    ) -> AttemptCompareRow {
         AttemptCompareRow {
             attempt_id: attempt_id.to_string(),
             status: "active".to_string(),
@@ -8274,7 +8520,7 @@ mod tests {
                 content_ref: "git-tree:deadbeef".to_string(),
             }),
             changed_paths: Vec::new(),
-            changed_count: 0,
+            changed_count,
             gates: Vec::new(),
             check_status: check_status.map(str::to_string),
             metrics: StructuredMetrics {
@@ -8451,6 +8697,280 @@ mod tests {
         let ids_second: Vec<_> = second.iter().map(|r| r.attempt_id.clone()).collect();
         assert_eq!(ids_first, ids_second);
         assert_eq!(ids_first, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn rank_verified_nonempty_above_no_evidence_empty_on_tied_gates() {
+        // NER-256: when the gate/check status ties at non-"passed" (here both "missing"),
+        // a zero-change, no_evidence attempt must NOT outrank a verified attempt with a
+        // real diff just because it was created first. `a` is placed FIRST in input
+        // (earlier created order) but is empty + no_evidence; `b` is verified + non-empty.
+        // Before the tie-break the stable sort kept `a` first; now `b` ranks 1.
+        let mut rows = vec![
+            compare_row_with_changes(
+                "a",
+                true,
+                INTEGRITY_NO_EVIDENCE,
+                Some("missing"),
+                None,
+                None,
+                0,
+            ),
+            compare_row_with_changes(
+                "b",
+                true,
+                INTEGRITY_VERIFIED,
+                Some("missing"),
+                None,
+                None,
+                3,
+            ),
+        ];
+        rank_compare_rows(&mut rows);
+        assert_eq!(rows[0].attempt_id, "b");
+        assert_eq!(rows[0].rank, Some(1));
+        assert_eq!(rows[1].attempt_id, "a");
+        assert_eq!(rows[1].rank, Some(2));
+        // The rank_reason must name the tie-break that ACTUALLY applied. Integrity is the
+        // first field that differs (verified vs no_evidence), so it — not the diff — is the
+        // deciding discriminator the reason should cite (NER-256 adversarial review: the old
+        // code always claimed "verified evidence + non-empty diff" even when only one of
+        // those fields differentiated the rows).
+        assert!(
+            rows[0].rank_reason.contains("gates tie"),
+            "winner rank_reason should mention the gate tie-break: {}",
+            rows[0].rank_reason
+        );
+        assert!(
+            rows[0].rank_reason.contains("verified evidence"),
+            "winner rank_reason should cite its verified-evidence advantage: {}",
+            rows[0].rank_reason
+        );
+        // The loser's reason states why IT landed below: its no-evidence integrity, the
+        // first field on which it lost to the verified winner.
+        assert!(
+            rows[1].rank_reason.contains("gates tie")
+                && rows[1].rank_reason.contains("no-evidence integrity"),
+            "loser rank_reason should state its no-evidence integrity: {}",
+            rows[1].rank_reason
+        );
+    }
+
+    #[test]
+    fn rank_reason_names_diff_discriminator_when_integrity_ties_on_gate_tie() {
+        // NER-256 adversarial review: when integrity AND gates tie, the diff size is the
+        // real discriminator. The reason must cite the diff — NOT a fixed integrity label.
+        let mut rows = vec![
+            compare_row_with_changes(
+                "a",
+                true,
+                INTEGRITY_VERIFIED,
+                Some("missing"),
+                None,
+                None,
+                0,
+            ),
+            compare_row_with_changes(
+                "b",
+                true,
+                INTEGRITY_VERIFIED,
+                Some("missing"),
+                None,
+                None,
+                4,
+            ),
+        ];
+        rank_compare_rows(&mut rows);
+        assert_eq!(rows[0].attempt_id, "b");
+        assert_eq!(rows[1].attempt_id, "a");
+        assert!(
+            rows[0].rank_reason.contains("non-empty diff"),
+            "winner reason should cite its non-empty diff: {}",
+            rows[0].rank_reason
+        );
+        assert!(
+            rows[1].rank_reason.contains("empty diff"),
+            "loser reason should cite its empty diff: {}",
+            rows[1].rank_reason
+        );
+    }
+
+    #[test]
+    fn rank_reason_names_test_count_discriminator_when_integrity_and_diff_tie() {
+        // NER-256 adversarial review: three non-passing attempts, all verified + non-empty,
+        // differing ONLY in tests_failed. The discriminator is tests_failed — the reason
+        // must say so, not the (identical, non-differentiating) integrity + diff labels.
+        let mut rows = vec![
+            compare_row_with_changes(
+                "x",
+                true,
+                INTEGRITY_VERIFIED,
+                Some("missing"),
+                Some(0),
+                Some(5),
+                2,
+            ),
+            compare_row_with_changes(
+                "y",
+                true,
+                INTEGRITY_VERIFIED,
+                Some("missing"),
+                Some(3),
+                Some(5),
+                2,
+            ),
+            compare_row_with_changes(
+                "z",
+                true,
+                INTEGRITY_VERIFIED,
+                Some("missing"),
+                Some(10),
+                Some(5),
+                2,
+            ),
+        ];
+        rank_compare_rows(&mut rows);
+        assert_eq!(rows[0].attempt_id, "x");
+        assert_eq!(rows[1].attempt_id, "y");
+        assert_eq!(rows[2].attempt_id, "z");
+        // The middle row lost to x on failing-test count, not integrity or diff.
+        assert!(
+            rows[1].rank_reason.contains("more failing tests"),
+            "y's reason should cite the failing-test discriminator, not integrity/diff: {}",
+            rows[1].rank_reason
+        );
+        assert!(
+            rows[2].rank_reason.contains("more failing tests"),
+            "z's reason should cite the failing-test discriminator: {}",
+            rows[2].rank_reason
+        );
+        // The winner reads positively: it has the fewest failing tests.
+        assert!(
+            rows[0].rank_reason.contains("fewer failing tests"),
+            "x's reason should cite its fewer-failing-tests advantage: {}",
+            rows[0].rank_reason
+        );
+    }
+
+    #[test]
+    fn rank_reason_says_gates_not_satisfied_when_a_passing_attempt_outranks() {
+        // NER-256 correctness review: when one attempt passes its gates, the non-passing
+        // remainder did NOT tie on gates — they lost. Their reason must say "required gates
+        // not satisfied", not "gates tie" (which would falsely claim equal gate status).
+        let mut rows = vec![
+            compare_row(
+                "a",
+                true,
+                INTEGRITY_VERIFIED,
+                Some("passed"),
+                Some(0),
+                Some(5),
+            ),
+            compare_row(
+                "b",
+                true,
+                INTEGRITY_VERIFIED,
+                Some("failed"),
+                Some(2),
+                Some(3),
+            ),
+            compare_row(
+                "c",
+                true,
+                INTEGRITY_NO_EVIDENCE,
+                Some("missing"),
+                None,
+                None,
+            ),
+        ];
+        rank_compare_rows(&mut rows);
+        assert_eq!(rows[0].attempt_id, "a");
+        assert!(
+            rows[0].rank_reason.contains("all required gates passing"),
+            "passing attempt reason: {}",
+            rows[0].rank_reason
+        );
+        for loser in &rows[1..] {
+            assert!(
+                loser.rank_reason.contains("required gates not satisfied"),
+                "non-passing attempt must NOT claim a gate tie when a passing attempt exists: {}",
+                loser.rank_reason
+            );
+            assert!(
+                !loser.rank_reason.contains("gates tie"),
+                "non-passing attempt must not claim a gate tie here: {}",
+                loser.rank_reason
+            );
+        }
+    }
+
+    #[test]
+    fn rank_reason_legacy_caveat_on_gate_tie() {
+        // NER-256 testing review: a legacy_unverified attempt is rankable but its deciding
+        // evidence was never hash-verified. On a gate tie it must (a) rank between verified
+        // and no_evidence and (b) carry the legacy caveat in its rank_reason.
+        let mut rows = vec![
+            compare_row_with_changes(
+                "v",
+                true,
+                INTEGRITY_VERIFIED,
+                Some("missing"),
+                None,
+                None,
+                1,
+            ),
+            compare_row_with_changes("l", true, INTEGRITY_LEGACY, Some("missing"), None, None, 1),
+            compare_row_with_changes(
+                "n",
+                true,
+                INTEGRITY_NO_EVIDENCE,
+                Some("missing"),
+                None,
+                None,
+                1,
+            ),
+        ];
+        rank_compare_rows(&mut rows);
+        assert_eq!(rows[0].attempt_id, "v");
+        assert_eq!(rows[1].attempt_id, "l");
+        assert_eq!(rows[2].attempt_id, "n");
+        assert!(
+            rows[1].rank_reason.contains("legacy_unverified"),
+            "legacy attempt reason must carry the legacy caveat: {}",
+            rows[1].rank_reason
+        );
+    }
+
+    #[test]
+    fn rank_tie_break_does_not_override_passing_gate() {
+        // NER-256 guardrail: gates_passing stays the FIRST sort key, so a passing-gate
+        // attempt outranks a non-passing one EVEN IF the non-passing one has stronger
+        // integrity and a non-empty diff. Here `b` passes but is empty + (still verified),
+        // while `a` is non-passing, verified, non-empty — `b` must still rank 1.
+        let mut rows = vec![
+            compare_row_with_changes(
+                "a",
+                true,
+                INTEGRITY_VERIFIED,
+                Some("failed"),
+                Some(1),
+                Some(9),
+                5,
+            ),
+            compare_row_with_changes(
+                "b",
+                true,
+                INTEGRITY_VERIFIED,
+                Some("passed"),
+                Some(0),
+                Some(9),
+                0,
+            ),
+        ];
+        rank_compare_rows(&mut rows);
+        assert_eq!(rows[0].attempt_id, "b");
+        assert_eq!(rows[0].rank, Some(1));
+        assert_eq!(rows[1].attempt_id, "a");
     }
 
     #[test]

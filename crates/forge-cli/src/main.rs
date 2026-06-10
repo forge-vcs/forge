@@ -3372,6 +3372,50 @@ fn replay_response(
             }
         }
     }
+    // NER-255: lifecycle commands an agent realistically retries after a crash carry
+    // their original success `data` payload in the op view state under `replay_data`
+    // (persisted in the SAME txn that recorded the op). Merge it back so a replay
+    // returns the ORIGINAL ids (snapshot_id / content_ref / proposal_id / …) instead of
+    // just {idempotent_replay, request_id}. Gated on BOTH command AND the op kind, so a
+    // pre-change row (no `replay_data`) cleanly falls back to today's minimal payload.
+    //
+    // `accept`/`reject` are intentionally NOT handled here: `decide` records its op under
+    // the decision verb ("accepted"/"rejected"), so the `existing.command != command`
+    // check above already returns REQUEST_ID_CONFLICT for those — preserving the
+    // documented behavior asserted by native_accept_replay_same_request_id_writes_no_second_commit.
+    if let Some(expected_kind) = match command {
+        "save" => Some("snapshot_saved"),
+        "propose" => Some("proposal_created"),
+        "start" | "attempt start" => Some("attempt_started"),
+        _ => None,
+    } {
+        if existing.kind.as_deref() == Some(expected_kind) {
+            if let Some(replay_data) = existing
+                .state
+                .as_ref()
+                .and_then(|state| state.get("replay_data"))
+                .and_then(Value::as_object)
+            {
+                if let Some(object) = data.as_object_mut() {
+                    for (key, value) in replay_data {
+                        object.insert(key.clone(), value.clone());
+                    }
+                    object.insert(
+                        "operation_id".to_string(),
+                        json!(existing.operation_id.clone()),
+                    );
+                    // Re-assert the replay contract flags AFTER the merge so they cannot be
+                    // clobbered by a stored `replay_data` key collision. Today's payloads
+                    // carry neither key, but the merge has no allow/deny-list, so a future
+                    // change that folds `request_id` (or, worse, `idempotent_replay`) into
+                    // `replay_data` would otherwise silently corrupt the flag a retrying
+                    // agent relies on (NER-255 adversarial review).
+                    object.insert("idempotent_replay".to_string(), json!(true));
+                    object.insert("request_id".to_string(), json!(request_id_value));
+                }
+            }
+        }
+    }
     if matches!(command, "sync fetch" | "sync pull" | "sync push")
         && existing
             .kind
