@@ -36,6 +36,11 @@ fn propose_show_and_check_pass_with_successful_evidence() {
 
     let checked = json_output(repo.forge().args(["--json", "check"]).assert().success());
     assert_eq!(checked["data"]["status"], "passed");
+    // NER-254: a plain default-mode pass is decided by exit code, so the synthesized
+    // gate carries verdict_detail == "exit_code_only".
+    let gates = checked["data"]["gates"].as_array().expect("gates array");
+    assert!(!gates.is_empty(), "default mode synthesizes a gate");
+    assert_eq!(gates[0]["verdict_detail"], "exit_code_only");
 }
 
 #[test]
@@ -59,6 +64,12 @@ fn propose_requires_snapshot_and_check_reports_missing_evidence() {
     repo.forge().args(["--json", "propose"]).assert().success();
     let checked = json_output(repo.forge().args(["--json", "check"]).assert().success());
     assert_eq!(checked["data"]["status"], "missing");
+    // NER-254: default mode with no evidence on the snapshot emits no synthesized
+    // gates (the aggregate status is "missing"), so the gates array is empty here.
+    assert!(checked["data"]["gates"]
+        .as_array()
+        .expect("array")
+        .is_empty());
 }
 
 #[test]
@@ -104,6 +115,32 @@ fn start_with_gates(repo: &TestRepo, intent: &str, gates: &[&str]) {
     repo.forge().args(&args).assert().success();
 }
 
+/// Like `start_with_gates`, but emits `--require-tests-pass` so the gate is
+/// *structured* (zero exit AND zero parsed failures). Used by the NER-253 python
+/// unittest acceptance tests.
+fn start_with_structured_gates(repo: &TestRepo, intent: &str, gates: &[&str]) {
+    let mut args = vec![
+        "--json".to_string(),
+        "start".to_string(),
+        intent.to_string(),
+    ];
+    for gate in gates {
+        args.push("--require-tests-pass".to_string());
+        args.push((*gate).to_string());
+    }
+    repo.forge().args(&args).assert().success();
+}
+
+/// Probe for a usable `python3` on PATH so the NER-253 end-to-end tests skip cleanly
+/// on a dev machine without python (CI ubuntu has it). Returns `true` when present.
+fn python3_available() -> bool {
+    std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 fn run_cmd(repo: &TestRepo, argv: &[&str]) {
     let mut args = vec!["--json", "run", "--"];
     args.extend_from_slice(argv);
@@ -130,6 +167,8 @@ fn run_true_cannot_satisfy_a_declared_gate() {
     assert_eq!(gates.len(), 1);
     assert_eq!(gates[0]["program"], "cargo");
     assert_eq!(gates[0]["verdict"], "missing");
+    // NER-254: no matching evidence at all -> verdict_detail "no_evidence".
+    assert_eq!(gates[0]["verdict_detail"], "no_evidence");
 }
 
 #[test]
@@ -168,6 +207,8 @@ fn declared_gate_is_stale_when_evidence_is_on_an_earlier_snapshot() {
     assert_eq!(checked["data"]["status"], "stale");
     let gates = checked["data"]["gates"].as_array().expect("gates array");
     assert_eq!(gates[0]["verdict"], "stale");
+    // NER-254: stale because evidence is only on an earlier snapshot.
+    assert_eq!(gates[0]["verdict_detail"], "stale_off_snapshot");
 }
 
 #[test]
@@ -270,4 +311,80 @@ fn accept_reevaluates_and_overrides_a_stale_passing_check() {
 
     let blocked = json_output(repo.forge().args(["--json", "accept"]).assert().failure());
     assert_eq!(blocked["errors"][0]["code"], "CHECK_NOT_PASSED");
+}
+
+/// Write a tiny unittest module into the repo. `passing == false` makes one test fail
+/// (a real assertion failure, so `python3 -m unittest` emits `FAILED (failures=1)`).
+fn write_unittest_module(repo: &TestRepo, passing: bool) {
+    let body = if passing {
+        "import unittest\n\
+         class StatsTest(unittest.TestCase):\n\
+         \x20   def test_add(self):\n\
+         \x20       self.assertEqual(1 + 1, 2)\n\
+         \x20   def test_sub(self):\n\
+         \x20       self.assertEqual(3 - 1, 2)\n"
+    } else {
+        "import unittest\n\
+         class StatsTest(unittest.TestCase):\n\
+         \x20   def test_add(self):\n\
+         \x20       self.assertEqual(1 + 1, 2)\n\
+         \x20   def test_broken(self):\n\
+         \x20       self.assertEqual(1 + 1, 3)\n"
+    };
+    std::fs::write(repo.path().join("test_stats.py"), body).expect("write unittest module");
+}
+
+#[test]
+fn structured_python_unittest_gate_passes_end_to_end() {
+    // NER-253 acceptance test: a `--require-tests-pass "python3 -m unittest test_stats"`
+    // structured gate goes green end to end when all tests pass with exit 0.
+    if !python3_available() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    start_with_structured_gates(&repo, "python tests", &["python3 -m unittest test_stats"]);
+    write_unittest_module(&repo, true);
+    repo.forge().args(["--json", "save"]).assert().success();
+    run_cmd(&repo, &["python3", "-m", "unittest", "test_stats"]);
+    repo.forge().args(["--json", "propose"]).assert().success();
+
+    let checked = json_output(repo.forge().args(["--json", "check"]).assert().success());
+    assert_eq!(
+        checked["data"]["status"], "passed",
+        "python unittest structured gate must be satisfiable: {checked:?}"
+    );
+    let gates = checked["data"]["gates"].as_array().expect("gates array");
+    assert_eq!(gates[0]["program"], "python3");
+    assert_eq!(gates[0]["verdict"], "passed");
+    // NER-254: a parsed count (failed=0) decided the verdict.
+    assert_eq!(gates[0]["verdict_detail"], "parsed");
+}
+
+#[test]
+fn structured_python_unittest_gate_fails_on_failing_tests() {
+    // The failing-test mirror: a real assertion failure produces a parsed failure
+    // count, so the structured gate is "failed" with verdict_detail "parsed".
+    if !python3_available() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    start_with_structured_gates(&repo, "python tests", &["python3 -m unittest test_stats"]);
+    write_unittest_module(&repo, false);
+    repo.forge().args(["--json", "save"]).assert().success();
+    run_cmd(&repo, &["python3", "-m", "unittest", "test_stats"]);
+    repo.forge().args(["--json", "propose"]).assert().success();
+
+    let checked = json_output(repo.forge().args(["--json", "check"]).assert().success());
+    assert_eq!(checked["data"]["status"], "failed", "got {checked:?}");
+    let gates = checked["data"]["gates"].as_array().expect("gates array");
+    assert_eq!(gates[0]["verdict"], "failed");
+    // `python3 -m unittest` exits non-zero on a failing test, so the nonzero exit
+    // fails the gate before the parsed count is consulted -> verdict_detail
+    // "exit_code_only" (the structured count is still surfaced via structured_failures).
+    assert_eq!(gates[0]["verdict_detail"], "exit_code_only");
+    assert_eq!(gates[0]["structured_failures"], 1);
 }

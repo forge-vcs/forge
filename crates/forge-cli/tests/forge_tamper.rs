@@ -349,6 +349,9 @@ fn structured_gate_passes_on_zero_failures_and_blocks_on_parsed_failures() {
         checked["data"]["status"], "passed",
         "structured gate green on parsed 0 failures: {checked:?}"
     );
+    // NER-254: the parsed count decided the verdict on the cargo structured path too.
+    let gates = checked["data"]["gates"].as_array().expect("gates array");
+    assert_eq!(gates[0]["verdict_detail"], "parsed");
 
     // FAIL: a parsed non-zero failure count blocks the gate even though exit is 0.
     let fail = TestRepo::new_git();
@@ -380,5 +383,58 @@ fn structured_gate_passes_on_zero_failures_and_blocks_on_parsed_failures() {
     assert_eq!(
         checked["data"]["status"], "failed",
         "structured gate fails on parsed 2 failures despite exit 0: {checked:?}"
+    );
+    // NER-254: failed because the parsed count (2) decided it, not the exit code.
+    let gates = checked["data"]["gates"].as_array().expect("gates array");
+    assert_eq!(gates[0]["verdict_detail"], "parsed");
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_gate_unparseable_output_is_missing_with_unparsed_detail() {
+    // NER-254 disambiguation: a structured `cargo test` gate whose deciding evidence
+    // has exit 0 but output the parser does NOT recognize resolves to verdict
+    // "missing" with verdict_detail "structured_required_but_unparsed" — the exact
+    // overloaded case the diagnostic disentangles from a plain absence of evidence.
+    let repo = TestRepo::new_git();
+    // Fake cargo prints nothing the libtest parser recognizes, exits 0.
+    let bin = fake_cargo(&repo, "compiling things, no test summary here", 0);
+    repo.forge().args(["--json", "init"]).assert().success();
+    repo.forge()
+        .args([
+            "--json",
+            "start",
+            "gated",
+            "--require-tests-pass",
+            "cargo test",
+        ])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("h.txt"), "z\n").expect("write");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .env("PATH", path_with(&bin))
+        .args(["--json", "run", "--", "cargo", "test"])
+        .assert()
+        .success();
+    repo.forge().args(["--json", "propose"]).assert().success();
+    let checked = json(repo.forge().args(["--json", "check"]).assert());
+    assert_eq!(
+        checked["data"]["status"], "missing",
+        "unparseable structured evidence is missing: {checked:?}"
+    );
+    let gates = checked["data"]["gates"].as_array().expect("gates array");
+    assert_eq!(gates[0]["verdict"], "missing");
+    assert_eq!(
+        gates[0]["verdict_detail"],
+        "structured_required_but_unparsed"
+    );
+    // The human reason calls out the unparsed-structured case (NER-254).
+    assert!(
+        checked["data"]["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("structured result"),
+        "reason should mention the unparsed-structured case: {checked:?}"
     );
 }
