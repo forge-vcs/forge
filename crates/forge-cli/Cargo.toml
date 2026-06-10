@@ -20,6 +20,7 @@ forge-protocol = { path = "../forge-protocol" }
 forge-store = { path = "../forge-store" }
 forge-sync = { path = "../forge-sync" }
 serde_json.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
