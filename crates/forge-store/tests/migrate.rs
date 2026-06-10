@@ -50,6 +50,9 @@ const SIGNING_KEY_ORIGINS_013: &str = include_str!("../migrations/013_signing_ke
 /// The 014 sync-merge signature subject migration.
 const SYNC_MERGE_SIGNATURE_SUBJECT_014: &str =
     include_str!("../migrations/014_sync_merge_signature_subject.sql");
+/// The 015 trust-ladder attestation-level migration.
+const TRUST_LADDER_ATTESTATION_LEVELS_015: &str =
+    include_str!("../migrations/015_trust_ladder_attestation_levels.sql");
 
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
@@ -149,6 +152,12 @@ fn apply_through_013(conn: &Connection) {
     apply_through_012(conn);
     conn.execute_batch(SIGNING_KEY_ORIGINS_013)
         .expect("apply 013 signing-key-origins");
+}
+
+fn apply_through_014(conn: &Connection) {
+    apply_through_013(conn);
+    conn.execute_batch(SYNC_MERGE_SIGNATURE_SUBJECT_014)
+        .expect("apply 014 sync-merge signature subject");
 }
 
 fn max_version(conn: &Connection) -> i64 {
@@ -383,6 +392,36 @@ fn sync_merge_signature_subject_migration_preserves_existing_signature_rows() {
 }
 
 #[test]
+fn trust_ladder_attestation_level_migration_allows_higher_policy_rungs() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .expect("enable fks");
+    apply_through_014(&conn);
+
+    conn.execute_batch(TRUST_LADDER_ATTESTATION_LEVELS_015)
+        .expect("apply 015 trust-ladder attestation levels");
+    conn.execute(
+        "UPDATE trust_policy
+         SET min_accept_trust = 'hosted_runner_signed',
+             min_export_trust = 'third_party_attested'
+         WHERE singleton = 1",
+        [],
+    )
+    .expect("higher trust levels should satisfy 015 CHECK constraints");
+
+    let policy: (String, String) = conn
+        .query_row(
+            "SELECT min_accept_trust, min_export_trust
+             FROM trust_policy WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("query migrated trust policy");
+    assert_eq!(policy.0, "hosted_runner_signed");
+    assert_eq!(policy.1, "third_party_attested");
+}
+
+#[test]
 fn behind_db_upgrades_to_head() {
     let repo = git_repo();
     let db = make_forge_db(repo.path());
@@ -443,7 +482,7 @@ fn behind_db_upgrades_to_head() {
         has_column(&conn, "attempt_workspaces", "workspace_rel_path"),
         "009 created attempt_workspaces"
     );
-    assert_eq!(max_version(&conn), 14, "reached HEAD=14");
+    assert_eq!(max_version(&conn), 15, "reached HEAD=15");
 }
 
 #[test]
@@ -476,6 +515,8 @@ fn at_head_db_is_a_noop() {
             .expect("apply 013 signing-key-origins");
         conn.execute_batch(SYNC_MERGE_SIGNATURE_SUBJECT_014)
             .expect("apply 014 sync-merge signature subject");
+        conn.execute_batch(TRUST_LADDER_ATTESTATION_LEVELS_015)
+            .expect("apply 015 trust-ladder attestation levels");
         stamp_versions(
             &conn,
             &[
@@ -493,15 +534,16 @@ fn at_head_db_is_a_noop() {
                 (12, "012_trust_policy"),
                 (13, "013_signing_key_origins"),
                 (14, "014_sync_merge_signature_subject"),
+                (15, "015_trust_ladder_attestation_levels"),
             ],
         );
-        assert_eq!(max_version(&conn), 14);
+        assert_eq!(max_version(&conn), 15);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 14, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 15, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -534,7 +576,9 @@ fn head_plus_one_is_refused() {
             .expect("apply 013 signing-key-origins");
         conn.execute_batch(SYNC_MERGE_SIGNATURE_SUBJECT_014)
             .expect("apply 014 sync-merge signature subject");
-        // HEAD is now 14, so the genuinely-ahead stamp is 15.
+        conn.execute_batch(TRUST_LADDER_ATTESTATION_LEVELS_015)
+            .expect("apply 015 trust-ladder attestation levels");
+        // HEAD is now 15, so the genuinely-ahead stamp is 16.
         stamp_versions(
             &conn,
             &[
@@ -552,10 +596,11 @@ fn head_plus_one_is_refused() {
                 (12, "012_trust_policy"),
                 (13, "013_signing_key_origins"),
                 (14, "014_sync_merge_signature_subject"),
-                (15, "future"),
+                (15, "015_trust_ladder_attestation_levels"),
+                (16, "future"),
             ],
         );
-        assert_eq!(max_version(&conn), 15);
+        assert_eq!(max_version(&conn), 16);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -564,8 +609,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 15);
-            assert_eq!(*supported_head, 14);
+            assert_eq!(*db_version, 16);
+            assert_eq!(*supported_head, 15);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }
