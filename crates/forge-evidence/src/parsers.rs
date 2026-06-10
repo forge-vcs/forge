@@ -363,6 +363,21 @@ fn pytest_summary_line_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^=+\s+(.*?)\s+=+\s*$").expect("valid pytest summary line regex"))
 }
 
+/// Match pytest's *quiet-mode* (`-q` / `-qq`) final summary line, which is NOT bracketed:
+/// e.g. `3 passed in 0.00s`, `1 failed, 2 passed in 0.01s`, `no tests ran in 0.01s`
+/// (optionally a `(H:MM:SS)` clock suffix for long runs). Captures the body before the
+/// `in <duration>` suffix in group 1; [`parse_pytest_summary_body`] then requires a count
+/// word (or `no tests ran`) so non-summary lines like `done in 0.5s` are rejected. The
+/// `in <float>s` anchor keeps this from matching arbitrary prose. Disjoint from the
+/// bracketed regex: a bracketed line ends in a run of `=`, this one ends in the duration.
+fn pytest_bare_summary_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)^(.*?\S)\s+in\s+\d+(?:\.\d+)?s(?:\s+\(\d+:\d{2}:\d{2}\))?\s*$")
+            .expect("valid pytest bare summary regex")
+    })
+}
+
 /// Match the `no tests ran` body variant (pytest's summary when zero tests were
 /// collected, e.g. `no tests ran in 0.01s`). This is a *recognized* summary that
 /// carries no count words, so it must be distinguished from a section header (which is
@@ -430,11 +445,20 @@ fn parse_python_pytest(stdout: &str, stderr: &str) -> Option<StructuredOutcome> 
 /// still matches; rejects section headers via [`parse_pytest_summary_body`].
 fn last_pytest_result_counts(raw: &str) -> Option<PytestCounts> {
     let cleaned = ansi_re().replace_all(raw, "");
-    let summary_re = pytest_summary_line_regex();
+    let bracketed_re = pytest_summary_line_regex();
+    let bare_re = pytest_bare_summary_regex();
     let mut last: Option<PytestCounts> = None;
     for line in cleaned.lines() {
-        if let Some(caps) = summary_re.captures(line.trim_end()) {
-            if let Some(counts) = parse_pytest_summary_body(&caps[1]) {
+        let trimmed = line.trim_end();
+        // Default-mode (`==== 3 passed in 0.00s ====`) and quiet-mode (`3 passed in 0.00s`)
+        // summaries are mutually exclusive shapes — the former ends in `=`, the latter in
+        // the duration — so trying the bracketed body first then the bare body is safe.
+        let body = bracketed_re
+            .captures(trimmed)
+            .or_else(|| bare_re.captures(trimmed))
+            .map(|caps| caps[1].to_string());
+        if let Some(body) = body {
+            if let Some(counts) = parse_pytest_summary_body(&body) {
                 last = Some(counts);
             }
         }
@@ -799,6 +823,57 @@ mod tests {
         assert_eq!(outcome.passed, Some(0));
         assert_eq!(outcome.failed, Some(0));
         assert_eq!(outcome.ignored, None);
+    }
+
+    #[test]
+    fn parses_pytest_quiet_mode_bare_summary() {
+        // `pytest -q` emits a NON-bracketed final line (`3 passed in 0.00s`). Caught by a
+        // live dogfood: the bracketed-only parser returned None for `-q`, the common CI form.
+        let out =
+            "...                                                  [100%]\n3 passed in 0.00s\n";
+        let outcome = parse_structured(
+            "/tmp/venv/bin/python",
+            &args(&["-m", "pytest", "-q"]),
+            out,
+            "",
+        )
+        .expect("parsed");
+        assert_eq!(outcome.passed, Some(3));
+        assert_eq!(outcome.failed, Some(0));
+    }
+
+    #[test]
+    fn parses_pytest_quiet_mode_bare_summary_with_failures() {
+        let out = "F..                                                  [100%]\n1 failed, 2 passed in 0.01s\n";
+        let outcome = parse_structured("pytest", &args(&["-q"]), out, "").expect("parsed");
+        assert_eq!(outcome.passed, Some(2));
+        assert_eq!(outcome.failed, Some(1));
+    }
+
+    #[test]
+    fn pytest_quiet_no_tests_ran_is_recognized() {
+        let out = "no tests ran in 0.01s\n";
+        let outcome = parse_structured("pytest", &args(&["-q"]), out, "").expect("parsed");
+        assert_eq!(outcome.passed, Some(0));
+        assert_eq!(outcome.failed, Some(0));
+    }
+
+    #[test]
+    fn pytest_bare_summary_requires_a_real_duration_and_count() {
+        // The `in <float>s` anchor + count-word requirement reject prose that merely ends
+        // in "... in <word>" so a test that prints "done in review" cannot spoof a result.
+        assert!(parse_structured("pytest", &args(&["-q"]), "done in review\n", "").is_none());
+        // A count word without the duration anchor is also not a summary line.
+        assert!(parse_structured("pytest", &args(&["-q"]), "3 passed already\n", "").is_none());
+    }
+
+    #[test]
+    fn pytest_quiet_long_run_clock_suffix_still_parses() {
+        // Runs over 60s get a `(H:MM:SS)` clock suffix after the seconds.
+        let out = "5 passed in 75.43s (0:01:15)\n";
+        let outcome = parse_structured("pytest", &args(&["-q"]), out, "").expect("parsed");
+        assert_eq!(outcome.passed, Some(5));
+        assert_eq!(outcome.failed, Some(0));
     }
 
     #[test]
