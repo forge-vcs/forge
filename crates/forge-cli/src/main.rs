@@ -419,6 +419,36 @@ enum KeyCommand {
 enum TrustCommand {
     /// Show or update the local minimum trust policy.
     Policy(TrustPolicyArgs),
+    /// Record a hosted-runner attestation for a proposal's current evidence.
+    Attest(TrustAttestArgs),
+}
+
+#[derive(Debug, Args)]
+struct TrustAttestArgs {
+    #[command(subcommand)]
+    command: TrustAttestCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TrustAttestCommand {
+    /// Sign the proposal's evidence subjects with a hosted-runner key.
+    HostedRunner(HostedRunnerAttestArgs),
+}
+
+#[derive(Debug, Args)]
+struct HostedRunnerAttestArgs {
+    /// Scope attestation to this attempt. Omit when one attempt is active.
+    #[arg(long)]
+    attempt: Option<String>,
+    /// Scope attestation to this proposal. Omit when the attempt has one proposal.
+    #[arg(long)]
+    proposal: Option<String>,
+    /// Ed25519 PKCS#8 private key used by the hosted runner.
+    #[arg(long)]
+    key: PathBuf,
+    /// Human-readable hosted runner issuer, e.g. a CI workflow or runner pool.
+    #[arg(long, default_value = "hosted-runner")]
+    issuer: String,
 }
 
 #[derive(Debug, Args)]
@@ -1370,6 +1400,20 @@ fn trust_response(request_id: Option<String>, args: TrustArgs) -> ResponseEnvelo
             };
             Ok((None, serde_json::to_value(policy)?, Vec::new()))
         }),
+        TrustCommand::Attest(args) => match args.command {
+            TrustAttestCommand::HostedRunner(args) => {
+                command_result("trust attest hosted-runner", request_id, |cwd, _| {
+                    let attestation = forge_store::attest_hosted_runner(
+                        &cwd,
+                        args.attempt.as_deref(),
+                        args.proposal.as_deref(),
+                        &args.key,
+                        &args.issuer,
+                    )?;
+                    Ok((None, serde_json::to_value(attestation)?, Vec::new()))
+                })
+            }
+        },
     }
 }
 
