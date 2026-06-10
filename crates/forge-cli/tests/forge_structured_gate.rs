@@ -38,6 +38,44 @@ fn start_rejects_structured_gate_without_a_parser() {
     );
 }
 
+/// NER-259 adversarial: when the rejected gate program is a secret-like `key=value` token
+/// (a plausible agent misconfiguration, e.g. passing a credential as the first token of
+/// `--require-tests-pass`), the secret must NOT leak unredacted into the JSON `message`
+/// field. `details.program` was already redacted; the human-readable `message` (which
+/// `error_to_object` derives from the error's `Display`) must redact it too.
+#[test]
+fn rejected_structured_gate_redacts_secret_like_program_in_message() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+
+    let output = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "start",
+                "x",
+                "--require-tests-pass",
+                "TOKEN=ghp_supersecret script.py",
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(output["errors"][0]["code"], "UNSUPPORTED_STRUCTURED_GATE");
+    assert_eq!(
+        output["errors"][0]["details"]["program"],
+        "TOKEN=[REDACTED]"
+    );
+    let message = output["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        !message.contains("ghp_supersecret"),
+        "secret token must not leak into the message: {message}"
+    );
+    assert!(
+        message.contains("TOKEN=[REDACTED]"),
+        "message should carry the redacted program token: {message}"
+    );
+}
+
 /// NER-259: fail-fast means no attempt/intent/worktree is created (a failed-operation row
 /// is still recorded by the mutating-error path — this asserts only the attempt side).
 #[test]

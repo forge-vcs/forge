@@ -605,10 +605,20 @@ impl std::fmt::Display for ForgeError {
                 f,
                 "sync {direction} divergent native merge is not supported yet ({reason})"
             ),
-            ForgeError::UnsupportedStructuredGate { program } => write!(
-                f,
-                "no structured parser is registered for `{program}`; a --require-tests-pass gate needs a program Forge can parse (cargo test, cargo clippy, python -m unittest, pytest). Use --require \"{program} …\" for a plain exit-code gate instead"
-            ),
+            ForgeError::UnsupportedStructuredGate { program } => {
+                // Redact the user-supplied program token before it lands in the
+                // human-readable message. `error_to_object` (forge-cli) routes this
+                // `Display` string into the JSON response `message` field and to stderr,
+                // neither of which pass through `details()`'s redaction — so a secret-like
+                // `key=value` program (e.g. `TOKEN=ghp_…`) would otherwise leak here even
+                // though `details.program` is redacted. Mirrors `details()`'s single-token
+                // `redact_secret_like_text` call so both surfaces agree.
+                let program = forge_content::redact_secret_like_text(program).0;
+                write!(
+                    f,
+                    "no structured parser is registered for `{program}`; a --require-tests-pass gate needs a program Forge can parse (cargo test, cargo clippy, python -m unittest, pytest). Use --require \"{program} …\" for a plain exit-code gate instead"
+                )
+            }
         }
     }
 }

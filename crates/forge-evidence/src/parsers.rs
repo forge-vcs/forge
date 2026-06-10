@@ -313,25 +313,28 @@ fn parse_unittest_stream(text: &str) -> Option<StructuredOutcome> {
     for line in &lines[ran_idx + 1..end] {
         let line = line.trim_end();
         if let Some(caps) = ok_re.captures(line) {
-            let skipped = caps
-                .get(1)
-                .map(|body| unittest_count(body.as_str(), "skipped"))
-                .unwrap_or(0);
+            let body = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            // `skipped` and `expected failures` both ran-but-didn't-pass; fold both into
+            // `ignored` (mirrors the pytest parser's `skipped + xfailed`) so `passed` is
+            // not inflated by expected-failure tests.
+            let ignored =
+                unittest_count(body, "skipped") + unittest_count(body, "expected failures");
             return Some(StructuredOutcome {
                 failed: Some(0),
-                passed: Some(total.saturating_sub(skipped)),
-                ignored: (skipped > 0).then_some(skipped),
+                passed: Some(total.saturating_sub(ignored)),
+                ignored: (ignored > 0).then_some(ignored),
                 findings: None,
             });
         }
         if let Some(caps) = failed_re.captures(line) {
             let body = &caps[1];
             let failed = unittest_failed_count(body);
-            let skipped = unittest_count(body, "skipped");
+            let ignored =
+                unittest_count(body, "skipped") + unittest_count(body, "expected failures");
             return Some(StructuredOutcome {
                 failed: Some(failed),
-                passed: Some(total.saturating_sub(failed).saturating_sub(skipped)),
-                ignored: (skipped > 0).then_some(skipped),
+                passed: Some(total.saturating_sub(failed).saturating_sub(ignored)),
+                ignored: (ignored > 0).then_some(ignored),
                 findings: None,
             });
         }
@@ -476,7 +479,7 @@ fn last_pytest_result_counts(raw: &str) -> Option<PytestCounts> {
 /// result with all-zero counts (NER-258 adversarial review).
 fn parse_pytest_summary_body(body: &str) -> Option<PytestCounts> {
     let mut counts = PytestCounts::default();
-    let mut saw_count = false;
+    let mut saw_outcome = false;
     for caps in pytest_count_regex().captures_iter(body) {
         let n = caps[1].parse::<u64>().unwrap_or(0);
         match &caps[2] {
@@ -487,17 +490,25 @@ fn parse_pytest_summary_body(body: &str) -> Option<PytestCounts> {
             "xfailed" => counts.xfailed += n,
             "xpassed" => counts.xpassed += n,
             // `deselected` / `warnings` are recognized by the count regex but carry no
-            // pass/fail meaning, so they are intentionally not accumulated.
-            _ => {}
+            // pass/fail meaning, so they are intentionally not accumulated — and crucially
+            // do NOT mark this body as a result. A standalone `N warnings in Xs` /
+            // `N deselected in Xs` line (a CI wrapper or plugin re-emitting a count-only
+            // summary after the real result) must not register as an all-zero result that
+            // clobbers a prior real `failed` count to a silent failed=0 false pass
+            // (NER-258 adversarial). It still counts as a result when it co-occurs with a
+            // real outcome word on the same line (`1 failed, 3 warnings in Xs`), because
+            // `failed` sets `saw_outcome` first.
+            _ => continue,
         }
-        saw_count = true;
+        saw_outcome = true;
     }
-    if saw_count {
+    if saw_outcome {
         return Some(counts);
     }
-    // No count words: only the `no tests ran` variant is still a valid (all-zero) result;
-    // anything else with this shape is a section header → reject so it cannot clobber a
-    // real result line.
+    // No pass/fail outcome words: only the `no tests ran` variant is still a valid
+    // (all-zero) result; anything else with this shape — a section header, or a bare
+    // `N deselected/warnings in Xs` line — is rejected so it cannot clobber a real result
+    // line with all-zero counts.
     pytest_no_tests_ran_regex().is_match(body).then_some(counts)
 }
 
@@ -742,14 +753,26 @@ mod tests {
     #[test]
     fn unexpected_successes_combine_with_failures_and_errors() {
         // A mixed footer: assertion failures, errors, and an unexpected success all
-        // count toward `failed`; `skipped`/`expected failures` do not.
+        // count toward `failed`; `skipped`/`expected failures` are ignored (not passes).
         let stderr = "Ran 6 tests in 0.000s\n\n\
                       FAILED (failures=1, errors=1, unexpected successes=1, skipped=1, expected failures=1)\n";
         let outcome =
             parse_structured("python3", &args(&["-m", "unittest"]), "", stderr).expect("parsed");
         assert_eq!(outcome.failed, Some(3)); // 1 failure + 1 error + 1 unexpected success
-        assert_eq!(outcome.ignored, Some(1)); // skipped
-        assert_eq!(outcome.passed, Some(2)); // 6 ran - 3 failed - 1 skipped
+        assert_eq!(outcome.ignored, Some(2)); // 1 skipped + 1 expected failure
+        assert_eq!(outcome.passed, Some(1)); // 6 ran - 3 failed - 2 ignored
+    }
+
+    #[test]
+    fn ok_with_expected_failures_are_ignored_not_passed() {
+        // An all-green run that includes `@unittest.expectedFailure` tests: those ran and
+        // failed expectedly, so they are `ignored`, never `passed`.
+        let stderr = "Ran 5 tests in 0.000s\n\nOK (skipped=1, expected failures=2)\n";
+        let outcome =
+            parse_structured("python3", &args(&["-m", "unittest"]), "", stderr).expect("parsed");
+        assert_eq!(outcome.failed, Some(0));
+        assert_eq!(outcome.ignored, Some(3)); // 1 skipped + 2 expected failures
+        assert_eq!(outcome.passed, Some(2)); // 5 ran - 3 ignored
     }
 
     #[test]
@@ -964,6 +987,34 @@ mod tests {
         let stderr = "===================== warnings summary ======================\n";
         let outcome = parse_structured("pytest", &args(&[]), stdout, stderr).expect("parsed");
         assert_eq!(outcome.failed, Some(3));
+    }
+
+    #[test]
+    fn pytest_trailing_bare_count_only_line_does_not_clobber_to_zero() {
+        // NER-258 adversarial: a bare quiet-mode count-only line whose only count words are
+        // `warnings`/`deselected` (a CI wrapper or plugin re-emitting a summary after the
+        // real result) matches the bare-summary shape AND the count regex, but carries no
+        // pass/fail outcome. It must NOT register as an all-zero result that clobbers the
+        // real `1 failed` to a silent failed=0 false pass.
+        for trailing in ["2 warnings in 0.10s", "3 deselected in 0.10s"] {
+            let out = format!("1 failed in 0.10s\n{trailing}\n");
+            let outcome = parse_structured("pytest", &args(&["-q"]), &out, "").expect("parsed");
+            assert_eq!(
+                outcome.failed,
+                Some(1),
+                "trailing `{trailing}` must not clobber the real failure to failed=0"
+            );
+        }
+    }
+
+    #[test]
+    fn pytest_combined_outcome_with_warnings_on_same_line_still_parses() {
+        // The fix must NOT reject a legitimate combined summary that mixes a real outcome
+        // word with `warnings`/`deselected` on the same line — `failed` marks it a result.
+        let out = "1 failed, 2 passed, 3 warnings, 4 deselected in 0.10s\n";
+        let outcome = parse_structured("pytest", &args(&["-q"]), out, "").expect("parsed");
+        assert_eq!(outcome.failed, Some(1));
+        assert_eq!(outcome.passed, Some(2));
     }
 
     #[test]
