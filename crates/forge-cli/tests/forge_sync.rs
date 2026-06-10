@@ -1673,26 +1673,190 @@ fn sync_peer_commands_fetch_and_pull_over_fake_ssh() {
 }
 
 #[test]
-fn sync_push_over_ssh_fails_until_remote_receive_transport_exists() {
+fn sync_push_over_fake_ssh_fast_forwards_and_merges_clean_divergence() {
     let source = TestRepo::new_git();
     native_accepted_lifecycle(&source);
+    let bundle_path = source.path().join("target/forge-sync-ssh-push-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path.to_str().expect("utf8 ssh push base path"),
+        ])
+        .assert()
+        .success();
 
-    let failed = json(
-        source
-            .forge()
-            .args(["--json", "sync", "push", &ssh_url_for_test(source.path())])
+    let fake_ssh = fake_ssh_command();
+    let fake_ssh_path = fake_ssh.path().join("ssh");
+    let forge_bin = assert_cmd::cargo::cargo_bin("forge");
+    let source_url = ssh_url_for_test(source.path());
+
+    let fast_forward_peer = cloned_peer_from_bundle(&bundle_path);
+    native_accept_file_change_in(
+        fast_forward_peer.path(),
+        "ssh push fast forward",
+        "ssh-pushed.txt",
+        "peer\n",
+    );
+    let pushed = json(
+        forge_in(fast_forward_peer.path())
+            .env("FORGE_SYNC_SSH_COMMAND", &fake_ssh_path)
+            .env("FORGE_SYNC_REMOTE_FORGE", &forge_bin)
+            .args(["--json", "sync", "push", &source_url])
             .assert()
-            .failure(),
+            .success(),
     );
-    assert_eq!(failed["status"], "error");
-    assert_eq!(failed["errors"][0]["code"], "COMMAND_FAILED");
+    assert_eq!(pushed["data"]["direction"], "push");
+    assert_eq!(pushed["data"]["remote_path"], source_url);
+    assert_eq!(pushed["data"]["materialized"], false);
+    assert_eq!(
+        export_native_head(source.path(), "ssh-push-fast-forward-head.json")["data"]["native_head"],
+        pushed["data"]["local_native_head"],
+        "ssh push should advance the remote native head on fast-forward"
+    );
     assert!(
-        failed["errors"][0]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("ssh sync push is not supported yet"),
-        "ssh push should fail clearly until receive transport exists"
+        !source.path().join("ssh-pushed.txt").exists(),
+        "ssh push fast-forward must not materialize the remote worktree"
     );
+
+    let clean_source = TestRepo::new_git();
+    native_accepted_lifecycle(&clean_source);
+    let clean_bundle_path = clean_source
+        .path()
+        .join("target/forge-sync-ssh-push-clean-base.json");
+    clean_source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            clean_bundle_path
+                .to_str()
+                .expect("utf8 ssh clean push base path"),
+        ])
+        .assert()
+        .success();
+    native_accept_file_change(
+        &clean_source,
+        "ssh push remote side",
+        "remote-only.txt",
+        "remote\n",
+    );
+    let clean_source_url = ssh_url_for_test(clean_source.path());
+    let clean_peer = cloned_peer_from_bundle(&clean_bundle_path);
+    native_accept_file_change_in(
+        clean_peer.path(),
+        "ssh push peer side",
+        "peer-only.txt",
+        "peer\n",
+    );
+
+    let clean_pushed = json(
+        forge_in(clean_peer.path())
+            .env("FORGE_SYNC_SSH_COMMAND", &fake_ssh_path)
+            .env("FORGE_SYNC_REMOTE_FORGE", &forge_bin)
+            .args([
+                "--json",
+                "--request-id",
+                "ssh-clean-push",
+                "sync",
+                "push",
+                &clean_source_url,
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(clean_pushed["data"]["direction"], "push");
+    assert_eq!(clean_pushed["data"]["remote_path"], clean_source_url);
+    assert_eq!(clean_pushed["data"]["merged"], true);
+    assert_eq!(clean_pushed["data"]["materialized"], false);
+    assert!(clean_pushed["data"]["remote_operation_id"].is_string());
+    assert_eq!(
+        export_native_head(clean_source.path(), "ssh-push-clean-head.json")["data"]["native_head"],
+        clean_pushed["data"]["merge_commit_id"],
+        "ssh clean push should advance the remote native head to the merge commit"
+    );
+    assert!(
+        !clean_source.path().join("peer-only.txt").exists(),
+        "ssh clean push must not materialize the peer-side file remotely"
+    );
+
+    let replayed = json(
+        forge_in(clean_peer.path())
+            .env("FORGE_SYNC_SSH_COMMAND", &fake_ssh_path)
+            .env("FORGE_SYNC_REMOTE_FORGE", &forge_bin)
+            .args([
+                "--json",
+                "--request-id",
+                "ssh-clean-push",
+                "sync",
+                "push",
+                &clean_source_url,
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(replayed["operation_id"], clean_pushed["operation_id"]);
+    assert_eq!(replayed["data"]["idempotent_replay"], true);
+    assert_eq!(
+        replayed["data"]["merge_commit_id"],
+        clean_pushed["data"]["merge_commit_id"]
+    );
+}
+
+#[test]
+fn sync_push_over_fake_ssh_records_remote_conflicts_as_data() {
+    let source = TestRepo::new_git();
+    native_accepted_lifecycle(&source);
+    let bundle_path = source
+        .path()
+        .join("target/forge-sync-ssh-push-conflict-base.json");
+    source
+        .forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            bundle_path
+                .to_str()
+                .expect("utf8 ssh conflict push base path"),
+        ])
+        .assert()
+        .success();
+    native_accept_file_change(&source, "ssh conflict remote", "side.txt", "remote\n");
+    let source_before = export_native_head(source.path(), "ssh-push-conflict-before.json");
+
+    let peer = cloned_peer_from_bundle(&bundle_path);
+    native_accept_file_change_in(peer.path(), "ssh conflict peer", "side.txt", "peer\n");
+    let fake_ssh = fake_ssh_command();
+    let fake_ssh_path = fake_ssh.path().join("ssh");
+    let forge_bin = assert_cmd::cargo::cargo_bin("forge");
+    let source_url = ssh_url_for_test(source.path());
+
+    let pushed = json(
+        forge_in(peer.path())
+            .env("FORGE_SYNC_SSH_COMMAND", &fake_ssh_path)
+            .env("FORGE_SYNC_REMOTE_FORGE", &forge_bin)
+            .args(["--json", "sync", "push", &source_url])
+            .assert()
+            .success(),
+    );
+    assert_eq!(pushed["data"]["direction"], "push");
+    assert_eq!(pushed["data"]["remote_path"], source_url);
+    assert_eq!(pushed["data"]["merged"], false);
+    assert_eq!(pushed["data"]["materialized"], false);
+    assert!(pushed["data"]["conflict_set_id"].is_string());
+    assert_eq!(
+        export_native_head(source.path(), "ssh-push-conflict-after.json")["data"]["native_head"],
+        source_before["data"]["native_head"],
+        "conflicting ssh push must not advance the remote native head"
+    );
+    assert_single_native_sync_conflict(source.path(), "sync_push_divergence");
 }
 
 #[test]
