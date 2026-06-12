@@ -1,0 +1,20 @@
+{
+  "name": "forge",
+  "version": "0.1.0",
+  "description": "Agent workflows for using the Forge CLI safely.",
+  "author": {
+    "name": "Jan Scholte",
+    "url": "https://github.com/freezscholte"
+  },
+  "homepage": "https://github.com/freezscholte/forge",
+  "repository": "https://github.com/freezscholte/forge",
+  "license": "MIT",
+  "keywords": [
+    "forge",
+    "source-control",
+    "agents",
+    "cli",
+    "provenance",
+    "review"
+  ]
+}

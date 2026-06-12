@@ -1,0 +1,4 @@
+interface:
+  display_name: "Forge CLI"
+  short_description: "Use Forge's agent-native source-control CLI safely."
+  default_prompt: "Use Forge to checkpoint and verify this change."
