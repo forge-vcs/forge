@@ -161,7 +161,7 @@ The cost is concentrated and predictable: the moment two agents touch the same f
 - Builds on the NER-142/143 consolidation (merged): `schema_head` is currently **7** (migration 007 `expected_content_ref` landed); Phase 8's new migration is **008**. `FORGE_ERROR_CODES` is currently 24.
 - The gc fail-closed-on-malformed-op-log-view behavior already shipped (NER-143 PR-A R6); Phase 8 inherits the *next* layer (doctor parsing `state_json` + doctor-clean deletion gate).
 - Assumes the during-materialize partial-restore crash state (safe-by-refusal today) is revisited under real deletion + physical worktrees but remains refuse-never-clobber.
-- Gate: `bash scripts/ci.sh`. `gh` authed `freezscholte`; squash-merge `(#N)`. Track under Linear **NER-139** (Forge project, team SE Engineers).
+- Gate: `bash scripts/ci.sh`. `gh` authenticated; squash-merge `(#N)`. Track under Linear **NER-139** (Forge project, team SE Engineers).
 
 ---
 

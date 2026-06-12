@@ -11,7 +11,7 @@ Forge is an agent-first local change-control CLI over Git (Rust workspace, `crat
 
 `main` is clean and synced. Phase 1b's plan is at `docs/plans/completed/2026-05-29-006-fix-phase-1b-crash-correctness-plan.md`; its code review is `docs/code-reviews/2026-05-29-phase-1b-crash-correctness.md`; its learnings are captured in `docs/solutions/architecture-patterns/crash-correctness-advisory-lock-and-atomic-restore-2026-05-29.md` (**read it** — it pins the invariants 2 must not regress). Phase 1a's solution doc (`…/sqlite-multiprocess-concurrency-and-idempotent-replay-2026-05-29.md`) still applies.
 
-Verify trio is the gate (`cargo fmt --all --check` · `cargo test --workspace` · `cargo clippy --workspace --all-targets -- -D warnings`); CI runs the same trio on every PR. Toolchain pinned `1.92.0`. `gh` authed as `freezscholte`; remote `freezscholte/forge`; squash-merge convention `(#N)`.
+Verify trio is the gate (`cargo fmt --all --check` · `cargo test --workspace` · `cargo clippy --workspace --all-targets -- -D warnings`); CI runs the same trio on every PR. Toolchain pinned `1.92.0`. `gh` authenticated; remote repository configured; squash-merge convention `(#N)`.
 
 ## What's next — NER-133 (Phase 2), the last open M1 track
 

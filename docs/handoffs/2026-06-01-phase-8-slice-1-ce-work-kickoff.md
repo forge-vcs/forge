@@ -6,7 +6,7 @@
 
 Phase 8 is pre-sliced **S1 / S2a / S2b / S3 / S4 / S5** (6 PRs). **S1 is planned and the doc-review gate is complete** — the gate applied 1 silent fix + 10 best-judgment fixes into the plan and resolved 2 judgment calls. The plan is ready to implement; this session begins **`/ce-work` on the S1 plan**. Later slices each get their own plan + doc-review gate when reached.
 
-**Gate state:** `main` clean. `schema_head` is **7**. `FORGE_ERROR_CODES` is **24** (S1 adds **no** typed error and no migration). Gate = `bash scripts/ci.sh` (fmt `--check` · `cargo test --workspace` · clippy `-D warnings` · e2e). `gh` authed `freezscholte`; squash-merge `(#N)`.
+**Gate state:** `main` clean. `schema_head` is **7**. `FORGE_ERROR_CODES` is **24** (S1 adds **no** typed error and no migration). Gate = `bash scripts/ci.sh` (fmt `--check` · `cargo test --workspace` · clippy `-D warnings` · e2e). `gh` authenticated; squash-merge `(#N)`.
 
 **New dependency:** add `similar` (with the `bytes` feature) to the workspace in U1. It satisfies the global **4-day min-release-age supply-chain gate** (mature, 137M downloads) — **do not bypass/lower that gate**; if an install is blocked, surface it, don't work around it.
 
@@ -62,7 +62,7 @@ No 3-way merge / conflict-as-data / `conflict_sets` / migration 008 (S2a/S2b); n
 
 ## Start prompt
 
-Paste this into a fresh Codex session from `/Users/skolte/Github-Private/forge`:
+Paste this into a fresh Codex session from the Forge repository root:
 
 ```text
 Pick up Forge NER-139 Phase 8 Slice S1: native hunk/line diff + rename detection.
@@ -70,7 +70,7 @@ Pick up Forge NER-139 Phase 8 Slice S1: native hunk/line diff + rename detection
 Use Compound Engineering only. Superpowers has been disabled in Codex config; do not invoke Superpowers workflows. Follow repo `AGENTS.md` / `CLAUDE.md` and keep using `rtk` for shell commands.
 
 Current expected repo context:
-- Repo: /Users/skolte/Github-Private/forge
+- Repo: Forge repository root
 - Branch may still be `main`; check `git status --short --branch` first.
 - Preserve existing uncommitted setup/planning files unless explicitly asked otherwise: `AGENTS.md`, `.agents/`, `.compound-engineering/config.local.example.yaml`, the Phase 8 brainstorm/plan/handoff docs, and the schema-head update in `docs/handoffs/2026-05-31-ner-139-phase-8-kickoff.md`.
 - Prefer creating/switching to a feature branch before code changes: `codex/ner-139-phase-8-s1-native-diff`.
