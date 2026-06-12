@@ -178,6 +178,10 @@ attestation checks:
 rtk bash scripts/dogfood-release-gate.sh
 ```
 
+## Citation
+
+If you use Forge in published work, please cite it using [CITATION.cff](CITATION.cff).
+
 ## License
 
 Forge is licensed under the MIT License. See [LICENSE](LICENSE).
