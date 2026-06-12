@@ -4,7 +4,7 @@
 
 ## Where things stand
 
-**Phase 7 (NER-138) is Done** — all 3 slices merged: native walker (slice 1), commit objects + ref store + git-free base/changed-paths (slice 2), and navigable history + full git independence (slice 3, PR #26 / closeout #27). `main` is clean at `996c8a2`. **`schema_head` is now `6`. `FORGE_ERROR_CODES` is `24`** (`NATIVE_HISTORY_CORRUPT` added). Gate: `bash scripts/ci.sh` (fmt `--check` · `cargo test --workspace` · clippy `-D warnings` · `scripts/e2e-eval.sh` 85/85). `gh` authed as `freezscholte`; remote `freezscholte/forge`; squash-merge convention `(#N)`.
+**Phase 7 (NER-138) is Done** — all 3 slices merged: native walker (slice 1), commit objects + ref store + git-free base/changed-paths (slice 2), and navigable history + full git independence (slice 3, PR #26 / closeout #27). `main` is clean at `996c8a2`. **`schema_head` is now `6`. `FORGE_ERROR_CODES` is `24`** (`NATIVE_HISTORY_CORRUPT` added). Gate: `bash scripts/ci.sh` (fmt `--check` · `cargo test --workspace` · clippy `-D warnings` · `scripts/e2e-eval.sh` 85/85). `gh` authenticated; remote repository configured; squash-merge convention `(#N)`.
 
 These two tickets are **independent small/medium PRs** — do them in **either order, as two separate PRs** (NER-142 is the quicker, fully self-contained one; NER-143 is the larger cluster). Both must clear the doc-review (if you write a plan) and code-review gates + `bash scripts/ci.sh` before merge.
 

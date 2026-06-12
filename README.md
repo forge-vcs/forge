@@ -144,7 +144,7 @@ silently satisfy local, hosted-runner, or third-party policy.
 - lifecycle: `init`, `start`, `save`, `run`, `propose`, `check`, `accept`,
   `reject`, `show`
 - attempts and review: `attempt start`, `attempt list`, `attempt show`,
-  `attempt attach`, `compare`, `attempt compare`
+  `attempt attach`, `proposal list`, `compare`, `attempt compare`, `diff`
 - intents: `intent list`, `intent show`
 - worktree/history: `restore`, `checkout`, `log`, `undo`
 - native merge: `merge`, `conflict list`, `conflict show`,
@@ -169,6 +169,11 @@ same commands directly if `rtk` is not installed.
 rtk cargo fmt --all --check
 rtk cargo test --workspace
 rtk cargo clippy --workspace --all-targets -- -D warnings
+
+# Without rtk:
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 The release dogfood gate aggregates the core local, native, sync, storage, and
@@ -177,6 +182,10 @@ attestation checks:
 ```bash
 rtk bash scripts/dogfood-release-gate.sh
 ```
+
+## Citation
+
+If you use Forge in published work, please cite it using [CITATION.cff](CITATION.cff).
 
 ## License
 

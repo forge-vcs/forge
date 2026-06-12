@@ -6,7 +6,7 @@
 
 Phases 1–7 are merged. The native backend is fully git-independent for the local loop: native walker + ignore engine, content-addressed Blob/Tree/**Commit** objects with object-kind headers, a `.forge/refs/HEAD` ref store, justified commit-on-accept (`decisions.commit_id`) with a ledger-authoritative HEAD reconcile, native `log`/`checkout`/`undo`, symlink content (mode 120000), a commit-DAG `doctor` integrity walk behind the typed `NativeHistoryCorrupt`, and a **dry-run-only** gc whose reachability roots already include the ledger tip + op-log targets. The full lifecycle (`init→start→save→run→propose→check→accept→restore`, `log`, checkout, `undo`) runs **with git removed from PATH**.
 
-`main` clean. **`schema_head` is `7`** (NER-142/NER-143 consolidation merged — migration 007 `expected_content_ref` landed; Phase 8's new migration is **008**). **`FORGE_ERROR_CODES` is `24`.** Gate: `bash scripts/ci.sh`. `gh` authed `freezscholte`; remote `freezscholte/forge`; squash-merge `(#N)`. (The gc-malformed-view fail-closed and the undo/worktree-state model are now in `main`.)
+`main` clean. **`schema_head` is `7`** (NER-142/NER-143 consolidation merged — migration 007 `expected_content_ref` landed; Phase 8's new migration is **008**). **`FORGE_ERROR_CODES` is `24`.** Gate: `bash scripts/ci.sh`. `gh` authenticated; remote repository configured; squash-merge `(#N)`. (The gc-malformed-view fail-closed and the undo/worktree-state model are now in `main`.)
 
 **Read first, in order:**
 - `docs/ROADMAP.md` Phase 8 section (the authoritative scope) and Phase 9 (NER-140, what Phase 8 must NOT pull in).

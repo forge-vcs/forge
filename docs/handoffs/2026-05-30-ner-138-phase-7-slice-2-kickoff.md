@@ -10,7 +10,7 @@ Phase 7 is staged internally into 3 slices. **Slice 1 is merged:**
 
 `main` is clean and synced. Slice-1 plan: `docs/plans/completed/2026-05-30-012-feat-phase-7-slice-1-native-walker-plan.md`. Code review: `docs/code-reviews/2026-05-30-ner-138-phase-7-slice-1.md`. **Read the slice-1 learnings** — they pin invariants slice 2 must not regress: `docs/solutions/architecture-patterns/native-worktree-walker-ignore-engine-and-index-vs-filesystem-divergence-2026-05-30.md`.
 
-Gate: `bash scripts/ci.sh` (fmt `--check` · `cargo test --workspace` · clippy `-D warnings` · `scripts/e2e-eval.sh`) — **CI runs this on every PR and it passed on #22** (verify ~1m46s). Toolchain pinned `1.92.0`. `gh` authed as `freezscholte`; remote `freezscholte/forge`; squash-merge convention `(#N)`. `schema_head` is **4** (slice 1 added no migration). `FORGE_ERROR_CODES` is **23**.
+Gate: `bash scripts/ci.sh` (fmt `--check` · `cargo test --workspace` · clippy `-D warnings` · `scripts/e2e-eval.sh`) — **CI runs this on every PR and it passed on #22** (verify ~1m46s). Toolchain pinned `1.92.0`. `gh` authenticated; remote repository configured; squash-merge convention `(#N)`. `schema_head` is **4** (slice 1 added no migration). `FORGE_ERROR_CODES` is **23**.
 
 **Adjacent ticket already filed:** **NER-142** — the NER-137 D1 `-z`/C-quote secret-leak in the *export* path's `filter_secret_paths_from_tree` (`crates/forge-export-git/src/lib.rs`). Its own minimal PR; **not** slice-2 scope, but cheap and can land anytime.
 

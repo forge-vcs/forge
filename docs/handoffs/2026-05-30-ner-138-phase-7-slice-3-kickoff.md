@@ -16,7 +16,7 @@ Phase 7 is staged into 3 slices. **Slices 1 and 2 are merged:**
 - Slice-1 learnings: `docs/solutions/architecture-patterns/native-worktree-walker-ignore-engine-and-index-vs-filesystem-divergence-2026-05-30.md`
 - `docs/ROADMAP.md` (Phase 7 section).
 
-Gate: `bash scripts/ci.sh` (fmt `--check` · `cargo test --workspace` · clippy `-D warnings` · `scripts/e2e-eval.sh`). `gh` authed as `freezscholte`; remote `freezscholte/forge`; squash-merge convention `(#N)`. **`schema_head` is now `5`. `FORGE_ERROR_CODES` is `23`.**
+Gate: `bash scripts/ci.sh` (fmt `--check` · `cargo test --workspace` · clippy `-D warnings` · `scripts/e2e-eval.sh`). `gh` authenticated; remote repository configured; squash-merge convention `(#N)`. **`schema_head` is now `5`. `FORGE_ERROR_CODES` is `23`.**
 
 **Adjacent ticket still open:** **NER-142** — the NER-137 D1 `-z`/C-quote secret-leak in the *export* path's `filter_secret_paths_from_tree` (`crates/forge-export-git/src/lib.rs`). Slice 2's native-base synthesis reuses that path (covered by a non-ASCII-secret test) but did **not** fix the structural `-z` flaw. Its own minimal PR; can land anytime.
 

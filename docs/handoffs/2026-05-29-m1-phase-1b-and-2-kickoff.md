@@ -11,7 +11,7 @@ Forge is an agent-first local change-control CLI over Git (Rust workspace, `crat
 
 The plan is completed and archived at `docs/plans/completed/2026-05-28-005-fix-substrate-phase-1a-plan.md`. The first `docs/solutions/` entry now exists: `docs/solutions/architecture-patterns/sqlite-multiprocess-concurrency-and-idempotent-replay-2026-05-29.md` (read it — it encodes the WAL/IMMEDIATE/replay/UUIDv7 learnings and the **scope boundaries** that bound the work below). Code-review triage: `docs/code-reviews/2026-05-29-phase-1a-pr-b-concurrency.md`.
 
-`main` is clean. Verify trio is the gate (`cargo fmt --all --check` · `cargo test --workspace` · `cargo clippy --workspace --all-targets -- -D warnings`); CI runs the same trio. Toolchain pinned `1.92.0`. `gh` authed as `freezscholte`; remote `freezscholte/forge`; squash-merge convention `(#N)`.
+`main` is clean. Verify trio is the gate (`cargo fmt --all --check` · `cargo test --workspace` · `cargo clippy --workspace --all-targets -- -D warnings`); CI runs the same trio. Toolchain pinned `1.92.0`. `gh` authenticated; remote repository configured; squash-merge convention `(#N)`.
 
 ## What's next — two L-effort tracks (can run in parallel)
 

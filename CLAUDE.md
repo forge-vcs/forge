@@ -65,6 +65,7 @@ Single Cargo workspace. The binary is `forge` (`crates/forge-cli`). Library crat
 - `FORGE_CONTENT_BACKEND` (`git` or `native`) selects the backend when `--content-backend` is not passed to `forge init`. For release-candidate native workflows, prefer `forge init --content-backend native` explicitly.
 - Mutating commands accept `--request-id <id>` for idempotency: replaying the same id returns the original result; reusing it for a different command errors `REQUEST_ID_CONFLICT`.
 - Behavioral invariants that intentionally error: materializing commands (`restore`, `checkout`, `undo`, `attempt attach`, and `sync pull`) refuse a dirty worktree (`DIRTY_WORKTREE`); `accept` requires HEAD to still match the proposal's `base_head` (`STALE_BASE`); `gc` deletion requires a clean `doctor`, `--yes`, and `--plan-digest` from a prior dry-run; `export branch` requires an accepted proposal and a non-existent branch name.
+- Run ad-hoc dogfood sessions (driving the `forge` binary through real `init`/`start`/lifecycle commands) **only inside throwaway `/tmp` repos, never from this project root** — a stray `forge init` here creates a gitignored `.forge/` in the repo root that then makes repo-scoped commands (e.g. `forge intent show`) resolve the wrong repo. The CI-style `scripts/*.sh` gates are fine to run from the root; this applies to interactive/multi-agent dogfooding.
 
 ## Security defaults (do not weaken without asking)
 

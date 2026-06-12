@@ -112,7 +112,7 @@ windows:
   - tabs:
       - title: forge-relay
         layout:
-          cwd: /Users/skolte/Github-Private/forge
+          cwd: /path/to/forge
           commands:
             - exec: >
                 claude --append-system-prompt-file docs/handoffs/latest.md
