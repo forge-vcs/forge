@@ -18,6 +18,33 @@ branches with structured `Forge-*` provenance trailers. The native backend now
 also supports Forge-owned content storage, history, diff/merge, garbage
 collection, pack/index storage, and native peer sync.
 
+## Installation
+
+Forge is currently published as a public release candidate from GitHub. Install
+the latest tagged RC with Cargo:
+
+```bash
+cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc1 forge-cli
+```
+
+This installs the `forge` binary:
+
+```bash
+forge --help
+forge schema --json
+```
+
+To build from source instead:
+
+```bash
+git clone https://github.com/freezscholte/forge.git
+cd forge
+cargo install --path crates/forge-cli
+```
+
+Homebrew and crates.io packages are planned, but not published yet. Until then,
+the GitHub tag install is the supported installation path.
+
 ## Why Forge Exists
 
 Git is excellent at storing commits. It is not designed around agent workflows
