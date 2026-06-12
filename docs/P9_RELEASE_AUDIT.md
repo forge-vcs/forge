@@ -1,7 +1,7 @@
 # Phase 9 Release Audit
 
-Date: 2026-06-10
-Audited commit: `9d7a33c docs: add public release notes`
+Date: 2026-06-12
+Audited commit: `45e4f2c fix: run release gate without rtk`
 
 This document maps the Phase 9 roadmap exit criteria to current executable
 evidence. It is intentionally stricter than a status note: an item is marked
@@ -15,20 +15,27 @@ The release gate is:
 rtk bash scripts/dogfood-release-gate.sh
 ```
 
-Latest local run on `9d7a33c` passed:
+The gate script also runs without `rtk` when `rtk` is not installed, which keeps
+the public release check usable from a plain shell:
+
+```bash
+bash scripts/dogfood-release-gate.sh
+```
+
+Latest local run on `45e4f2c` passed:
 
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: 478 passed, 52 suites
+- `cargo test --workspace`: passed
 - `scripts/e2e-eval.sh`: PASS=95 FAIL=0
 - `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
 - `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
 - `scripts/dogfood-native-sync-peer.sh`: PASS=26 FAIL=0
 - `scripts/dogfood-native-sync-peer-nogit.sh`: PASS=26 FAIL=0
-- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0
+- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0 with TypeScript 5.9.3
 - `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
 
-PR #75 also passed GitHub `verify` before merge.
+PR #82 merged the public release metadata cleanup before this audit refresh.
 
 ## Exit Criteria
 
