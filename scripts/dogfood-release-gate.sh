@@ -9,18 +9,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-if command -v rtk >/dev/null 2>&1; then
-  RUN=(rtk)
-else
-  RUN=()
-fi
-
 step() {
   printf '\n=== %s ===\n' "$*"
 }
 
 run() {
-  "${RUN[@]}" "$@"
+  if command -v rtk >/dev/null 2>&1; then
+    rtk "$@"
+  else
+    "$@"
+  fi
 }
 
 cd "$ROOT"
