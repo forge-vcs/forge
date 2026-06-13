@@ -1,0 +1,57 @@
+name: Security hardening
+description: Discuss non-sensitive security, privacy, or trust-model improvements.
+title: "security-hardening: "
+labels:
+  - security
+  - hardening
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form only for public hardening discussions. Do not disclose exploitable vulnerabilities here. For vulnerabilities, use GitHub private vulnerability reporting.
+  - type: textarea
+    id: area
+    attributes:
+      label: Area
+      description: Which Forge surface is involved?
+      placeholder: redaction, trust policy, signatures, sync transport, export provenance, local storage...
+    validations:
+      required: true
+  - type: textarea
+    id: concern
+    attributes:
+      label: Concern
+      description: Describe the hardening opportunity without exposing sensitive exploit details.
+    validations:
+      required: true
+  - type: textarea
+    id: threat_model
+    attributes:
+      label: Threat model
+      description: What actor, capability, or failure mode should Forge defend against?
+    validations:
+      required: true
+  - type: textarea
+    id: mitigation
+    attributes:
+      label: Suggested mitigation
+      description: What change would improve the situation?
+  - type: dropdown
+    id: sensitivity
+    attributes:
+      label: Is this safe to discuss publicly?
+      options:
+        - Yes, this is a general hardening idea.
+        - I am not sure.
+        - No, this should be reported privately.
+    validations:
+      required: true
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: Disclosure check
+      options:
+        - label: This report does not include secrets, tokens, private paths, or exploit instructions.
+          required: true
+        - label: I understand vulnerabilities should use private vulnerability reporting, not a public issue.
+          required: true

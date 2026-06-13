@@ -1,0 +1,85 @@
+name: Bug report
+description: Report a reproducible Forge CLI bug.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a Forge issue. Please redact secrets, tokens, private repository names, and personal paths from logs before submitting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+      placeholder: Forge returned an unexpected error when...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Forge version or commit
+      description: Include the release tag, installed commit, or local commit SHA.
+      placeholder: v0.1.0-rc2
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Repository mode
+      options:
+        - Native Forge backend
+        - Git-backed repository
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, shell, Rust version if built from source, and anything unusual about the repo.
+      placeholder: macOS 15, zsh, rustc 1.xx, installed with cargo install --git ...
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or workflow
+      description: The command sequence that triggered the issue.
+      render: bash
+      placeholder: |
+        forge init --native
+        forge start --intent "..."
+        forge save
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect Forge to do?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted output
+      description: Paste relevant `--json` output, terminal output, or `forge doctor --json` output after redacting sensitive data.
+      render: text
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets, tokens, private paths, and private repository names from this report.
+          required: true
+        - label: This is not a vulnerability report. If it is, I will use GitHub private vulnerability reporting instead.
+          required: true
