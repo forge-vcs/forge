@@ -1,5 +1,41 @@
 # Forge Public Release Notes
 
+## v0.1.0-rc2
+
+Forge v0.1.0-rc2 is a public release candidate focused on the open-source
+launch surface around rc1. The core local/native Forge CLI remains the rc1
+feature set, with release readiness improvements for installation, security,
+contribution, and agent onboarding.
+
+### What Changed Since rc1
+
+- Added the Forge agent plugin for Codex and Claude Code, including plugin
+  manifests, marketplace metadata, and the `forge-cli` skill.
+- Added README installation instructions that use the tagged GitHub release
+  candidate:
+
+```bash
+cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc2 forge-cli
+```
+
+- Added public `SECURITY.md` and `CONTRIBUTING.md` guides.
+- Documented current package boundaries: Cargo GitHub tag install is supported;
+  Homebrew and crates.io packages are planned but not published yet.
+- Dogfooded the agent skill in a temporary repository against the local Forge
+  binary, including lifecycle, multi-attempt, compare, export, and sync flows.
+
+### Release Validation
+
+Quick validation on `main` before preparing rc2:
+
+```bash
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+All three commands passed locally on `d35f3a1`.
+
 ## v0.1.0-rc1
 
 Forge v0.1.0-rc1 is the first public release candidate for the local/native
