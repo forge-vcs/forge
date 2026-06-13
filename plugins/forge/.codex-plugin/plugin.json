@@ -1,0 +1,39 @@
+{
+  "name": "forge",
+  "version": "0.1.0",
+  "description": "Agent workflows for using the Forge CLI safely.",
+  "author": {
+    "name": "Jan Scholte",
+    "url": "https://github.com/freezscholte"
+  },
+  "homepage": "https://github.com/freezscholte/forge",
+  "repository": "https://github.com/freezscholte/forge",
+  "license": "MIT",
+  "keywords": [
+    "forge",
+    "source-control",
+    "agents",
+    "cli",
+    "provenance",
+    "review"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Forge",
+    "shortDescription": "Use Forge's agent-native source-control CLI safely.",
+    "longDescription": "Forge teaches agents how to drive the Forge CLI for checked change attempts: initialize repositories, checkpoint work, capture evidence, propose and verify changes, accept reviewed proposals, sync native history, and export provenance to Git without editing Forge internals.",
+    "developerName": "Forge",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/freezscholte/forge",
+    "defaultPrompt": [
+      "Use Forge to checkpoint this change.",
+      "Review the current Forge proposal evidence.",
+      "Export an accepted Forge proposal to Git."
+    ]
+  }
+}

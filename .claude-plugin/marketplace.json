@@ -1,0 +1,13 @@
+{
+  "name": "forge",
+  "owner": {
+    "name": "Forge"
+  },
+  "plugins": [
+    {
+      "name": "forge",
+      "source": "./plugins/forge",
+      "description": "Agent workflows for using the Forge CLI safely."
+    }
+  ]
+}

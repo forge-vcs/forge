@@ -30,7 +30,7 @@ cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc1 forge
 This installs the `forge` binary:
 
 ```bash
-forge --help
+command -v forge
 forge schema --json
 ```
 
@@ -44,6 +44,44 @@ cargo install --path crates/forge-cli
 
 Homebrew and crates.io packages are planned, but not published yet. Until then,
 the GitHub tag install is the supported installation path.
+
+## Agent Plugin
+
+Forge ships a skill-only plugin that teaches coding agents how to use the
+`forge` CLI safely. It packages the `forge-cli` skill for Codex and Claude Code
+without adding hooks or MCP servers.
+
+For Codex:
+
+```bash
+codex plugin marketplace add freezscholte/forge
+codex plugin add forge@forge
+```
+
+For Claude Code:
+
+```text
+/plugin marketplace add freezscholte/forge
+/plugin install forge@forge
+/reload-plugins
+```
+
+For local plugin development from a checkout:
+
+```bash
+codex plugin marketplace add .
+codex plugin add forge@forge
+```
+
+Claude Code can also add the local checkout with:
+
+```text
+/plugin marketplace add .
+/plugin install forge@forge
+```
+
+After installing or updating the plugin, start a new agent thread so the bundled
+skills are loaded.
 
 ## Why Forge Exists
 
@@ -175,7 +213,7 @@ silently satisfy local, hosted-runner, or third-party policy.
 - intents: `intent list`, `intent show`
 - worktree/history: `restore`, `checkout`, `log`, `undo`
 - native merge: `merge`, `conflict list`, `conflict show`,
-  `conflict suggest`, `conflict resolve`
+  `conflict show --suggest`, `conflict resolve`
 - maintenance: `doctor`, `gc`
 - trust: `key status`, `key rotate`, `trust policy`,
   `trust attest hosted-runner`, `trust attest third-party`
