@@ -1,0 +1,61 @@
+name: Feature request
+description: Propose a Forge capability or workflow improvement.
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow, limitation, or user need should Forge address?
+      placeholder: When agents create multiple attempts, I need...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should Forge do?
+    validations:
+      required: true
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Example workflow
+      description: Show the commands, agent behavior, or review flow you expect.
+      render: bash
+      placeholder: |
+        forge start --intent "..."
+        forge attempt start --label "..."
+  - type: dropdown
+    id: audience
+    attributes:
+      label: Primary user
+      options:
+        - Coding agent
+        - Human maintainer
+        - CI or release automation
+        - Hosted collaboration
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workaround or other tool are you using today?
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility notes
+      description: Any expected impact on JSON envelopes, existing CLI commands, native storage, sync, or Git export.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: I checked the README and release notes for existing support.
+          required: true
+        - label: I can help test this against a real repository or agent workflow.
+          required: false
