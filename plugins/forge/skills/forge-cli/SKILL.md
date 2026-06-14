@@ -26,7 +26,7 @@ command -v forge
 2. If `forge` is missing, suggest the current release-candidate install path:
 
 ```bash
-cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc2 forge-cli
+cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc3 forge-cli
 ```
 
 3. For a quick machine-readable capability check, run:

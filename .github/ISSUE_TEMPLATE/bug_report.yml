@@ -21,7 +21,7 @@ body:
     attributes:
       label: Forge version or commit
       description: Include the release tag, installed commit, or local commit SHA.
-      placeholder: v0.1.0-rc2
+      placeholder: v0.1.0-rc3
     validations:
       required: true
   - type: dropdown

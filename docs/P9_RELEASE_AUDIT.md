@@ -1,7 +1,7 @@
 # Phase 9 Release Audit
 
-Date: 2026-06-12
-Audited commit: `45e4f2c fix: run release gate without rtk`
+Date: 2026-06-14
+Audited commit: `354c450 fix: redact macOS var path aliases (#95)`
 
 This document maps the Phase 9 roadmap exit criteria to current executable
 evidence. It is intentionally stricter than a status note: an item is marked
@@ -22,7 +22,7 @@ the public release check usable from a plain shell:
 bash scripts/dogfood-release-gate.sh
 ```
 
-Latest local run on `45e4f2c` passed:
+Latest local run while preparing `v0.1.0-rc3` passed:
 
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
@@ -32,10 +32,13 @@ Latest local run on `45e4f2c` passed:
 - `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
 - `scripts/dogfood-native-sync-peer.sh`: PASS=26 FAIL=0
 - `scripts/dogfood-native-sync-peer-nogit.sh`: PASS=26 FAIL=0
-- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0 with TypeScript 5.9.3
+- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0 with TypeScript 6.0.3
 - `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
 
-PR #82 merged the public release metadata cleanup before this audit refresh.
+PR #82 merged the public release metadata cleanup before the original audit
+refresh. PR #88 added public issue templates, PR #94 addressed the first
+Forge CLI dogfood feedback, and PR #95 fixed macOS `/private/var` path-alias
+redaction before this rc3 audit refresh.
 
 ## Exit Criteria
 
