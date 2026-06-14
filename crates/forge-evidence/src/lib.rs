@@ -202,6 +202,11 @@ fn push_path_candidate(candidates: &mut Vec<String>, path: &Path) {
     } else if let Some(rest) = candidate.strip_prefix("/tmp/") {
         push_candidate_string(candidates, format!("/private/tmp/{rest}"));
     }
+    if let Some(rest) = candidate.strip_prefix("/private/var/") {
+        push_candidate_string(candidates, format!("/var/{rest}"));
+    } else if let Some(rest) = candidate.strip_prefix("/var/") {
+        push_candidate_string(candidates, format!("/private/var/{rest}"));
+    }
 }
 
 fn push_candidate_string(candidates: &mut Vec<String>, candidate: String) {
@@ -227,4 +232,28 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_path_redaction_covers_macos_tmp_aliases() {
+        let repo_root = Path::new("/private/tmp/forge-test");
+        let (redacted, changed) = redact_local_worktree_paths("cwd=/tmp/forge-test\n", repo_root);
+
+        assert!(changed);
+        assert_eq!(redacted, "cwd=[REPO_ROOT]\n");
+    }
+
+    #[test]
+    fn local_path_redaction_covers_macos_var_aliases() {
+        let repo_root = Path::new("/private/var/folders/example/forge-test");
+        let (redacted, changed) =
+            redact_local_worktree_paths("cwd=/var/folders/example/forge-test\n", repo_root);
+
+        assert!(changed);
+        assert_eq!(redacted, "cwd=[REPO_ROOT]\n");
+    }
 }
