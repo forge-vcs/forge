@@ -3,9 +3,10 @@ pub mod parsers;
 use anyhow::{Context, Result};
 use forge_content::{redact_evidence_excerpt, RedactionKind, SECRET_RISK_SENSITIVITY};
 use serde::Serialize;
+use std::env;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -79,8 +80,9 @@ pub fn capture_with_timeout(
         thread::sleep(Duration::from_millis(10));
     };
     let ended_at_ms = now_ms();
-    let (stdout_excerpt, stdout_truncated, mut redactions) = excerpt_file(&stdout_path)?;
-    let (stderr_excerpt, stderr_truncated, stderr_redactions) = excerpt_file(&stderr_path)?;
+    let (stdout_excerpt, stdout_truncated, mut redactions) = excerpt_file(&stdout_path, repo_root)?;
+    let (stderr_excerpt, stderr_truncated, stderr_redactions) =
+        excerpt_file(&stderr_path, repo_root)?;
     redactions.extend(stderr_redactions);
 
     // Structured parse over the FULL captured output (the summary line often sits past
@@ -145,7 +147,7 @@ fn read_for_parsing(path: &Path) -> Result<String> {
 /// `EXCERPT_LIMIT` so a secret straddling byte 4096 is removed before its prefix is
 /// persisted (NER-136 §U4). The hash is computed over this persisted (redacted +
 /// truncated) excerpt, so verification recomputes from the same bytes.
-fn excerpt_file(path: &Path) -> Result<(String, bool, Vec<RedactionKind>)> {
+fn excerpt_file(path: &Path, repo_root: &Path) -> Result<(String, bool, Vec<RedactionKind>)> {
     let mut file = File::open(path)?;
     let mut bytes = vec![0; REDACTION_WINDOW + 1];
     let read = file.read(&mut bytes)?;
@@ -153,9 +155,59 @@ fn excerpt_file(path: &Path) -> Result<(String, bool, Vec<RedactionKind>)> {
     // The excerpt is truncated whenever the raw output exceeded the persisted cap,
     // independent of the larger redaction window.
     let truncated = read > EXCERPT_LIMIT;
-    let (redacted, redactions) = redact_evidence_excerpt(&String::from_utf8_lossy(&bytes));
+    let (redacted, mut redactions) = redact_evidence_excerpt(&String::from_utf8_lossy(&bytes));
+    let (redacted, local_path_redacted) = redact_local_worktree_paths(&redacted, repo_root);
+    if local_path_redacted {
+        redactions.push(RedactionKind::LocalPath);
+    }
     let excerpt = truncate_to_bytes(&redacted, EXCERPT_LIMIT);
     Ok((excerpt, truncated, redactions))
+}
+
+fn redact_local_worktree_paths(text: &str, repo_root: &Path) -> (String, bool) {
+    let mut candidates = Vec::new();
+    push_path_candidate(&mut candidates, repo_root);
+    if let Ok(canonical) = repo_root.canonicalize() {
+        push_path_candidate(&mut candidates, &canonical);
+    }
+    if repo_root.is_relative() {
+        if let Ok(current_dir) = env::current_dir() {
+            push_path_candidate(&mut candidates, &current_dir.join(repo_root));
+        }
+        if let Ok(pwd) = env::var("PWD") {
+            push_path_candidate(&mut candidates, &PathBuf::from(pwd).join(repo_root));
+        }
+    }
+
+    let mut output = text.to_string();
+    let mut redacted = false;
+    for candidate in candidates {
+        if output.contains(&candidate) {
+            output = output.replace(&candidate, "[REPO_ROOT]");
+            redacted = true;
+        }
+    }
+    (output, redacted)
+}
+
+fn push_path_candidate(candidates: &mut Vec<String>, path: &Path) {
+    let normalized: PathBuf = path
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect();
+    let candidate = normalized.to_string_lossy().into_owned();
+    push_candidate_string(candidates, candidate.clone());
+    if let Some(rest) = candidate.strip_prefix("/private/tmp/") {
+        push_candidate_string(candidates, format!("/tmp/{rest}"));
+    } else if let Some(rest) = candidate.strip_prefix("/tmp/") {
+        push_candidate_string(candidates, format!("/private/tmp/{rest}"));
+    }
+}
+
+fn push_candidate_string(candidates: &mut Vec<String>, candidate: String) {
+    if candidate.len() > 1 && !candidates.contains(&candidate) {
+        candidates.push(candidate);
+    }
 }
 
 /// Truncate a string to at most `limit` bytes on a UTF-8 char boundary.

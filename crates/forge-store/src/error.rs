@@ -251,7 +251,7 @@ pub enum ForgeError {
     /// `program` is the user-supplied gate program token, surfaced WITHOUT execution, so
     /// it is run through the same `key=value` secret redactor as `CheckNotPassed`'s
     /// unmet gates in [`ForgeError::details`].
-    UnsupportedStructuredGate { program: String },
+    UnsupportedStructuredGate { program: String, gate: String },
 }
 
 impl ForgeError {
@@ -428,7 +428,7 @@ impl ForgeError {
             ForgeError::SyncDivergenceUnsupported { direction, reason } => {
                 json!({ "direction": direction, "reason": reason })
             }
-            ForgeError::UnsupportedStructuredGate { program } => {
+            ForgeError::UnsupportedStructuredGate { program, gate } => {
                 // `program` is the user-supplied gate program token (the first
                 // whitespace split of a `--require-tests-pass` entry), surfaced WITHOUT
                 // execution. It is already a single token, so the per-token redaction the
@@ -436,7 +436,18 @@ impl ForgeError {
                 // call here — `redact_secret_like_text` keys on the first `=`/`:`, which is
                 // sufficient for one token. Mirrors `CheckNotPassed` so a secret-like
                 // `key=value` program token cannot leak through error details.
-                json!({ "program": forge_content::redact_secret_like_text(program).0 })
+                let program = forge_content::redact_secret_like_text(program).0;
+                let gate = forge_content::redact_secret_like_text(gate).0;
+                json!({
+                    "program": program,
+                    "gate": gate,
+                    "suggested_plain_gate": format!("--require \"{gate}\""),
+                    "supported_structured_examples": [
+                        "cargo test",
+                        "python -m unittest",
+                        "pytest"
+                    ],
+                })
             }
             _ => Value::Object(Default::default()),
         }
@@ -605,7 +616,7 @@ impl std::fmt::Display for ForgeError {
                 f,
                 "sync {direction} divergent native merge is not supported yet ({reason})"
             ),
-            ForgeError::UnsupportedStructuredGate { program } => {
+            ForgeError::UnsupportedStructuredGate { program, gate } => {
                 // Redact the user-supplied program token before it lands in the
                 // human-readable message. `error_to_object` (forge-cli) routes this
                 // `Display` string into the JSON response `message` field and to stderr,
@@ -614,9 +625,10 @@ impl std::fmt::Display for ForgeError {
                 // though `details.program` is redacted. Mirrors `details()`'s single-token
                 // `redact_secret_like_text` call so both surfaces agree.
                 let program = forge_content::redact_secret_like_text(program).0;
+                let gate = forge_content::redact_secret_like_text(gate).0;
                 write!(
                     f,
-                    "no structured parser is registered for `{program}`; a --require-tests-pass gate needs a program Forge can parse (cargo test, cargo clippy, python -m unittest, pytest). Use --require \"{program} …\" for a plain exit-code gate instead"
+                    "no structured parser is registered for `{program}` in `{gate}`; use --require \"{gate}\" for a plain exit-code gate, or use a structured parser target such as cargo test, python -m unittest, or pytest"
                 )
             }
         }
@@ -988,7 +1000,8 @@ mod tests {
         );
         assert_eq!(
             ForgeError::UnsupportedStructuredGate {
-                program: "python3".into()
+                program: "python3".into(),
+                gate: "python3 script.py".into(),
             }
             .code(),
             "UNSUPPORTED_STRUCTURED_GATE"
@@ -1245,14 +1258,21 @@ mod tests {
     fn unsupported_structured_gate_details_redact_secret_program() {
         let plain = ForgeError::UnsupportedStructuredGate {
             program: "python3".into(),
+            gate: "python3 script.py".into(),
         }
         .details();
         assert_eq!(plain["program"], "python3");
+        assert_eq!(plain["gate"], "python3 script.py");
+        assert_eq!(
+            plain["suggested_plain_gate"],
+            "--require \"python3 script.py\""
+        );
         let object = plain.as_object().expect("details object");
-        assert_eq!(object.len(), 1, "details carry exactly program");
+        assert_eq!(object.len(), 4, "details carry recovery guidance");
 
         let secret = ForgeError::UnsupportedStructuredGate {
             program: "TOKEN=ghp_supersecret".into(),
+            gate: "TOKEN=ghp_supersecret script.py".into(),
         }
         .details();
         let serialized = secret["program"].to_string();
@@ -1261,6 +1281,7 @@ mod tests {
             "secret-like program token must be redacted in details"
         );
         assert!(serialized.contains("[REDACTED]"));
+        assert_eq!(secret["gate"], "TOKEN=[REDACTED]");
     }
 
     #[test]
@@ -1403,6 +1424,7 @@ mod tests {
             },
             ForgeError::UnsupportedStructuredGate {
                 program: "python3".into(),
+                gate: "python3 script.py".into(),
             },
         ];
 

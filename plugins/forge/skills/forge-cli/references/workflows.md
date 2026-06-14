@@ -8,7 +8,7 @@ in `SKILL.md`.
 Install the current release candidate:
 
 ```bash
-cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc1 forge-cli
+cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc2 forge-cli
 ```
 
 Inspect command contracts:
@@ -40,6 +40,19 @@ Notes:
 - `forge propose` creates or updates a proposal over the saved content.
 - `forge check` evaluates the proposal against declared requirements.
 - `forge accept` records the decision and native accepted commit.
+
+For JavaScript/TypeScript projects, exclude `.forge/**` from test runners and
+linters before recording evidence. Example Vitest config:
+
+```ts
+import { configDefaults, defineConfig } from 'vitest/config'
+
+export default defineConfig({
+  test: {
+    exclude: [...configDefaults.exclude, '.forge/**'],
+  },
+})
+```
 
 ## Multiple Attempts for One Intent
 
@@ -74,6 +87,28 @@ forge reject --proposal <proposal-id>
 
 Treat `compare` ranking as advisory. Use the underlying evidence, checks, and
 diffs to justify selection.
+
+## Stale Base Recovery
+
+If `forge accept` or `forge export branch` returns `STALE_BASE`, the proposal's
+base no longer matches the repository head. The checked proposal is not wrong,
+but it is no longer directly acceptable.
+
+Use a fresh attempt from the current base:
+
+```bash
+forge start "reapply <change> on current base"
+# reapply the desired edits
+forge save
+forge run -- <required-check>
+forge propose
+forge check
+forge accept
+```
+
+Do not edit `.forge` internals or force the old decision. If the original
+attempt is still useful, inspect it with `forge show --attempt <attempt-id>` and
+copy the source-level edits into the fresh attempt.
 
 ## Native Conflict Flow
 

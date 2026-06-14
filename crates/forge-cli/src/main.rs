@@ -678,6 +678,7 @@ fn start_response(request_id: Option<String>, args: IntentArgs) -> ResponseEnvel
             if !forge_evidence::parsers::has_structured_parser(program, &gate_args) {
                 return Err(ForgeError::UnsupportedStructuredGate {
                     program: program.to_string(),
+                    gate: raw.clone(),
                 }
                 .into());
             }
@@ -3874,6 +3875,7 @@ fn redaction_warnings(redactions: &[forge_content::RedactionKind]) -> Vec<String
             RedactionKind::JsonSecret => "JSON-embedded secret",
             RedactionKind::PemPrivateKey => "PEM private key",
             RedactionKind::CredentialUrl => "credential URL password",
+            RedactionKind::LocalPath => "local repository path",
         };
         *counts.entry(label).or_insert(0) += 1;
     }
