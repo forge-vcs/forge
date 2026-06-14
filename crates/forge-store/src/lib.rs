@@ -251,6 +251,8 @@ pub struct ProposalRecord {
     pub base_head: String,
     pub content_ref: String,
     pub changed_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     pub operation_id: String,
 }
 
@@ -2950,9 +2952,11 @@ pub fn propose(
     cwd: &Path,
     request_id: Option<String>,
     attempt_id: Option<&str>,
+    summary: Option<&str>,
 ) -> Result<ProposalRecord> {
     let context = open_repository(cwd)?;
     let attempt = resolve_attempt_in_context(&context, attempt_id)?.attempt;
+    let summary = summary.map(str::to_string);
     let mut connection = open_connection(&context.database_path)?;
     let (proposal_id, revision_id, snapshot, op) = with_immediate_retry(&mut connection, |tx| {
         replay_guard(tx, &context.repo_id, request_id.as_deref())?;
@@ -2987,6 +2991,18 @@ pub fn propose(
                 now_ms()
             ],
         )?;
+        let mut replay_data = json!({
+            "proposal_id": proposal_id,
+            "proposal_revision_id": revision_id,
+            "attempt_id": attempt.attempt_id,
+            "snapshot_id": snapshot.snapshot_id,
+            "base_head": attempt.base_head,
+            "content_ref": snapshot.content_ref,
+            "changed_paths": snapshot.changed_paths,
+        });
+        if let Some(summary) = summary.as_ref() {
+            replay_data["summary"] = json!(summary);
+        }
         let op = insert_operation_view(
             tx,
             &context.repo_id,
@@ -3002,15 +3018,7 @@ pub fn propose(
                 state: json!({
                     "lifecycle": "proposal_draft",
                     "proposal_id": proposal_id,
-                    "replay_data": {
-                        "proposal_id": proposal_id,
-                        "proposal_revision_id": revision_id,
-                        "attempt_id": attempt.attempt_id,
-                        "snapshot_id": snapshot.snapshot_id,
-                        "base_head": attempt.base_head,
-                        "content_ref": snapshot.content_ref,
-                        "changed_paths": snapshot.changed_paths,
-                    }
+                    "replay_data": replay_data
                 }),
             },
         )?;
@@ -3024,6 +3032,7 @@ pub fn propose(
         base_head: attempt.base_head,
         content_ref: snapshot.content_ref,
         changed_paths: snapshot.changed_paths,
+        summary,
         operation_id: op.operation_id,
     })
 }

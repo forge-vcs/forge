@@ -37,7 +37,7 @@ enum Command {
     Save(AttemptScopedArgs),
     Restore(RestoreArgs),
     Run(RunArgs),
-    Propose(AttemptScopedArgs),
+    Propose(ProposeArgs),
     Check(ProposalScopedArgs),
     Accept(AcceptArgs),
     Reject(ProposalScopedArgs),
@@ -173,6 +173,15 @@ struct IntentArgs {
 struct AttemptScopedArgs {
     #[arg(long)]
     attempt: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct ProposeArgs {
+    #[arg(long)]
+    attempt: Option<String>,
+    /// Optional human summary echoed in the proposal response for agent workflows.
+    #[arg(long)]
+    summary: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1261,9 +1270,14 @@ fn run_response(request_id: Option<String>, args: RunArgs) -> ResponseEnvelope {
     })
 }
 
-fn propose_response(request_id: Option<String>, args: AttemptScopedArgs) -> ResponseEnvelope {
+fn propose_response(request_id: Option<String>, args: ProposeArgs) -> ResponseEnvelope {
     command_result("propose", request_id, |cwd, request_id| {
-        let proposal = forge_store::propose(&cwd, request_id, args.attempt.as_deref())?;
+        let proposal = forge_store::propose(
+            &cwd,
+            request_id,
+            args.attempt.as_deref(),
+            args.summary.as_deref(),
+        )?;
         Ok((
             Some(proposal.operation_id.clone()),
             serde_json::to_value(proposal)?,
