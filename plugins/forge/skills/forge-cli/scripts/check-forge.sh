@@ -6,7 +6,7 @@ if ! command -v forge >/dev/null 2>&1; then
 forge is not installed or is not on PATH.
 
 Install the current release candidate with:
-  cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc2 forge-cli
+  cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc3 forge-cli
 EOF
   exit 1
 fi

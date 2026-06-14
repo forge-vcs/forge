@@ -1,5 +1,62 @@
 # Forge Public Release Notes
 
+## v0.1.0-rc3
+
+Forge v0.1.0-rc3 is a public release candidate focused on the first
+open-source dogfood feedback after rc2. It keeps the rc1/rc2 release boundary
+intact while tightening agent-facing UX, evidence hygiene, and public issue
+intake.
+
+### What Changed Since rc2
+
+- Added GitHub issue templates for bug reports, feature requests, and security
+  hardening requests.
+- Added `forge propose --summary <text>` so agents can attach a concise proposal
+  summary without depending on an unsupported positional argument.
+- Improved unsupported structured-gate errors. For commands such as
+  `--require-tests-pass "npm test"`, Forge now returns the original gate and a
+  concrete `--require "npm test"` fallback suggestion for plain exit-code
+  gating.
+- Redacted local repository/worktree paths from persisted `forge run` evidence
+  excerpts, including macOS `/private/tmp`/`/tmp` and
+  `/private/var`/`/var` aliases.
+- Documented `.forge/**` excludes for broad JavaScript/TypeScript test runners
+  so tools such as Vitest do not discover duplicate tests in managed attempt
+  worktrees.
+- Documented stale-base recovery guidance for `accept` and `export`: start a
+  fresh attempt from the current base, re-save, rerun evidence, then
+  propose/check/accept again.
+- Updated the Forge agent plugin install guidance to use the rc3 tag.
+
+### Installation
+
+```bash
+cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc3 forge-cli
+```
+
+### Release Validation
+
+The rc3 preparation ran the aggregate release gate:
+
+```bash
+bash scripts/dogfood-release-gate.sh
+```
+
+The TypeScript dogfood portion used the local dogfood repository's TypeScript
+binary on `PATH` because `tsc` is an explicit environment prerequisite for that
+script. Gate results:
+
+- `cargo fmt --all --check`: passed
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed
+- `cargo test --workspace`: passed
+- `scripts/e2e-eval.sh`: PASS=95 FAIL=0
+- `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
+- `scripts/dogfood-native-sync-peer.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-peer-nogit.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0 with TypeScript 6.0.3
+- `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
+
 ## v0.1.0-rc2
 
 Forge v0.1.0-rc2 is a public release candidate focused on the open-source
