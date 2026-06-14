@@ -275,6 +275,8 @@ pub enum RedactionKind {
     PemPrivateKey,
     /// A `scheme://user:pass@host` credential URL password.
     CredentialUrl,
+    /// The local repository/worktree path printed by a command.
+    LocalPath,
 }
 
 /// Harden captured command output against secret leakage before it is persisted

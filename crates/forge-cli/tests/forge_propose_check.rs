@@ -44,6 +44,37 @@ fn propose_show_and_check_pass_with_successful_evidence() {
 }
 
 #[test]
+fn propose_accepts_summary_and_replays_it_with_request_id() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    repo.forge()
+        .args(["--json", "start", "summarize proposal"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("README.md"), "proposal\n").expect("write readme");
+    repo.forge().args(["--json", "save"]).assert().success();
+
+    let args = [
+        "--json",
+        "--request-id",
+        "req-propose-summary",
+        "propose",
+        "--summary",
+        "Scaffold app shell",
+    ];
+    let proposed = json_output(repo.forge().args(args).assert().success());
+    assert_eq!(proposed["data"]["summary"], "Scaffold app shell");
+
+    let replayed = json_output(repo.forge().args(args).assert().success());
+    assert_eq!(replayed["data"]["summary"], "Scaffold app shell");
+    assert_eq!(replayed["data"]["idempotent_replay"], true);
+    assert_eq!(
+        replayed["data"]["proposal_id"],
+        proposed["data"]["proposal_id"]
+    );
+}
+
+#[test]
 fn propose_requires_snapshot_and_check_reports_missing_evidence() {
     let repo = TestRepo::new_git();
     repo.forge().args(["--json", "init"]).assert().success();

@@ -176,6 +176,38 @@ fn run_redacts_secret_like_output_and_marks_sensitivity() {
 }
 
 #[test]
+fn run_redacts_local_worktree_path_from_output() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    repo.forge()
+        .args(["--json", "start", "capture local path"])
+        .assert()
+        .success();
+
+    let output = json_output(
+        repo.forge()
+            .args(["--json", "run", "--", "sh", "-c", "pwd"])
+            .assert()
+            .success(),
+    );
+
+    let stdout = output["data"]["stdout_excerpt"].as_str().unwrap();
+    let repo_path = repo.path().to_string_lossy();
+    assert!(
+        !stdout.contains(repo_path.as_ref()),
+        "captured output must not leak the local repo path: {stdout}"
+    );
+    assert_eq!(stdout.trim(), "[REPO_ROOT]");
+    assert!(output["warnings"]
+        .as_array()
+        .expect("warnings")
+        .iter()
+        .any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("local repository path"))));
+}
+
+#[test]
 fn run_times_out_and_persists_timed_out_evidence() {
     let repo = TestRepo::new_git();
     repo.forge().args(["--json", "init"]).assert().success();

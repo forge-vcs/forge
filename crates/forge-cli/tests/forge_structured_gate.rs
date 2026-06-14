@@ -30,11 +30,47 @@ fn start_rejects_structured_gate_without_a_parser() {
     );
     assert_eq!(output["errors"][0]["code"], "UNSUPPORTED_STRUCTURED_GATE");
     assert_eq!(output["errors"][0]["details"]["program"], "python3");
+    assert_eq!(output["errors"][0]["details"]["gate"], "python3 script.py");
+    assert_eq!(
+        output["errors"][0]["details"]["suggested_plain_gate"],
+        "--require \"python3 script.py\""
+    );
     assert_eq!(output["retry"]["retryable"], false);
     let message = output["errors"][0]["message"].as_str().unwrap();
     assert!(
         message.contains("python3"),
         "message should name the program: {message}"
+    );
+}
+
+#[test]
+fn unsupported_npm_structured_gate_suggests_plain_require() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+
+    let output = json_output(
+        repo.forge()
+            .args([
+                "--json",
+                "start",
+                "node app",
+                "--require-tests-pass",
+                "npm test",
+            ])
+            .assert()
+            .failure(),
+    );
+
+    assert_eq!(output["errors"][0]["code"], "UNSUPPORTED_STRUCTURED_GATE");
+    assert_eq!(output["errors"][0]["details"]["program"], "npm");
+    assert_eq!(
+        output["errors"][0]["details"]["suggested_plain_gate"],
+        "--require \"npm test\""
+    );
+    let message = output["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("use --require \"npm test\""),
+        "message should tell npm users exactly how to recover: {message}"
     );
 }
 
@@ -65,6 +101,7 @@ fn rejected_structured_gate_redacts_secret_like_program_in_message() {
         output["errors"][0]["details"]["program"],
         "TOKEN=[REDACTED]"
     );
+    assert_eq!(output["errors"][0]["details"]["gate"], "TOKEN=[REDACTED]");
     let message = output["errors"][0]["message"].as_str().unwrap();
     assert!(
         !message.contains("ghp_supersecret"),

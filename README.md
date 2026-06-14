@@ -106,7 +106,8 @@ Forge makes those concepts first-class:
 - Snapshots and exported branches exclude `.forge`, `.env`, `.env.*`, private
   keys, credential files, and obvious secret-risk paths.
 - Evidence excerpts redact common token, password, secret, key, PEM, credential
-  URL, and high-entropy values before JSON output or SQLite persistence.
+  URL, high-entropy values, and local worktree paths before JSON output or
+  SQLite persistence.
 - `forge run` caps captured stdout/stderr excerpts and defaults to a 30 second
   timeout. Use `forge run --timeout-ms <n> -- <command>` for a shorter local
   bound.
@@ -116,6 +117,8 @@ Forge makes those concepts first-class:
 - `.forge/worktrees/<attempt-id>/` directories are managed stash space: only the
   attached attempt, materialized at the repo root, is editable. Edits made
   directly inside those stash directories are discarded on the next attach.
+- Broad test runners should exclude `.forge/**`; otherwise tools such as Vitest
+  may discover duplicate tests inside managed attempt worktrees.
 - Mutating `--request-id` values are scoped to the command and replay the
   original success or failure. Reusing one for a different mutating command
   returns `REQUEST_ID_CONFLICT`.

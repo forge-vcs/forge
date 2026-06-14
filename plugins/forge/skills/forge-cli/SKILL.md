@@ -26,7 +26,7 @@ command -v forge
 2. If `forge` is missing, suggest the current release-candidate install path:
 
 ```bash
-cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc1 forge-cli
+cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc2 forge-cli
 ```
 
 3. For a quick machine-readable capability check, run:
@@ -58,6 +58,11 @@ Use `forge run -- <command>` for evidence-producing commands. Do not claim a
 proposal is checked unless Forge has recorded the evidence and `forge check`
 passes for the proposal revision.
 
+For JavaScript/TypeScript projects, add `.forge/**` to broad test-runner and
+lint/tooling excludes. Forge keeps per-attempt worktrees under `.forge/`, and
+tools like Vitest can otherwise discover duplicate tests in those managed
+worktrees.
+
 ## Agent Operating Rules
 
 - Keep work inside a real project repository or a temporary test repository.
@@ -74,6 +79,9 @@ passes for the proposal revision.
 - Use `forge key status` and `forge trust policy` before changing accept/export
   trust requirements.
 - Use `forge export verify-branch <branch>` after exporting to Git.
+- When `accept` or `export` returns `STALE_BASE`, do not edit `.forge` or retry
+  blindly. Start a fresh intent/attempt from the current base, re-save the
+  desired changes, rerun evidence, then propose/check/accept again.
 
 ## Common Tasks
 

@@ -37,9 +37,10 @@ Common guarded commands include:
 ## Secret and Evidence Hygiene
 
 Forge excludes common secret-risk paths from snapshots and exports and redacts
-secret-like values from captured evidence. Do not weaken those defaults. Do not
-paste real credentials, private keys, tokens, customer data, or proprietary code
-into issue reports, test fixtures, prompts, or evidence examples.
+secret-like values and local worktree paths from captured evidence. Do not
+weaken those defaults. Do not paste real credentials, private keys, tokens,
+customer data, local personal paths, or proprietary code into issue reports,
+test fixtures, prompts, or evidence examples.
 
 Use synthetic fixtures for tests:
 
@@ -48,6 +49,24 @@ EXAMPLE_TOKEN=not-a-real-token
 -----BEGIN TEST KEY-----
 ...
 -----END TEST KEY-----
+```
+
+## Test-Runner Excludes
+
+Forge stores managed per-attempt worktrees under `.forge/worktrees/`. Broad
+test discovery can recurse into those directories and run duplicate tests.
+
+For JavaScript and TypeScript projects, add `.forge/**` to test and lint
+excludes. For Vitest:
+
+```ts
+import { configDefaults, defineConfig } from 'vitest/config'
+
+export default defineConfig({
+  test: {
+    exclude: [...configDefaults.exclude, '.forge/**'],
+  },
+})
 ```
 
 ## Trust Policy and Signatures
@@ -105,6 +124,25 @@ forge export verify-branch forge/<topic>
 
 Verification failure means the Git branch should not be treated as carrying
 valid Forge provenance.
+
+## Stale Base Recovery
+
+`STALE_BASE` means the proposal was checked against an older base than the
+current repository head. The safe recovery path is:
+
+```bash
+forge start "reapply the change on the current base"
+# reapply or keep the desired edit in the attached worktree
+forge save
+forge run -- <required-check>
+forge propose
+forge check
+forge accept
+```
+
+Do not force acceptance of the stale proposal. If the old proposal still
+contains useful work, inspect it with `forge show --attempt <attempt-id>` and
+copy or reapply the relevant source edits into the fresh attempt.
 
 ## Maintenance Safety
 
