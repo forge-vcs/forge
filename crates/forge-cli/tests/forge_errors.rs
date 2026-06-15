@@ -225,6 +225,23 @@ fn deterministic_failure_under_request_id_replays_with_same_code() {
     let first_actual = first["errors"][0]["details"]["actual_head"].clone();
     assert!(first_expected.is_string(), "first response has details");
     assert!(first_actual.is_string(), "first response has details");
+    assert_eq!(
+        first["errors"][0]["details"]["reason"],
+        "current repository head has advanced since this proposal was based"
+    );
+    assert!(first["errors"][0]["details"]["recovery_hint"]
+        .as_str()
+        .expect("recovery hint")
+        .contains("Start a fresh intent or attempt"));
+    assert!(first["errors"][0]["details"]["recovery_steps"]
+        .as_array()
+        .expect("recovery steps")
+        .iter()
+        .any(|step| step == "forge start \"reapply the change on the current base\""));
+    assert!(first["errors"][0]["message"]
+        .as_str()
+        .expect("message")
+        .contains("Start a fresh intent or attempt from the current head"));
 
     // Replaying the same request id reproduces the SAME code AND the SAME details,
     // read from the stored error_json (not re-derived from the message). The
@@ -246,5 +263,10 @@ fn deterministic_failure_under_request_id_replays_with_same_code() {
     assert_eq!(
         replay["errors"][0]["details"]["actual_head"], first_actual,
         "replayed STALE_BASE must carry the same actual_head detail"
+    );
+    assert_eq!(
+        replay["errors"][0]["details"]["recovery_hint"],
+        first["errors"][0]["details"]["recovery_hint"],
+        "replayed STALE_BASE must carry the same recovery guidance"
     );
 }

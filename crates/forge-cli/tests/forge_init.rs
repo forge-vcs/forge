@@ -6,6 +6,20 @@ use rusqlite::Connection;
 use serde_json::Value;
 
 #[test]
+fn version_exits_successfully_without_subcommand() {
+    let assert = assert_cmd::Command::cargo_bin("forge")
+        .expect("forge binary")
+        .arg("--version")
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
+    assert!(
+        stdout.starts_with("forge "),
+        "version output should name the binary, got {stdout:?}"
+    );
+}
+
+#[test]
 fn stubbed_command_returns_json_envelope_and_echoes_request_id() {
     let repo = TestRepo::new_git();
 

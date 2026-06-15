@@ -622,6 +622,9 @@ pub struct ResolvedProposal {
 pub struct DoctorReport {
     pub ok: bool,
     pub issues: Vec<String>,
+    /// Non-fatal guidance for configuration that can confuse Forge workflows. Warnings do
+    /// not affect `ok` and are also surfaced as top-level CLI `warnings[]`.
+    pub warnings: Vec<String>,
     pub schema_version: Option<i64>,
     /// File-byte accounting for `.forge`, grouped by stable storage category. This is
     /// informational only; storage-budget overflow is reported separately and never evicts.
@@ -5685,10 +5688,12 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
             native_pack_issues.len()
         ));
     }
+    let warnings = doctor_warnings(&context.root_path)?;
 
     Ok(DoctorReport {
         ok: issues.is_empty(),
         issues,
+        warnings,
         schema_version,
         storage,
         storage_policy,
@@ -5703,6 +5708,94 @@ pub fn doctor(cwd: &Path) -> Result<DoctorReport> {
         signature_issues,
         signature_key_summary,
     })
+}
+
+fn doctor_warnings(root: &Path) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    if js_test_runner_may_scan_forge_worktrees(root)? {
+        warnings.push(
+            "JavaScript/TypeScript test discovery may scan Forge-managed worktrees; add `.forge/**` to test-runner excludes (for example Vitest `exclude: [...configDefaults.exclude, '.forge/**']`).".to_string(),
+        );
+    }
+    Ok(warnings)
+}
+
+fn js_test_runner_may_scan_forge_worktrees(root: &Path) -> Result<bool> {
+    let has_package_test_script = package_json_has_test_script(root)?;
+    let mut relevant_files = js_test_config_files(root);
+    if has_package_test_script {
+        relevant_files.push(root.join("package.json"));
+    }
+    if relevant_files.is_empty() {
+        return Ok(false);
+    }
+    for path in relevant_files {
+        if file_mentions_forge_exclude(&path)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn package_json_has_test_script(root: &Path) -> Result<bool> {
+    let path = root.join("package.json");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("read {}", path.to_string_lossy()))?;
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => return Ok(false),
+    };
+    Ok(value
+        .get("scripts")
+        .and_then(|scripts| scripts.get("test"))
+        .and_then(Value::as_str)
+        .is_some())
+}
+
+fn js_test_config_files(root: &Path) -> Vec<PathBuf> {
+    [
+        "vite.config.js",
+        "vite.config.cjs",
+        "vite.config.mjs",
+        "vite.config.ts",
+        "vite.config.cts",
+        "vite.config.mts",
+        "vitest.config.js",
+        "vitest.config.cjs",
+        "vitest.config.mjs",
+        "vitest.config.ts",
+        "vitest.config.cts",
+        "vitest.config.mts",
+        "jest.config.js",
+        "jest.config.cjs",
+        "jest.config.mjs",
+        "jest.config.ts",
+        "playwright.config.js",
+        "playwright.config.cjs",
+        "playwright.config.mjs",
+        "playwright.config.ts",
+    ]
+    .into_iter()
+    .map(|name| root.join(name))
+    .filter(|path| path.exists())
+    .collect()
+}
+
+fn file_mentions_forge_exclude(path: &Path) -> Result<bool> {
+    const MAX_CONFIG_BYTES: u64 = 1_048_576;
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Ok(false);
+    }
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read {}", path.to_string_lossy()))?;
+    Ok(text.contains(".forge/**")
+        || text.contains(".forge/")
+        || text.contains("'.forge'")
+        || text.contains("\".forge\""))
 }
 
 /// `doctor`'s native commit-DAG integrity pass (NER-138 Phase 7 slice 3): walk the DAG from

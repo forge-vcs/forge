@@ -317,7 +317,21 @@ impl ForgeError {
             ForgeError::StaleBase {
                 expected_head,
                 actual_head,
-            } => json!({ "expected_head": expected_head, "actual_head": actual_head }),
+            } => json!({
+                "expected_head": expected_head,
+                "actual_head": actual_head,
+                "reason": "current repository head has advanced since this proposal was based",
+                "recovery_hint": "Start a fresh intent or attempt from the current head, reapply the desired source edits, save, rerun evidence, propose, check, and accept again.",
+                "recovery_steps": [
+                    "forge start \"reapply the change on the current base\"",
+                    "reapply the desired source edits",
+                    "forge save",
+                    "forge run -- <required-check>",
+                    "forge propose",
+                    "forge check",
+                    "forge accept"
+                ]
+            }),
             ForgeError::DirtyWorktree { paths } => redact_paths(paths),
             ForgeError::AmbiguousAttempt { candidate_ids }
             | ForgeError::AmbiguousProposal { candidate_ids } => {
@@ -481,7 +495,7 @@ impl std::fmt::Display for ForgeError {
                 actual_head,
             } => write!(
                 f,
-                "stale base: HEAD moved from {expected_head} to {actual_head}"
+                "stale base: HEAD moved from {expected_head} to {actual_head}; this proposal is based on an obsolete base. Start a fresh intent or attempt from the current head, reapply the desired edits, save, rerun evidence, propose, check, and accept again"
             ),
             ForgeError::DirtyWorktree { .. } => {
                 write!(f, "dirty worktree has unsaved changes")
@@ -663,7 +677,13 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             code: "STALE_BASE",
             retryable: false,
             after_ms: None,
-            details_keys: &["expected_head", "actual_head"],
+            details_keys: &[
+                "expected_head",
+                "actual_head",
+                "reason",
+                "recovery_hint",
+                "recovery_steps",
+            ],
         },
         ErrorCodeSpec {
             code: "DIRTY_WORKTREE",
