@@ -32,6 +32,72 @@ fn doctor_passes_healthy_repo_and_reports_dangling_temp_files() {
 }
 
 #[test]
+fn doctor_warns_when_js_test_config_may_scan_forge_worktrees() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    std::fs::write(
+        repo.path().join("package.json"),
+        r#"{"scripts":{"test":"vitest run"}}"#,
+    )
+    .expect("write package");
+    std::fs::write(
+        repo.path().join("vite.config.ts"),
+        "import { defineConfig } from 'vitest/config';\nexport default defineConfig({ test: {} });\n",
+    )
+    .expect("write vite config");
+
+    let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(
+        report["data"]["ok"], true,
+        "test-runner guidance must be non-fatal: {report}"
+    );
+    let warning = report["warnings"]
+        .as_array()
+        .expect("top-level warnings")
+        .iter()
+        .find_map(|warning| warning.as_str())
+        .expect("expected doctor warning");
+    assert!(
+        warning.contains(".forge/**"),
+        "warning should name the exclude pattern: {warning}"
+    );
+    assert_eq!(
+        report["data"]["warnings"][0], report["warnings"][0],
+        "doctor report and envelope should carry the same guidance"
+    );
+}
+
+#[test]
+fn doctor_suppresses_js_test_warning_when_forge_is_excluded() {
+    let repo = TestRepo::new_git();
+    repo.forge().args(["--json", "init"]).assert().success();
+    std::fs::write(
+        repo.path().join("package.json"),
+        r#"{"scripts":{"test":"vitest run"}}"#,
+    )
+    .expect("write package");
+    std::fs::write(
+        repo.path().join("vite.config.ts"),
+        "import { configDefaults, defineConfig } from 'vitest/config';\nexport default defineConfig({ test: { exclude: [...configDefaults.exclude, '.forge/**'] } });\n",
+    )
+    .expect("write vite config");
+
+    let report = json_output(repo.forge().args(["--json", "doctor"]).assert().success());
+    assert_eq!(report["data"]["ok"], true, "doctor report: {report}");
+    assert!(
+        report["warnings"].as_array().expect("warnings").is_empty(),
+        "configured test runner should not warn: {report}"
+    );
+    assert!(
+        report["data"]["warnings"]
+            .as_array()
+            .expect("warnings")
+            .is_empty(),
+        "configured test runner should not warn in data: {report}"
+    );
+}
+
+#[test]
 fn doctor_reports_half_applied_worktree_from_leftover_restore_temp() {
     let repo = TestRepo::new_git();
     repo.forge().args(["--json", "init"]).assert().success();

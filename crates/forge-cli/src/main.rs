@@ -523,6 +523,15 @@ fn main() -> ExitCode {
     let json_mode = raw_args.iter().any(|arg| arg == "--json");
     let cli = match Cli::try_parse_from(&raw_args) {
         Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            let _ = error.print();
+            return ExitCode::SUCCESS;
+        }
         Err(error) if json_mode => {
             let response = parser_error_response(&raw_args, error);
             println!("{}", serde_json::to_string_pretty(&response).unwrap());
@@ -1486,7 +1495,8 @@ fn log_response(request_id: Option<String>, args: LogArgs) -> ResponseEnvelope {
 fn doctor_response(request_id: Option<String>) -> ResponseEnvelope {
     command_result("doctor", request_id, |cwd, _request_id| {
         let report = forge_store::doctor(&cwd)?;
-        Ok((None, serde_json::to_value(report)?, Vec::new()))
+        let warnings = report.warnings.clone();
+        Ok((None, serde_json::to_value(report)?, warnings))
     })
 }
 
