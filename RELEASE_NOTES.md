@@ -1,5 +1,51 @@
 # Forge Public Release Notes
 
+## v0.1.0-rc4
+
+Forge v0.1.0-rc4 is a public release candidate focused on the second
+open-source dogfood feedback pass after rc3. It keeps the rc3 release boundary
+intact while fixing command-line friction that showed up in fresh agent
+workflows.
+
+### What Changed Since rc3
+
+- Fixed `forge --version` and help-display paths so they print successfully and
+  exit with status `0`.
+- Made `STALE_BASE` responses actionable by adding a reason, recovery hint, and
+  concrete recovery steps to the JSON details and human message.
+- Added a non-fatal `forge doctor` warning when JavaScript/TypeScript test
+  configuration may scan Forge-managed `.forge/worktrees` directories without a
+  `.forge/**` exclude.
+- Confirmed the rc4 build locally through focused dogfood smokes for version
+  exit status, stale-base recovery JSON, and the doctor JS/TS worktree warning.
+
+### Installation
+
+```bash
+cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc4 forge-cli
+```
+
+### Release Validation
+
+The rc4 preparation ran the aggregate release gate:
+
+```bash
+bash scripts/dogfood-release-gate.sh
+```
+
+Gate results:
+
+- `cargo fmt --all --check`: passed
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed
+- `cargo test --workspace`: passed
+- `scripts/e2e-eval.sh`: PASS=95 FAIL=0
+- `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
+- `scripts/dogfood-native-sync-peer.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-peer-nogit.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0 with TypeScript 6.0.3
+- `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
+
 ## v0.1.0-rc3
 
 Forge v0.1.0-rc3 is a public release candidate focused on the first
