@@ -1,7 +1,8 @@
 # Phase 9 Release Audit
 
 Date: 2026-06-24
-Audited commit: `3c45e83 Merge pull request #99 from freezscholte/codex/permissioned-forge-projections`
+Audited candidate: PR #101 release-prep branch. The final immutable audited
+commit is the `v0.1.0-rc6` tag after merge to `main`.
 
 This document maps the Phase 9 roadmap exit criteria to current executable
 evidence. It is intentionally stricter than a status note: an item is marked
@@ -22,11 +23,11 @@ the public release check usable from a plain shell:
 bash scripts/dogfood-release-gate.sh
 ```
 
-Latest local run while preparing `v0.1.0-rc5` passed:
+Latest local run while preparing `v0.1.0-rc6` passed:
 
-- `cargo fmt --all --check`
+- `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: passed
+- `cargo test --workspace`: 568 passed
 - `scripts/e2e-eval.sh`: PASS=95 FAIL=0
 - `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
 - `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
@@ -40,7 +41,8 @@ refresh. PR #88 added public issue templates, PR #94 addressed the first
 Forge CLI dogfood feedback, PR #95 fixed macOS `/private/var` path-alias
 redaction before the rc3 audit refresh, PR #97 fixed the second dogfood
 feedback pass before the rc4 audit refresh, and PR #99 added permissioned sync
-projections before this rc5 audit refresh.
+projections before the rc5 audit refresh. PR #101 adds the first organization
+identity and key-governance bootstrap slice before this rc6 audit refresh.
 
 ## External Dogfood Validation
 
@@ -107,6 +109,44 @@ materialization. This is a release-candidate limitation and should be fixed
 before the next RC that claims end-to-end permissioned projections. Tracking:
 NER-363.
 
+## Feature-Specific Organization Identity Dogfood
+
+Follow-up dogfood explicitly exercised the rc6 organization identity foundation
+in the `forge-dogfood` checkout and in a fresh temporary repository.
+
+Existing dogfood repository checks:
+
+- `forge --json org status`: migrated the repository to schema version 19 and
+  reported organization governance disabled with zero principal/key/role counts.
+- `forge --json visibility policy`: continued to work before organization
+  activation.
+- `forge --json key status`: continued to work before organization activation.
+- `forge --json --request-id dogfood-org-init org init --actor skolte --reason
+  "NER-357 dogfood bootstrap"`: created one owner principal, one signing-key
+  binding, one owner role binding, one `org_init` audit row, and one
+  `org init`/`org_initialized` operation.
+- Replaying `dogfood-org-init` with changed actor/reason returned
+  `idempotent_replay: true` and preserved the original bootstrap result.
+- A second bootstrap without the replay id failed closed with
+  `ORG_ALREADY_ENABLED`.
+- `forge --json org status` after activation reported enabled governance with
+  principal/key/role counts of 1/1/1.
+
+Fresh repository checks:
+
+- Blank actor bootstrap failed with `ORG_AUTHORITY_REQUIRED`.
+- The failed blank-actor attempt left organization profile rows unmodified.
+- A valid request-id bootstrap created the owner identity and replayed
+  idempotently.
+- `forge schema` exposed `org status`, `org init`, and the organization
+  governance error codes.
+
+Conclusion: rc6 proves the local durable organization identity bootstrap path,
+request-id replay, schema discoverability, and closed failure for missing
+authority. It does not yet prove broad organization policy enforcement,
+multi-admin management, authority rotation/revocation, hosted identity, or
+cross-organization certificate authority behavior.
+
 ## Exit Criteria
 
 | Roadmap criterion | Evidence | Status |
@@ -131,6 +171,9 @@ The local/native release claim is supportable:
 - Forge can emit recipient-scoped sync projection bundles for local
   permissioned collaboration boundaries, but rc5 feature-specific dogfood found
   projected import/clone failures on the receiving side.
+- Forge can bootstrap a local organization identity profile, owner principal,
+  signing-key binding, owner role, and audit trail, but rc6 does not yet enforce
+  organization policy across the full command surface.
 - Forge can still export accepted work to Git branches for existing PR workflows.
 
 The supported public wording should avoid claiming a hosted multi-tenant service,

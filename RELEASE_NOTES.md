@@ -1,5 +1,100 @@
 # Forge Public Release Notes
 
+## v0.1.0-rc6
+
+Forge v0.1.0-rc6 is a public release candidate focused on the first
+organization identity and key-governance foundation slice. It adds an
+explicit organization bootstrap path and durable identity-governance tables
+without yet claiming hosted identity, certificate authority, revocation, or
+organization policy-management behavior.
+
+### What Changed Since rc5
+
+- Added schema migration 19 for organization authority profiles, principals,
+  principal aliases, key bindings, role bindings, issuer bindings, and
+  organization policy audit rows.
+- Added `forge org status` so agents can inspect whether organization
+  governance is enabled and see principal/key/role counts through the stable
+  JSON envelope.
+- Added `forge org init --actor <id> [--reason <text>]` to bootstrap a local
+  owner principal, bind the current local signing key to that principal, record
+  the owner role, and write replay-safe audit/operation evidence.
+- Added typed organization-governance errors:
+  `ORG_NOT_ENABLED`, `ORG_ALREADY_ENABLED`, and `ORG_AUTHORITY_REQUIRED`.
+- Added schema metadata for the new org commands and errors so agents can
+  discover the surface without scraping human help text.
+- Preserved legacy local workflows before and after organization bootstrap:
+  visibility policy, key status, and existing lifecycle commands continue to
+  work when org governance is disabled or newly enabled.
+
+### Installation
+
+```bash
+cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc6 forge-cli
+```
+
+### Release Validation
+
+The rc6 preparation ran the aggregate release dogfood gate on the PR #101
+candidate branch after the NER-357 implementation and rc6 release-doc updates:
+
+```bash
+rtk bash scripts/dogfood-release-gate.sh
+```
+
+Gate results:
+
+- `cargo fmt --all -- --check`: passed
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed
+- `cargo test --workspace`: 568 passed
+- `scripts/e2e-eval.sh`: PASS=95 FAIL=0
+- `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
+- `scripts/dogfood-native-sync-peer.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-peer-nogit.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0 with TypeScript 5.9.3
+- `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
+
+Focused feature validation also passed:
+
+- `cargo test -p forge-cli --test forge_org_identity`: 5 passed
+- `cargo test -p forge-cli --test forge_schema`: 7 passed
+- `cargo test -p forge-store --test migrate`: 9 passed
+- `cargo test -p forge-store`: 79 passed
+- `cargo test -p forge-cli --tests`: 303 passed
+
+Feature-specific dogfood ran with the candidate binary in the
+`forge-dogfood` checkout:
+
+- `forge --json org status` migrated the existing dogfood repository to schema
+  version 19 and reported organization governance disabled with zero
+  principal/key/role counts.
+- `forge --json visibility policy` and `forge --json key status` continued to
+  work before org activation.
+- `forge --json --request-id dogfood-org-init org init --actor skolte --reason
+  "NER-357 dogfood bootstrap"` created one owner principal, one signing-key
+  binding, one owner role binding, one `org_init` audit row, and an
+  `org init`/`org_initialized` operation.
+- Replaying the same request id with changed actor/reason returned
+  `idempotent_replay: true` and the original bootstrap result.
+- A second bootstrap without the replay id failed closed with
+  `ORG_ALREADY_ENABLED`.
+- `forge --json org status` after activation reported organization governance
+  enabled with principal/key/role counts of 1/1/1.
+- A fresh temporary repository rejected blank actors with
+  `ORG_AUTHORITY_REQUIRED` and left organization profile rows unmodified, then
+  successfully bootstrapped and replayed a valid owner initialization.
+- `forge schema` exposed `org status`, `org init`, and the org-governance error
+  codes.
+
+### Current Boundary
+
+This RC adds the durable local foundation for organization identity and
+key-governance. It does not yet enforce organization policy across every
+existing command, manage multi-admin grants, rotate or revoke organization
+authority, provide hosted identity, or implement a cross-organization
+certificate authority. Those remain follow-on slices.
+
 ## v0.1.0-rc5
 
 Forge v0.1.0-rc5 is a public release candidate focused on permissioned Forge
