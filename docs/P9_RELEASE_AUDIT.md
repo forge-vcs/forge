@@ -104,7 +104,8 @@ Receiver-side projected bundle checks:
 Conclusion: rc5 proves visibility policy decisions and recipient-scoped export
 metadata/count behavior, but does not prove projected receiver import or
 materialization. This is a release-candidate limitation and should be fixed
-before the next RC that claims end-to-end permissioned projections.
+before the next RC that claims end-to-end permissioned projections. Tracking:
+NER-363.
 
 ## Exit Criteria
 

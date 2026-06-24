@@ -88,7 +88,8 @@ receiver-side blocker:
 
 That means rc5 validates visibility decisions and projected export metadata, but
 does not validate projected receiver import/materialization. Treat this as a
-known rc5 limitation and a required fix before the next release candidate.
+known rc5 limitation and a required fix before the next release candidate. This
+is tracked in Linear as NER-363.
 
 ### Current Boundary
 
