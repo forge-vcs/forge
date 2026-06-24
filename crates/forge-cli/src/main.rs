@@ -59,6 +59,8 @@ enum Command {
     Undo,
     /// Inspect or update local trust policy gates.
     Trust(TrustArgs),
+    /// Inspect or update local visibility policy and work-package grants.
+    Visibility(VisibilityArgs),
     /// Inspect or rotate the local Ed25519 signing key.
     Key(KeyArgs),
     Doctor,
@@ -335,6 +337,12 @@ struct SyncExportArgs {
     /// Emit only native objects and ledger rows absent from this prior bundle.
     #[arg(long)]
     since: Option<std::path::PathBuf>,
+    /// Export a recipient-scoped projected manifest instead of a full manifest.
+    #[arg(long)]
+    recipient: Option<String>,
+    /// Projection capability for recipient-scoped exports.
+    #[arg(long, default_value = "sync_materialize")]
+    capability: String,
 }
 
 #[derive(Debug, Args)]
@@ -424,6 +432,12 @@ struct ExportBranchArgs {
 struct TrustArgs {
     #[command(subcommand)]
     command: TrustCommand,
+}
+
+#[derive(Debug, Args)]
+struct VisibilityArgs {
+    #[command(subcommand)]
+    command: VisibilityCommand,
 }
 
 #[derive(Debug, Args)]
@@ -518,6 +532,87 @@ struct TrustPolicyArgs {
     export: Option<String>,
 }
 
+#[derive(Debug, Subcommand)]
+enum VisibilityCommand {
+    /// Show the default work-package visibility policy.
+    Policy,
+    /// Set one work package's visibility label.
+    Set(VisibilitySetArgs),
+    /// Grant one capability to a recipient for a work package.
+    Grant(VisibilityGrantArgs),
+    /// Revoke one capability from a recipient for a work package.
+    Revoke(VisibilityGrantArgs),
+    /// Check a recipient/capability projection decision for a work package.
+    Check(VisibilityCheckArgs),
+}
+
+#[derive(Debug, Args)]
+struct VisibilityWorkPackageArgs {
+    /// Work-package kind: intent, attempt, or proposal.
+    #[arg(long, value_parser = ["intent", "attempt", "proposal"])]
+    kind: String,
+    /// Work-package id for the selected kind.
+    #[arg(long)]
+    id: String,
+}
+
+#[derive(Debug, Args)]
+struct VisibilitySetArgs {
+    #[command(flatten)]
+    work_package: VisibilityWorkPackageArgs,
+    /// Visibility label: private, team, public, or embargoed.
+    #[arg(long, value_parser = ["private", "team", "public", "embargoed"])]
+    visibility: String,
+    /// Actor recorded in visibility audit.
+    #[arg(long)]
+    actor: Option<String>,
+    /// Optional audit reason.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct VisibilityGrantArgs {
+    #[command(flatten)]
+    work_package: VisibilityWorkPackageArgs,
+    /// Recipient identifier for this local v1 grant.
+    #[arg(long)]
+    recipient: String,
+    /// Capability: see_stub, inspect_content, inspect_evidence, sync_materialize, or publish_reveal.
+    #[arg(long, value_parser = [
+        "see_stub",
+        "inspect_content",
+        "inspect_evidence",
+        "sync_materialize",
+        "publish_reveal",
+    ])]
+    capability: String,
+    /// Actor recorded in visibility audit.
+    #[arg(long)]
+    actor: Option<String>,
+    /// Optional audit reason.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct VisibilityCheckArgs {
+    #[command(flatten)]
+    work_package: VisibilityWorkPackageArgs,
+    /// Recipient identifier for this local v1 projection decision.
+    #[arg(long)]
+    recipient: String,
+    /// Capability: see_stub, inspect_content, inspect_evidence, sync_materialize, or publish_reveal.
+    #[arg(long, value_parser = [
+        "see_stub",
+        "inspect_content",
+        "inspect_evidence",
+        "sync_materialize",
+        "publish_reveal",
+    ])]
+    capability: String,
+}
+
 fn main() -> ExitCode {
     let raw_args: Vec<String> = env::args().collect();
     let json_mode = raw_args.iter().any(|arg| arg == "--json");
@@ -572,6 +667,7 @@ fn main() -> ExitCode {
         Command::Checkout(args) => checkout_response(request_id, args),
         Command::Undo => undo_response(request_id),
         Command::Trust(args) => trust_response(request_id, args),
+        Command::Visibility(args) => visibility_response(request_id, args),
         Command::Key(args) => key_response(request_id, args),
         Command::Doctor => doctor_response(request_id),
         Command::Gc(args) if !args.dry_run && (!args.yes || args.plan_digest.is_none()) => {
@@ -1539,6 +1635,69 @@ fn trust_response(request_id: Option<String>, args: TrustArgs) -> ResponseEnvelo
     }
 }
 
+fn visibility_response(request_id: Option<String>, args: VisibilityArgs) -> ResponseEnvelope {
+    match args.command {
+        VisibilityCommand::Policy => command_result("visibility policy", request_id, |cwd, _| {
+            let policy = forge_store::visibility_policy(&cwd)?;
+            Ok((None, serde_json::to_value(policy)?, Vec::new()))
+        }),
+        VisibilityCommand::Set(args) => command_result("visibility set", request_id, |cwd, _| {
+            let actor = resolve_actor(args.actor.as_deref());
+            let record = forge_store::set_work_package_visibility(
+                &cwd,
+                &args.work_package.kind,
+                &args.work_package.id,
+                &args.visibility,
+                &actor,
+                args.reason.as_deref(),
+            )?;
+            Ok((None, serde_json::to_value(record)?, Vec::new()))
+        }),
+        VisibilityCommand::Grant(args) => {
+            command_result("visibility grant", request_id, |cwd, _| {
+                let actor = resolve_actor(args.actor.as_deref());
+                let grant = forge_store::grant_visibility_capability(
+                    &cwd,
+                    &args.work_package.kind,
+                    &args.work_package.id,
+                    &args.recipient,
+                    &args.capability,
+                    &actor,
+                    args.reason.as_deref(),
+                )?;
+                Ok((None, serde_json::to_value(grant)?, Vec::new()))
+            })
+        }
+        VisibilityCommand::Revoke(args) => {
+            command_result("visibility revoke", request_id, |cwd, _| {
+                let actor = resolve_actor(args.actor.as_deref());
+                let grant = forge_store::revoke_visibility_capability(
+                    &cwd,
+                    &args.work_package.kind,
+                    &args.work_package.id,
+                    &args.recipient,
+                    &args.capability,
+                    &actor,
+                    args.reason.as_deref(),
+                )?;
+                Ok((None, serde_json::to_value(grant)?, Vec::new()))
+            })
+        }
+        VisibilityCommand::Check(args) => {
+            command_result("visibility check", request_id, |cwd, _| {
+                let decision = forge_store::projection_decision(
+                    &cwd,
+                    &args.work_package.kind,
+                    &args.work_package.id,
+                    &args.recipient,
+                    &args.capability,
+                )?;
+                Ok((None, serde_json::to_value(decision)?, Vec::new()))
+            })
+        }
+    }
+}
+
 fn key_response(request_id: Option<String>, args: KeyArgs) -> ResponseEnvelope {
     match args.command {
         KeyCommand::Status => command_result("key status", request_id, |cwd, _| {
@@ -1566,8 +1725,17 @@ fn gc_response(request_id: Option<String>, args: GcArgs) -> ResponseEnvelope {
 fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope {
     match args.command {
         SyncCommand::Export(args) => command_result("sync export", request_id, |cwd, _| {
-            let report =
-                forge_sync::export_manifest_since(&cwd, &args.output, args.since.as_deref())?;
+            let report = if let Some(recipient) = args.recipient.as_deref() {
+                forge_sync::export_manifest_projected_since(
+                    &cwd,
+                    &args.output,
+                    args.since.as_deref(),
+                    recipient,
+                    &args.capability,
+                )?
+            } else {
+                forge_sync::export_manifest_since(&cwd, &args.output, args.since.as_deref())?
+            };
             Ok((None, serde_json::to_value(report)?, Vec::new()))
         }),
         SyncCommand::Inspect(args) => {
@@ -1590,6 +1758,10 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
         SyncCommand::Import(args) => {
             command_result("sync import", request_id, |cwd, request_id| {
                 if args.materialize {
+                    let manifest = forge_sync::read_supported_manifest(&args.path)
+                        .context("preflight sync import materialize manifest")?;
+                    forge_sync::ensure_manifest_materializable(&manifest)
+                        .context("preflight sync import materialize projection")?;
                     ensure_clean_for_sync_import_materialize(&cwd)
                         .context("preflight sync import materialize")?;
                 }
@@ -4115,6 +4287,9 @@ fn is_mutating_command(command: &str) -> bool {
             | "checkout"
             | "undo"
             | "trust policy"
+            | "visibility set"
+            | "visibility grant"
+            | "visibility revoke"
             | "key status"
             | "key rotate"
             | "gc"

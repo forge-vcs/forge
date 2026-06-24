@@ -252,6 +252,21 @@ pub enum ForgeError {
     /// it is run through the same `key=value` secret redactor as `CheckNotPassed`'s
     /// unmet gates in [`ForgeError::details`].
     UnsupportedStructuredGate { program: String, gate: String },
+    /// Permission/projection policy is missing, corrupt, or names an unsupported
+    /// label/capability. Deterministic and fail-closed: fix the local visibility
+    /// policy before retrying. The reason is restricted to closed vocabulary and
+    /// opaque identifiers from Forge's own policy layer.
+    VisibilityPolicyInvalid { reason: String },
+    /// A recipient lacks the requested capability for a work package projection.
+    /// Details carry opaque ids and closed capability/disclosure labels only; no
+    /// paths, diffs, evidence excerpts, or object ids.
+    VisibilityPolicyUnmet {
+        operation: String,
+        work_package_kind: String,
+        work_package_id: String,
+        capability: String,
+        disclosure: String,
+    },
 }
 
 impl ForgeError {
@@ -291,6 +306,8 @@ impl ForgeError {
             ForgeError::UnsupportedTrustLevel { .. } => "UNSUPPORTED_TRUST_LEVEL",
             ForgeError::SyncDivergenceUnsupported { .. } => "SYNC_DIVERGENCE_UNSUPPORTED",
             ForgeError::UnsupportedStructuredGate { .. } => "UNSUPPORTED_STRUCTURED_GATE",
+            ForgeError::VisibilityPolicyInvalid { .. } => "VISIBILITY_POLICY_INVALID",
+            ForgeError::VisibilityPolicyUnmet { .. } => "VISIBILITY_POLICY_UNMET",
         }
     }
 
@@ -463,6 +480,20 @@ impl ForgeError {
                     ],
                 })
             }
+            ForgeError::VisibilityPolicyInvalid { reason } => json!({ "reason": reason }),
+            ForgeError::VisibilityPolicyUnmet {
+                operation,
+                work_package_kind,
+                work_package_id,
+                capability,
+                disclosure,
+            } => json!({
+                "operation": operation,
+                "work_package_kind": work_package_kind,
+                "work_package_id": work_package_id,
+                "capability": capability,
+                "disclosure": disclosure,
+            }),
             _ => Value::Object(Default::default()),
         }
     }
@@ -645,6 +676,18 @@ impl std::fmt::Display for ForgeError {
                     "no structured parser is registered for `{program}` in `{gate}`; use --require \"{gate}\" for a plain exit-code gate, or use a structured parser target such as cargo test, python -m unittest, or pytest"
                 )
             }
+            ForgeError::VisibilityPolicyInvalid { reason } => {
+                write!(f, "visibility policy is invalid: {reason}")
+            }
+            ForgeError::VisibilityPolicyUnmet {
+                operation,
+                capability,
+                disclosure,
+                ..
+            } => write!(
+                f,
+                "visibility policy denied {operation}: capability {capability} is unavailable ({disclosure})"
+            ),
         }
     }
 }
@@ -875,6 +918,24 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             after_ms: None,
             details_keys: &["program"],
         },
+        ErrorCodeSpec {
+            code: "VISIBILITY_POLICY_INVALID",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["reason"],
+        },
+        ErrorCodeSpec {
+            code: "VISIBILITY_POLICY_UNMET",
+            retryable: false,
+            after_ms: None,
+            details_keys: &[
+                "operation",
+                "work_package_kind",
+                "work_package_id",
+                "capability",
+                "disclosure",
+            ],
+        },
     ]
 }
 
@@ -1026,6 +1087,24 @@ mod tests {
             .code(),
             "UNSUPPORTED_STRUCTURED_GATE"
         );
+        assert_eq!(
+            ForgeError::VisibilityPolicyInvalid {
+                reason: "unsupported visibility label `secret`".into(),
+            }
+            .code(),
+            "VISIBILITY_POLICY_INVALID"
+        );
+        assert_eq!(
+            ForgeError::VisibilityPolicyUnmet {
+                operation: "sync_materialize".into(),
+                work_package_kind: "attempt".into(),
+                work_package_id: "attempt_x".into(),
+                capability: "sync_materialize".into(),
+                disclosure: "hidden".into(),
+            }
+            .code(),
+            "VISIBILITY_POLICY_UNMET"
+        );
     }
 
     #[test]
@@ -1045,6 +1124,16 @@ mod tests {
             ForgeError::SyncDivergenceUnsupported {
                 direction: "fetch".into(),
                 reason: "clean_divergent_merge".into(),
+            },
+            ForgeError::VisibilityPolicyInvalid {
+                reason: "unsupported visibility label `secret`".into(),
+            },
+            ForgeError::VisibilityPolicyUnmet {
+                operation: "sync_materialize".into(),
+                work_package_kind: "attempt".into(),
+                work_package_id: "attempt_x".into(),
+                capability: "sync_materialize".into(),
+                disclosure: "hidden".into(),
             },
         ] {
             assert!(!deterministic.retryable());
@@ -1142,6 +1231,29 @@ mod tests {
             object.len(),
             2,
             "details must carry exactly branch + missing_field"
+        );
+    }
+
+    #[test]
+    fn visibility_policy_unmet_details_are_projection_safe() {
+        let details = ForgeError::VisibilityPolicyUnmet {
+            operation: "sync_materialize".into(),
+            work_package_kind: "attempt".into(),
+            work_package_id: "attempt_abc".into(),
+            capability: "sync_materialize".into(),
+            disclosure: "hidden".into(),
+        }
+        .details();
+        assert_eq!(details["operation"], "sync_materialize");
+        assert_eq!(details["work_package_kind"], "attempt");
+        assert_eq!(details["work_package_id"], "attempt_abc");
+        assert_eq!(details["capability"], "sync_materialize");
+        assert_eq!(details["disclosure"], "hidden");
+        let object = details.as_object().expect("details object");
+        assert_eq!(
+            object.len(),
+            5,
+            "details must carry only closed labels and opaque work-package id"
         );
     }
 
@@ -1446,6 +1558,16 @@ mod tests {
                 program: "python3".into(),
                 gate: "python3 script.py".into(),
             },
+            ForgeError::VisibilityPolicyInvalid {
+                reason: "unsupported visibility label `secret`".into(),
+            },
+            ForgeError::VisibilityPolicyUnmet {
+                operation: "sync_materialize".into(),
+                work_package_kind: "attempt".into(),
+                work_package_id: "attempt_x".into(),
+                capability: "sync_materialize".into(),
+                disclosure: "hidden".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -1483,7 +1605,9 @@ mod tests {
                 | ForgeError::TrustPolicyUnmet { .. }
                 | ForgeError::UnsupportedTrustLevel { .. }
                 | ForgeError::SyncDivergenceUnsupported { .. }
-                | ForgeError::UnsupportedStructuredGate { .. } => {}
+                | ForgeError::UnsupportedStructuredGate { .. }
+                | ForgeError::VisibilityPolicyInvalid { .. }
+                | ForgeError::VisibilityPolicyUnmet { .. } => {}
             }
         }
 

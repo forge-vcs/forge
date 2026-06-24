@@ -155,6 +155,50 @@ fn set_expected_content_ref_for_test(repo_path: &std::path::Path, content_ref: &
     .expect("set expected content ref");
 }
 
+fn manifest_table_rows<'a>(manifest: &'a Value, table: &str) -> &'a Vec<Value> {
+    manifest["ledger_rows"]
+        .as_array()
+        .expect("ledger rows")
+        .iter()
+        .find(|rows| rows["table"] == table)
+        .unwrap_or_else(|| panic!("manifest table {table}"))
+        .get("rows")
+        .and_then(Value::as_array)
+        .expect("table rows")
+}
+
+fn manifest_ledger_count(manifest: &Value, table: &str) -> i64 {
+    manifest["ledger_counts"]
+        .as_array()
+        .expect("ledger counts")
+        .iter()
+        .find(|count| count["table"] == table)
+        .unwrap_or_else(|| panic!("manifest count {table}"))
+        .get("rows")
+        .and_then(Value::as_i64)
+        .expect("count rows")
+}
+
+fn decode_hex_for_test(hex: &str) -> Vec<u8> {
+    assert_eq!(hex.len() % 2, 0, "hex payload must have even length");
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("payload hex byte"))
+        .collect()
+}
+
+fn decoded_native_payloads(manifest: &Value) -> Vec<String> {
+    manifest["native_payloads"]
+        .as_array()
+        .expect("native payloads")
+        .iter()
+        .map(|payload| {
+            let bytes = decode_hex_for_test(payload["payload_hex"].as_str().expect("payload hex"));
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+        .collect()
+}
+
 fn file_url_for_test(path: &std::path::Path) -> String {
     format!("file://{}", path.display())
 }
@@ -797,6 +841,367 @@ fn sync_export_writes_a_versioned_native_manifest_and_inspect_reads_it() {
     assert_eq!(
         inspected["data"]["local_key_fingerprint"],
         exported["data"]["local_key_fingerprint"]
+    );
+}
+
+#[test]
+fn sync_projected_export_filters_private_work_packages_and_hidden_head() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+
+    let public_start = json(
+        repo.forge()
+            .args([
+                "--json",
+                "start",
+                "public projected sync",
+                "--require",
+                "sh -c true",
+            ])
+            .assert()
+            .success(),
+    );
+    let public_attempt = public_start["data"]["attempt_id"]
+        .as_str()
+        .expect("public attempt")
+        .to_string();
+    std::fs::write(repo.path().join("public-sync.txt"), "public\n").expect("write public file");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    let public_propose = json(repo.forge().args(["--json", "propose"]).assert().success());
+    let public_proposal = public_propose["data"]["proposal_id"]
+        .as_str()
+        .expect("public proposal")
+        .to_string();
+    repo.forge().args(["--json", "check"]).assert().success();
+    repo.forge().args(["--json", "accept"]).assert().success();
+
+    let private_start = json(
+        repo.forge()
+            .args([
+                "--json",
+                "start",
+                "private projected sync",
+                "--require",
+                "sh -c true",
+            ])
+            .assert()
+            .success(),
+    );
+    let private_attempt = private_start["data"]["attempt_id"]
+        .as_str()
+        .expect("private attempt")
+        .to_string();
+    repo.forge()
+        .args([
+            "--json",
+            "visibility",
+            "set",
+            "--kind",
+            "attempt",
+            "--id",
+            &private_attempt,
+            "--visibility",
+            "private",
+        ])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("private-sync.txt"), "private\n").expect("write private file");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    let private_propose = json(repo.forge().args(["--json", "propose"]).assert().success());
+    let private_proposal = private_propose["data"]["proposal_id"]
+        .as_str()
+        .expect("private proposal")
+        .to_string();
+    repo.forge().args(["--json", "check"]).assert().success();
+    repo.forge().args(["--json", "accept"]).assert().success();
+
+    let manifest_path = repo.path().join("target/projected-sync.json");
+    let exported = json(
+        repo.forge()
+            .args([
+                "--json",
+                "sync",
+                "export",
+                "--output",
+                manifest_path.to_str().expect("utf8 manifest path"),
+                "--recipient",
+                "alice@example.test",
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(exported["data"]["projection"]["mode"], "recipient");
+    assert_eq!(exported["data"]["projection"]["projected"], true);
+    assert_eq!(
+        exported["data"]["projection"]["capability"],
+        "sync_materialize"
+    );
+
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("read projected manifest"))
+            .expect("projected manifest json");
+    assert_eq!(manifest["projection"]["recipient"], "alice@example.test");
+    assert!(
+        manifest["native_head"].is_null(),
+        "hidden latest head is not exported"
+    );
+
+    let attempt_ids: Vec<&str> = manifest_table_rows(&manifest, "attempts")
+        .iter()
+        .map(|row| row["id"].as_str().expect("attempt id"))
+        .collect();
+    assert!(attempt_ids.contains(&public_attempt.as_str()));
+    assert!(!attempt_ids.contains(&private_attempt.as_str()));
+
+    let proposal_ids: Vec<&str> = manifest_table_rows(&manifest, "proposals")
+        .iter()
+        .map(|row| row["id"].as_str().expect("proposal id"))
+        .collect();
+    assert!(proposal_ids.contains(&public_proposal.as_str()));
+    assert!(!proposal_ids.contains(&private_proposal.as_str()));
+
+    for table in [
+        "operations",
+        "views",
+        "ledger_signatures",
+        "conflict_sets",
+        "path_conflicts",
+        "visibility_policy",
+        "work_package_visibility",
+        "path_visibility_labels",
+        "visibility_grants",
+        "visibility_audit",
+    ] {
+        assert!(
+            manifest_table_rows(&manifest, table).is_empty(),
+            "projected manifest must not include {table} rows"
+        );
+        assert_eq!(
+            manifest_ledger_count(&manifest, table),
+            0,
+            "projected manifest count for {table} must be recomputed"
+        );
+    }
+
+    let payload_texts = decoded_native_payloads(&manifest);
+    assert!(
+        payload_texts
+            .iter()
+            .any(|payload| payload.contains("public-sync.txt") || payload == "public\n"),
+        "projected manifest should keep public content"
+    );
+    assert!(
+        !payload_texts
+            .iter()
+            .any(|payload| payload.contains("private-sync.txt") || payload == "private\n"),
+        "projected manifest must not include private payload bytes"
+    );
+
+    repo.forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            repo.path()
+                .join("target/projected-see-stub.json")
+                .to_str()
+                .expect("utf8 unsupported capability path"),
+            "--recipient",
+            "alice@example.test",
+            "--capability",
+            "see_stub",
+        ])
+        .assert()
+        .failure();
+
+    let full_path = repo.path().join("target/full-sync.json");
+    repo.forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            full_path.to_str().expect("utf8 full manifest path"),
+        ])
+        .assert()
+        .success();
+    repo.forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            repo.path()
+                .join("target/projected-since-full.json")
+                .to_str()
+                .expect("utf8 projected since full path"),
+            "--since",
+            full_path.to_str().expect("utf8 full manifest path"),
+            "--recipient",
+            "alice@example.test",
+        ])
+        .assert()
+        .failure();
+    repo.forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            repo.path()
+                .join("target/full-since-projected.json")
+                .to_str()
+                .expect("utf8 full since projected path"),
+            "--since",
+            manifest_path
+                .to_str()
+                .expect("utf8 projected manifest path"),
+        ])
+        .assert()
+        .failure();
+    let full_manifest: Value =
+        serde_json::from_slice(&std::fs::read(&full_path).expect("read full manifest"))
+            .expect("full manifest json");
+    let projected_payload_ids: std::collections::HashSet<&str> = manifest["native_payloads"]
+        .as_array()
+        .expect("projected payloads")
+        .iter()
+        .map(|payload| payload["object_id"].as_str().expect("payload id"))
+        .collect();
+    let extra_payload = full_manifest["native_payloads"]
+        .as_array()
+        .expect("full payloads")
+        .iter()
+        .find(|payload| {
+            !projected_payload_ids.contains(payload["object_id"].as_str().expect("payload id"))
+        })
+        .expect("extra full payload")
+        .clone();
+    let extra_object_id = extra_payload["object_id"]
+        .as_str()
+        .expect("extra object id");
+    let extra_object = full_manifest["native_objects"]
+        .as_array()
+        .expect("full objects")
+        .iter()
+        .find(|object| object["object_id"].as_str() == Some(extra_object_id))
+        .expect("extra object")
+        .clone();
+    let mut tampered = manifest.clone();
+    tampered["native_payloads"]
+        .as_array_mut()
+        .expect("tampered payloads")
+        .push(extra_payload);
+    tampered["native_objects"]
+        .as_array_mut()
+        .expect("tampered objects")
+        .push(extra_object);
+    let tampered_path = repo.path().join("target/projected-tampered.json");
+    std::fs::write(
+        &tampered_path,
+        serde_json::to_vec_pretty(&tampered).expect("tampered json"),
+    )
+    .expect("write tampered manifest");
+    repo.forge()
+        .args([
+            "--json",
+            "sync",
+            "inspect",
+            tampered_path.to_str().expect("utf8 tampered path"),
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn sync_projected_export_does_not_leak_private_proposal_snapshot() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+
+    repo.forge()
+        .args([
+            "--json",
+            "start",
+            "public attempt private proposal",
+            "--require",
+            "sh -c true",
+        ])
+        .assert()
+        .success();
+    std::fs::write(
+        repo.path().join("proposal-private.txt"),
+        "proposal secret\n",
+    )
+    .expect("write private proposal file");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    let proposed = json(repo.forge().args(["--json", "propose"]).assert().success());
+    let proposal_id = proposed["data"]["proposal_id"]
+        .as_str()
+        .expect("proposal id")
+        .to_string();
+    repo.forge()
+        .args([
+            "--json",
+            "visibility",
+            "set",
+            "--kind",
+            "proposal",
+            "--id",
+            &proposal_id,
+            "--visibility",
+            "private",
+        ])
+        .assert()
+        .success();
+
+    let manifest_path = repo.path().join("target/private-proposal-projected.json");
+    repo.forge()
+        .args([
+            "--json",
+            "sync",
+            "export",
+            "--output",
+            manifest_path.to_str().expect("utf8 manifest path"),
+            "--recipient",
+            "alice@example.test",
+        ])
+        .assert()
+        .success();
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("read projected manifest"))
+            .expect("projected manifest json");
+
+    let proposal_ids: Vec<&str> = manifest_table_rows(&manifest, "proposals")
+        .iter()
+        .map(|row| row["id"].as_str().expect("proposal id"))
+        .collect();
+    assert!(!proposal_ids.contains(&proposal_id.as_str()));
+    let payload_texts = decoded_native_payloads(&manifest);
+    assert!(
+        !payload_texts
+            .iter()
+            .any(|payload| payload.contains("proposal-private.txt")
+                || payload.contains("proposal secret")),
+        "private proposal snapshot payloads must not leak"
     );
 }
 
