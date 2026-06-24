@@ -16,6 +16,22 @@ fn json(assert: assert_cmd::assert::Assert) -> Value {
     serde_json::from_slice(&assert.get_output().stdout).expect("valid json envelope")
 }
 
+fn assert_no_structural_doctor_findings(doctor: &Value, context: &str) {
+    for field in [
+        "native_history_issues",
+        "tampered_rows",
+        "ledger_view_issues",
+    ] {
+        assert!(
+            doctor["data"][field]
+                .as_array()
+                .unwrap_or_else(|| panic!("{field} array"))
+                .is_empty(),
+            "{context} must not report {field}: {doctor}"
+        );
+    }
+}
+
 fn native_accepted_lifecycle(repo: &TestRepo) {
     repo.forge()
         .args(["--json", "init", "--content-backend", "native"])
@@ -1008,6 +1024,52 @@ fn sync_projected_export_filters_private_work_packages_and_hidden_head() {
         "projected manifest must not include private payload bytes"
     );
 
+    let hidden_target = TestRepo::new_git();
+    hidden_target
+        .forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let hidden_import = json(
+        hidden_target
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "import",
+                manifest_path.to_str().expect("utf8 hidden bundle path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(hidden_import["data"]["projection"]["mode"], "recipient");
+    assert_eq!(hidden_import["data"]["projection"]["projected"], true);
+    assert!(hidden_import["data"]["native_head"].is_null());
+    assert_eq!(hidden_import["data"]["materialized"], false);
+    assert!(
+        !hidden_target.path().join("public-sync.txt").exists(),
+        "plain hidden projection import must not materialize files"
+    );
+    let hidden_doctor = json(
+        hidden_target
+            .forge()
+            .args(["--json", "doctor"])
+            .assert()
+            .success(),
+    );
+    assert_no_structural_doctor_findings(&hidden_doctor, "denied projected import");
+
+    let hidden_clone = tempfile::tempdir().expect("hidden projected clone dir");
+    forge_in(hidden_clone.path())
+        .args([
+            "--json",
+            "sync",
+            "clone",
+            manifest_path.to_str().expect("utf8 hidden bundle path"),
+        ])
+        .assert()
+        .failure();
+
     repo.forge()
         .args([
             "--json",
@@ -1203,6 +1265,153 @@ fn sync_projected_export_does_not_leak_private_proposal_snapshot() {
                 || payload.contains("proposal secret")),
         "private proposal snapshot payloads must not leak"
     );
+}
+
+#[test]
+fn sync_projected_import_and_clone_materialize_granted_projection() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+
+    repo.forge()
+        .args([
+            "--json",
+            "start",
+            "granted projected sync",
+            "--require",
+            "sh -c true",
+        ])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("granted-projection.txt"), "draft\n")
+        .expect("write granted projection draft file");
+    repo.forge().args(["--json", "save"]).assert().success();
+    std::fs::write(repo.path().join("granted-projection.txt"), "allowed\n")
+        .expect("write granted projection final file");
+    repo.forge().args(["--json", "save"]).assert().success();
+    repo.forge()
+        .args(["--json", "run", "--", "sh", "-c", "true"])
+        .assert()
+        .success();
+    let proposed = json(repo.forge().args(["--json", "propose"]).assert().success());
+    let proposal_id = proposed["data"]["proposal_id"]
+        .as_str()
+        .expect("proposal id")
+        .to_string();
+    repo.forge().args(["--json", "check"]).assert().success();
+    repo.forge().args(["--json", "accept"]).assert().success();
+    repo.forge()
+        .args([
+            "--json",
+            "visibility",
+            "set",
+            "--kind",
+            "proposal",
+            "--id",
+            &proposal_id,
+            "--visibility",
+            "private",
+        ])
+        .assert()
+        .success();
+    repo.forge()
+        .args([
+            "--json",
+            "visibility",
+            "grant",
+            "--kind",
+            "proposal",
+            "--id",
+            &proposal_id,
+            "--recipient",
+            "release-auditor@example.test",
+            "--capability",
+            "sync_materialize",
+        ])
+        .assert()
+        .success();
+
+    let bundle_path = repo.path().join("target/granted-projected-sync.json");
+    let exported = json(
+        repo.forge()
+            .args([
+                "--json",
+                "sync",
+                "export",
+                "--output",
+                bundle_path.to_str().expect("utf8 bundle path"),
+                "--recipient",
+                "release-auditor@example.test",
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(exported["data"]["projection"]["mode"], "recipient");
+    assert_eq!(exported["data"]["projection"]["projected"], true);
+    assert!(
+        exported["data"]["native_head"].is_string(),
+        "granted materialization projection should carry a native head"
+    );
+
+    let target = TestRepo::new_git();
+    target
+        .forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    let imported = json(
+        target
+            .forge()
+            .args([
+                "--json",
+                "sync",
+                "import",
+                "--materialize",
+                bundle_path.to_str().expect("utf8 bundle path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(imported["data"]["projection"]["mode"], "recipient");
+    assert_eq!(imported["data"]["projection"]["projected"], true);
+    assert_eq!(imported["data"]["materialized"], true);
+    assert_eq!(
+        std::fs::read_to_string(target.path().join("granted-projection.txt"))
+            .expect("read projected import file"),
+        "allowed\n"
+    );
+    let import_doctor = json(target.forge().args(["--json", "doctor"]).assert().success());
+    assert_no_structural_doctor_findings(&import_doctor, "granted projected import");
+
+    let clone = tempfile::tempdir().expect("projected clone dir");
+    let cloned = json(
+        forge_in(clone.path())
+            .args([
+                "--json",
+                "sync",
+                "clone",
+                bundle_path.to_str().expect("utf8 bundle path"),
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(cloned["data"]["projection"]["mode"], "recipient");
+    assert_eq!(cloned["data"]["projection"]["projected"], true);
+    assert_eq!(cloned["data"]["materialized"], true);
+    assert_eq!(
+        std::fs::read_to_string(clone.path().join("granted-projection.txt"))
+            .expect("read projected clone file"),
+        "allowed\n"
+    );
+    let clone_doctor = json(
+        forge_in(clone.path())
+            .args(["--json", "doctor"])
+            .assert()
+            .success(),
+    );
+    assert_no_structural_doctor_findings(&clone_doctor, "granted projected clone");
 }
 
 #[test]

@@ -2226,6 +2226,72 @@ pub fn prepare_native_sync_clone(cwd: &Path, repository_id: &str) -> Result<Sync
     })
 }
 
+pub fn record_projected_sync_clone_initialized(
+    database_path: &Path,
+    repo_id: &str,
+    root_path: &Path,
+    commit_id: &str,
+    content_ref: &str,
+) -> Result<OperationViewResult> {
+    let mut connection = open_connection(database_path)
+        .with_context(|| format!("failed to open {}", database_path.display()))?;
+    let operation_id = OperationId::new().to_string();
+    let view_id = ViewId::new().to_string();
+    let now = now_ms();
+    let state_json = json!({
+        "repository_id": repo_id,
+        "root_path": root_path,
+        "content_backend": "native",
+        "lifecycle": "sync_clone_projected",
+        "commit_id": commit_id,
+        "content_ref": content_ref
+    })
+    .to_string();
+    with_immediate_retry(&mut connection, |tx| {
+        let genesis_hash = integrity::operation_link_hash(
+            integrity::GENESIS_PARENT_HASH,
+            &integrity::OperationDigestInput {
+                operation_id: &operation_id,
+                command: "sync clone",
+                kind: "sync_clone_projected",
+                created_at_ms: now,
+            },
+            None,
+        );
+        tx.execute(
+            "INSERT INTO operations (
+                id, repo_id, request_id, command, status, kind, parent_operation_id,
+                resulting_view_id, error_json, content_hash, created_at_ms
+            ) VALUES (?1, ?2, NULL, 'sync clone', ?3, 'sync_clone_projected', NULL, ?4, NULL, ?5, ?6)",
+            params![
+                operation_id,
+                repo_id,
+                format!("{:?}", OperationStatus::Succeeded).to_lowercase(),
+                view_id,
+                genesis_hash,
+                now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO views (id, repo_id, operation_id, kind, state_json, created_at_ms)
+             VALUES (?1, ?2, ?3, 'initialized', ?4, ?5)",
+            params![view_id, repo_id, operation_id, state_json, now],
+        )?;
+        tx.execute(
+            "INSERT INTO current_state (
+                singleton, repo_id, current_operation_id, current_view_id,
+                attached_attempt_id, expected_content_ref, updated_at_ms
+            ) VALUES (1, ?1, ?2, ?3, NULL, ?4, ?5)",
+            params![repo_id, operation_id, view_id, content_ref, now],
+        )?;
+        Ok(())
+    })?;
+    Ok(OperationViewResult {
+        operation_id,
+        view_id,
+    })
+}
+
 pub fn open_repository(cwd: &Path) -> Result<RepositoryContext> {
     // Git-free root resolution (slice 3): walk up for `.forge/forge.db` rather than shelling
     // `git rev-parse`, so every post-init command works with git removed from PATH.
