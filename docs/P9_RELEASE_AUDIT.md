@@ -42,6 +42,44 @@ redaction before the rc3 audit refresh, PR #97 fixed the second dogfood
 feedback pass before the rc4 audit refresh, and PR #99 added permissioned sync
 projections before this rc5 audit refresh.
 
+## External Dogfood Validation
+
+After publishing `v0.1.0-rc5`, the release candidate was installed from the
+published Git tag at `ba241050` into an isolated PATH and run against the
+`forge-dogfood` checkout.
+
+Baseline app checks:
+
+- `npm run typecheck`: passed
+- `npm test`: passed
+- `npm run build`: passed
+- `npm run lint`: failed before the dogfood fix because ESLint scanned
+  Forge-managed attempt worktrees and the TypeScript parser saw multiple
+  candidate tsconfig roots
+
+The lint/tooling friction was then fixed through the rc5 Forge lifecycle:
+
+- `forge --version`: `forge 0.1.0`
+- `forge schema --json`: passed
+- `forge doctor --json`: passed on schema version 18
+- `forge start --json --require "npm run typecheck" --require "npm test" --require "npm run build" --require "npm run lint" ...`: passed
+- `forge save --json`: changed `docs/DOGFOOD_PLAN.md` and `eslint.config.js`
+- `forge run --json -- npm run typecheck`: passed
+- `forge run --json -- npm test`: passed, with local checkout path redacted from
+  persisted output
+- `forge run --json -- npm run build`: passed
+- `forge run --json -- npm run lint`: passed
+- `forge propose --json --summary ...`: passed
+- `forge check --json`: passed all four required gates
+- `forge accept --json`: accepted proposal
+  `proposal_019ef8cfa5e6728391725ce8a0086aef` as native commit
+  `f1:commit:sha256:377a30002adb0dda9b342dcef1291a8eec6f7ee56d01e7c548d2e79179f9edfe`
+
+This dogfood pass did not expose an rc5 Forge release blocker. It did expose a
+repeatable JavaScript tooling requirement for projects using Forge worktrees:
+broad lint/test tools must exclude `.forge/**`, and typed ESLint configs should
+pin their parser root.
+
 ## Exit Criteria
 
 | Roadmap criterion | Evidence | Status |

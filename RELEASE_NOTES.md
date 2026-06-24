@@ -51,6 +51,23 @@ Gate results:
 - `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0 with TypeScript 5.9.3
 - `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
 
+External dogfood validation also ran against the published `v0.1.0-rc5` tag at
+`ba241050` in the `forge-dogfood` checkout:
+
+- isolated `cargo install --git ... --tag v0.1.0-rc5` succeeded
+- `forge --version`, `forge schema --json`, and `forge doctor --json` passed
+- baseline `npm run typecheck`, `npm test`, and `npm run build` passed
+- baseline `npm run lint` exposed dogfood app tooling friction: ESLint scanned
+  Forge-managed attempt worktrees and needed a `.forge/**` ignore plus explicit
+  TypeScript parser root
+- the fix was completed through the rc5 Forge lifecycle:
+  `forge start`, `forge save`, four `forge run` evidence commands,
+  `forge propose --summary`, `forge check`, and `forge accept`
+- `forge check` passed all four required gates: `npm run typecheck`,
+  `npm test`, `npm run build`, and `npm run lint`
+- accepted native commit:
+  `f1:commit:sha256:377a30002adb0dda9b342dcef1291a8eec6f7ee56d01e7c548d2e79179f9edfe`
+
 ### Current Boundary
 
 This RC is still a local/native release candidate. Permissioned projections are
