@@ -20,6 +20,16 @@ rtk cargo clippy --workspace --all-targets -- -D warnings
 
 Clippy runs with `-D warnings` — warnings are hard failures. Format with `rtk cargo fmt --all`. To mirror CI exactly in one shot — the trio **plus** the end-to-end eval that drives the real `forge` binary — run `rtk bash scripts/ci.sh` before pushing; `scripts/e2e-eval.sh` runs that eval on its own. GitHub Actions CI (`.github/workflows/ci.yml`) runs these same checks (fmt, test, clippy, then the e2e eval) on every push to `main` and every pull request; there is no Makefile or justfile — Cargo is the only build system.
 
+For every feature branch, verification must prove both:
+
+- the existing baseline still passes through the standard gates above
+- the new behavior is exercised directly through focused tests, an e2e/scripted
+  scenario, or dogfood steps that use the feature as a user would
+
+Do not treat broad regression gates as sufficient for a feature branch unless
+they actually cover the new behavior. The plan, PR description, or release notes
+must name the new-feature scenarios that were run and what they proved.
+
 For release/P9 closeout work, run the aggregate dogfood gate:
 
 ```

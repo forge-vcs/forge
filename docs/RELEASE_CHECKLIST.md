@@ -45,11 +45,32 @@ Expected evidence:
 - TypeScript native dogfood reports `PASS=44 FAIL=0`
 - native storage-scale smoke reports `PASS=30 FAIL=0`
 
+## Feature-Specific Validation
+
+For any release that includes a new feature or changed user-visible behavior,
+validate that feature explicitly before tagging. The aggregate release gate is a
+regression backstop; it is not enough unless it directly exercises the new
+behavior.
+
+Record the feature-specific evidence in `RELEASE_NOTES.md` or
+`docs/P9_RELEASE_AUDIT.md`:
+
+- feature or behavior changed
+- focused tests, e2e scripts, or manual dogfood scenarios run
+- expected user-visible outcome
+- important negative or boundary cases
+- result and remaining known limits
+
 ## External Dogfood
 
 Before tagging, run a full product dogfood pass in
 `/Users/skolte/Github-Private/forge-dogfood` against the exact candidate Forge
 binary from current `main`.
+
+For feature-bearing releases, this dogfood pass must include at least one
+scenario that uses the release's headline feature. A generic
+`start/save/run/propose/check/accept` lifecycle pass is useful but does not, by
+itself, validate an unrelated new feature.
 
 Required setup:
 
