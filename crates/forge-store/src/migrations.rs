@@ -118,6 +118,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "018_visibility_policy",
         include_str!("../migrations/018_visibility_policy.sql"),
     ),
+    (
+        19,
+        "019_org_identity_governance",
+        include_str!("../migrations/019_org_identity_governance.sql"),
+    ),
 ];
 
 /// The highest migration version this binary knows how to apply.
@@ -467,7 +472,7 @@ mod tests {
 
     #[test]
     fn schema_head_is_max_version() {
-        assert_eq!(schema_head(), 18);
+        assert_eq!(schema_head(), 19);
     }
 
     #[test]
@@ -478,14 +483,14 @@ mod tests {
         assert_eq!(checksum, checksum_of("ALTER TABLE x ADD COLUMN y TEXT;"));
     }
 
-    /// Fresh apply reaches HEAD=18 with non-NULL checksums for every row.
+    /// Fresh apply reaches HEAD=19 with non-NULL checksums for every row.
     #[test]
     fn fresh_apply_reaches_head_with_checksums() {
         let mut conn = mem_conn();
         apply_pending_migrations(&mut conn).expect("apply migrations");
 
         let versions = applied_versions(&conn);
-        assert_eq!(versions.len(), 18);
+        assert_eq!(versions.len(), 19);
         assert_eq!(versions[0].0, 1);
         assert_eq!(versions[1].0, 2);
         assert_eq!(versions[2].0, 3);
@@ -504,6 +509,7 @@ mod tests {
         assert_eq!(versions[15].0, 16);
         assert_eq!(versions[16].0, 17);
         assert_eq!(versions[17].0, 18);
+        assert_eq!(versions[18].0, 19);
         assert!(versions[0].1.is_some(), "001 checksum must be non-NULL");
         assert!(versions[1].1.is_some(), "002 checksum must be non-NULL");
         assert!(versions[2].1.is_some(), "003 checksum must be non-NULL");
@@ -522,6 +528,7 @@ mod tests {
         assert!(versions[15].1.is_some(), "016 checksum must be non-NULL");
         assert!(versions[16].1.is_some(), "017 checksum must be non-NULL");
         assert!(versions[17].1.is_some(), "018 checksum must be non-NULL");
+        assert!(versions[18].1.is_some(), "019 checksum must be non-NULL");
 
         // 005 seeds one native_object_format row; 006 bumps commit_schema_version -> 2
         // (justified-commit payload epoch) and adds object_format_version = 2 (kind-header
@@ -587,6 +594,15 @@ mod tests {
             )
             .expect("018 seeds visibility policy");
         assert_eq!(visibility_default, "public");
+        let org_profile: (i64, i64, String) = conn
+            .query_row(
+                "SELECT enabled, policy_revision, recovery_status
+                 FROM org_authority_profile WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("019 seeds disabled org authority profile");
+        assert_eq!(org_profile, (0, 0, "normal".to_string()));
     }
 
     /// Build genesis case B — a GENUINE old v1 DB — by running the reverted-001

@@ -24,7 +24,7 @@ Forge is currently published as a public release candidate from GitHub. Install
 the latest tagged RC with Cargo:
 
 ```bash
-cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc5 forge-cli
+cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc6 forge-cli
 ```
 
 This installs the `forge` binary:

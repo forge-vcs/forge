@@ -40,6 +40,9 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "UNSUPPORTED_STRUCTURED_GATE",
     "VISIBILITY_POLICY_INVALID",
     "VISIBILITY_POLICY_UNMET",
+    "ORG_NOT_ENABLED",
+    "ORG_ALREADY_ENABLED",
+    "ORG_AUTHORITY_REQUIRED",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.
@@ -226,6 +229,8 @@ fn commands_list_the_lifecycle() {
         "visibility check",
         "key status",
         "key rotate",
+        "org status",
+        "org init",
         "sync export",
         "sync inspect",
         "sync fetch",
