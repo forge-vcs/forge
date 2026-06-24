@@ -267,6 +267,15 @@ pub enum ForgeError {
         capability: String,
         disclosure: String,
     },
+    /// Org-governed operation was requested before local org governance was enabled.
+    OrgNotEnabled,
+    /// The first-owner bootstrap command was attempted after an org profile exists.
+    OrgAlreadyEnabled { org_id: String },
+    /// An org mutation requires an authority that the acting principal does not hold.
+    OrgAuthorityRequired {
+        action: String,
+        required_role: String,
+    },
 }
 
 impl ForgeError {
@@ -308,6 +317,9 @@ impl ForgeError {
             ForgeError::UnsupportedStructuredGate { .. } => "UNSUPPORTED_STRUCTURED_GATE",
             ForgeError::VisibilityPolicyInvalid { .. } => "VISIBILITY_POLICY_INVALID",
             ForgeError::VisibilityPolicyUnmet { .. } => "VISIBILITY_POLICY_UNMET",
+            ForgeError::OrgNotEnabled => "ORG_NOT_ENABLED",
+            ForgeError::OrgAlreadyEnabled { .. } => "ORG_ALREADY_ENABLED",
+            ForgeError::OrgAuthorityRequired { .. } => "ORG_AUTHORITY_REQUIRED",
         }
     }
 
@@ -494,6 +506,14 @@ impl ForgeError {
                 "capability": capability,
                 "disclosure": disclosure,
             }),
+            ForgeError::OrgNotEnabled => {
+                json!({ "recovery_hint": "Run `forge org init --actor <id>` to enable org governance for this repository." })
+            }
+            ForgeError::OrgAlreadyEnabled { org_id } => json!({ "org_id": org_id }),
+            ForgeError::OrgAuthorityRequired {
+                action,
+                required_role,
+            } => json!({ "action": action, "required_role": required_role }),
             _ => Value::Object(Default::default()),
         }
     }
@@ -687,6 +707,19 @@ impl std::fmt::Display for ForgeError {
             } => write!(
                 f,
                 "visibility policy denied {operation}: capability {capability} is unavailable ({disclosure})"
+            ),
+            ForgeError::OrgNotEnabled => {
+                write!(f, "org governance is not enabled for this repository")
+            }
+            ForgeError::OrgAlreadyEnabled { org_id } => {
+                write!(f, "org governance is already enabled for {org_id}")
+            }
+            ForgeError::OrgAuthorityRequired {
+                action,
+                required_role,
+            } => write!(
+                f,
+                "{action} requires org role {required_role}; acting principal lacks authority"
             ),
         }
     }
@@ -935,6 +968,24 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
                 "capability",
                 "disclosure",
             ],
+        },
+        ErrorCodeSpec {
+            code: "ORG_NOT_ENABLED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["recovery_hint"],
+        },
+        ErrorCodeSpec {
+            code: "ORG_ALREADY_ENABLED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["org_id"],
+        },
+        ErrorCodeSpec {
+            code: "ORG_AUTHORITY_REQUIRED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["action", "required_role"],
         },
     ]
 }
@@ -1568,6 +1619,14 @@ mod tests {
                 capability: "sync_materialize".into(),
                 disclosure: "hidden".into(),
             },
+            ForgeError::OrgNotEnabled,
+            ForgeError::OrgAlreadyEnabled {
+                org_id: "org_x".into(),
+            },
+            ForgeError::OrgAuthorityRequired {
+                action: "key_bind".into(),
+                required_role: "owner".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -1607,7 +1666,10 @@ mod tests {
                 | ForgeError::SyncDivergenceUnsupported { .. }
                 | ForgeError::UnsupportedStructuredGate { .. }
                 | ForgeError::VisibilityPolicyInvalid { .. }
-                | ForgeError::VisibilityPolicyUnmet { .. } => {}
+                | ForgeError::VisibilityPolicyUnmet { .. }
+                | ForgeError::OrgNotEnabled
+                | ForgeError::OrgAlreadyEnabled { .. }
+                | ForgeError::OrgAuthorityRequired { .. } => {}
             }
         }
 

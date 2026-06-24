@@ -63,6 +63,8 @@ enum Command {
     Visibility(VisibilityArgs),
     /// Inspect or rotate the local Ed25519 signing key.
     Key(KeyArgs),
+    /// Inspect or initialize local org governance.
+    Org(OrgArgs),
     Doctor,
     Gc(GcArgs),
     /// Export or inspect a Forge-native sync protocol bundle manifest.
@@ -446,12 +448,36 @@ struct KeyArgs {
     command: KeyCommand,
 }
 
+#[derive(Debug, Args)]
+struct OrgArgs {
+    #[command(subcommand)]
+    command: OrgCommand,
+}
+
 #[derive(Debug, Subcommand)]
 enum KeyCommand {
     /// Show the current local signing key fingerprint.
     Status,
     /// Rotate the current local signing key, preserving old public keys in signatures.
     Rotate,
+}
+
+#[derive(Debug, Subcommand)]
+enum OrgCommand {
+    /// Show the current org governance profile.
+    Status,
+    /// Enable org governance and bind the first owner to the local signing key.
+    Init(OrgInitArgs),
+}
+
+#[derive(Debug, Args)]
+struct OrgInitArgs {
+    /// Human-readable actor alias for the bootstrap owner.
+    #[arg(long)]
+    actor: String,
+    /// Optional audit reason for enabling org governance.
+    #[arg(long)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -669,6 +695,7 @@ fn main() -> ExitCode {
         Command::Trust(args) => trust_response(request_id, args),
         Command::Visibility(args) => visibility_response(request_id, args),
         Command::Key(args) => key_response(request_id, args),
+        Command::Org(args) => org_response(request_id, args),
         Command::Doctor => doctor_response(request_id),
         Command::Gc(args) if !args.dry_run && (!args.yes || args.plan_digest.is_none()) => {
             structured_error(
@@ -736,7 +763,7 @@ fn command_from_args(args: &[String]) -> String {
         [command, subcommand, ..]
             if matches!(
                 command.as_str(),
-                "export" | "attempt" | "proposal" | "sync" | "intent"
+                "export" | "attempt" | "proposal" | "sync" | "intent" | "org"
             ) =>
         {
             format!("{command} {subcommand}")
@@ -1707,6 +1734,28 @@ fn key_response(request_id: Option<String>, args: KeyArgs) -> ResponseEnvelope {
         KeyCommand::Rotate => command_result("key rotate", request_id, |cwd, _| {
             let rotation = forge_store::rotate_local_key(&cwd)?;
             Ok((None, serde_json::to_value(rotation)?, Vec::new()))
+        }),
+    }
+}
+
+fn org_response(request_id: Option<String>, args: OrgArgs) -> ResponseEnvelope {
+    match args.command {
+        OrgCommand::Status => command_result("org status", request_id, |cwd, _| {
+            let status = forge_store::org_status(&cwd)?;
+            Ok((None, serde_json::to_value(status)?, Vec::new()))
+        }),
+        OrgCommand::Init(args) => command_result("org init", request_id, |cwd, request_id| {
+            let bootstrap = forge_store::init_org_governance(
+                &cwd,
+                request_id,
+                &args.actor,
+                args.reason.as_deref(),
+            )?;
+            Ok((
+                Some(bootstrap.operation_id.clone()),
+                serde_json::to_value(bootstrap)?,
+                Vec::new(),
+            ))
         }),
     }
 }
@@ -3651,6 +3700,7 @@ fn replay_response(
         "save" => Some("snapshot_saved"),
         "propose" => Some("proposal_created"),
         "start" | "attempt start" => Some("attempt_started"),
+        "org init" => Some("org_initialized"),
         _ => None,
     } {
         if existing.kind.as_deref() == Some(expected_kind) {
@@ -4292,6 +4342,7 @@ fn is_mutating_command(command: &str) -> bool {
             | "visibility revoke"
             | "key status"
             | "key rotate"
+            | "org init"
             | "gc"
             | "sync import"
             | "sync clone"

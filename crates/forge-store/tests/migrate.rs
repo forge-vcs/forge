@@ -61,6 +61,9 @@ const THIRD_PARTY_ATTESTATIONS_017: &str =
     include_str!("../migrations/017_third_party_attestations.sql");
 /// The 018 visibility policy migration.
 const VISIBILITY_POLICY_018: &str = include_str!("../migrations/018_visibility_policy.sql");
+/// The 019 org identity governance migration.
+const ORG_IDENTITY_GOVERNANCE_019: &str =
+    include_str!("../migrations/019_org_identity_governance.sql");
 
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
@@ -166,6 +169,20 @@ fn apply_through_014(conn: &Connection) {
     apply_through_013(conn);
     conn.execute_batch(SYNC_MERGE_SIGNATURE_SUBJECT_014)
         .expect("apply 014 sync-merge signature subject");
+}
+
+fn apply_through_019(conn: &Connection) {
+    apply_through_014(conn);
+    conn.execute_batch(TRUST_LADDER_ATTESTATION_LEVELS_015)
+        .expect("apply 015 trust-ladder attestation levels");
+    conn.execute_batch(HOSTED_RUNNER_ATTESTATIONS_016)
+        .expect("apply 016 hosted-runner attestations");
+    conn.execute_batch(THIRD_PARTY_ATTESTATIONS_017)
+        .expect("apply 017 third-party attestations");
+    conn.execute_batch(VISIBILITY_POLICY_018)
+        .expect("apply 018 visibility-policy");
+    conn.execute_batch(ORG_IDENTITY_GOVERNANCE_019)
+        .expect("apply 019 org identity governance");
 }
 
 fn max_version(conn: &Connection) -> i64 {
@@ -430,6 +447,91 @@ fn trust_ladder_attestation_level_migration_allows_higher_policy_rungs() {
 }
 
 #[test]
+fn org_identity_migration_enforces_principal_and_key_references() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .expect("enable fks");
+    apply_through_019(&conn);
+    conn.execute(
+        "INSERT INTO repositories (id, root_path, git_head, content_backend, created_at_ms)
+         VALUES ('repo_test', '/tmp/forge-test', NULL, 'native', 0)",
+        [],
+    )
+    .expect("insert repository");
+
+    let orphan_alias = conn.execute(
+        "INSERT INTO org_principal_aliases (
+            id, repo_id, principal_id, alias_kind, alias_value, visibility, state,
+            created_at_ms, updated_at_ms
+         ) VALUES (
+            'alias_orphan', 'repo_test', 'actor_missing', 'actor', 'alice',
+            'private', 'active', 1, 1
+         )",
+        [],
+    );
+    assert!(
+        orphan_alias.is_err(),
+        "aliases must reference an existing principal in the same repo"
+    );
+
+    conn.execute(
+        "INSERT INTO org_principals (id, repo_id, kind, state, created_at_ms, updated_at_ms)
+         VALUES ('actor_owner', 'repo_test', 'human', 'active', 1, 1)",
+        [],
+    )
+    .expect("insert principal");
+
+    let missing_key = conn.execute(
+        "INSERT INTO org_key_bindings (
+            id, repo_id, principal_id, key_fingerprint, public_key, binding_authority,
+            state, valid_from_revision, created_at_ms, updated_at_ms
+         ) VALUES (
+            'key_missing', 'repo_test', 'actor_owner', 'fingerprint_missing', 'public_key',
+            'actor_owner', 'active', 1, 1, 1
+         )",
+        [],
+    );
+    assert!(
+        missing_key.is_err(),
+        "key bindings must reference an existing signing key"
+    );
+
+    conn.execute(
+        "INSERT INTO signing_keys (
+            repo_id, key_fingerprint, public_key, trust_origin, created_at_ms, updated_at_ms
+         ) VALUES ('repo_test', 'fingerprint_owner', 'public_key', 'local', 1, 1)",
+        [],
+    )
+    .expect("insert signing key");
+    conn.execute(
+        "INSERT INTO org_key_bindings (
+            id, repo_id, principal_id, key_fingerprint, public_key, binding_authority,
+            state, valid_from_revision, created_at_ms, updated_at_ms
+         ) VALUES (
+            'key_owner', 'repo_test', 'actor_owner', 'fingerprint_owner', 'public_key',
+            'actor_owner', 'active', 1, 1, 1
+         )",
+        [],
+    )
+    .expect("valid key binding");
+
+    let missing_authority = conn.execute(
+        "INSERT INTO org_role_bindings (
+            id, repo_id, principal_id, role, authority, state, valid_from_revision,
+            created_at_ms, updated_at_ms
+         ) VALUES (
+            'role_bad', 'repo_test', 'actor_owner', 'maintainer', 'actor_missing',
+            'active', 1, 1, 1
+         )",
+        [],
+    );
+    assert!(
+        missing_authority.is_err(),
+        "role bindings must reference an existing authority principal"
+    );
+}
+
+#[test]
 fn behind_db_upgrades_to_head() {
     let repo = git_repo();
     let db = make_forge_db(repo.path());
@@ -498,7 +600,11 @@ fn behind_db_upgrades_to_head() {
         ),
         "018 created visibility_policy"
     );
-    assert_eq!(max_version(&conn), 18, "reached HEAD=18");
+    assert!(
+        has_column(&conn, "org_authority_profile", "policy_revision"),
+        "019 created org_authority_profile"
+    );
+    assert_eq!(max_version(&conn), 19, "reached HEAD=19");
 }
 
 #[test]
@@ -507,38 +613,7 @@ fn at_head_db_is_a_noop() {
     let db = make_forge_db(repo.path());
     {
         let conn = open(&db);
-        conn.execute_batch(BASELINE_001).expect("apply baseline");
-        conn.execute_batch(COLUMNS_002).expect("apply 002 ALTERs");
-        conn.execute_batch(CHECK_SPEC_003).expect("apply 003 ALTER");
-        conn.execute_batch(INTEGRITY_004).expect("apply 004 ALTERs");
-        conn.execute_batch(NATIVE_HISTORY_005)
-            .expect("apply 005 native-history");
-        conn.execute_batch(NATIVE_HISTORY_COMMIT_ID_006)
-            .expect("apply 006 commit-id");
-        conn.execute_batch(EXPECTED_CONTENT_REF_007)
-            .expect("apply 007 expected-content-ref");
-        conn.execute_batch(CONFLICT_DATA_008)
-            .expect("apply 008 conflict-data");
-        conn.execute_batch(ATTEMPT_WORKSPACES_009)
-            .expect("apply 009 attempt-workspaces");
-        conn.execute_batch(STORAGE_POLICY_010)
-            .expect("apply 010 storage-policy");
-        conn.execute_batch(LOCAL_SIGNATURES_011)
-            .expect("apply 011 local-signatures");
-        conn.execute_batch(TRUST_POLICY_012)
-            .expect("apply 012 trust-policy");
-        conn.execute_batch(SIGNING_KEY_ORIGINS_013)
-            .expect("apply 013 signing-key-origins");
-        conn.execute_batch(SYNC_MERGE_SIGNATURE_SUBJECT_014)
-            .expect("apply 014 sync-merge signature subject");
-        conn.execute_batch(TRUST_LADDER_ATTESTATION_LEVELS_015)
-            .expect("apply 015 trust-ladder attestation levels");
-        conn.execute_batch(HOSTED_RUNNER_ATTESTATIONS_016)
-            .expect("apply 016 hosted-runner attestations");
-        conn.execute_batch(THIRD_PARTY_ATTESTATIONS_017)
-            .expect("apply 017 third-party attestations");
-        conn.execute_batch(VISIBILITY_POLICY_018)
-            .expect("apply 018 visibility-policy");
+        apply_through_019(&conn);
         stamp_versions(
             &conn,
             &[
@@ -560,15 +635,16 @@ fn at_head_db_is_a_noop() {
                 (16, "016_hosted_runner_attestations"),
                 (17, "017_third_party_attestations"),
                 (18, "018_visibility_policy"),
+                (19, "019_org_identity_governance"),
             ],
         );
-        assert_eq!(max_version(&conn), 18);
+        assert_eq!(max_version(&conn), 19);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 18, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 19, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -577,39 +653,8 @@ fn head_plus_one_is_refused() {
     let db = make_forge_db(repo.path());
     {
         let conn = open(&db);
-        conn.execute_batch(BASELINE_001).expect("apply baseline");
-        conn.execute_batch(COLUMNS_002).expect("apply 002 ALTERs");
-        conn.execute_batch(CHECK_SPEC_003).expect("apply 003 ALTER");
-        conn.execute_batch(INTEGRITY_004).expect("apply 004 ALTERs");
-        conn.execute_batch(NATIVE_HISTORY_005)
-            .expect("apply 005 native-history");
-        conn.execute_batch(NATIVE_HISTORY_COMMIT_ID_006)
-            .expect("apply 006 commit-id");
-        conn.execute_batch(EXPECTED_CONTENT_REF_007)
-            .expect("apply 007 expected-content-ref");
-        conn.execute_batch(CONFLICT_DATA_008)
-            .expect("apply 008 conflict-data");
-        conn.execute_batch(ATTEMPT_WORKSPACES_009)
-            .expect("apply 009 attempt-workspaces");
-        conn.execute_batch(STORAGE_POLICY_010)
-            .expect("apply 010 storage-policy");
-        conn.execute_batch(LOCAL_SIGNATURES_011)
-            .expect("apply 011 local-signatures");
-        conn.execute_batch(TRUST_POLICY_012)
-            .expect("apply 012 trust-policy");
-        conn.execute_batch(SIGNING_KEY_ORIGINS_013)
-            .expect("apply 013 signing-key-origins");
-        conn.execute_batch(SYNC_MERGE_SIGNATURE_SUBJECT_014)
-            .expect("apply 014 sync-merge signature subject");
-        conn.execute_batch(TRUST_LADDER_ATTESTATION_LEVELS_015)
-            .expect("apply 015 trust-ladder attestation levels");
-        conn.execute_batch(HOSTED_RUNNER_ATTESTATIONS_016)
-            .expect("apply 016 hosted-runner attestations");
-        conn.execute_batch(THIRD_PARTY_ATTESTATIONS_017)
-            .expect("apply 017 third-party attestations");
-        conn.execute_batch(VISIBILITY_POLICY_018)
-            .expect("apply 018 visibility-policy");
-        // HEAD is now 18, so the genuinely-ahead stamp is 19.
+        apply_through_019(&conn);
+        // HEAD is now 19, so the genuinely-ahead stamp is 20.
         stamp_versions(
             &conn,
             &[
@@ -631,10 +676,11 @@ fn head_plus_one_is_refused() {
                 (16, "016_hosted_runner_attestations"),
                 (17, "017_third_party_attestations"),
                 (18, "018_visibility_policy"),
-                (19, "future"),
+                (19, "019_org_identity_governance"),
+                (20, "future"),
             ],
         );
-        assert_eq!(max_version(&conn), 19);
+        assert_eq!(max_version(&conn), 20);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -643,8 +689,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 19);
-            assert_eq!(*supported_head, 18);
+            assert_eq!(*db_version, 20);
+            assert_eq!(*supported_head, 19);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }

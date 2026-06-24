@@ -407,6 +407,36 @@ pub struct LocalKeyRotation {
     pub peer_key_count: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct OrgStatus {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+    pub policy_revision: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_actor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_key_fingerprint: Option<String>,
+    pub recovery_status: String,
+    pub principal_count: i64,
+    pub key_binding_count: i64,
+    pub role_binding_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OrgBootstrap {
+    pub operation_id: String,
+    pub enabled: bool,
+    pub org_id: String,
+    pub policy_revision: i64,
+    pub owner_actor_id: String,
+    pub owner_alias: String,
+    pub key_fingerprint: String,
+    pub public_key: String,
+    pub role: String,
+    pub audit_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustPolicyAction {
     Accept,
@@ -1627,6 +1657,240 @@ pub fn rotate_local_key(cwd: &Path) -> Result<LocalKeyRotation> {
         local_key_count: key_summary.local_key_fingerprints.len() as i64,
         peer_key_count: key_summary.peer_key_fingerprints.len() as i64,
     })
+}
+
+pub fn org_status(cwd: &Path) -> Result<OrgStatus> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    org_status_on(&connection, &context.repo_id)
+}
+
+pub fn init_org_governance(
+    cwd: &Path,
+    request_id: Option<String>,
+    actor: &str,
+    reason: Option<&str>,
+) -> Result<OrgBootstrap> {
+    let actor = actor.trim();
+    if actor.is_empty() {
+        return Err(ForgeError::OrgAuthorityRequired {
+            action: "org_init".into(),
+            required_role: "non_empty_actor".into(),
+        }
+        .into());
+    }
+
+    let context = open_repository(cwd)?;
+    let key = signing::local_key_status(&context.root_path)?;
+    let mut connection = open_connection(&context.database_path)?;
+    with_immediate_retry(&mut connection, |tx| {
+        replay_guard(tx, &context.repo_id, request_id.as_deref())?;
+        let profile = org_status_on(tx, &context.repo_id)?;
+        if profile.enabled {
+            return Err(ForgeError::OrgAlreadyEnabled {
+                org_id: profile.org_id.unwrap_or_else(|| "unknown".into()),
+            }
+            .into());
+        }
+
+        let now = now_ms();
+        let org_id = new_id("org");
+        let owner_actor_id = new_id("actor");
+        let alias_id = new_id("org_alias");
+        let key_binding_id = new_id("org_key");
+        let role_binding_id = new_id("org_role");
+        let audit_id = new_id("org_audit");
+        let policy_revision = 1;
+
+        signing::register_local_signing_key(
+            tx,
+            &context.repo_id,
+            &key.public_key,
+            &key.key_fingerprint,
+            now,
+        )?;
+
+        tx.execute(
+            "INSERT INTO org_principals (
+                id, repo_id, kind, state, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, 'human', 'active', ?3, ?3)",
+            params![owner_actor_id, context.repo_id, now],
+        )?;
+        tx.execute(
+            "INSERT INTO org_principal_aliases (
+                id, repo_id, principal_id, alias_kind, alias_value, visibility, state,
+                created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, 'actor', ?4, 'private', 'active', ?5, ?5)",
+            params![alias_id, context.repo_id, owner_actor_id, actor, now],
+        )?;
+        tx.execute(
+            "INSERT INTO org_key_bindings (
+                id, repo_id, principal_id, key_fingerprint, public_key, binding_authority,
+                state, valid_from_revision, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?3, 'active', ?6, ?7, ?7)",
+            params![
+                key_binding_id,
+                context.repo_id,
+                owner_actor_id,
+                key.key_fingerprint,
+                key.public_key,
+                policy_revision,
+                now
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO org_role_bindings (
+                id, repo_id, principal_id, role, authority, state, valid_from_revision,
+                created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, 'owner', ?3, 'active', ?4, ?5, ?5)",
+            params![
+                role_binding_id,
+                context.repo_id,
+                owner_actor_id,
+                policy_revision,
+                now
+            ],
+        )?;
+
+        let prior_state = json!({"enabled": false, "policy_revision": 0}).to_string();
+        let new_state = json!({
+            "enabled": true,
+            "org_id": org_id.clone(),
+            "owner_actor_id": owner_actor_id.clone(),
+            "owner_alias": actor,
+            "key_fingerprint": key.key_fingerprint.clone(),
+            "role": "owner",
+            "policy_revision": policy_revision
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO org_policy_audit (
+                id, repo_id, action, actor_id, acting_key_fingerprint, authority,
+                prior_state_json, new_state_json, policy_revision, reason, created_at_ms
+             ) VALUES (?1, ?2, 'org_init', ?3, ?4, ?3, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                audit_id,
+                context.repo_id,
+                owner_actor_id,
+                key.key_fingerprint,
+                prior_state,
+                new_state,
+                policy_revision,
+                reason,
+                now
+            ],
+        )?;
+        tx.execute(
+            "UPDATE org_authority_profile
+             SET enabled = 1,
+                 org_id = ?1,
+                 policy_revision = ?2,
+                 bootstrap_actor_id = ?3,
+                 bootstrap_key_fingerprint = ?4,
+                 recovery_status = 'normal',
+                 updated_at_ms = ?5
+             WHERE singleton = 1",
+            params![
+                org_id.clone(),
+                policy_revision,
+                owner_actor_id.clone(),
+                key.key_fingerprint.clone(),
+                now
+            ],
+        )?;
+        let op = insert_operation_view(
+            tx,
+            &context.repo_id,
+            Some(&context.current_operation_id),
+            OperationViewInput {
+                request_id: request_id.clone(),
+                command: "org init".to_string(),
+                kind: "org_initialized".to_string(),
+                view_kind: ViewKind::Initialized,
+                state: json!({
+                    "lifecycle": "org_initialized",
+                    "org_id": org_id.clone(),
+                    "owner_actor_id": owner_actor_id.clone(),
+                    "key_fingerprint": key.key_fingerprint.clone(),
+                    "replay_data": {
+                        "enabled": true,
+                        "org_id": org_id.clone(),
+                        "policy_revision": policy_revision,
+                        "owner_actor_id": owner_actor_id.clone(),
+                        "owner_alias": actor,
+                        "key_fingerprint": key.key_fingerprint.clone(),
+                        "public_key": key.public_key.clone(),
+                        "role": "owner",
+                        "audit_id": audit_id.clone(),
+                    }
+                }),
+            },
+        )?;
+
+        Ok(OrgBootstrap {
+            operation_id: op.operation_id,
+            enabled: true,
+            org_id,
+            policy_revision,
+            owner_actor_id,
+            owner_alias: actor.to_string(),
+            key_fingerprint: key.key_fingerprint.clone(),
+            public_key: key.public_key.clone(),
+            role: "owner".into(),
+            audit_id,
+        })
+    })
+}
+
+fn org_status_on(conn: &Connection, repo_id: &str) -> Result<OrgStatus> {
+    let (
+        enabled,
+        org_id,
+        policy_revision,
+        bootstrap_actor_id,
+        bootstrap_key_fingerprint,
+        recovery_status,
+    ): (
+        i64,
+        Option<String>,
+        i64,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = conn.query_row(
+        "SELECT enabled, org_id, policy_revision, bootstrap_actor_id,
+                bootstrap_key_fingerprint, recovery_status
+         FROM org_authority_profile
+         WHERE singleton = 1",
+        [],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )?;
+
+    Ok(OrgStatus {
+        enabled: enabled == 1,
+        org_id,
+        policy_revision,
+        bootstrap_actor_id,
+        bootstrap_key_fingerprint,
+        recovery_status,
+        principal_count: count_org_rows(conn, "org_principals", repo_id)?,
+        key_binding_count: count_org_rows(conn, "org_key_bindings", repo_id)?,
+        role_binding_count: count_org_rows(conn, "org_role_bindings", repo_id)?,
+    })
+}
+
+fn count_org_rows(conn: &Connection, table: &str, repo_id: &str) -> Result<i64> {
+    let sql = format!("SELECT COUNT(*) FROM {table} WHERE repo_id = ?1");
+    Ok(conn.query_row(&sql, params![repo_id], |row| row.get(0))?)
 }
 
 pub fn attest_hosted_runner(
