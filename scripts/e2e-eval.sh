@@ -19,6 +19,25 @@ trap 'rm -rf "$TMP"' EXIT
 
 PASS=0; FAIL=0; declare -a FAILS=()
 have_sqlite=1; command -v sqlite3 >/dev/null 2>&1 || have_sqlite=0
+MIGRATION_DIR="$ROOT/crates/forge-store/migrations"
+MIGRATION_HEAD="$(find "$MIGRATION_DIR" -maxdepth 1 -type f -name '[0-9][0-9][0-9]_*.sql' \
+  | sed -E 's#.*/([0-9]+)_.*#\1#' \
+  | sort -n \
+  | tail -1 \
+  | sed 's/^0*//')"
+if [ -z "$MIGRATION_HEAD" ]; then
+  echo "No migration files found in $MIGRATION_DIR"
+  exit 1
+fi
+MIGRATION_VERSIONS=""
+for ((i = 1; i <= MIGRATION_HEAD; i++)); do
+  if [ -z "$MIGRATION_VERSIONS" ]; then
+    MIGRATION_VERSIONS="$i"
+  else
+    MIGRATION_VERSIONS="$MIGRATION_VERSIONS,$i"
+  fi
+done
+MIGRATION_FUTURE=$((MIGRATION_HEAD + 1))
 
 ck() { # ck "desc" actual expected
   if [ "$2" = "$3" ]; then PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$1"
@@ -58,7 +77,7 @@ echo; echo "=== LIFECYCLE (init→start→save→run→propose→check→accept�
 mkrepo life >/dev/null
 F init;    ck "init success" "$(pg "d['status']")" "success"
 F doctor;  ck "doctor ok" "$(pg "d['data']['ok']")" "True"
-ck "doctor schema_version=18" "$(pg "d['data']['schema_version']")" "18"
+ck "doctor schema_version=$MIGRATION_HEAD" "$(pg "d['data']['schema_version']")" "$MIGRATION_HEAD"
 F start "build a feature"; ck "start success" "$(pg "d['status']")" "success"
 echo "hello" > feature.txt
 F save;    ck "save success" "$(pg "d['status']")" "success"
@@ -221,12 +240,12 @@ fi
 echo; echo "=== MIGRATION state (live binary) ==="
 if [ "$have_sqlite" = 1 ]; then
   vers="$(db "$TMP/life" "SELECT group_concat(version) FROM schema_migrations ORDER BY version;")"
-  ck "schema_migrations has versions 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18" "$vers" "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18"
+  ck "schema_migrations has versions $MIGRATION_VERSIONS" "$vers" "$MIGRATION_VERSIONS"
   nullck="$(db "$TMP/life" "SELECT count(*) FROM schema_migrations WHERE checksum IS NULL;")"
   ck "all migration rows carry a checksum" "$nullck" "0"
   # HEAD+1 read-only refuse on a separate repo
   mkrepo headplus1 >/dev/null; F init >/dev/null
-  db "$TMP/headplus1" "INSERT OR REPLACE INTO schema_migrations(version,name,applied_at_ms,checksum) VALUES (19,'future',0,NULL);"
+  db "$TMP/headplus1" "INSERT OR REPLACE INTO schema_migrations(version,name,applied_at_ms,checksum) VALUES ($MIGRATION_FUTURE,'future',0,NULL);"
   F show; ck "DB ahead of binary refuses read-only" "$(pg "d['errors'][0]['code']")" "SCHEMA_VERSION_UNSUPPORTED"
 else
   echo "  (skipped: sqlite3 unavailable)"
