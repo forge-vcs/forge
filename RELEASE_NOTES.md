@@ -68,11 +68,35 @@ External dogfood validation also ran against the published `v0.1.0-rc5` tag at
 - accepted native commit:
   `f1:commit:sha256:377a30002adb0dda9b342dcef1291a8eec6f7ee56d01e7c548d2e79179f9edfe`
 
+Follow-up feature-specific dogfood for permissioned projections found a
+receiver-side blocker:
+
+- `forge visibility set` marked the dogfood proposal private
+- `forge visibility check` denied `rc5-outsider` with `disclosure: hidden`
+- `forge visibility grant` allowed `rc5-release-auditor` to
+  `sync_materialize`
+- `forge sync export --recipient rc5-outsider` produced a projected bundle with
+  `native_head: null`
+- `forge sync export --recipient rc5-release-auditor` produced a projected
+  bundle with native head
+  `f1:commit:sha256:377a30002adb0dda9b342dcef1291a8eec6f7ee56d01e7c548d2e79179f9edfe`
+- full, non-projected `forge sync export` plus `forge sync import --materialize`
+  succeeded in a fresh receiver
+- projected `forge sync import` failed with `COMMAND_FAILED: apply sync bundle`
+  for the allowed recipient bundle, with and without `--materialize`
+- projected `forge sync clone` failed with `COMMAND_FAILED: clone sync bundle`
+
+That means rc5 validates visibility decisions and projected export metadata, but
+does not validate projected receiver import/materialization. Treat this as a
+known rc5 limitation and a required fix before the next release candidate.
+
 ### Current Boundary
 
 This RC is still a local/native release candidate. Permissioned projections are
 Forge-managed projection enforcement, not encryption or a hosted
-identity/governance system.
+identity/governance system. Recipient-scoped projection import/clone is not yet
+validated in rc5 because feature-specific dogfood exposed receiver-side
+`COMMAND_FAILED` failures for projected bundles.
 
 ## v0.1.0-rc4
 

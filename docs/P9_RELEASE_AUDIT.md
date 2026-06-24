@@ -75,10 +75,36 @@ The lint/tooling friction was then fixed through the rc5 Forge lifecycle:
   `proposal_019ef8cfa5e6728391725ce8a0086aef` as native commit
   `f1:commit:sha256:377a30002adb0dda9b342dcef1291a8eec6f7ee56d01e7c548d2e79179f9edfe`
 
-This dogfood pass did not expose an rc5 Forge release blocker. It did expose a
-repeatable JavaScript tooling requirement for projects using Forge worktrees:
-broad lint/test tools must exclude `.forge/**`, and typed ESLint configs should
-pin their parser root.
+This generic lifecycle dogfood pass did not expose an rc5 Forge lifecycle
+blocker. It did expose a repeatable JavaScript tooling requirement for projects
+using Forge worktrees: broad lint/test tools must exclude `.forge/**`, and typed
+ESLint configs should pin their parser root.
+
+## Feature-Specific Projection Dogfood
+
+Follow-up dogfood explicitly exercised the rc5 permissioned projection feature
+in the `forge-dogfood` checkout.
+
+Policy and export-side checks:
+
+- `forge visibility set --kind proposal --id proposal_019ef8cfa5e6728391725ce8a0086aef --visibility private`: passed
+- `forge visibility check --recipient rc5-outsider --capability sync_materialize`: passed with `allowed: false` and `disclosure: hidden`
+- `forge visibility grant --recipient rc5-release-auditor --capability sync_materialize`: passed
+- `forge visibility check --recipient rc5-release-auditor --capability sync_materialize`: passed with `allowed: true` and `disclosure: full`
+- `forge sync export --recipient rc5-outsider --capability sync_materialize`: passed, producing a projected bundle with `native_head: null`
+- `forge sync export --recipient rc5-release-auditor --capability sync_materialize`: passed, producing a projected bundle with native head `f1:commit:sha256:377a30002adb0dda9b342dcef1291a8eec6f7ee56d01e7c548d2e79179f9edfe`
+- full, non-projected `forge sync export` followed by `forge sync import --materialize` into a fresh receiver: passed
+
+Receiver-side projected bundle checks:
+
+- allowed projected `forge sync import --materialize`: failed with `COMMAND_FAILED: apply sync bundle`
+- allowed projected `forge sync import` without materialization: failed with `COMMAND_FAILED: apply sync bundle`
+- allowed projected `forge sync clone`: failed with `COMMAND_FAILED: clone sync bundle`
+
+Conclusion: rc5 proves visibility policy decisions and recipient-scoped export
+metadata/count behavior, but does not prove projected receiver import or
+materialization. This is a release-candidate limitation and should be fixed
+before the next RC that claims end-to-end permissioned projections.
 
 ## Exit Criteria
 
@@ -101,8 +127,9 @@ The local/native release claim is supportable:
 - Forge can represent remote-boundary conflicts as typed conflict-as-data.
 - Forge can sign local evidence, decisions, native commits, and sync merge commits.
 - Forge can enforce local, hosted-runner, and third-party trust policies.
-- Forge can emit recipient-scoped sync projections for local permissioned
-  collaboration boundaries.
+- Forge can emit recipient-scoped sync projection bundles for local
+  permissioned collaboration boundaries, but rc5 feature-specific dogfood found
+  projected import/clone failures on the receiving side.
 - Forge can still export accepted work to Git branches for existing PR workflows.
 
 The supported public wording should avoid claiming a hosted multi-tenant service,
