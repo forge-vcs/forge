@@ -468,6 +468,10 @@ enum OrgCommand {
     Status,
     /// Enable org governance and bind the first owner to the local signing key.
     Init(OrgInitArgs),
+    /// Bind or inspect local org encryption keys.
+    Encryption(OrgEncryptionArgs),
+    /// Check whether a principal can decrypt private content for a work package.
+    DecryptAuthority(OrgDecryptAuthorityArgs),
 }
 
 #[derive(Debug, Args)]
@@ -478,6 +482,40 @@ struct OrgInitArgs {
     /// Optional audit reason for enabling org governance.
     #[arg(long)]
     reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct OrgEncryptionArgs {
+    #[command(subcommand)]
+    command: OrgEncryptionCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum OrgEncryptionCommand {
+    /// Bind this machine's local age recipient to an org principal.
+    BindLocal(OrgEncryptionBindLocalArgs),
+}
+
+#[derive(Debug, Args)]
+struct OrgEncryptionBindLocalArgs {
+    /// Org principal id that owns this local encryption recipient.
+    #[arg(long)]
+    principal_id: String,
+    /// Authority principal id. Defaults to --principal-id.
+    #[arg(long)]
+    authority_id: Option<String>,
+    /// Optional audit reason.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct OrgDecryptAuthorityArgs {
+    #[command(flatten)]
+    work_package: VisibilityWorkPackageArgs,
+    /// Org principal id that should have decrypt authority.
+    #[arg(long)]
+    principal_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -570,6 +608,8 @@ enum VisibilityCommand {
     Revoke(VisibilityGrantArgs),
     /// Check a recipient/capability projection decision for a work package.
     Check(VisibilityCheckArgs),
+    /// Manage exact private path labels for a work package.
+    Path(VisibilityPathArgs),
 }
 
 #[derive(Debug, Args)]
@@ -637,6 +677,30 @@ struct VisibilityCheckArgs {
         "publish_reveal",
     ])]
     capability: String,
+}
+
+#[derive(Debug, Args)]
+struct VisibilityPathArgs {
+    #[command(subcommand)]
+    command: VisibilityPathCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum VisibilityPathCommand {
+    /// Set one exact private path label for a work package.
+    Set(VisibilityPathSetArgs),
+}
+
+#[derive(Debug, Args)]
+struct VisibilityPathSetArgs {
+    #[command(flatten)]
+    work_package: VisibilityWorkPackageArgs,
+    /// Exact repo-relative private path. Globs and parent traversal are rejected.
+    #[arg(long)]
+    path: String,
+    /// Visibility label for this path: private, team, or embargoed. Public is rejected for private path labels.
+    #[arg(long, value_parser = ["private", "team", "public", "embargoed"], default_value = "private")]
+    visibility: String,
 }
 
 fn main() -> ExitCode {
@@ -1189,18 +1253,26 @@ fn save_response(request_id: Option<String>, args: AttemptScopedArgs) -> Respons
         // authoritatively on the write path; this returns the resolved attempt id, which
         // we pass back as an explicit selector.
         let resolved_attempt = forge_store::verify_save_target(&cwd, args.attempt.as_deref())?;
-        let content = snapshot_effective_worktree(&cwd)?;
+        let private_paths =
+            forge_store::local_private_path_exclusions(&cwd, "attempt", resolved_attempt.as_str())?;
+        let content = snapshot_effective_worktree_excluding(&cwd, &private_paths)?;
         // Crash boundary (NER-132 U6, debug-only): objects are now durably fsynced
         // but no content_ref row is committed. A crash here must never leave a
         // committed ref pointing at a missing object — the objects are present, the
         // ref is absent.
         forge_content::maybe_crash("after_object_fsync_before_db_commit");
-        let saved = forge_store::save_snapshot(
+        let private_overlays = forge_store::capture_local_private_overlays(
+            &cwd,
+            "attempt",
+            resolved_attempt.as_str(),
+        )?;
+        let saved = forge_store::save_snapshot_with_private_overlays(
             &cwd,
             request_id,
             Some(resolved_attempt.as_str()),
             content.content_ref,
             content.changed_paths,
+            private_overlays,
         )?;
         // Crash boundary (NER-132 U6, debug-only): the content_ref is committed and
         // durable (synchronous=NORMAL fsyncs the WAL on commit) even if the WAL is
@@ -1364,6 +1436,14 @@ fn run_response(request_id: Option<String>, args: RunArgs) -> ResponseEnvelope {
     command_result("run", request_id, |cwd, request_id| {
         if args.command.is_empty() {
             anyhow::bail!("missing command after --");
+        }
+        let attempt = forge_store::resolve_attempt(&cwd, args.attempt.as_deref())?.attempt;
+        if !forge_store::local_private_path_labels(&cwd, "attempt", &attempt.attempt_id)?.is_empty()
+        {
+            return Err(forge_store::ForgeError::PrivateContentInvalid {
+                reason: "private_tainted_evidence_unsupported".to_string(),
+            }
+            .into());
         }
         ensure_worktree_matches_expected(&cwd)?;
         let worktree = forge_store::effective_worktree_path(&cwd)?;
@@ -1722,6 +1802,20 @@ fn visibility_response(request_id: Option<String>, args: VisibilityArgs) -> Resp
                 Ok((None, serde_json::to_value(decision)?, Vec::new()))
             })
         }
+        VisibilityCommand::Path(args) => match args.command {
+            VisibilityPathCommand::Set(args) => {
+                command_result("visibility path set", request_id, |cwd, _| {
+                    let label = forge_store::set_local_private_path_label(
+                        &cwd,
+                        &args.work_package.kind,
+                        &args.work_package.id,
+                        &args.path,
+                        &args.visibility,
+                    )?;
+                    Ok((None, serde_json::to_value(label)?, Vec::new()))
+                })
+            }
+        },
     }
 }
 
@@ -1757,6 +1851,33 @@ fn org_response(request_id: Option<String>, args: OrgArgs) -> ResponseEnvelope {
                 Vec::new(),
             ))
         }),
+        OrgCommand::Encryption(args) => match args.command {
+            OrgEncryptionCommand::BindLocal(args) => {
+                command_result("org encryption bind-local", request_id, |cwd, _| {
+                    let recipient = forge_store::local_encryption_recipient(&cwd)?;
+                    let authority = args.authority_id.as_deref().unwrap_or(&args.principal_id);
+                    let binding = forge_store::bind_org_encryption_key(
+                        &cwd,
+                        &args.principal_id,
+                        &recipient,
+                        authority,
+                        args.reason.as_deref(),
+                    )?;
+                    Ok((None, serde_json::to_value(binding)?, Vec::new()))
+                })
+            }
+        },
+        OrgCommand::DecryptAuthority(args) => {
+            command_result("org decrypt-authority", request_id, |cwd, _| {
+                let authority = forge_store::private_decrypt_authority(
+                    &cwd,
+                    &args.work_package.kind,
+                    &args.work_package.id,
+                    &args.principal_id,
+                )?;
+                Ok((None, serde_json::to_value(authority)?, Vec::new()))
+            })
+        }
     }
 }
 
@@ -1811,6 +1932,9 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
                         .context("preflight sync import materialize manifest")?;
                     forge_sync::ensure_manifest_materializable(&manifest)
                         .context("preflight sync import materialize projection")?;
+                    let _prepared_private_overlays =
+                        forge_sync::prepare_private_overlay_materialization(&cwd, &manifest)
+                            .context("preflight sync import private overlays")?;
                     ensure_clean_for_sync_import_materialize(&cwd)
                         .context("preflight sync import materialize")?;
                 }
@@ -1824,8 +1948,19 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
                     })?;
                     let content_ref = forge_store::checkout_target_content_ref(&cwd, commit_id)
                         .context("resolve imported native head")?;
+                    let manifest = forge_sync::read_supported_manifest(&args.path)
+                        .context("read sync import private overlays")?;
+                    let prepared_private_overlays =
+                        forge_sync::prepare_private_overlay_materialization(&cwd, &manifest)
+                            .context("prepare sync import private overlays")?;
                     restore_effective_worktree(&cwd, &content_ref)
                         .context("restore imported native head")?;
+                    let materialized_private_overlay_count =
+                        forge_sync::install_prepared_private_overlays(
+                            &cwd,
+                            &prepared_private_overlays,
+                        )
+                        .context("materialize sync import private overlays")?;
                     let record = forge_store::record_sync_import_materialized(
                         &cwd,
                         request_id,
@@ -1842,6 +1977,10 @@ fn sync_response(request_id: Option<String>, args: SyncArgs) -> ResponseEnvelope
                             json!(record.operation_id),
                         );
                         object.insert("materialized_view_id".to_string(), json!(record.view_id));
+                        object.insert(
+                            "materialized_private_overlay_count".to_string(),
+                            json!(materialized_private_overlay_count),
+                        );
                     }
                 } else if let Some(object) = data.as_object_mut() {
                     object.insert("materialized".to_string(), json!(false));
@@ -4139,12 +4278,29 @@ fn selected_backend(cwd: &std::path::Path) -> anyhow::Result<Box<dyn ContentBack
 }
 
 fn snapshot_effective_worktree(cwd: &Path) -> anyhow::Result<SnapshotContent> {
+    snapshot_effective_worktree_excluding(cwd, &[])
+}
+
+fn snapshot_effective_worktree_excluding(
+    cwd: &Path,
+    excluded_paths: &[String],
+) -> anyhow::Result<SnapshotContent> {
     let context = forge_store::open_repository(cwd)?;
     match context.content_backend.as_str() {
-        "git" => forge_content_git::GitContentBackend.snapshot_worktree(&context.root_path),
-        "native" => forge_content_native::snapshot_worktree_into_store(
+        "git" => {
+            if !excluded_paths.is_empty() {
+                anyhow::bail!(ForgeError::UnsupportedContentBackend {
+                    command: "save private path".to_string(),
+                    required: "native".to_string(),
+                    actual: "git".to_string(),
+                });
+            }
+            forge_content_git::GitContentBackend.snapshot_worktree(&context.root_path)
+        }
+        "native" => forge_content_native::snapshot_worktree_into_store_excluding(
             &context.root_path,
             &context.worktree_path,
+            excluded_paths,
         ),
         other => anyhow::bail!("unsupported content backend {other}"),
     }
@@ -4338,11 +4494,13 @@ fn is_mutating_command(command: &str) -> bool {
             | "undo"
             | "trust policy"
             | "visibility set"
+            | "visibility path set"
             | "visibility grant"
             | "visibility revoke"
             | "key status"
             | "key rotate"
             | "org init"
+            | "org encryption bind-local"
             | "gc"
             | "sync import"
             | "sync clone"

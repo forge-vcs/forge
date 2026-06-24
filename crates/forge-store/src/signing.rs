@@ -879,25 +879,25 @@ fn hex_nibble(byte: u8) -> Result<u8> {
 }
 
 #[cfg(unix)]
-fn set_private_dir_permissions(path: &Path) -> Result<()> {
+pub(crate) fn set_private_dir_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_private_dir_permissions(_path: &Path) -> Result<()> {
+pub(crate) fn set_private_dir_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn set_private_file_permissions(path: &Path) -> Result<()> {
+pub(crate) fn set_private_file_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_private_file_permissions(_path: &Path) -> Result<()> {
+pub(crate) fn set_private_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }

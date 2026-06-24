@@ -310,3 +310,146 @@ fn org_init_rejects_blank_actor_without_bootstrap_side_effects() {
         assert_eq!(count, 0, "{table} must remain empty after blank actor");
     }
 }
+
+#[test]
+fn org_encryption_binding_enables_private_decrypt_authority_after_grant() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+
+    let org = json(
+        repo.forge()
+            .args(["--json", "org", "init", "--actor", "alice"])
+            .assert()
+            .success(),
+    );
+    let principal_id = org["data"]["owner_actor_id"]
+        .as_str()
+        .expect("owner actor id");
+
+    let attempt = json(
+        repo.forge()
+            .args(["--json", "start", "private overlay"])
+            .assert()
+            .success(),
+    );
+    let attempt_id = attempt["data"]["attempt_id"].as_str().expect("attempt id");
+
+    let missing_before_key = json(
+        repo.forge()
+            .args([
+                "--json",
+                "org",
+                "decrypt-authority",
+                "--kind",
+                "attempt",
+                "--id",
+                attempt_id,
+                "--principal-id",
+                principal_id,
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(
+        missing_before_key["errors"][0]["code"],
+        "PRIVATE_DECRYPT_AUTHORITY_MISSING"
+    );
+
+    let binding = json(
+        repo.forge()
+            .args([
+                "--json",
+                "org",
+                "encryption",
+                "bind-local",
+                "--principal-id",
+                principal_id,
+                "--reason",
+                "bind local recipient",
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(binding["command"], "org encryption bind-local");
+    assert_eq!(binding["data"]["principal_id"], principal_id);
+    assert!(binding["data"]["public_key"]
+        .as_str()
+        .expect("age recipient")
+        .starts_with("age1"));
+    assert!(binding["data"]["key_fingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .starts_with("age-x25519:"));
+
+    let missing_before_grant = json(
+        repo.forge()
+            .args([
+                "--json",
+                "org",
+                "decrypt-authority",
+                "--kind",
+                "attempt",
+                "--id",
+                attempt_id,
+                "--principal-id",
+                principal_id,
+            ])
+            .assert()
+            .failure(),
+    );
+    assert_eq!(
+        missing_before_grant["errors"][0]["code"],
+        "PRIVATE_DECRYPT_AUTHORITY_MISSING"
+    );
+    assert!(missing_before_grant["errors"][0]["details"]["reason"]
+        .as_str()
+        .expect("reason")
+        .starts_with("missing_visibility_grant:"));
+
+    repo.forge()
+        .args([
+            "--json",
+            "visibility",
+            "grant",
+            "--kind",
+            "attempt",
+            "--id",
+            attempt_id,
+            "--recipient",
+            principal_id,
+            "--capability",
+            "sync_materialize",
+        ])
+        .assert()
+        .success();
+
+    let authority = json(
+        repo.forge()
+            .args([
+                "--json",
+                "org",
+                "decrypt-authority",
+                "--kind",
+                "attempt",
+                "--id",
+                attempt_id,
+                "--principal-id",
+                principal_id,
+            ])
+            .assert()
+            .success(),
+    );
+    assert_eq!(authority["command"], "org decrypt-authority");
+    assert_eq!(authority["data"]["principal_id"], principal_id);
+    assert_eq!(
+        authority["data"]["public_key"],
+        binding["data"]["public_key"]
+    );
+    assert_eq!(
+        authority["data"]["recipient_fingerprint"],
+        binding["data"]["key_fingerprint"]
+    );
+}

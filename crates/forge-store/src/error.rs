@@ -276,6 +276,15 @@ pub enum ForgeError {
         action: String,
         required_role: String,
     },
+    /// Private-content metadata is malformed or inconsistent with ledger state.
+    /// Details carry a closed reason string only; no path names or plaintext.
+    PrivateContentInvalid { reason: String },
+    /// A principal lacks an active org-bound encryption key or visibility grant
+    /// required to materialize private content.
+    PrivateDecryptAuthorityMissing {
+        principal_id: String,
+        reason: String,
+    },
 }
 
 impl ForgeError {
@@ -320,6 +329,10 @@ impl ForgeError {
             ForgeError::OrgNotEnabled => "ORG_NOT_ENABLED",
             ForgeError::OrgAlreadyEnabled { .. } => "ORG_ALREADY_ENABLED",
             ForgeError::OrgAuthorityRequired { .. } => "ORG_AUTHORITY_REQUIRED",
+            ForgeError::PrivateContentInvalid { .. } => "PRIVATE_CONTENT_INVALID",
+            ForgeError::PrivateDecryptAuthorityMissing { .. } => {
+                "PRIVATE_DECRYPT_AUTHORITY_MISSING"
+            }
         }
     }
 
@@ -514,6 +527,11 @@ impl ForgeError {
                 action,
                 required_role,
             } => json!({ "action": action, "required_role": required_role }),
+            ForgeError::PrivateContentInvalid { reason } => json!({ "reason": reason }),
+            ForgeError::PrivateDecryptAuthorityMissing {
+                principal_id,
+                reason,
+            } => json!({ "principal_id": principal_id, "reason": reason }),
             _ => Value::Object(Default::default()),
         }
     }
@@ -720,6 +738,16 @@ impl std::fmt::Display for ForgeError {
             } => write!(
                 f,
                 "{action} requires org role {required_role}; acting principal lacks authority"
+            ),
+            ForgeError::PrivateContentInvalid { reason } => {
+                write!(f, "private content metadata is invalid: {reason}")
+            }
+            ForgeError::PrivateDecryptAuthorityMissing {
+                principal_id,
+                reason,
+            } => write!(
+                f,
+                "principal {principal_id} lacks private decrypt authority: {reason}"
             ),
         }
     }
@@ -987,6 +1015,18 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             after_ms: None,
             details_keys: &["action", "required_role"],
         },
+        ErrorCodeSpec {
+            code: "PRIVATE_CONTENT_INVALID",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["reason"],
+        },
+        ErrorCodeSpec {
+            code: "PRIVATE_DECRYPT_AUTHORITY_MISSING",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["principal_id", "reason"],
+        },
     ]
 }
 
@@ -1156,6 +1196,21 @@ mod tests {
             .code(),
             "VISIBILITY_POLICY_UNMET"
         );
+        assert_eq!(
+            ForgeError::PrivateContentInvalid {
+                reason: "metadata_mismatch".into(),
+            }
+            .code(),
+            "PRIVATE_CONTENT_INVALID"
+        );
+        assert_eq!(
+            ForgeError::PrivateDecryptAuthorityMissing {
+                principal_id: "actor_x".into(),
+                reason: "missing_active_encryption_key".into(),
+            }
+            .code(),
+            "PRIVATE_DECRYPT_AUTHORITY_MISSING"
+        );
     }
 
     #[test]
@@ -1185,6 +1240,13 @@ mod tests {
                 work_package_id: "attempt_x".into(),
                 capability: "sync_materialize".into(),
                 disclosure: "hidden".into(),
+            },
+            ForgeError::PrivateContentInvalid {
+                reason: "metadata_mismatch".into(),
+            },
+            ForgeError::PrivateDecryptAuthorityMissing {
+                principal_id: "actor_x".into(),
+                reason: "missing_active_encryption_key".into(),
             },
         ] {
             assert!(!deterministic.retryable());
@@ -1627,6 +1689,13 @@ mod tests {
                 action: "key_bind".into(),
                 required_role: "owner".into(),
             },
+            ForgeError::PrivateContentInvalid {
+                reason: "metadata_mismatch".into(),
+            },
+            ForgeError::PrivateDecryptAuthorityMissing {
+                principal_id: "actor_x".into(),
+                reason: "missing_active_encryption_key".into(),
+            },
         ];
 
         // Exhaustiveness check: if a variant is added, this match fails to compile
@@ -1669,7 +1738,9 @@ mod tests {
                 | ForgeError::VisibilityPolicyUnmet { .. }
                 | ForgeError::OrgNotEnabled
                 | ForgeError::OrgAlreadyEnabled { .. }
-                | ForgeError::OrgAuthorityRequired { .. } => {}
+                | ForgeError::OrgAuthorityRequired { .. }
+                | ForgeError::PrivateContentInvalid { .. }
+                | ForgeError::PrivateDecryptAuthorityMissing { .. } => {}
             }
         }
 

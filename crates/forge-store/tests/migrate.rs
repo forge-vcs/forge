@@ -64,6 +64,9 @@ const VISIBILITY_POLICY_018: &str = include_str!("../migrations/018_visibility_p
 /// The 019 org identity governance migration.
 const ORG_IDENTITY_GOVERNANCE_019: &str =
     include_str!("../migrations/019_org_identity_governance.sql");
+/// The 020 encrypted private content migration.
+const ENCRYPTED_PRIVATE_CONTENT_020: &str =
+    include_str!("../migrations/020_encrypted_private_content.sql");
 
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
@@ -183,6 +186,12 @@ fn apply_through_019(conn: &Connection) {
         .expect("apply 018 visibility-policy");
     conn.execute_batch(ORG_IDENTITY_GOVERNANCE_019)
         .expect("apply 019 org identity governance");
+}
+
+fn apply_through_020(conn: &Connection) {
+    apply_through_019(conn);
+    conn.execute_batch(ENCRYPTED_PRIVATE_CONTENT_020)
+        .expect("apply 020 encrypted private content");
 }
 
 fn max_version(conn: &Connection) -> i64 {
@@ -532,6 +541,144 @@ fn org_identity_migration_enforces_principal_and_key_references() {
 }
 
 #[test]
+fn encrypted_private_content_migration_enforces_overlay_references() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .expect("enable fks");
+    apply_through_020(&conn);
+    conn.execute(
+        "INSERT INTO repositories (id, root_path, git_head, content_backend, created_at_ms)
+         VALUES ('repo_test', '/tmp/forge-test', NULL, 'native', 0)",
+        [],
+    )
+    .expect("insert repository");
+
+    let orphan_encryption_key = conn.execute(
+        "INSERT INTO org_encryption_key_bindings (
+            id, repo_id, principal_id, key_fingerprint, public_key, binding_authority,
+            state, valid_from_revision, created_at_ms, updated_at_ms
+         ) VALUES (
+            'enc_missing', 'repo_test', 'actor_missing', 'age-x25519:fingerprint',
+            'age1recipient', 'actor_missing', 'active', 1, 1, 1
+         )",
+        [],
+    );
+    assert!(
+        orphan_encryption_key.is_err(),
+        "encryption key bindings must reference org principals"
+    );
+
+    conn.execute(
+        "INSERT INTO org_principals (id, repo_id, kind, state, created_at_ms, updated_at_ms)
+         VALUES ('actor_owner', 'repo_test', 'human', 'active', 1, 1)",
+        [],
+    )
+    .expect("insert principal");
+    conn.execute(
+        "INSERT INTO org_encryption_key_bindings (
+            id, repo_id, principal_id, key_fingerprint, public_key, binding_authority,
+            state, valid_from_revision, created_at_ms, updated_at_ms
+         ) VALUES (
+            'enc_owner', 'repo_test', 'actor_owner', 'age-x25519:fingerprint',
+            'age1recipient', 'actor_owner', 'active', 1, 1, 1
+         )",
+        [],
+    )
+    .expect("valid encryption key binding does not require signing key row");
+
+    conn.execute(
+        "INSERT INTO intents (id, repo_id, text, check_spec_json, created_at_ms)
+         VALUES ('intent_test', 'repo_test', 'private work', NULL, 1)",
+        [],
+    )
+    .expect("insert intent");
+    conn.execute(
+        "INSERT INTO attempts (id, repo_id, intent_id, base_head, status, created_at_ms)
+         VALUES ('attempt_test', 'repo_test', 'intent_test', 'HEAD0', 'active', 1)",
+        [],
+    )
+    .expect("insert attempt");
+    conn.execute(
+        "INSERT INTO private_path_labels (
+            id, repo_id, work_package_kind, work_package_id, path_hash,
+            encrypted_display_path, visibility, created_at_ms, updated_at_ms
+         ) VALUES (
+            'path_private', 'repo_test', 'attempt', 'attempt_test',
+            'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            'encrypted-path-metadata', 'private', 1, 1
+         )",
+        [],
+    )
+    .expect("insert private path label");
+
+    let duplicate_label = conn.execute(
+        "INSERT INTO private_path_labels (
+            id, repo_id, work_package_kind, work_package_id, path_hash,
+            encrypted_display_path, visibility, created_at_ms, updated_at_ms
+         ) VALUES (
+            'path_duplicate', 'repo_test', 'attempt', 'attempt_test',
+            'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            'encrypted-path-metadata-2', 'private', 2, 2
+         )",
+        [],
+    );
+    assert!(
+        duplicate_label.is_err(),
+        "private path labels are unique per work package and path hash"
+    );
+
+    let missing_label_payload = conn.execute(
+        "INSERT INTO encrypted_private_payloads (
+            id, repo_id, work_package_kind, work_package_id, path_label_id, path_hash,
+            envelope_format, recipient_fingerprint, ciphertext_digest, private_object_path,
+            encrypted_metadata_json, created_at_ms
+         ) VALUES (
+            'payload_missing_label', 'repo_test', 'attempt', 'attempt_test', 'path_missing',
+            'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+            'age-x25519-v1', 'age-x25519:fingerprint',
+            'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+            '.forge/private/objects/sha256/cc', '{}', 1
+         )",
+        [],
+    );
+    assert!(
+        missing_label_payload.is_err(),
+        "encrypted payloads must reference a private path label"
+    );
+
+    conn.execute(
+        "INSERT INTO intents (id, repo_id, text, check_spec_json, created_at_ms)
+         VALUES ('intent_other', 'repo_test', 'other private work', NULL, 1)",
+        [],
+    )
+    .expect("insert other intent");
+    conn.execute(
+        "INSERT INTO attempts (id, repo_id, intent_id, base_head, status, created_at_ms)
+         VALUES ('attempt_other', 'repo_test', 'intent_other', 'HEAD0', 'active', 1)",
+        [],
+    )
+    .expect("insert other attempt");
+    let mismatched_label_payload = conn.execute(
+        "INSERT INTO encrypted_private_payloads (
+            id, repo_id, work_package_kind, work_package_id, path_label_id, path_hash,
+            envelope_format, recipient_fingerprint, ciphertext_digest, private_object_path,
+            encrypted_metadata_json, created_at_ms
+         ) VALUES (
+            'payload_mismatched_label', 'repo_test', 'attempt', 'attempt_other', 'path_private',
+            'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            'age-x25519-v1', 'age-x25519:fingerprint',
+            'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+            '.forge/private/objects/sha256/dd', '{}', 1
+         )",
+        [],
+    );
+    assert!(
+        mismatched_label_payload.is_err(),
+        "encrypted payload label must match work package and path hash"
+    );
+}
+
+#[test]
 fn behind_db_upgrades_to_head() {
     let repo = git_repo();
     let db = make_forge_db(repo.path());
@@ -604,7 +751,19 @@ fn behind_db_upgrades_to_head() {
         has_column(&conn, "org_authority_profile", "policy_revision"),
         "019 created org_authority_profile"
     );
-    assert_eq!(max_version(&conn), 19, "reached HEAD=19");
+    assert!(
+        has_column(&conn, "org_encryption_key_bindings", "key_fingerprint"),
+        "020 created org_encryption_key_bindings"
+    );
+    assert!(
+        has_column(&conn, "private_path_labels", "path_hash"),
+        "020 created private_path_labels"
+    );
+    assert!(
+        has_column(&conn, "encrypted_private_payloads", "ciphertext_digest"),
+        "020 created encrypted_private_payloads"
+    );
+    assert_eq!(max_version(&conn), 20, "reached HEAD=20");
 }
 
 #[test]
@@ -613,7 +772,7 @@ fn at_head_db_is_a_noop() {
     let db = make_forge_db(repo.path());
     {
         let conn = open(&db);
-        apply_through_019(&conn);
+        apply_through_020(&conn);
         stamp_versions(
             &conn,
             &[
@@ -636,15 +795,16 @@ fn at_head_db_is_a_noop() {
                 (17, "017_third_party_attestations"),
                 (18, "018_visibility_policy"),
                 (19, "019_org_identity_governance"),
+                (20, "020_encrypted_private_content"),
             ],
         );
-        assert_eq!(max_version(&conn), 19);
+        assert_eq!(max_version(&conn), 20);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 19, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 20, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -653,8 +813,8 @@ fn head_plus_one_is_refused() {
     let db = make_forge_db(repo.path());
     {
         let conn = open(&db);
-        apply_through_019(&conn);
-        // HEAD is now 19, so the genuinely-ahead stamp is 20.
+        apply_through_020(&conn);
+        // HEAD is now 20, so the genuinely-ahead stamp is 21.
         stamp_versions(
             &conn,
             &[
@@ -677,10 +837,11 @@ fn head_plus_one_is_refused() {
                 (17, "017_third_party_attestations"),
                 (18, "018_visibility_policy"),
                 (19, "019_org_identity_governance"),
-                (20, "future"),
+                (20, "020_encrypted_private_content"),
+                (21, "future"),
             ],
         );
-        assert_eq!(max_version(&conn), 20);
+        assert_eq!(max_version(&conn), 21);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -689,8 +850,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 20);
-            assert_eq!(*supported_head, 19);
+            assert_eq!(*db_version, 21);
+            assert_eq!(*supported_head, 20);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }
