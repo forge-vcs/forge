@@ -45,6 +45,48 @@ Expected evidence:
 - TypeScript native dogfood reports `PASS=44 FAIL=0`
 - native storage-scale smoke reports `PASS=30 FAIL=0`
 
+## External Dogfood
+
+Before tagging, run a full product dogfood pass in
+`/Users/skolte/Github-Private/forge-dogfood` against the exact candidate Forge
+binary from current `main`.
+
+Required setup:
+
+```bash
+cargo install --path /Users/skolte/Github-Private/forge/crates/forge-cli --root "$TMP_FORGE_INSTALL"
+cd /Users/skolte/Github-Private/forge-dogfood
+PATH="$TMP_FORGE_INSTALL/bin:$PATH" forge --version
+```
+
+Required checks:
+
+```bash
+npm run typecheck
+npm test
+npm run build
+npm run lint
+```
+
+Then execute a real Forge workflow from `docs/DOGFOOD_PLAN.md` using the
+candidate binary:
+
+- `forge init` or `forge doctor`, depending on the current dogfood repo state.
+- `forge start` with the dogfood check commands as requirements.
+- Make a small user-visible app or documentation change.
+- `forge save`.
+- `forge run -- npm run typecheck`.
+- `forge run -- npm test`.
+- `forge run -- npm run build`.
+- `forge run -- npm run lint`.
+- `forge propose --summary ...`.
+- `forge check`.
+- `forge accept`.
+
+Record the candidate commit, Forge binary source, commands, pass/fail results,
+and any friction in `RELEASE_NOTES.md` or `docs/P9_RELEASE_AUDIT.md`. Do not
+tag if this external dogfood pass fails or exposes release-blocking friction.
+
 ## Release Boundary
 
 The public release may claim local/native Forge is release-candidate complete.
@@ -53,8 +95,8 @@ revocation, organization policy management, or resumable transport.
 
 ## Tagging
 
-After release docs are updated on `main` and the release gate plus GitHub
-`verify` are green:
+After release docs are updated on `main`, the release gate plus GitHub `verify`
+are green, and the external dogfood pass is complete:
 
 ```bash
 git checkout main
