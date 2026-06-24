@@ -1,7 +1,7 @@
 # Phase 9 Release Audit
 
-Date: 2026-06-15
-Audited commit: `12125ca Merge pull request #97 from freezscholte/codex/ner-306-308-dogfood-fixes`
+Date: 2026-06-24
+Audited commit: `3c45e83 Merge pull request #99 from freezscholte/codex/permissioned-forge-projections`
 
 This document maps the Phase 9 roadmap exit criteria to current executable
 evidence. It is intentionally stricter than a status note: an item is marked
@@ -22,7 +22,7 @@ the public release check usable from a plain shell:
 bash scripts/dogfood-release-gate.sh
 ```
 
-Latest local run while preparing `v0.1.0-rc4` passed:
+Latest local run while preparing `v0.1.0-rc5` passed:
 
 - `cargo fmt --all --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
@@ -32,14 +32,15 @@ Latest local run while preparing `v0.1.0-rc4` passed:
 - `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
 - `scripts/dogfood-native-sync-peer.sh`: PASS=26 FAIL=0
 - `scripts/dogfood-native-sync-peer-nogit.sh`: PASS=26 FAIL=0
-- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0 with TypeScript 6.0.3
+- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0 with TypeScript 5.9.3
 - `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
 
 PR #82 merged the public release metadata cleanup before the original audit
 refresh. PR #88 added public issue templates, PR #94 addressed the first
 Forge CLI dogfood feedback, PR #95 fixed macOS `/private/var` path-alias
-redaction before the rc3 audit refresh, and PR #97 fixed the second dogfood
-feedback pass before this rc4 audit refresh.
+redaction before the rc3 audit refresh, PR #97 fixed the second dogfood
+feedback pass before the rc4 audit refresh, and PR #99 added permissioned sync
+projections before this rc5 audit refresh.
 
 ## Exit Criteria
 
@@ -62,9 +63,11 @@ The local/native release claim is supportable:
 - Forge can represent remote-boundary conflicts as typed conflict-as-data.
 - Forge can sign local evidence, decisions, native commits, and sync merge commits.
 - Forge can enforce local, hosted-runner, and third-party trust policies.
+- Forge can emit recipient-scoped sync projections for local permissioned
+  collaboration boundaries.
 - Forge can still export accepted work to Git branches for existing PR workflows.
 
 The supported public wording should avoid claiming a hosted multi-tenant service,
 global identity, revocation infrastructure, resumable network transfer, or
-cross-organization certificate authority. Hosted collaboration, permissions, and
-identity governance remain product follow-ons.
+cross-organization certificate authority. Hosted collaboration, organization-wide
+policy management, and identity governance remain product follow-ons.

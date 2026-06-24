@@ -45,8 +45,8 @@ After the release gate and GitHub `verify` are green:
 ```bash
 git checkout main
 git pull --ff-only origin main
-git tag -a v0.1.0-rc4 -m "Forge v0.1.0-rc4"
-git push origin v0.1.0-rc4
+git tag -a v0.1.0-rc5 -m "Forge v0.1.0-rc5"
+git push origin v0.1.0-rc5
 ```
 
 ## Publish
