@@ -8,10 +8,23 @@ Use this checklist before making the repository public or pushing a release tag.
 - `README.md` describes the current native sync, trust, merge, and storage
   surface.
 - `LICENSE` exists and matches workspace package metadata.
-- `RELEASE_NOTES.md` describes the release claim and current boundaries.
+- `RELEASE_NOTES.md` has a top entry for the exact release tag being prepared,
+  including the install command, release validation evidence, and current
+  boundaries.
 - `docs/P9_RELEASE_AUDIT.md` maps every Phase 9 exit criterion to executable
   evidence.
 - No local `dogfood/*` branches are deleted as part of release prep.
+
+## Release Documentation
+
+Before tagging, update and review these files together:
+
+- `README.md` install commands name the release tag.
+- `RELEASE_NOTES.md` top entry names the release tag and matches the GitHub
+  release body.
+- `docs/P9_RELEASE_AUDIT.md` names the audited commit, release tag, and latest
+  gate evidence.
+- `docs/RELEASE_CHECKLIST.md` tag examples name the release tag.
 
 ## Verification
 
@@ -40,7 +53,8 @@ revocation, organization policy management, or resumable transport.
 
 ## Tagging
 
-After the release gate and GitHub `verify` are green:
+After release docs are updated on `main` and the release gate plus GitHub
+`verify` are green:
 
 ```bash
 git checkout main

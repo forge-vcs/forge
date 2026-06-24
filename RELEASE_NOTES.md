@@ -1,5 +1,62 @@
 # Forge Public Release Notes
 
+## v0.1.0-rc5
+
+Forge v0.1.0-rc5 is a public release candidate focused on permissioned Forge
+projections. It makes local visibility policy explicit and adds
+recipient-scoped sync export/import hardening so restricted work can be kept out
+of projected bundles.
+
+### What Changed Since rc4
+
+- Added visibility policy storage for work packages, including visibility
+  labels, grants, revocation, audit rows, and typed visibility errors.
+- Added `forge visibility` command coverage and schema metadata so agents can
+  inspect policy and projection decisions without scraping human output.
+- Added protocol-visible sync projection metadata for full and recipient-scoped
+  manifests.
+- Added recipient-scoped `sync export --recipient` support for
+  `sync_materialize` projections.
+- Hardened projected sync boundaries by filtering unsafe ledger tables,
+  recomputing projected counts, validating reachable native object closures,
+  rejecting unsupported projection capabilities, and rejecting mismatched
+  incremental projection bases.
+- Updated the shell e2e migration-head gate so it derives the expected migration
+  version from migration files instead of a hardcoded version literal.
+
+### Installation
+
+```bash
+cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc5 forge-cli
+```
+
+### Release Validation
+
+The rc5 preparation ran the aggregate release gate on `main` at `ba24105`:
+
+```bash
+rtk bash scripts/dogfood-release-gate.sh
+```
+
+Gate results:
+
+- `cargo fmt --all --check`: passed
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed
+- `cargo test --workspace`: 561 passed
+- `scripts/e2e-eval.sh`: PASS=95 FAIL=0
+- `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
+- `scripts/dogfood-native-sync-peer.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-peer-nogit.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0 with TypeScript 5.9.3
+- `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
+
+### Current Boundary
+
+This RC is still a local/native release candidate. Permissioned projections are
+Forge-managed projection enforcement, not encryption or a hosted
+identity/governance system.
+
 ## v0.1.0-rc4
 
 Forge v0.1.0-rc4 is a public release candidate focused on the second
