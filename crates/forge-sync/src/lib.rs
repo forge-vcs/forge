@@ -608,7 +608,9 @@ fn apply_recipient_projection(cwd: &Path, manifest: &mut SyncManifest) -> Result
         .expected_content_ref
         .take()
         .filter(|content_ref| projected_content_refs(manifest).contains(content_ref));
+    sanitize_projected_snapshot_parent_refs(manifest);
     prune_native_payloads_to_projected_rows(manifest)?;
+    sanitize_projected_decision_commit_refs(manifest);
     recompute_projected_ledger_counts(manifest);
     validate_projected_manifest(manifest)
 }
@@ -694,6 +696,27 @@ fn recompute_projected_ledger_counts(manifest: &mut SyncManifest) {
         .collect();
 }
 
+fn sanitize_projected_snapshot_parent_refs(manifest: &mut SyncManifest) {
+    let retained_snapshots = table_rows(manifest, "snapshots")
+        .into_iter()
+        .filter_map(|row| row_string(row, "id").map(str::to_string))
+        .collect::<HashSet<_>>();
+    if let Some(rows) = manifest
+        .ledger_rows
+        .iter_mut()
+        .find(|rows| rows.table == "snapshots")
+    {
+        for row in &mut rows.rows {
+            let parent_visible = row_string(row, "parent_snapshot_id")
+                .map(|parent| retained_snapshots.contains(parent))
+                .unwrap_or(true);
+            if !parent_visible {
+                row.insert("parent_snapshot_id".to_string(), serde_json::Value::Null);
+            }
+        }
+    }
+}
+
 fn prune_native_payloads_to_projected_rows(manifest: &mut SyncManifest) -> Result<()> {
     if let Some(head) = manifest.native_head.as_deref() {
         let visible_content_refs = projected_content_refs(manifest);
@@ -710,6 +733,28 @@ fn prune_native_payloads_to_projected_rows(manifest: &mut SyncManifest) -> Resul
         .native_payloads
         .retain(|payload| reachable.contains(payload.object_id.as_str()));
     Ok(())
+}
+
+fn sanitize_projected_decision_commit_refs(manifest: &mut SyncManifest) {
+    let retained_native_objects = manifest
+        .native_objects
+        .iter()
+        .map(|object| object.object_id.as_str())
+        .collect::<HashSet<_>>();
+    if let Some(rows) = manifest
+        .ledger_rows
+        .iter_mut()
+        .find(|rows| rows.table == "decisions")
+    {
+        for row in &mut rows.rows {
+            let commit_visible = row_string(row, "commit_id")
+                .map(|commit_id| retained_native_objects.contains(commit_id))
+                .unwrap_or(true);
+            if !commit_visible {
+                row.insert("commit_id".to_string(), serde_json::Value::Null);
+            }
+        }
+    }
 }
 
 fn projected_reachable_native_objects(manifest: &SyncManifest) -> Result<HashSet<String>> {
@@ -847,9 +892,6 @@ pub fn import_ledger_rows_from_manifest(cwd: &Path, manifest: &SyncManifest) -> 
 
 pub fn clone_manifest(cwd: &Path, path: &Path) -> Result<SyncCloneReport> {
     let manifest = read_supported_manifest(path)?;
-    if manifest.projection.projected {
-        bail!("sync clone requires a full sync manifest");
-    }
     if manifest.native_head.is_none() {
         bail!("sync clone requires a native head");
     }
@@ -863,6 +905,26 @@ pub fn clone_manifest(cwd: &Path, path: &Path) -> Result<SyncCloneReport> {
         &manifest,
         CurrentStateMode::Insert,
     )?;
+    let (current_operation_id, current_view_id) = if manifest.projection.projected {
+        let commit_id = manifest
+            .native_head
+            .as_deref()
+            .ok_or_else(|| anyhow!("sync clone requires a native head"))?;
+        let content_ref = manifest_commit_content_ref(&manifest, commit_id)?;
+        let state = forge_store::record_projected_sync_clone_initialized(
+            database_path,
+            &manifest.repo_id,
+            root_path,
+            commit_id,
+            &content_ref,
+        )?;
+        (state.operation_id, state.view_id)
+    } else {
+        (
+            manifest.current_operation_id.clone(),
+            manifest.current_view_id.clone(),
+        )
+    };
     Ok(SyncCloneReport {
         protocol_version: manifest.protocol_version,
         projection: manifest.projection,
@@ -872,8 +934,8 @@ pub fn clone_manifest(cwd: &Path, path: &Path) -> Result<SyncCloneReport> {
         imported_native_objects: manifest.native_payloads.len(),
         imported_ledger_rows,
         native_head: manifest.native_head,
-        current_operation_id: manifest.current_operation_id,
-        current_view_id: manifest.current_view_id,
+        current_operation_id,
+        current_view_id,
         local_key_fingerprint: manifest.local_key_fingerprint,
     })
 }
