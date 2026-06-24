@@ -15,6 +15,8 @@ pub struct SyncManifest {
     pub protocol_version: String,
     pub cli_schema_version: String,
     pub repo_id: String,
+    #[serde(default)]
+    pub projection: SyncProjection,
     pub content_backend: String,
     pub current_operation_id: String,
     pub current_view_id: String,
@@ -30,6 +32,45 @@ pub struct SyncManifest {
     #[serde(default)]
     pub ledger_rows: Vec<LedgerTableRows>,
     pub local_key_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncProjection {
+    pub mode: String,
+    pub policy_version: String,
+    #[serde(default)]
+    pub recipient: Option<String>,
+    #[serde(default)]
+    pub capability: Option<String>,
+    pub projected: bool,
+}
+
+impl Default for SyncProjection {
+    fn default() -> Self {
+        Self::full()
+    }
+}
+
+impl SyncProjection {
+    fn full() -> Self {
+        Self {
+            mode: "full".to_string(),
+            policy_version: "visibility.v1".to_string(),
+            recipient: None,
+            capability: None,
+            projected: false,
+        }
+    }
+
+    fn recipient(recipient: &str, capability: &str) -> Self {
+        Self {
+            mode: "recipient".to_string(),
+            policy_version: "visibility.v1".to_string(),
+            recipient: Some(recipient.to_string()),
+            capability: Some(capability.to_string()),
+            projected: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +101,7 @@ pub struct LedgerTableRows {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncExportReport {
     pub protocol_version: String,
+    pub projection: SyncProjection,
     pub output_path: String,
     pub content_backend: String,
     pub incremental: bool,
@@ -76,6 +118,7 @@ pub struct SyncExportReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncInspectReport {
     pub protocol_version: String,
+    pub projection: SyncProjection,
     pub content_backend: String,
     pub native_object_count: usize,
     pub native_payload_count: usize,
@@ -88,6 +131,7 @@ pub struct SyncInspectReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncImportReport {
     pub protocol_version: String,
+    pub projection: SyncProjection,
     pub content_backend: String,
     pub imported_native_objects: usize,
     pub imported_ledger_rows: usize,
@@ -100,6 +144,7 @@ pub struct SyncImportReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncCloneReport {
     pub protocol_version: String,
+    pub projection: SyncProjection,
     pub repository_id: String,
     pub root_path: String,
     pub content_backend: String,
@@ -145,6 +190,7 @@ pub fn build_manifest(cwd: &Path) -> Result<SyncManifest> {
         protocol_version: SYNC_PROTOCOL_VERSION.to_string(),
         cli_schema_version: forge_protocol::SCHEMA_VERSION.to_string(),
         repo_id: context.repo_id,
+        projection: SyncProjection::full(),
         content_backend: context.content_backend,
         current_operation_id: context.current_operation_id,
         current_view_id: context.current_view_id,
@@ -163,6 +209,36 @@ pub fn export_manifest(cwd: &Path, output_path: &Path) -> Result<SyncExportRepor
     export_manifest_since(cwd, output_path, None)
 }
 
+pub fn export_manifest_projected_since(
+    cwd: &Path,
+    output_path: &Path,
+    since_path: Option<&Path>,
+    recipient: &str,
+    capability: &str,
+) -> Result<SyncExportReport> {
+    if capability != "sync_materialize" {
+        bail!("projected sync export only supports sync_materialize capability");
+    }
+    let since_path_text = since_path.map(|path| path.display().to_string());
+    let since_manifest = since_path
+        .map(read_supported_manifest)
+        .transpose()
+        .context("read incremental sync base")?;
+    let (manifest, report) = export_manifest_delta_with_projection(
+        cwd,
+        since_manifest.as_ref(),
+        output_path.display().to_string(),
+        since_path_text,
+        Some(SyncProjection::recipient(recipient, capability)),
+    )?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    fs::write(output_path, bytes)?;
+    Ok(report)
+}
+
 pub fn export_manifest_since(
     cwd: &Path,
     output_path: &Path,
@@ -173,11 +249,12 @@ pub fn export_manifest_since(
         .map(read_supported_manifest)
         .transpose()
         .context("read incremental sync base")?;
-    let (manifest, report) = export_manifest_delta(
+    let (manifest, report) = export_manifest_delta_with_projection(
         cwd,
         since_manifest.as_ref(),
         output_path.display().to_string(),
         since_path_text,
+        None,
     )?;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
@@ -200,13 +277,28 @@ fn export_manifest_delta(
     output_path: String,
     since_path: Option<String>,
 ) -> Result<(SyncManifest, SyncExportReport)> {
+    export_manifest_delta_with_projection(cwd, since_manifest, output_path, since_path, None)
+}
+
+fn export_manifest_delta_with_projection(
+    cwd: &Path,
+    since_manifest: Option<&SyncManifest>,
+    output_path: String,
+    since_path: Option<String>,
+    projection: Option<SyncProjection>,
+) -> Result<(SyncManifest, SyncExportReport)> {
     let mut manifest = build_manifest(cwd)?;
+    if let Some(projection) = projection {
+        manifest.projection = projection;
+        apply_recipient_projection(cwd, &mut manifest)?;
+    }
     if let Some(base) = since_manifest {
         ensure_supported_manifest(base)?;
         prune_manifest_since(&mut manifest, base)?;
     }
     let report = SyncExportReport {
         protocol_version: manifest.protocol_version.clone(),
+        projection: manifest.projection.clone(),
         output_path,
         content_backend: manifest.content_backend.clone(),
         incremental: since_manifest.is_some(),
@@ -239,6 +331,9 @@ fn prune_manifest_since(manifest: &mut SyncManifest, base: &SyncManifest) -> Res
             manifest.repo_id,
             base.repo_id
         );
+    }
+    if manifest.projection != base.projection {
+        bail!("sync incremental export requires matching projection metadata");
     }
 
     let base_objects: HashSet<&str> = base
@@ -282,6 +377,28 @@ fn ledger_row_identity(
     table: &str,
     row: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<String> {
+    if table == "visibility_policy" {
+        let value = row
+            .get("singleton")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| anyhow!("sync ledger row missing visibility_policy.singleton"))?;
+        return Ok(format!("{table}:singleton:{value}"));
+    }
+    if table == "work_package_visibility" {
+        let kind = row
+            .get("work_package_kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                anyhow!("sync ledger row missing work_package_visibility.work_package_kind")
+            })?;
+        let id = row
+            .get("work_package_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                anyhow!("sync ledger row missing work_package_visibility.work_package_id")
+            })?;
+        return Ok(format!("{table}:work_package:{kind}:{id}"));
+    }
     let column = if table == "attempt_workspaces" {
         "attempt_id"
     } else {
@@ -294,17 +411,377 @@ fn ledger_row_identity(
     Ok(format!("{table}:{column}:{value}"))
 }
 
+fn apply_recipient_projection(cwd: &Path, manifest: &mut SyncManifest) -> Result<()> {
+    ensure_supported_projection(&manifest.projection)?;
+    let recipient = manifest
+        .projection
+        .recipient
+        .as_deref()
+        .ok_or_else(|| anyhow!("projected sync manifest is missing recipient"))?;
+    let capability = manifest
+        .projection
+        .capability
+        .as_deref()
+        .ok_or_else(|| anyhow!("projected sync manifest is missing capability"))?;
+    if capability != "sync_materialize" {
+        bail!("projected sync manifests only support sync_materialize capability");
+    }
+
+    let allowed_intents =
+        allowed_work_package_ids(cwd, manifest, "intents", "intent", recipient, capability)?;
+    let allowed_attempts =
+        allowed_work_package_ids(cwd, manifest, "attempts", "attempt", recipient, capability)?;
+    let allowed_proposals = allowed_work_package_ids(
+        cwd,
+        manifest,
+        "proposals",
+        "proposal",
+        recipient,
+        capability,
+    )?;
+
+    let attempts_with_visible_intents: HashSet<String> = table_rows(manifest, "attempts")
+        .into_iter()
+        .filter_map(|row| {
+            let id = row_string(row, "id")?;
+            let intent_id = row_string(row, "intent_id")?;
+            (allowed_attempts.contains(id) && allowed_intents.contains(intent_id))
+                .then(|| id.to_string())
+        })
+        .collect();
+
+    let visible_proposals: HashSet<String> = table_rows(manifest, "proposals")
+        .into_iter()
+        .filter_map(|row| {
+            let id = row_string(row, "id")?;
+            let attempt_id = row_string(row, "attempt_id")?;
+            (allowed_proposals.contains(id) && attempts_with_visible_intents.contains(attempt_id))
+                .then(|| id.to_string())
+        })
+        .collect();
+
+    let visible_revisions: HashSet<String> = table_rows(manifest, "proposal_revisions")
+        .into_iter()
+        .filter_map(|row| {
+            let id = row_string(row, "id")?;
+            let proposal_id = row_string(row, "proposal_id")?;
+            visible_proposals
+                .contains(proposal_id)
+                .then(|| id.to_string())
+        })
+        .collect();
+
+    let mut visible_snapshot_ids: HashSet<String> = HashSet::new();
+    for row in table_rows(manifest, "proposals") {
+        let Some(proposal_id) = row_string(row, "id") else {
+            continue;
+        };
+        if visible_proposals.contains(proposal_id) {
+            if let Some(snapshot_id) = row_string(row, "snapshot_id") {
+                visible_snapshot_ids.insert(snapshot_id.to_string());
+            }
+        }
+    }
+    for row in table_rows(manifest, "proposal_revisions") {
+        let Some(revision_id) = row_string(row, "id") else {
+            continue;
+        };
+        if visible_revisions.contains(revision_id) {
+            if let Some(snapshot_id) = row_string(row, "snapshot_id") {
+                visible_snapshot_ids.insert(snapshot_id.to_string());
+            }
+        }
+    }
+
+    let visible_evidence: HashSet<String> = table_rows(manifest, "evidence")
+        .into_iter()
+        .filter_map(|row| {
+            let id = row_string(row, "id")?;
+            let attempt_id = row_string(row, "attempt_id")?;
+            let snapshot_visible = row_string(row, "snapshot_id")
+                .map(|id| visible_snapshot_ids.contains(id))
+                .unwrap_or(true);
+            if attempts_with_visible_intents.contains(attempt_id) && snapshot_visible {
+                if let Some(snapshot_id) = row_string(row, "snapshot_id") {
+                    visible_snapshot_ids.insert(snapshot_id.to_string());
+                }
+                Some(id.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let visible_snapshots: HashSet<String> = table_rows(manifest, "snapshots")
+        .into_iter()
+        .filter_map(|row| {
+            let id = row_string(row, "id")?;
+            visible_snapshot_ids.contains(id).then(|| id.to_string())
+        })
+        .collect();
+
+    filter_table_rows(manifest, "intents", |row| {
+        row_string(row, "id")
+            .map(|id| allowed_intents.contains(id))
+            .unwrap_or(false)
+    });
+    filter_table_rows(manifest, "attempts", |row| {
+        row_string(row, "id")
+            .map(|id| attempts_with_visible_intents.contains(id))
+            .unwrap_or(false)
+    });
+    filter_table_rows(manifest, "snapshots", |row| {
+        row_string(row, "id")
+            .map(|id| visible_snapshots.contains(id))
+            .unwrap_or(false)
+    });
+    filter_table_rows(manifest, "evidence", |row| {
+        row_string(row, "id")
+            .map(|id| visible_evidence.contains(id))
+            .unwrap_or(false)
+    });
+    filter_table_rows(manifest, "proposals", |row| {
+        row_string(row, "id")
+            .map(|id| visible_proposals.contains(id))
+            .unwrap_or(false)
+    });
+    filter_table_rows(manifest, "proposal_revisions", |row| {
+        row_string(row, "id")
+            .map(|id| visible_revisions.contains(id))
+            .unwrap_or(false)
+    });
+    filter_table_rows(manifest, "check_results", |row| {
+        let proposal_visible = row_string(row, "proposal_id")
+            .map(|id| visible_proposals.contains(id))
+            .unwrap_or(false);
+        let revision_visible = row_string(row, "proposal_revision_id")
+            .map(|id| visible_revisions.contains(id))
+            .unwrap_or(false);
+        let evidence_visible = row_string(row, "evidence_id")
+            .map(|id| visible_evidence.contains(id))
+            .unwrap_or(true);
+        proposal_visible && revision_visible && evidence_visible
+    });
+    filter_table_rows(manifest, "decisions", |row| {
+        row_string(row, "proposal_id")
+            .map(|id| visible_proposals.contains(id))
+            .unwrap_or(false)
+            && row_string(row, "proposal_revision_id")
+                .map(|id| visible_revisions.contains(id))
+                .unwrap_or(false)
+    });
+    filter_table_rows(manifest, "publications", |row| {
+        row_string(row, "proposal_id")
+            .map(|id| visible_proposals.contains(id))
+            .unwrap_or(false)
+            && row_string(row, "proposal_revision_id")
+                .map(|id| visible_revisions.contains(id))
+                .unwrap_or(false)
+    });
+    filter_table_rows(manifest, "attempt_workspaces", |row| {
+        row_string(row, "attempt_id")
+            .map(|id| attempts_with_visible_intents.contains(id))
+            .unwrap_or(false)
+    });
+    for table in [
+        "operations",
+        "views",
+        "ledger_signatures",
+        "conflict_sets",
+        "path_conflicts",
+        "visibility_policy",
+        "work_package_visibility",
+        "path_visibility_labels",
+        "visibility_grants",
+        "visibility_audit",
+    ] {
+        filter_table_rows(manifest, table, |_| false);
+    }
+
+    manifest.current_operation_id.clear();
+    manifest.current_view_id.clear();
+    manifest.attached_attempt_id = manifest
+        .attached_attempt_id
+        .take()
+        .filter(|id| attempts_with_visible_intents.contains(id));
+    manifest.expected_content_ref = manifest
+        .expected_content_ref
+        .take()
+        .filter(|content_ref| projected_content_refs(manifest).contains(content_ref));
+    prune_native_payloads_to_projected_rows(manifest)?;
+    recompute_projected_ledger_counts(manifest);
+    validate_projected_manifest(manifest)
+}
+
+fn allowed_work_package_ids(
+    cwd: &Path,
+    manifest: &SyncManifest,
+    table: &str,
+    work_package_kind: &str,
+    recipient: &str,
+    capability: &str,
+) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    for row in table_rows(manifest, table) {
+        let Some(id) = row_string(row, "id") else {
+            continue;
+        };
+        let decision =
+            forge_store::projection_decision(cwd, work_package_kind, id, recipient, capability)?;
+        if decision.allowed {
+            ids.insert(id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+fn table_rows<'a>(
+    manifest: &'a SyncManifest,
+    table: &str,
+) -> Vec<&'a serde_json::Map<String, serde_json::Value>> {
+    manifest
+        .ledger_rows
+        .iter()
+        .find(|rows| rows.table == table)
+        .map(|rows| rows.rows.iter().collect())
+        .unwrap_or_default()
+}
+
+fn filter_table_rows<F>(manifest: &mut SyncManifest, table: &str, mut keep: F)
+where
+    F: FnMut(&serde_json::Map<String, serde_json::Value>) -> bool,
+{
+    if let Some(rows) = manifest
+        .ledger_rows
+        .iter_mut()
+        .find(|rows| rows.table == table)
+    {
+        rows.rows.retain(|row| keep(row));
+    }
+}
+
+fn row_string<'a>(
+    row: &'a serde_json::Map<String, serde_json::Value>,
+    column: &str,
+) -> Option<&'a str> {
+    row.get(column).and_then(serde_json::Value::as_str)
+}
+
+fn projected_content_refs(manifest: &SyncManifest) -> HashSet<String> {
+    let mut refs = HashSet::new();
+    for table in ["snapshots", "proposals", "proposal_revisions"] {
+        for row in table_rows(manifest, table) {
+            if let Some(content_ref) = row_string(row, "content_ref") {
+                refs.insert(content_ref.to_string());
+            }
+        }
+    }
+    refs
+}
+
+fn recompute_projected_ledger_counts(manifest: &mut SyncManifest) {
+    manifest.ledger_counts = LEDGER_COUNT_TABLES
+        .iter()
+        .map(|table| LedgerTableCount {
+            table: (*table).to_string(),
+            rows: manifest
+                .ledger_rows
+                .iter()
+                .find(|rows| rows.table == *table)
+                .map(|rows| rows.rows.len() as i64)
+                .unwrap_or(0),
+        })
+        .collect();
+}
+
+fn prune_native_payloads_to_projected_rows(manifest: &mut SyncManifest) -> Result<()> {
+    if let Some(head) = manifest.native_head.as_deref() {
+        let visible_content_refs = projected_content_refs(manifest);
+        let head_content_ref = manifest_commit_content_ref(manifest, head)?;
+        if !visible_content_refs.contains(&head_content_ref) {
+            manifest.native_head = None;
+        }
+    }
+    let reachable = projected_reachable_native_objects(manifest)?;
+    manifest
+        .native_objects
+        .retain(|object| reachable.contains(object.object_id.as_str()));
+    manifest
+        .native_payloads
+        .retain(|payload| reachable.contains(payload.object_id.as_str()));
+    Ok(())
+}
+
+fn projected_reachable_native_objects(manifest: &SyncManifest) -> Result<HashSet<String>> {
+    let object_payloads = manifest
+        .native_payloads
+        .iter()
+        .map(|payload| (payload.object_id.as_str(), payload))
+        .collect::<HashMap<_, _>>();
+    let mut reachable = HashSet::new();
+    for content_ref in projected_content_refs(manifest) {
+        let Some(tree_id) = content_ref.strip_prefix(forge_content::FORGE_TREE_PREFIX) else {
+            bail!("projected sync manifest has non-native content ref");
+        };
+        mark_reachable_native_object(tree_id, &object_payloads, &mut reachable)?;
+    }
+    if let Some(head) = manifest.native_head.as_deref() {
+        mark_reachable_native_object(head, &object_payloads, &mut reachable)?;
+    }
+    Ok(reachable)
+}
+
+fn mark_reachable_native_object(
+    object_id: &str,
+    payloads: &HashMap<&str, &SyncObjectPayload>,
+    reachable: &mut HashSet<String>,
+) -> Result<()> {
+    if !reachable.insert(object_id.to_string()) {
+        return Ok(());
+    }
+    let Some(payload) = payloads.get(object_id) else {
+        bail!("projected sync manifest references missing native object {object_id}");
+    };
+    let bytes = hex_decode(&payload.payload_hex)?;
+    match payload.kind.as_str() {
+        "commit" => {
+            let commit: forge_content_native::CommitObject = serde_json::from_slice(&bytes)?;
+            mark_reachable_native_object(&commit.tree, payloads, reachable)?;
+            for parent in commit.parents {
+                if payloads.contains_key(parent.as_str()) {
+                    mark_reachable_native_object(&parent, payloads, reachable)?;
+                }
+            }
+        }
+        "tree" => {
+            let tree: NativeSyncTreeObject = serde_json::from_slice(&bytes)?;
+            for entry in tree.entries {
+                mark_reachable_native_object(&entry.object, payloads, reachable)?;
+            }
+        }
+        "blob" => {}
+        other => bail!("projected sync manifest has unknown native object kind {other}"),
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeSyncTreeObject {
+    entries: Vec<NativeSyncTreeEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NativeSyncTreeEntry {
+    object: String,
+}
+
 pub fn inspect_manifest(path: &Path) -> Result<SyncInspectReport> {
     let bytes = fs::read(path)?;
     let manifest: SyncManifest = serde_json::from_slice(&bytes)?;
-    if manifest.protocol_version != SYNC_PROTOCOL_VERSION {
-        bail!(
-            "unsupported sync protocol version {}",
-            manifest.protocol_version
-        );
-    }
+    ensure_supported_manifest(&manifest)?;
     Ok(SyncInspectReport {
         protocol_version: manifest.protocol_version,
+        projection: manifest.projection,
         content_backend: manifest.content_backend,
         native_object_count: manifest.native_objects.len(),
         native_payload_count: manifest.native_payloads.len(),
@@ -340,6 +817,7 @@ pub fn import_manifest_value(cwd: &Path, manifest: &SyncManifest) -> Result<Sync
 
     Ok(SyncImportReport {
         protocol_version: manifest.protocol_version.clone(),
+        projection: manifest.projection.clone(),
         content_backend: manifest.content_backend.clone(),
         imported_native_objects: manifest.native_payloads.len(),
         imported_ledger_rows,
@@ -369,6 +847,9 @@ pub fn import_ledger_rows_from_manifest(cwd: &Path, manifest: &SyncManifest) -> 
 
 pub fn clone_manifest(cwd: &Path, path: &Path) -> Result<SyncCloneReport> {
     let manifest = read_supported_manifest(path)?;
+    if manifest.projection.projected {
+        bail!("sync clone requires a full sync manifest");
+    }
     if manifest.native_head.is_none() {
         bail!("sync clone requires a native head");
     }
@@ -384,6 +865,7 @@ pub fn clone_manifest(cwd: &Path, path: &Path) -> Result<SyncCloneReport> {
     )?;
     Ok(SyncCloneReport {
         protocol_version: manifest.protocol_version,
+        projection: manifest.projection,
         repository_id: clone.repository_id,
         root_path: clone.root_path,
         content_backend: clone.content_backend,
@@ -592,6 +1074,87 @@ fn ensure_supported_manifest(manifest: &SyncManifest) -> Result<()> {
     if manifest.content_backend != "native" {
         bail!("sync import only supports native content bundles");
     }
+    ensure_supported_projection(&manifest.projection)?;
+    if manifest.projection.projected {
+        validate_projected_manifest(manifest)?;
+    }
+    Ok(())
+}
+
+fn ensure_supported_projection(projection: &SyncProjection) -> Result<()> {
+    if projection.policy_version != "visibility.v1" {
+        bail!(
+            "unsupported sync projection policy version {}",
+            projection.policy_version
+        );
+    }
+    match projection.mode.as_str() {
+        "full" => {
+            if projection.projected
+                || projection.recipient.is_some()
+                || projection.capability.is_some()
+            {
+                bail!("full sync projection metadata must not declare recipient scope");
+            }
+        }
+        "recipient" => {
+            if !projection.projected {
+                bail!("recipient sync projection must be marked projected");
+            }
+            if projection
+                .recipient
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                bail!("recipient sync projection is missing recipient");
+            }
+            if projection
+                .capability
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                bail!("recipient sync projection is missing capability");
+            }
+            if projection.capability.as_deref() != Some("sync_materialize") {
+                bail!("recipient sync projection only supports sync_materialize capability");
+            }
+        }
+        other => bail!("unsupported sync projection mode {other}"),
+    }
+    Ok(())
+}
+
+pub fn ensure_manifest_materializable(manifest: &SyncManifest) -> Result<()> {
+    ensure_supported_manifest(manifest)?;
+    if manifest.projection.projected
+        && manifest.projection.capability.as_deref() != Some("sync_materialize")
+    {
+        bail!("projected sync materialization requires sync_materialize capability");
+    }
+    Ok(())
+}
+
+fn validate_projected_manifest(manifest: &SyncManifest) -> Result<()> {
+    if !manifest.current_operation_id.is_empty() || !manifest.current_view_id.is_empty() {
+        bail!("projected sync manifest must not declare source current state");
+    }
+    let content_refs = projected_content_refs(manifest);
+    if manifest.native_head.is_some() && content_refs.is_empty() {
+        bail!("projected sync manifest has native head but no visible content refs");
+    }
+    let reachable = projected_reachable_native_objects(manifest)?;
+    for object in &manifest.native_objects {
+        if !reachable.contains(object.object_id.as_str()) {
+            bail!("projected sync manifest includes unreachable native object");
+        }
+    }
+    for payload in &manifest.native_payloads {
+        if !reachable.contains(payload.object_id.as_str()) {
+            bail!("projected sync manifest includes unreachable native payload");
+        }
+    }
     Ok(())
 }
 
@@ -623,7 +1186,9 @@ fn apply_manifest(
             .with_context(|| format!("sync native head object {head} is missing"))?;
         NativeRefStore::new(root_path).set_head(&head_id)?;
     }
-    set_current_state(&connection, repo_id, manifest, current_state_mode)?;
+    if !manifest.projection.projected {
+        set_current_state(&connection, repo_id, manifest, current_state_mode)?;
+    }
     Ok(imported_ledger_rows)
 }
 
@@ -689,6 +1254,11 @@ const LEDGER_COUNT_TABLES: &[&str] = &[
     "conflict_sets",
     "path_conflicts",
     "attempt_workspaces",
+    "visibility_policy",
+    "work_package_visibility",
+    "path_visibility_labels",
+    "visibility_grants",
+    "visibility_audit",
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -914,6 +1484,68 @@ const LEDGER_ROW_TABLES: &[LedgerTableSpec] = &[
             "updated_at_ms",
         ],
     },
+    LedgerTableSpec {
+        table: "visibility_policy",
+        columns: &[
+            "singleton",
+            "default_work_package_visibility",
+            "updated_at_ms",
+        ],
+    },
+    LedgerTableSpec {
+        table: "work_package_visibility",
+        columns: &[
+            "repo_id",
+            "work_package_kind",
+            "work_package_id",
+            "visibility",
+            "created_at_ms",
+            "updated_at_ms",
+        ],
+    },
+    LedgerTableSpec {
+        table: "path_visibility_labels",
+        columns: &[
+            "id",
+            "repo_id",
+            "work_package_kind",
+            "work_package_id",
+            "path",
+            "visibility",
+            "created_at_ms",
+            "updated_at_ms",
+        ],
+    },
+    LedgerTableSpec {
+        table: "visibility_grants",
+        columns: &[
+            "id",
+            "repo_id",
+            "work_package_kind",
+            "work_package_id",
+            "recipient",
+            "capability",
+            "created_at_ms",
+            "revoked_at_ms",
+        ],
+    },
+    LedgerTableSpec {
+        table: "visibility_audit",
+        columns: &[
+            "id",
+            "repo_id",
+            "work_package_kind",
+            "work_package_id",
+            "action",
+            "actor",
+            "prior_visibility",
+            "new_visibility",
+            "recipient",
+            "capability",
+            "reason",
+            "created_at_ms",
+        ],
+    },
 ];
 
 fn ledger_rows(connection: &Connection) -> Result<Vec<LedgerTableRows>> {
@@ -1056,12 +1688,24 @@ fn insert_row(
     let placeholders = std::iter::repeat_n("?", spec.columns.len())
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!(
-        "INSERT OR IGNORE INTO {} ({}) VALUES ({})",
-        spec.table,
-        spec.columns.join(", "),
-        placeholders
-    );
+    let sql = if spec.table == "visibility_policy" {
+        format!(
+            "INSERT INTO {} ({}) VALUES ({})
+             ON CONFLICT(singleton) DO UPDATE SET
+                 default_work_package_visibility = excluded.default_work_package_visibility,
+                 updated_at_ms = excluded.updated_at_ms",
+            spec.table,
+            spec.columns.join(", "),
+            placeholders
+        )
+    } else {
+        format!(
+            "INSERT OR IGNORE INTO {} ({}) VALUES ({})",
+            spec.table,
+            spec.columns.join(", "),
+            placeholders
+        )
+    };
     let mut values = Vec::with_capacity(spec.columns.len());
     for column in spec.columns {
         if *column == "repo_id" {
@@ -1197,6 +1841,7 @@ mod tests {
             protocol_version: SYNC_PROTOCOL_VERSION.to_string(),
             cli_schema_version: forge_protocol::SCHEMA_VERSION.to_string(),
             repo_id: "repo_test".to_string(),
+            projection: SyncProjection::full(),
             content_backend: "native".to_string(),
             current_operation_id: "op_test".to_string(),
             current_view_id: "view_test".to_string(),
@@ -1249,6 +1894,7 @@ mod tests {
                 protocol_version: "forge-sync.v99".to_string(),
                 cli_schema_version: forge_protocol::SCHEMA_VERSION.to_string(),
                 repo_id: "repo_test".to_string(),
+                projection: SyncProjection::full(),
                 content_backend: "native".to_string(),
                 current_operation_id: "op_test".to_string(),
                 current_view_id: "view_test".to_string(),

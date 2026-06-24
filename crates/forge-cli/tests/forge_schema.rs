@@ -38,6 +38,8 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "TRUST_POLICY_UNMET",
     "UNSUPPORTED_TRUST_LEVEL",
     "UNSUPPORTED_STRUCTURED_GATE",
+    "VISIBILITY_POLICY_INVALID",
+    "VISIBILITY_POLICY_UNMET",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.
@@ -217,6 +219,11 @@ fn commands_list_the_lifecycle() {
         "conflict show",
         "conflict resolve",
         "trust policy",
+        "visibility policy",
+        "visibility set",
+        "visibility grant",
+        "visibility revoke",
+        "visibility check",
         "key status",
         "key rotate",
         "sync export",

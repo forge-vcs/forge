@@ -59,6 +59,8 @@ const HOSTED_RUNNER_ATTESTATIONS_016: &str =
 /// The 017 third-party attestation migration.
 const THIRD_PARTY_ATTESTATIONS_017: &str =
     include_str!("../migrations/017_third_party_attestations.sql");
+/// The 018 visibility policy migration.
+const VISIBILITY_POLICY_018: &str = include_str!("../migrations/018_visibility_policy.sql");
 
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
@@ -488,7 +490,15 @@ fn behind_db_upgrades_to_head() {
         has_column(&conn, "attempt_workspaces", "workspace_rel_path"),
         "009 created attempt_workspaces"
     );
-    assert_eq!(max_version(&conn), 17, "reached HEAD=17");
+    assert!(
+        has_column(
+            &conn,
+            "visibility_policy",
+            "default_work_package_visibility"
+        ),
+        "018 created visibility_policy"
+    );
+    assert_eq!(max_version(&conn), 18, "reached HEAD=18");
 }
 
 #[test]
@@ -527,6 +537,8 @@ fn at_head_db_is_a_noop() {
             .expect("apply 016 hosted-runner attestations");
         conn.execute_batch(THIRD_PARTY_ATTESTATIONS_017)
             .expect("apply 017 third-party attestations");
+        conn.execute_batch(VISIBILITY_POLICY_018)
+            .expect("apply 018 visibility-policy");
         stamp_versions(
             &conn,
             &[
@@ -547,15 +559,16 @@ fn at_head_db_is_a_noop() {
                 (15, "015_trust_ladder_attestation_levels"),
                 (16, "016_hosted_runner_attestations"),
                 (17, "017_third_party_attestations"),
+                (18, "018_visibility_policy"),
             ],
         );
-        assert_eq!(max_version(&conn), 17);
+        assert_eq!(max_version(&conn), 18);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 17, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 18, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -594,7 +607,9 @@ fn head_plus_one_is_refused() {
             .expect("apply 016 hosted-runner attestations");
         conn.execute_batch(THIRD_PARTY_ATTESTATIONS_017)
             .expect("apply 017 third-party attestations");
-        // HEAD is now 17, so the genuinely-ahead stamp is 18.
+        conn.execute_batch(VISIBILITY_POLICY_018)
+            .expect("apply 018 visibility-policy");
+        // HEAD is now 18, so the genuinely-ahead stamp is 19.
         stamp_versions(
             &conn,
             &[
@@ -615,10 +630,11 @@ fn head_plus_one_is_refused() {
                 (15, "015_trust_ladder_attestation_levels"),
                 (16, "016_hosted_runner_attestations"),
                 (17, "017_third_party_attestations"),
-                (18, "future"),
+                (18, "018_visibility_policy"),
+                (19, "future"),
             ],
         );
-        assert_eq!(max_version(&conn), 18);
+        assert_eq!(max_version(&conn), 19);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -627,8 +643,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 18);
-            assert_eq!(*supported_head, 17);
+            assert_eq!(*db_version, 19);
+            assert_eq!(*supported_head, 18);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }
