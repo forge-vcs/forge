@@ -43,6 +43,8 @@ const FORGE_ERROR_CODES: &[&str] = &[
     "ORG_NOT_ENABLED",
     "ORG_ALREADY_ENABLED",
     "ORG_AUTHORITY_REQUIRED",
+    "PRIVATE_CONTENT_INVALID",
+    "PRIVATE_DECRYPT_AUTHORITY_MISSING",
 ];
 
 /// Run `forge schema --json` and return the full response envelope.
@@ -224,6 +226,7 @@ fn commands_list_the_lifecycle() {
         "trust policy",
         "visibility policy",
         "visibility set",
+        "visibility path set",
         "visibility grant",
         "visibility revoke",
         "visibility check",
@@ -231,6 +234,8 @@ fn commands_list_the_lifecycle() {
         "key rotate",
         "org status",
         "org init",
+        "org encryption bind-local",
+        "org decrypt-authority",
         "sync export",
         "sync inspect",
         "sync fetch",

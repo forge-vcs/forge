@@ -8,7 +8,9 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SYNC_PROTOCOL_VERSION: &str = "forge-sync.v1";
+pub const SYNC_PROTOCOL_VERSION: &str = SYNC_PROTOCOL_VERSION_V1;
+pub const SYNC_PROTOCOL_VERSION_V1: &str = "forge-sync.v1";
+pub const SYNC_PROTOCOL_VERSION_V2: &str = "forge-sync.v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncManifest {
@@ -17,6 +19,10 @@ pub struct SyncManifest {
     pub repo_id: String,
     #[serde(default)]
     pub projection: SyncProjection,
+    #[serde(default)]
+    pub private_content: SyncPrivateContent,
+    #[serde(default)]
+    pub private_overlays: Vec<SyncPrivateOverlay>,
     pub content_backend: String,
     pub current_operation_id: String,
     pub current_view_id: String,
@@ -32,6 +38,28 @@ pub struct SyncManifest {
     #[serde(default)]
     pub ledger_rows: Vec<LedgerTableRows>,
     pub local_key_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncPrivateContent {
+    pub capable: bool,
+    pub omitted: bool,
+    pub encrypted_payload_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncPrivateOverlay {
+    pub work_package_kind: String,
+    pub work_package_id: String,
+    pub snapshot_id: String,
+    pub path_label_id: String,
+    pub path_hash: String,
+    pub path: String,
+    pub visibility: String,
+    pub envelope_format: String,
+    pub recipient_fingerprint: String,
+    pub ciphertext_digest: String,
+    pub ciphertext_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,11 +214,21 @@ pub fn build_manifest(cwd: &Path) -> Result<SyncManifest> {
         (None, Vec::new(), Vec::new())
     };
 
+    let private_payload_count = private_payload_count(&connection)?;
     Ok(SyncManifest {
-        protocol_version: SYNC_PROTOCOL_VERSION.to_string(),
+        protocol_version: if private_payload_count > 0 {
+            SYNC_PROTOCOL_VERSION_V2.to_string()
+        } else {
+            SYNC_PROTOCOL_VERSION.to_string()
+        },
         cli_schema_version: forge_protocol::SCHEMA_VERSION.to_string(),
         repo_id: context.repo_id,
         projection: SyncProjection::full(),
+        // NER-356: v2 is a generic upgraded sync protocol. Until authorized
+        // private-overlay transport ships, manifests must not claim private
+        // content capability or expose omission/count metadata.
+        private_content: SyncPrivateContent::default(),
+        private_overlays: Vec::new(),
         content_backend: context.content_backend,
         current_operation_id: context.current_operation_id,
         current_view_id: context.current_view_id,
@@ -418,6 +456,7 @@ fn apply_recipient_projection(cwd: &Path, manifest: &mut SyncManifest) -> Result
         .recipient
         .as_deref()
         .ok_or_else(|| anyhow!("projected sync manifest is missing recipient"))?;
+    let recipient = recipient.to_string();
     let capability = manifest
         .projection
         .capability
@@ -428,15 +467,15 @@ fn apply_recipient_projection(cwd: &Path, manifest: &mut SyncManifest) -> Result
     }
 
     let allowed_intents =
-        allowed_work_package_ids(cwd, manifest, "intents", "intent", recipient, capability)?;
+        allowed_work_package_ids(cwd, manifest, "intents", "intent", &recipient, capability)?;
     let allowed_attempts =
-        allowed_work_package_ids(cwd, manifest, "attempts", "attempt", recipient, capability)?;
+        allowed_work_package_ids(cwd, manifest, "attempts", "attempt", &recipient, capability)?;
     let allowed_proposals = allowed_work_package_ids(
         cwd,
         manifest,
         "proposals",
         "proposal",
-        recipient,
+        &recipient,
         capability,
     )?;
 
@@ -598,6 +637,42 @@ fn apply_recipient_projection(cwd: &Path, manifest: &mut SyncManifest) -> Result
         filter_table_rows(manifest, table, |_| false);
     }
 
+    let visible_private_payloads = visible_private_payload_count(cwd, &visible_snapshots)?;
+    // Recipient projections use the generic v2 protocol regardless of whether
+    // this recipient can see private overlays. The version therefore does not
+    // become a private-content existence oracle across recipients.
+    manifest.protocol_version = SYNC_PROTOCOL_VERSION_V2.to_string();
+    manifest.private_content = SyncPrivateContent::default();
+    manifest.private_overlays.clear();
+    if visible_private_payloads > 0 {
+        let mut snapshot_ids: Vec<String> = visible_snapshots.iter().cloned().collect();
+        snapshot_ids.sort();
+        let transports =
+            forge_store::private_overlay_transports_for_snapshots(cwd, &snapshot_ids, &recipient)?;
+        if !transports.is_empty() {
+            manifest.private_content = SyncPrivateContent {
+                capable: true,
+                omitted: false,
+                encrypted_payload_count: transports.len(),
+            };
+            manifest.private_overlays = transports
+                .into_iter()
+                .map(|transport| SyncPrivateOverlay {
+                    work_package_kind: transport.work_package_kind,
+                    work_package_id: transport.work_package_id,
+                    snapshot_id: transport.snapshot_id,
+                    path_label_id: transport.path_label_id,
+                    path_hash: transport.path_hash,
+                    path: transport.path,
+                    visibility: transport.visibility,
+                    envelope_format: transport.envelope_format,
+                    recipient_fingerprint: transport.recipient_fingerprint,
+                    ciphertext_digest: transport.ciphertext_digest,
+                    ciphertext_hex: hex_encode(&transport.ciphertext),
+                })
+                .collect();
+        }
+    }
     manifest.current_operation_id.clear();
     manifest.current_view_id.clear();
     manifest.attached_attempt_id = manifest
@@ -1127,11 +1202,38 @@ pub fn read_supported_manifest(path: &Path) -> Result<SyncManifest> {
 }
 
 fn ensure_supported_manifest(manifest: &SyncManifest) -> Result<()> {
-    if manifest.protocol_version != SYNC_PROTOCOL_VERSION {
-        bail!(
-            "unsupported sync protocol version {}",
-            manifest.protocol_version
-        );
+    match manifest.protocol_version.as_str() {
+        SYNC_PROTOCOL_VERSION_V1 => {
+            if manifest.private_content.capable {
+                bail!("sync v1 manifest must not carry private content capability");
+            }
+            if !manifest.private_overlays.is_empty() {
+                bail!("sync v1 manifest must not carry private overlays");
+            }
+        }
+        SYNC_PROTOCOL_VERSION_V2 => {
+            if !manifest.private_overlays.is_empty() {
+                if !manifest.private_content.capable {
+                    bail!("sync private overlays require private content capability");
+                }
+                if manifest.private_content.encrypted_payload_count
+                    != manifest.private_overlays.len()
+                {
+                    bail!("sync private overlay count does not match manifest metadata");
+                }
+                if !manifest.projection.projected
+                    || manifest.projection.capability.as_deref() != Some("sync_materialize")
+                {
+                    bail!("sync private overlays require sync_materialize projection");
+                }
+            }
+        }
+        _ => {
+            bail!(
+                "unsupported sync protocol version {}",
+                manifest.protocol_version
+            );
+        }
     }
     if manifest.content_backend != "native" {
         bail!("sync import only supports native content bundles");
@@ -1196,6 +1298,47 @@ pub fn ensure_manifest_materializable(manifest: &SyncManifest) -> Result<()> {
         bail!("projected sync materialization requires sync_materialize capability");
     }
     Ok(())
+}
+
+pub fn prepare_private_overlay_materialization(
+    cwd: &Path,
+    manifest: &SyncManifest,
+) -> Result<Vec<forge_store::MaterializedPrivateOverlay>> {
+    ensure_manifest_materializable(manifest)?;
+    let visible_snapshots: HashSet<String> = table_rows(manifest, "snapshots")
+        .into_iter()
+        .filter_map(|row| row_string(row, "id").map(str::to_string))
+        .collect();
+    let mut prepared = Vec::with_capacity(manifest.private_overlays.len());
+    for overlay in &manifest.private_overlays {
+        if !visible_snapshots.contains(&overlay.snapshot_id) {
+            bail!("sync private overlay references non-visible snapshot");
+        }
+        let ciphertext = hex_decode(&overlay.ciphertext_hex)?;
+        prepared.push(forge_store::prepare_materialized_private_overlay(
+            cwd,
+            forge_store::PrivateOverlayMaterializeInput {
+                work_package_kind: overlay.work_package_kind.clone(),
+                work_package_id: overlay.work_package_id.clone(),
+                path_label_id: overlay.path_label_id.clone(),
+                path_hash: overlay.path_hash.clone(),
+                path: overlay.path.clone(),
+                visibility: overlay.visibility.clone(),
+                envelope_format: overlay.envelope_format.clone(),
+                recipient_fingerprint: overlay.recipient_fingerprint.clone(),
+                ciphertext_digest: overlay.ciphertext_digest.clone(),
+                ciphertext,
+            },
+        )?);
+    }
+    Ok(prepared)
+}
+
+pub fn install_prepared_private_overlays(
+    cwd: &Path,
+    overlays: &[forge_store::MaterializedPrivateOverlay],
+) -> Result<usize> {
+    forge_store::install_materialized_private_overlays(cwd, overlays)
 }
 
 fn validate_projected_manifest(manifest: &SyncManifest) -> Result<()> {
@@ -1297,6 +1440,39 @@ fn latest_key_fingerprint(connection: &Connection) -> Result<Option<String>> {
         )
         .optional()
         .map_err(Into::into)
+}
+
+fn private_payload_count(connection: &Connection) -> Result<usize> {
+    let count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM encrypted_private_payloads",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count.max(0) as usize)
+}
+
+fn visible_private_payload_count(
+    cwd: &Path,
+    visible_snapshot_ids: &HashSet<String>,
+) -> Result<usize> {
+    if visible_snapshot_ids.is_empty() {
+        return Ok(0);
+    }
+    let context = forge_store::open_repository(cwd)?;
+    let connection = Connection::open(&context.database_path)?;
+    let mut count = 0usize;
+    let mut statement = connection.prepare(
+        "SELECT snapshot_id FROM encrypted_private_payloads
+         WHERE repo_id = ?1 AND snapshot_id IS NOT NULL",
+    )?;
+    let mut rows = statement.query(params![context.repo_id])?;
+    while let Some(row) = rows.next()? {
+        let snapshot_id: String = row.get(0)?;
+        if visible_snapshot_ids.contains(&snapshot_id) {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 const LEDGER_COUNT_TABLES: &[&str] = &[
@@ -1904,6 +2080,8 @@ mod tests {
             cli_schema_version: forge_protocol::SCHEMA_VERSION.to_string(),
             repo_id: "repo_test".to_string(),
             projection: SyncProjection::full(),
+            private_content: SyncPrivateContent::default(),
+            private_overlays: Vec::new(),
             content_backend: "native".to_string(),
             current_operation_id: "op_test".to_string(),
             current_view_id: "view_test".to_string(),
@@ -1957,6 +2135,8 @@ mod tests {
                 cli_schema_version: forge_protocol::SCHEMA_VERSION.to_string(),
                 repo_id: "repo_test".to_string(),
                 projection: SyncProjection::full(),
+                private_content: SyncPrivateContent::default(),
+                private_overlays: Vec::new(),
                 content_backend: "native".to_string(),
                 current_operation_id: "op_test".to_string(),
                 current_view_id: "view_test".to_string(),

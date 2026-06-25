@@ -331,12 +331,24 @@ pub fn snapshot_worktree_into_store(
     repo_root: &Path,
     worktree_root: &Path,
 ) -> Result<SnapshotContent> {
+    snapshot_worktree_into_store_excluding(repo_root, worktree_root, &[])
+}
+
+pub fn snapshot_worktree_into_store_excluding(
+    repo_root: &Path,
+    worktree_root: &Path,
+    excluded_paths: &[String],
+) -> Result<SnapshotContent> {
     let store = NativeObjectStore::new(repo_root);
-    let files = scan_worktree(worktree_root)?;
+    let excluded: BTreeSet<&str> = excluded_paths.iter().map(String::as_str).collect();
+    let files: Vec<FileEntry> = scan_worktree(worktree_root)?
+        .into_iter()
+        .filter(|entry| !excluded.contains(entry.path.as_str()))
+        .collect();
     let root = write_tree(&store, worktree_root, &files, "")?;
     // NER-138 Phase 7 slice 2: changed_paths is a native name-level diff of the
     // owner repo's base HEAD tree against the freshly-built effective worktree tree.
-    let changed = changed_paths(&store, repo_root, &root)?;
+    let changed = changed_paths_excluding(&store, repo_root, &root, &excluded)?;
     Ok(SnapshotContent {
         content_ref: format!("{FORGE_TREE_PREFIX}{root}"),
         changed_paths: changed,
@@ -1637,10 +1649,11 @@ fn materialized_paths(repo_root: &Path) -> Result<BTreeSet<String>> {
 /// the base tree equals the worktree tree (nothing changed, or a just-created genesis),
 /// the result is empty. Policy-excluded paths cannot appear in either tree (the walker
 /// filters them), but the final `retain` mirrors the git backend's backstop.
-fn changed_paths(
+fn changed_paths_excluding(
     store: &NativeObjectStore,
     repo_root: &Path,
     worktree_root: &ObjectId,
+    excluded_paths: &BTreeSet<&str>,
 ) -> Result<Vec<String>> {
     let head = ensure_head(repo_root)?;
     let base_tree = ObjectId::parse(&store.read_commit(&head)?.tree)?;
@@ -1662,7 +1675,7 @@ fn changed_paths(
     }
     Ok(changed
         .into_iter()
-        .filter(|path| !is_ignored_by_policy(path))
+        .filter(|path| !is_ignored_by_policy(path) && !excluded_paths.contains(path.as_str()))
         .collect())
 }
 
