@@ -11,7 +11,7 @@ the same license.
 
 - Use GitHub Issues for bugs, design questions, and feature requests.
 - Use GitHub private vulnerability reporting for security issues:
-  <https://github.com/freezscholte/forge/security/advisories/new>
+  <https://github.com/forge-vcs/forge/security/advisories/new>
 - Check the current release boundary in `docs/P9_RELEASE_AUDIT.md` before
   expanding public claims.
 - Keep roadmap-sized ideas in or linked from `docs/ROADMAP.md`.

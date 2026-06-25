@@ -1,8 +1,9 @@
 # Phase 9 Release Audit
 
-Date: 2026-06-24
-Audited candidate: PR #101 release-prep branch. The final immutable audited
-commit is the `v0.1.0-rc6` tag after merge to `main`.
+Date: 2026-06-25
+Audited candidate: `main` at `2711761` after PR #103 merged. The final
+immutable audited commit is the `v0.1.0-rc7` tag after release-prep docs are
+committed and tagged.
 
 This document maps the Phase 9 roadmap exit criteria to current executable
 evidence. It is intentionally stricter than a status note: an item is marked
@@ -23,11 +24,11 @@ the public release check usable from a plain shell:
 bash scripts/dogfood-release-gate.sh
 ```
 
-Latest local run while preparing `v0.1.0-rc6` passed:
+Latest local run while preparing `v0.1.0-rc7` passed:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: 568 passed
+- `cargo test --workspace`: 589 passed
 - `scripts/e2e-eval.sh`: PASS=95 FAIL=0
 - `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
 - `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
@@ -42,7 +43,8 @@ Forge CLI dogfood feedback, PR #95 fixed macOS `/private/var` path-alias
 redaction before the rc3 audit refresh, PR #97 fixed the second dogfood
 feedback pass before the rc4 audit refresh, and PR #99 added permissioned sync
 projections before the rc5 audit refresh. PR #101 adds the first organization
-identity and key-governance bootstrap slice before this rc6 audit refresh.
+identity and key-governance bootstrap slice before the rc6 audit refresh. PR
+#103 adds encrypted private content overlays before this rc7 audit refresh.
 
 ## External Dogfood Validation
 
@@ -147,6 +149,67 @@ authority. It does not yet prove broad organization policy enforcement,
 multi-admin management, authority rotation/revocation, hosted identity, or
 cross-organization certificate authority behavior.
 
+## Feature-Specific Encrypted Private Content Dogfood
+
+Follow-up dogfood explicitly exercised the rc7 encrypted private content
+overlay path in temporary copies of the `forge-dogfood` checkout, using the
+candidate binary from `main` at `2711761`.
+
+Source repository checks:
+
+- `forge --json init --content-backend native`: initialized a native Forge
+  repository from the dogfood app source.
+- `forge --json org init --actor dogfood-owner`: bootstrapped the local owner
+  principal.
+- `forge --json org encryption bind-local --principal-id <owner>`: bound the
+  owner principal to the local age recipient.
+- `forge --json start "NER-356 dogfood private extension"`: created a dogfood
+  attempt.
+- `forge --json visibility path set --kind attempt --id <attempt> --path
+  src/private-extension.ts --visibility private`: labeled a dogfood source file
+  as private.
+- `forge --json visibility grant --kind attempt --id <attempt> --recipient
+  <owner> --capability sync_materialize`: granted authorized materialization.
+- `forge --json save`, `forge --json propose`, and `forge --json accept
+  --allow-unverified`: saved and accepted the work while private-tainted
+  evidence remained intentionally unsupported.
+
+Projection checks:
+
+- Unauthorized `forge sync export --recipient outsider@example.test` produced a
+  generic `forge-sync.v2` bundle with `private_content.capable: false` and no
+  private path, private sentinel, `.forge/private/objects` path, or private
+  payload count.
+- Authorized `forge sync export --recipient <owner>` produced a bundle with
+  `private_content.capable: true`, one encrypted private overlay, no plaintext
+  sentinel, and no source private object-store path.
+
+Receiver checks:
+
+- A fresh native target repository copied only the recipient private key,
+  imported the authorized bundle with `forge sync import <bundle>
+  --materialize`, and restored both the public dogfood file and the private
+  `src/private-extension.ts` file.
+- Editing the materialized private file and running `forge save` re-encrypted
+  the path and did not leak the private sentinel into public native objects.
+
+Real dogfood checkout app checks:
+
+- `npm run typecheck`: passed.
+- `npm test`: passed, 1 file / 3 tests.
+- `npm run build`: passed.
+- `npm run lint`: initially failed because ESLint scanned `.forge/**` attempt
+  worktrees and lacked an explicit `tsconfigRootDir`. The dogfood repo was fixed
+  in commit `6b24be5` by ignoring `.forge/**` and pinning `tsconfigRootDir`;
+  lint then passed.
+
+Conclusion: rc7 proves the first local encrypted private-content path: exact
+private file labels, local encryption before public tree storage, unauthorized
+projection omission, authorized projected overlay transport, materialization,
+and private-label preservation on re-save. It does not yet prove hosted key
+distribution, multi-admin key rotation UX, same-user zero-trust after local
+materialization, or sanitized public reveal/evidence workflows.
+
 ## Exit Criteria
 
 | Roadmap criterion | Evidence | Status |
@@ -168,12 +231,14 @@ The local/native release claim is supportable:
 - Forge can represent remote-boundary conflicts as typed conflict-as-data.
 - Forge can sign local evidence, decisions, native commits, and sync merge commits.
 - Forge can enforce local, hosted-runner, and third-party trust policies.
-- Forge can emit recipient-scoped sync projection bundles for local
-  permissioned collaboration boundaries, but rc5 feature-specific dogfood found
-  projected import/clone failures on the receiving side.
+- Forge can emit and import recipient-scoped sync projection bundles for local
+  permissioned collaboration boundaries.
 - Forge can bootstrap a local organization identity profile, owner principal,
   signing-key binding, owner role, and audit trail, but rc6 does not yet enforce
   organization policy across the full command surface.
+- Forge can store exact private source/config paths as encrypted overlays,
+  omit them from unauthorized projections and Git export, and materialize them
+  for an authorized local org-bound recipient.
 - Forge can still export accepted work to Git branches for existing PR workflows.
 
 The supported public wording should avoid claiming a hosted multi-tenant service,

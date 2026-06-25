@@ -24,7 +24,7 @@ Forge is currently published as a public release candidate from GitHub. Install
 the latest tagged RC with Cargo:
 
 ```bash
-cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc6 forge-cli
+cargo install --git https://github.com/forge-vcs/forge --tag v0.1.0-rc7 forge-cli
 ```
 
 This installs the `forge` binary:
@@ -37,7 +37,7 @@ forge schema --json
 To build from source instead:
 
 ```bash
-git clone https://github.com/freezscholte/forge.git
+git clone https://github.com/forge-vcs/forge.git
 cd forge
 cargo install --path crates/forge-cli
 ```
@@ -54,14 +54,14 @@ without adding hooks or MCP servers.
 For Codex:
 
 ```bash
-codex plugin marketplace add freezscholte/forge
+codex plugin marketplace add forge-vcs/forge
 codex plugin add forge@forge
 ```
 
 For Claude Code:
 
 ```text
-/plugin marketplace add freezscholte/forge
+/plugin marketplace add forge-vcs/forge
 /plugin install forge@forge
 /reload-plugins
 ```

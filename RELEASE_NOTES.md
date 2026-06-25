@@ -1,5 +1,104 @@
 # Forge Public Release Notes
 
+## v0.1.0-rc7
+
+Forge v0.1.0-rc7 is a public release candidate focused on encrypted private
+content overlays. It lets one Forge graph carry public work plus private
+source/config paths, stores private paths outside the public native tree, omits
+private material from unauthorized projections, and materializes authorized
+private overlays for an org-bound recipient key.
+
+### What Changed Since rc6
+
+- Added the internal `forge-private` crate with age X25519 envelope helpers for
+  private payload encryption, recipient fingerprints, tamper detection, and
+  debug/serde secrecy boundaries.
+- Added schema migration 20 for organization encryption key bindings, private
+  path labels, encrypted private payload rows, and private-content audit rows.
+- Added `forge visibility path set` for exact repo-relative private path labels
+  and `forge org encryption bind-local` / `forge org decrypt-authority` for the
+  first local org-bound decrypt-authority flow.
+- Changed native save for labeled private paths so public `forge-tree:` content
+  excludes those paths and encrypted overlays are recorded separately.
+- Hardened public egress: public Git export and unauthorized projected sync omit
+  private plaintext, private ciphertext, private object paths, and private
+  existence metadata.
+- Added authorized projected sync transport/materialization for private overlays
+  when the recipient has `sync_materialize` visibility and an active org
+  encryption key binding.
+- Added private-tainted evidence fail-closed behavior for this slice so raw
+  command output from private materialized work is not persisted before a future
+  sanitized reveal mode exists.
+- Updated install and plugin references to the `forge-vcs/forge` repository
+  path after the GitHub organization transfer.
+
+### Installation
+
+```bash
+cargo install --git https://github.com/forge-vcs/forge --tag v0.1.0-rc7 forge-cli
+```
+
+### Release Validation
+
+The rc7 preparation ran the aggregate release dogfood gate on `main` at
+`2711761` after PR #103 merged:
+
+```bash
+rtk bash scripts/dogfood-release-gate.sh
+```
+
+Gate results:
+
+- `cargo fmt --all -- --check`: passed
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed
+- `cargo test --workspace`: 589 passed
+- `scripts/e2e-eval.sh`: PASS=95 FAIL=0
+- `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
+- `scripts/dogfood-native-sync-peer.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-peer-nogit.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0 with TypeScript 5.9.3
+- `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
+
+Focused feature validation also passed:
+
+- `cargo test -p forge-cli --test forge_encrypted_private_content`: 10 passed
+- `cargo test -p forge-cli --test forge_schema --test forge_org_identity --test forge_sync --test forge_visibility`: 66 passed
+- `cargo test -p forge-sync`: 8 passed
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed
+
+Feature-specific dogfood ran with the candidate binary in temporary copies of
+the `forge-dogfood` checkout:
+
+- A private dogfood source file was labeled under an attempt and saved as an
+  encrypted overlay while the public app file remained in the public tree.
+- An unauthorized projected sync bundle used generic `forge-sync.v2` metadata
+  and omitted the private path, private sentinel, private object path, and
+  private capability/count metadata.
+- An authorized projected sync bundle carried one encrypted private overlay,
+  without plaintext sentinel or private object-store paths.
+- A fresh target repository with the recipient private key imported the
+  authorized bundle with `--materialize`, restored the private file locally, and
+  re-saved without leaking the private sentinel into public native objects.
+
+External dogfood app validation also ran in the real `forge-dogfood` checkout:
+
+- `npm run typecheck`: passed
+- `npm test`: passed, 1 file / 3 tests
+- `npm run build`: passed
+- `npm run lint`: initially exposed stale ESLint scoping around `.forge/**`
+  worktrees; `forge-dogfood` commit `6b24be5` pins `tsconfigRootDir` and ignores
+  `.forge/**`, after which lint passed.
+
+### Current Boundary
+
+This RC proves the first local encrypted private-content path: exact private
+file labels, local at-rest encryption, authorized projected transport, and
+materialization with local private-label preservation. It does not yet provide a
+hosted key-distribution service, multi-admin key rotation UX, cross-org
+certificate authority, same-user zero-trust after plaintext materialization, or
+public reveal/sanitized private-evidence workflows.
+
 ## v0.1.0-rc6
 
 Forge v0.1.0-rc6 is a public release candidate focused on the first
@@ -30,7 +129,7 @@ organization policy-management behavior.
 ### Installation
 
 ```bash
-cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc6 forge-cli
+cargo install --git https://github.com/forge-vcs/forge --tag v0.1.0-rc6 forge-cli
 ```
 
 ### Release Validation
@@ -122,7 +221,7 @@ of projected bundles.
 ### Installation
 
 ```bash
-cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc5 forge-cli
+cargo install --git https://github.com/forge-vcs/forge --tag v0.1.0-rc5 forge-cli
 ```
 
 ### Release Validation
@@ -216,7 +315,7 @@ workflows.
 ### Installation
 
 ```bash
-cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc4 forge-cli
+cargo install --git https://github.com/forge-vcs/forge --tag v0.1.0-rc4 forge-cli
 ```
 
 ### Release Validation
@@ -271,7 +370,7 @@ intake.
 ### Installation
 
 ```bash
-cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc3 forge-cli
+cargo install --git https://github.com/forge-vcs/forge --tag v0.1.0-rc3 forge-cli
 ```
 
 ### Release Validation
@@ -312,7 +411,7 @@ contribution, and agent onboarding.
   candidate:
 
 ```bash
-cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc2 forge-cli
+cargo install --git https://github.com/forge-vcs/forge --tag v0.1.0-rc2 forge-cli
 ```
 
 - Added public `SECURITY.md` and `CONTRIBUTING.md` guides.

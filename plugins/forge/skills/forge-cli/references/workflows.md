@@ -8,7 +8,7 @@ in `SKILL.md`.
 Install the current release candidate:
 
 ```bash
-cargo install --git https://github.com/freezscholte/forge --tag v0.1.0-rc3 forge-cli
+cargo install --git https://github.com/forge-vcs/forge --tag v0.1.0-rc7 forge-cli
 ```
 
 Inspect command contracts:

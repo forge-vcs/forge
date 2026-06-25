@@ -24,7 +24,7 @@ Please do not open a public issue for a suspected vulnerability.
 
 Use GitHub private vulnerability reporting:
 
-<https://github.com/freezscholte/forge/security/advisories/new>
+<https://github.com/forge-vcs/forge/security/advisories/new>
 
 If GitHub private reporting is unavailable to you, open a public issue that
 only says you have a security report to share and does not include exploit
