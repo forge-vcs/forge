@@ -220,6 +220,11 @@ silently satisfy local, hosted-runner, or third-party policy.
 - maintenance: `doctor`, `gc`
 - trust: `key status`, `key rotate`, `trust policy`,
   `trust attest hosted-runner`, `trust attest third-party`
+- visibility and embargo: `visibility policy`, `visibility set`,
+  `visibility grant`, `visibility revoke`, `visibility check`,
+  `visibility path set`, `embargo mark`, `embargo grant`,
+  `embargo revoke`, `embargo release`, `embargo reveal`,
+  `embargo publish`, `embargo close`
 - sync: `sync export`, `sync inspect`, `sync import`, `sync clone`,
   `sync fetch`, `sync pull`, `sync push`, `sync serve`
 - Git interop: `export branch`, `export pr-body`, `export verify-branch`

@@ -42,6 +42,21 @@ Helpful reports include:
 Please do not include real access tokens, private keys, credentials, customer
 data, or proprietary source code in a report.
 
+## Embargoed Fix Workflow
+
+GitHub private vulnerability reporting remains the intake path for reports.
+Forge's local embargo workflow is the source-control path maintainers can use
+while preparing a fix: mark a work package with `forge embargo mark`, grant
+minimal reviewer or release-service capabilities with `forge embargo grant`,
+accept the proposal without revealing it, produce a constrained release bundle
+with `forge embargo release`, and later run `forge embargo reveal` and
+`forge embargo publish` before public Git export.
+
+This workflow does not replace GitHub advisories, CVE coordination, or
+downstream disclosure management. Revocation is future-only: Forge can block
+later managed release, sync, materialization, reveal, or export actions, but it
+does not claw back bundles or plaintext already delivered outside Forge.
+
 ## Response Expectations
 
 For actionable reports, maintainers aim to:

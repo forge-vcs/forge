@@ -12,6 +12,7 @@ use forge_store::ForgeError;
 use serde_json::{json, Value};
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
@@ -61,6 +62,8 @@ enum Command {
     Trust(TrustArgs),
     /// Inspect or update local visibility policy and work-package grants.
     Visibility(VisibilityArgs),
+    /// Manage embargoed security-fix workflow state and controlled release.
+    Embargo(EmbargoArgs),
     /// Inspect or rotate the local Ed25519 signing key.
     Key(KeyArgs),
     /// Inspect or initialize local org governance.
@@ -443,6 +446,12 @@ struct VisibilityArgs {
 }
 
 #[derive(Debug, Args)]
+struct EmbargoArgs {
+    #[command(subcommand)]
+    command: EmbargoCommand,
+}
+
+#[derive(Debug, Args)]
 struct KeyArgs {
     #[command(subcommand)]
     command: KeyCommand,
@@ -703,6 +712,99 @@ struct VisibilityPathSetArgs {
     visibility: String,
 }
 
+#[derive(Debug, Subcommand)]
+enum EmbargoCommand {
+    /// Mark a work package as governed by the embargo workflow.
+    Mark(EmbargoActorArgs),
+    /// Grant an embargo-scoped visibility capability.
+    Grant(EmbargoGrantArgs),
+    /// Revoke an embargo-scoped visibility capability.
+    Revoke(EmbargoGrantArgs),
+    /// Authorize and export a recipient-scoped embargo release bundle.
+    Release(EmbargoReleaseArgs),
+    /// Reveal a public-safe projection after accepted/released embargo state.
+    Reveal(EmbargoRevealArgs),
+    /// Mark a revealed embargo workflow as published.
+    Publish(EmbargoActorArgs),
+    /// Close an active embargo workflow without publication.
+    Close(EmbargoActorArgs),
+}
+
+#[derive(Debug, Args)]
+struct EmbargoActorArgs {
+    #[command(flatten)]
+    work_package: VisibilityWorkPackageArgs,
+    /// Actor recorded in the embargo event stream.
+    #[arg(long)]
+    actor: Option<String>,
+    /// Optional audit reason.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct EmbargoGrantArgs {
+    #[command(flatten)]
+    work_package: VisibilityWorkPackageArgs,
+    /// Recipient identifier for this local v1 grant.
+    #[arg(long)]
+    recipient: String,
+    /// Capability: see_stub, inspect_content, inspect_evidence, sync_materialize, or publish_reveal.
+    #[arg(long, value_parser = [
+        "see_stub",
+        "inspect_content",
+        "inspect_evidence",
+        "sync_materialize",
+        "publish_reveal",
+    ])]
+    capability: String,
+    /// Actor recorded in the embargo event stream.
+    #[arg(long)]
+    actor: Option<String>,
+    /// Optional audit reason.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct EmbargoReleaseArgs {
+    #[command(flatten)]
+    work_package: VisibilityWorkPackageArgs,
+    /// Recipient identifier that must hold sync_materialize.
+    #[arg(long)]
+    recipient: String,
+    /// Output path for the embargo-release sync bundle.
+    #[arg(long)]
+    output: PathBuf,
+    /// Content class included in the release envelope. Repeatable.
+    #[arg(long = "content-class")]
+    content_classes: Vec<String>,
+    /// Actor recorded in the embargo event stream.
+    #[arg(long)]
+    actor: Option<String>,
+    /// Optional audit reason.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct EmbargoRevealArgs {
+    #[command(flatten)]
+    work_package: VisibilityWorkPackageArgs,
+    /// Public projection mode for the eventual publication boundary.
+    #[arg(long, value_parser = ["provenance-only", "sanitized-source", "full-source"])]
+    mode: String,
+    /// Public-safe actor reference, distinct from private actor identity.
+    #[arg(long)]
+    public_actor_ref: Option<String>,
+    /// Actor recorded in the embargo event stream.
+    #[arg(long)]
+    actor: Option<String>,
+    /// Optional audit reason.
+    #[arg(long)]
+    reason: Option<String>,
+}
+
 fn main() -> ExitCode {
     let raw_args: Vec<String> = env::args().collect();
     let json_mode = raw_args.iter().any(|arg| arg == "--json");
@@ -758,6 +860,7 @@ fn main() -> ExitCode {
         Command::Undo => undo_response(request_id),
         Command::Trust(args) => trust_response(request_id, args),
         Command::Visibility(args) => visibility_response(request_id, args),
+        Command::Embargo(args) => embargo_response(request_id, args),
         Command::Key(args) => key_response(request_id, args),
         Command::Org(args) => org_response(request_id, args),
         Command::Doctor => doctor_response(request_id),
@@ -827,7 +930,7 @@ fn command_from_args(args: &[String]) -> String {
         [command, subcommand, ..]
             if matches!(
                 command.as_str(),
-                "export" | "attempt" | "proposal" | "sync" | "intent" | "org"
+                "export" | "attempt" | "proposal" | "sync" | "intent" | "org" | "embargo"
             ) =>
         {
             format!("{command} {subcommand}")
@@ -1817,6 +1920,193 @@ fn visibility_response(request_id: Option<String>, args: VisibilityArgs) -> Resp
             }
         },
     }
+}
+
+fn public_projection_mode_value(mode: &str) -> &'static str {
+    match mode {
+        "provenance-only" => "provenance_only",
+        "sanitized-source" => "sanitized_source",
+        "full-source" => "full_source",
+        _ => unreachable!("clap value_parser restricts public projection modes"),
+    }
+}
+
+fn embargo_response(request_id: Option<String>, args: EmbargoArgs) -> ResponseEnvelope {
+    match args.command {
+        EmbargoCommand::Mark(args) => command_result("embargo mark", request_id, |cwd, _| {
+            let actor = resolve_actor(args.actor.as_deref());
+            let result = forge_store::mark_embargo_workflow(
+                &cwd,
+                &args.work_package.kind,
+                &args.work_package.id,
+                &actor,
+                args.reason.as_deref(),
+            )?;
+            Ok((None, serde_json::to_value(result)?, Vec::new()))
+        }),
+        EmbargoCommand::Grant(args) => command_result("embargo grant", request_id, |cwd, _| {
+            let actor = resolve_actor(args.actor.as_deref());
+            let result = forge_store::grant_embargo_capability(
+                &cwd,
+                &args.work_package.kind,
+                &args.work_package.id,
+                &args.recipient,
+                &args.capability,
+                &actor,
+                args.reason.as_deref(),
+            )?;
+            Ok((None, serde_json::to_value(result)?, Vec::new()))
+        }),
+        EmbargoCommand::Revoke(args) => command_result("embargo revoke", request_id, |cwd, _| {
+            let actor = resolve_actor(args.actor.as_deref());
+            let result = forge_store::revoke_embargo_capability(
+                &cwd,
+                &args.work_package.kind,
+                &args.work_package.id,
+                &args.recipient,
+                &args.capability,
+                &actor,
+                args.reason.as_deref(),
+            )?;
+            Ok((None, serde_json::to_value(result)?, Vec::new()))
+        }),
+        EmbargoCommand::Release(args) => command_result("embargo release", request_id, |cwd, _| {
+            let actor = resolve_actor(args.actor.as_deref());
+            let release_plan = forge_store::prepare_embargo_release_workflow(
+                &cwd,
+                &args.work_package.kind,
+                &args.work_package.id,
+                &args.recipient,
+                &actor,
+                &args.content_classes,
+                args.reason.as_deref(),
+            )?;
+            ensure_release_output_available(&args.output)?;
+            let pending_output =
+                embargo_release_pending_output(&args.output, &release_plan.release_event_id);
+            let _pending_cleanup = PendingReleaseOutput::new(pending_output.clone());
+            let report = forge_sync::export_manifest_embargo_release(
+                &cwd,
+                &pending_output,
+                &release_plan.recipient,
+                &args.work_package.kind,
+                &args.work_package.id,
+                release_plan.policy_revision,
+                &release_plan.release_event_id,
+                release_plan.generated_at_ms,
+                release_plan.content_classes.clone(),
+                release_plan.generated_at_ms,
+                release_plan.revocation_warning.clone(),
+            )?;
+            let bundle_digest =
+                report.projection.bundle_digest.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("embargo release export missing bundle digest")
+                })?;
+            let release = forge_store::finish_embargo_release_workflow(
+                &cwd,
+                &args.work_package.kind,
+                &args.work_package.id,
+                &args.recipient,
+                &actor,
+                &release_plan.content_classes,
+                &release_plan.release_event_id,
+                release_plan.policy_revision,
+                release_plan.generated_at_ms,
+                bundle_digest,
+                args.reason.as_deref(),
+            )?;
+            forge_sync::publish_manifest_file_atomic_new(&pending_output, &args.output)?;
+            let _ = _pending_cleanup.disarm();
+            let mut report = report;
+            report.output_path = args.output.display().to_string();
+            Ok((
+                None,
+                json!({
+                    "release": release,
+                    "report": report,
+                }),
+                Vec::new(),
+            ))
+        }),
+        EmbargoCommand::Reveal(args) => command_result("embargo reveal", request_id, |cwd, _| {
+            let actor = resolve_actor(args.actor.as_deref());
+            let result = forge_store::reveal_embargo_workflow(
+                &cwd,
+                &args.work_package.kind,
+                &args.work_package.id,
+                &actor,
+                public_projection_mode_value(&args.mode),
+                args.public_actor_ref.as_deref(),
+                args.reason.as_deref(),
+            )?;
+            Ok((None, serde_json::to_value(result)?, Vec::new()))
+        }),
+        EmbargoCommand::Publish(args) => command_result("embargo publish", request_id, |cwd, _| {
+            let actor = resolve_actor(args.actor.as_deref());
+            let result = forge_store::publish_embargo_workflow(
+                &cwd,
+                &args.work_package.kind,
+                &args.work_package.id,
+                &actor,
+                args.reason.as_deref(),
+            )?;
+            Ok((None, serde_json::to_value(result)?, Vec::new()))
+        }),
+        EmbargoCommand::Close(args) => command_result("embargo close", request_id, |cwd, _| {
+            let actor = resolve_actor(args.actor.as_deref());
+            let result = forge_store::close_embargo_workflow(
+                &cwd,
+                &args.work_package.kind,
+                &args.work_package.id,
+                &actor,
+                args.reason.as_deref(),
+            )?;
+            Ok((None, serde_json::to_value(result)?, Vec::new()))
+        }),
+    }
+}
+
+struct PendingReleaseOutput {
+    path: Option<PathBuf>,
+}
+
+impl PendingReleaseOutput {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(mut self) -> PathBuf {
+        self.path.take().expect("pending output path")
+    }
+}
+
+impl Drop for PendingReleaseOutput {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.as_ref() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn ensure_release_output_available(output_path: &Path) -> Result<()> {
+    if output_path.exists() {
+        anyhow::bail!(
+            "sync export output already exists: {}",
+            output_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn embargo_release_pending_output(output_path: &Path, release_event_id: &str) -> PathBuf {
+    let file_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("embargo-release.json");
+    output_path.with_file_name(format!(
+        ".{file_name}.pending.{release_event_id}.{}",
+        std::process::id()
+    ))
 }
 
 fn key_response(request_id: Option<String>, args: KeyArgs) -> ResponseEnvelope {
@@ -3636,6 +3926,7 @@ fn export_response(request_id: Option<String>, args: ExportArgs) -> ResponseEnve
                     Some("rejected") => return Err(ForgeError::Rejected.into()),
                     _ => return Err(ForgeError::NotAccepted.into()),
                 }
+                forge_store::ensure_embargo_publishable(&cwd, "proposal", &proposal.proposal_id)?;
                 // Verify the accepted decision's integrity BEFORE creating the git
                 // branch (NER-136 R4): a tampered decision row that forged `accepted`
                 // is refused here, under the held repo lock, so no branch is created.
@@ -4497,6 +4788,13 @@ fn is_mutating_command(command: &str) -> bool {
             | "visibility path set"
             | "visibility grant"
             | "visibility revoke"
+            | "embargo mark"
+            | "embargo grant"
+            | "embargo revoke"
+            | "embargo release"
+            | "embargo reveal"
+            | "embargo publish"
+            | "embargo close"
             | "key status"
             | "key rotate"
             | "org init"
