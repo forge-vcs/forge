@@ -3,14 +3,22 @@ use forge_content_native::{NativeObjectStore, NativeRefStore, ObjectId, ObjectKi
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SYNC_PROTOCOL_VERSION: &str = SYNC_PROTOCOL_VERSION_V1;
 pub const SYNC_PROTOCOL_VERSION_V1: &str = "forge-sync.v1";
 pub const SYNC_PROTOCOL_VERSION_V2: &str = "forge-sync.v2";
+const PROJECTION_MODE_FULL: &str = "full";
+const PROJECTION_MODE_RECIPIENT: &str = "recipient";
+const PROJECTION_MODE_EMBARGO_RELEASE: &str = "embargo_release";
+const PROJECTION_POLICY_VISIBILITY_V1: &str = "visibility.v1";
+const PROJECTION_POLICY_EMBARGO_RELEASE_V1: &str = "embargo-release.v1";
+const CAPABILITY_SYNC_MATERIALIZE: &str = "sync_materialize";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncManifest {
@@ -71,6 +79,26 @@ pub struct SyncProjection {
     #[serde(default)]
     pub capability: Option<String>,
     pub projected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_package_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_package_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_revision: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_revision: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_summary: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_warning: Option<String>,
 }
 
 impl Default for SyncProjection {
@@ -82,21 +110,72 @@ impl Default for SyncProjection {
 impl SyncProjection {
     fn full() -> Self {
         Self {
-            mode: "full".to_string(),
-            policy_version: "visibility.v1".to_string(),
+            mode: PROJECTION_MODE_FULL.to_string(),
+            policy_version: PROJECTION_POLICY_VISIBILITY_V1.to_string(),
             recipient: None,
             capability: None,
             projected: false,
+            work_package_kind: None,
+            work_package_id: None,
+            policy_revision: None,
+            event_ids: Vec::new(),
+            state_revision: None,
+            content_classes: Vec::new(),
+            check_summary: None,
+            bundle_digest: None,
+            generated_at_ms: None,
+            revocation_warning: None,
         }
     }
 
     fn recipient(recipient: &str, capability: &str) -> Self {
         Self {
-            mode: "recipient".to_string(),
-            policy_version: "visibility.v1".to_string(),
+            mode: PROJECTION_MODE_RECIPIENT.to_string(),
+            policy_version: PROJECTION_POLICY_VISIBILITY_V1.to_string(),
             recipient: Some(recipient.to_string()),
             capability: Some(capability.to_string()),
             projected: true,
+            work_package_kind: None,
+            work_package_id: None,
+            policy_revision: None,
+            event_ids: Vec::new(),
+            state_revision: None,
+            content_classes: Vec::new(),
+            check_summary: None,
+            bundle_digest: None,
+            generated_at_ms: None,
+            revocation_warning: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn embargo_release(
+        recipient: &str,
+        work_package_kind: &str,
+        work_package_id: &str,
+        policy_revision: i64,
+        event_id: &str,
+        state_revision: i64,
+        content_classes: Vec<String>,
+        generated_at_ms: i64,
+        revocation_warning: String,
+    ) -> Self {
+        Self {
+            mode: PROJECTION_MODE_EMBARGO_RELEASE.to_string(),
+            policy_version: PROJECTION_POLICY_EMBARGO_RELEASE_V1.to_string(),
+            recipient: Some(recipient.to_string()),
+            capability: Some(CAPABILITY_SYNC_MATERIALIZE.to_string()),
+            projected: true,
+            work_package_kind: Some(work_package_kind.to_string()),
+            work_package_id: Some(work_package_id.to_string()),
+            policy_revision: Some(policy_revision),
+            event_ids: vec![event_id.to_string()],
+            state_revision: Some(state_revision),
+            content_classes,
+            check_summary: Some(serde_json::json!({})),
+            bundle_digest: None,
+            generated_at_ms: Some(generated_at_ms),
+            revocation_warning: Some(revocation_warning),
         }
     }
 }
@@ -254,7 +333,7 @@ pub fn export_manifest_projected_since(
     recipient: &str,
     capability: &str,
 ) -> Result<SyncExportReport> {
-    if capability != "sync_materialize" {
+    if capability != CAPABILITY_SYNC_MATERIALIZE {
         bail!("projected sync export only supports sync_materialize capability");
     }
     let since_path_text = since_path.map(|path| path.display().to_string());
@@ -274,6 +353,39 @@ pub fn export_manifest_projected_since(
     }
     let bytes = serde_json::to_vec_pretty(&manifest)?;
     fs::write(output_path, bytes)?;
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn export_manifest_embargo_release(
+    cwd: &Path,
+    output_path: &Path,
+    recipient: &str,
+    work_package_kind: &str,
+    work_package_id: &str,
+    policy_revision: i64,
+    event_id: &str,
+    state_revision: i64,
+    content_classes: Vec<String>,
+    generated_at_ms: i64,
+    revocation_warning: String,
+) -> Result<SyncExportReport> {
+    let projection = SyncProjection::embargo_release(
+        recipient,
+        work_package_kind,
+        work_package_id,
+        policy_revision,
+        event_id,
+        state_revision,
+        content_classes,
+        generated_at_ms,
+        revocation_warning,
+    );
+    let mut manifest = build_embargo_release_manifest(cwd, projection)?;
+    manifest.projection.bundle_digest = Some(manifest_bundle_digest(&manifest)?);
+    let report = export_report(&manifest, output_path.display().to_string(), false, None);
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    write_manifest_atomic_new(output_path, &bytes)?;
     Ok(report)
 }
 
@@ -328,18 +440,32 @@ fn export_manifest_delta_with_projection(
     let mut manifest = build_manifest(cwd)?;
     if let Some(projection) = projection {
         manifest.projection = projection;
-        apply_recipient_projection(cwd, &mut manifest)?;
+        if manifest.projection.mode == PROJECTION_MODE_EMBARGO_RELEASE {
+            apply_embargo_release_projection(cwd, &mut manifest)?;
+        } else {
+            apply_recipient_projection(cwd, &mut manifest)?;
+        }
     }
     if let Some(base) = since_manifest {
         ensure_supported_manifest(base)?;
         prune_manifest_since(&mut manifest, base)?;
     }
-    let report = SyncExportReport {
+    let report = export_report(&manifest, output_path, since_manifest.is_some(), since_path);
+    Ok((manifest, report))
+}
+
+fn export_report(
+    manifest: &SyncManifest,
+    output_path: String,
+    incremental: bool,
+    since_path: Option<String>,
+) -> SyncExportReport {
+    SyncExportReport {
         protocol_version: manifest.protocol_version.clone(),
         projection: manifest.projection.clone(),
         output_path,
         content_backend: manifest.content_backend.clone(),
-        incremental: since_manifest.is_some(),
+        incremental,
         since_path,
         native_object_count: manifest.native_objects.len(),
         native_payload_count: manifest.native_payloads.len(),
@@ -351,8 +477,93 @@ fn export_manifest_delta_with_projection(
             .sum(),
         native_head: manifest.native_head.clone(),
         local_key_fingerprint: manifest.local_key_fingerprint.clone(),
-    };
-    Ok((manifest, report))
+    }
+}
+
+fn build_embargo_release_manifest(cwd: &Path, projection: SyncProjection) -> Result<SyncManifest> {
+    validate_embargo_release_projection_authority(cwd, &projection)?;
+    let context = forge_store::open_repository(cwd)?;
+    Ok(SyncManifest {
+        protocol_version: SYNC_PROTOCOL_VERSION_V2.to_string(),
+        cli_schema_version: forge_protocol::SCHEMA_VERSION.to_string(),
+        repo_id: context.repo_id,
+        projection,
+        private_content: SyncPrivateContent::default(),
+        private_overlays: Vec::new(),
+        content_backend: context.content_backend,
+        current_operation_id: String::new(),
+        current_view_id: String::new(),
+        attached_attempt_id: None,
+        expected_content_ref: None,
+        native_head: None,
+        native_objects: Vec::new(),
+        native_payloads: Vec::new(),
+        ledger_counts: empty_ledger_counts(),
+        ledger_rows: empty_ledger_rows(),
+        local_key_fingerprint: None,
+    })
+}
+
+fn write_manifest_atomic_new(output_path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp_path = temporary_manifest_path(output_path);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .with_context(|| format!("create temporary sync export {}", tmp_path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("write temporary sync export {}", tmp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync temporary sync export {}", tmp_path.display()))?;
+    drop(file);
+    if let Err(error) = fs::hard_link(&tmp_path, output_path) {
+        let _ = fs::remove_file(&tmp_path);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            bail!(
+                "sync export output already exists: {}",
+                output_path.display()
+            );
+        }
+        return Err(error)
+            .with_context(|| format!("publish sync export {}", output_path.display()));
+    }
+    let _ = fs::remove_file(&tmp_path);
+    Ok(())
+}
+
+pub fn publish_manifest_file_atomic_new(source_path: &Path, output_path: &Path) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Err(error) = fs::hard_link(source_path, output_path) {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            bail!(
+                "sync export output already exists: {}",
+                output_path.display()
+            );
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "publish sync export {} to {}",
+                source_path.display(),
+                output_path.display()
+            )
+        });
+    }
+    let _ = fs::remove_file(source_path);
+    Ok(())
+}
+
+fn temporary_manifest_path(output_path: &Path) -> PathBuf {
+    let file_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("forge-sync-manifest");
+    let nonce = now_ms();
+    output_path.with_file_name(format!(".{file_name}.tmp.{}.{}", std::process::id(), nonce))
 }
 
 fn prune_manifest_since(manifest: &mut SyncManifest, base: &SyncManifest) -> Result<()> {
@@ -462,7 +673,7 @@ fn apply_recipient_projection(cwd: &Path, manifest: &mut SyncManifest) -> Result
         .capability
         .as_deref()
         .ok_or_else(|| anyhow!("projected sync manifest is missing capability"))?;
-    if capability != "sync_materialize" {
+    if capability != CAPABILITY_SYNC_MATERIALIZE {
         bail!("projected sync manifests only support sync_materialize capability");
     }
 
@@ -690,6 +901,63 @@ fn apply_recipient_projection(cwd: &Path, manifest: &mut SyncManifest) -> Result
     validate_projected_manifest(manifest)
 }
 
+fn apply_embargo_release_projection(cwd: &Path, manifest: &mut SyncManifest) -> Result<()> {
+    validate_embargo_release_projection_authority(cwd, &manifest.projection)?;
+
+    manifest.protocol_version = SYNC_PROTOCOL_VERSION_V2.to_string();
+    manifest.private_content = SyncPrivateContent::default();
+    manifest.private_overlays.clear();
+    manifest.native_head = None;
+    manifest.native_objects.clear();
+    manifest.native_payloads.clear();
+    manifest.current_operation_id.clear();
+    manifest.current_view_id.clear();
+    manifest.attached_attempt_id = None;
+    manifest.expected_content_ref = None;
+    for table in &mut manifest.ledger_rows {
+        table.rows.clear();
+    }
+    recompute_projected_ledger_counts(manifest);
+    validate_projected_manifest(manifest)
+}
+
+fn validate_embargo_release_projection_authority(
+    cwd: &Path,
+    projection: &SyncProjection,
+) -> Result<()> {
+    ensure_supported_projection(projection)?;
+    let recipient = projection
+        .recipient
+        .as_deref()
+        .ok_or_else(|| anyhow!("embargo release projection is missing recipient"))?;
+    let capability = projection
+        .capability
+        .as_deref()
+        .ok_or_else(|| anyhow!("embargo release projection is missing capability"))?;
+    if capability != CAPABILITY_SYNC_MATERIALIZE {
+        bail!("embargo release projections only support sync_materialize capability");
+    }
+    let work_package_kind = projection
+        .work_package_kind
+        .as_deref()
+        .ok_or_else(|| anyhow!("embargo release projection is missing work package kind"))?;
+    let work_package_id = projection
+        .work_package_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("embargo release projection is missing work package id"))?;
+    let decision = forge_store::projection_decision(
+        cwd,
+        work_package_kind,
+        work_package_id,
+        recipient,
+        capability,
+    )?;
+    if !decision.allowed {
+        bail!("embargo release recipient is not authorized to materialize this work package");
+    }
+    Ok(())
+}
+
 fn allowed_work_package_ids(
     cwd: &Path,
     manifest: &SyncManifest,
@@ -757,18 +1025,35 @@ fn projected_content_refs(manifest: &SyncManifest) -> HashSet<String> {
 }
 
 fn recompute_projected_ledger_counts(manifest: &mut SyncManifest) {
-    manifest.ledger_counts = LEDGER_COUNT_TABLES
+    manifest.ledger_counts = ledger_counts_from_rows(&manifest.ledger_rows);
+}
+
+fn empty_ledger_counts() -> Vec<LedgerTableCount> {
+    ledger_counts_from_rows(&[])
+}
+
+fn ledger_counts_from_rows(ledger_rows: &[LedgerTableRows]) -> Vec<LedgerTableCount> {
+    LEDGER_COUNT_TABLES
         .iter()
         .map(|table| LedgerTableCount {
             table: (*table).to_string(),
-            rows: manifest
-                .ledger_rows
+            rows: ledger_rows
                 .iter()
                 .find(|rows| rows.table == *table)
                 .map(|rows| rows.rows.len() as i64)
                 .unwrap_or(0),
         })
-        .collect();
+        .collect()
+}
+
+fn empty_ledger_rows() -> Vec<LedgerTableRows> {
+    LEDGER_ROW_TABLES
+        .iter()
+        .map(|spec| LedgerTableRows {
+            table: spec.table.to_string(),
+            rows: Vec::new(),
+        })
+        .collect()
 }
 
 fn sanitize_projected_snapshot_parent_refs(manifest: &mut SyncManifest) {
@@ -923,6 +1208,7 @@ pub fn import_manifest(cwd: &Path, path: &Path) -> Result<SyncImportReport> {
 
 pub fn import_manifest_value(cwd: &Path, manifest: &SyncManifest) -> Result<SyncImportReport> {
     ensure_supported_manifest(manifest)?;
+    ensure_not_embargo_release_import(manifest)?;
     let context = forge_store::open_repository(cwd)?;
     if context.content_backend != "native" {
         bail!("sync import requires a native content repository");
@@ -949,6 +1235,8 @@ pub fn import_manifest_value(cwd: &Path, manifest: &SyncManifest) -> Result<Sync
 }
 
 pub fn import_native_objects(cwd: &Path, manifest: &SyncManifest) -> Result<usize> {
+    ensure_supported_manifest(manifest)?;
+    ensure_not_embargo_release_import(manifest)?;
     let context = forge_store::open_repository(cwd)?;
     if context.content_backend != "native" {
         bail!("sync object import requires a native content repository");
@@ -959,6 +1247,8 @@ pub fn import_native_objects(cwd: &Path, manifest: &SyncManifest) -> Result<usiz
 }
 
 pub fn import_ledger_rows_from_manifest(cwd: &Path, manifest: &SyncManifest) -> Result<usize> {
+    ensure_supported_manifest(manifest)?;
+    ensure_not_embargo_release_import(manifest)?;
     let context = forge_store::open_repository(cwd)?;
     let mut connection = Connection::open(&context.database_path)?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -967,6 +1257,7 @@ pub fn import_ledger_rows_from_manifest(cwd: &Path, manifest: &SyncManifest) -> 
 
 pub fn clone_manifest(cwd: &Path, path: &Path) -> Result<SyncCloneReport> {
     let manifest = read_supported_manifest(path)?;
+    ensure_not_embargo_release_import(&manifest)?;
     if manifest.native_head.is_none() {
         bail!("sync clone requires a native head");
     }
@@ -1222,7 +1513,8 @@ fn ensure_supported_manifest(manifest: &SyncManifest) -> Result<()> {
                     bail!("sync private overlay count does not match manifest metadata");
                 }
                 if !manifest.projection.projected
-                    || manifest.projection.capability.as_deref() != Some("sync_materialize")
+                    || manifest.projection.capability.as_deref()
+                        != Some(CAPABILITY_SYNC_MATERIALIZE)
                 {
                     bail!("sync private overlays require sync_materialize projection");
                 }
@@ -1242,18 +1534,25 @@ fn ensure_supported_manifest(manifest: &SyncManifest) -> Result<()> {
     if manifest.projection.projected {
         validate_projected_manifest(manifest)?;
     }
+    validate_manifest_bundle_digest(manifest)?;
     Ok(())
 }
 
 fn ensure_supported_projection(projection: &SyncProjection) -> Result<()> {
-    if projection.policy_version != "visibility.v1" {
+    if !matches!(
+        projection.policy_version.as_str(),
+        PROJECTION_POLICY_VISIBILITY_V1 | PROJECTION_POLICY_EMBARGO_RELEASE_V1
+    ) {
         bail!(
             "unsupported sync projection policy version {}",
             projection.policy_version
         );
     }
     match projection.mode.as_str() {
-        "full" => {
+        PROJECTION_MODE_FULL => {
+            if projection.policy_version != PROJECTION_POLICY_VISIBILITY_V1 {
+                bail!("full sync projection requires visibility.v1");
+            }
             if projection.projected
                 || projection.recipient.is_some()
                 || projection.capability.is_some()
@@ -1261,7 +1560,10 @@ fn ensure_supported_projection(projection: &SyncProjection) -> Result<()> {
                 bail!("full sync projection metadata must not declare recipient scope");
             }
         }
-        "recipient" => {
+        PROJECTION_MODE_RECIPIENT => {
+            if projection.policy_version != PROJECTION_POLICY_VISIBILITY_V1 {
+                bail!("recipient sync projection requires visibility.v1");
+            }
             if !projection.projected {
                 bail!("recipient sync projection must be marked projected");
             }
@@ -1281,8 +1583,45 @@ fn ensure_supported_projection(projection: &SyncProjection) -> Result<()> {
             {
                 bail!("recipient sync projection is missing capability");
             }
-            if projection.capability.as_deref() != Some("sync_materialize") {
+            if projection.capability.as_deref() != Some(CAPABILITY_SYNC_MATERIALIZE) {
                 bail!("recipient sync projection only supports sync_materialize capability");
+            }
+        }
+        PROJECTION_MODE_EMBARGO_RELEASE => {
+            if projection.policy_version != PROJECTION_POLICY_EMBARGO_RELEASE_V1 {
+                bail!("embargo release projection requires embargo-release.v1");
+            }
+            if !projection.projected {
+                bail!("embargo release projection must be marked projected");
+            }
+            if projection
+                .recipient
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            {
+                bail!("embargo release projection is missing recipient");
+            }
+            if projection.capability.as_deref() != Some(CAPABILITY_SYNC_MATERIALIZE) {
+                bail!("embargo release projection requires sync_materialize capability");
+            }
+            if projection
+                .work_package_kind
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+                || projection
+                    .work_package_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                || projection.policy_revision.is_none()
+                || projection.event_ids.is_empty()
+                || projection.state_revision.is_none()
+                || projection.content_classes.is_empty()
+                || projection.generated_at_ms.is_none()
+            {
+                bail!("embargo release projection is missing envelope metadata");
             }
         }
         other => bail!("unsupported sync projection mode {other}"),
@@ -1290,12 +1629,44 @@ fn ensure_supported_projection(projection: &SyncProjection) -> Result<()> {
     Ok(())
 }
 
+fn manifest_bundle_digest(manifest: &SyncManifest) -> Result<String> {
+    let mut digest_manifest = manifest.clone();
+    digest_manifest.projection.bundle_digest = None;
+    let bytes = serde_json::to_vec(&digest_manifest)?;
+    let digest = Sha256::digest(bytes);
+    Ok(hex_encode(&digest))
+}
+
+fn validate_manifest_bundle_digest(manifest: &SyncManifest) -> Result<()> {
+    if manifest.projection.mode != PROJECTION_MODE_EMBARGO_RELEASE {
+        return Ok(());
+    }
+    let Some(actual) = manifest.projection.bundle_digest.as_deref() else {
+        bail!("embargo release projection is missing bundle digest");
+    };
+    let expected = manifest_bundle_digest(manifest)?;
+    if actual != expected {
+        bail!("embargo release projection bundle digest mismatch");
+    }
+    Ok(())
+}
+
 pub fn ensure_manifest_materializable(manifest: &SyncManifest) -> Result<()> {
     ensure_supported_manifest(manifest)?;
+    ensure_not_embargo_release_import(manifest)?;
     if manifest.projection.projected
-        && manifest.projection.capability.as_deref() != Some("sync_materialize")
+        && manifest.projection.capability.as_deref() != Some(CAPABILITY_SYNC_MATERIALIZE)
     {
         bail!("projected sync materialization requires sync_materialize capability");
+    }
+    Ok(())
+}
+
+fn ensure_not_embargo_release_import(manifest: &SyncManifest) -> Result<()> {
+    if manifest.projection.mode == PROJECTION_MODE_EMBARGO_RELEASE {
+        bail!(
+            "embargo release bundles are release artifacts and cannot be imported or materialized without local authority validation"
+        );
     }
     Ok(())
 }
@@ -2185,6 +2556,58 @@ mod tests {
         assert!(error
             .to_string()
             .contains("unsupported sync protocol version"));
+    }
+
+    #[test]
+    fn embargo_release_artifacts_are_not_importable_or_materializable() {
+        let mut manifest = test_manifest("C", &[("C", &[])]);
+        manifest.projection = SyncProjection::embargo_release(
+            "reviewer@example.test",
+            "proposal",
+            "proposal_test",
+            1,
+            "embargo_event_test",
+            123,
+            vec!["release_inputs".to_string()],
+            123,
+            "Revocation applies to future releases.".to_string(),
+        );
+        manifest.protocol_version = SYNC_PROTOCOL_VERSION_V2.to_string();
+        manifest.current_operation_id.clear();
+        manifest.current_view_id.clear();
+        manifest.attached_attempt_id = None;
+        manifest.expected_content_ref = None;
+        manifest.native_head = None;
+        manifest.native_objects.clear();
+        manifest.native_payloads.clear();
+        manifest.ledger_counts = empty_ledger_counts();
+        manifest.ledger_rows = empty_ledger_rows();
+        manifest.projection.bundle_digest = Some(manifest_bundle_digest(&manifest).unwrap());
+
+        let error = ensure_not_embargo_release_import(&manifest).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("cannot be imported or materialized"));
+
+        let target = tempfile::tempdir().unwrap();
+        forge_store::init_repository(target.path(), None, "native".to_string()).unwrap();
+        let error = import_manifest_value(target.path(), &manifest).unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("cannot be imported or materialized"),
+            "{error}"
+        );
+
+        let clone_target = tempfile::tempdir().unwrap();
+        let manifest_path = clone_target.path().join("embargo-release.json");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let error = clone_manifest(clone_target.path(), &manifest_path).unwrap_err();
+        let error = error.to_string();
+        assert!(
+            error.contains("cannot be imported or materialized"),
+            "{error}"
+        );
     }
 
     #[test]

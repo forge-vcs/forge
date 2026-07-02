@@ -267,6 +267,21 @@ pub enum ForgeError {
         capability: String,
         disclosure: String,
     },
+    /// A security-sensitive embargoed work package was addressed through a generic
+    /// visibility/publication path. Deterministic and non-retryable: use the
+    /// explicit embargo workflow command so the lifecycle event and authority are
+    /// recorded atomically.
+    EmbargoWorkflowRequired {
+        operation: String,
+        work_package_kind: String,
+        work_package_id: String,
+    },
+    /// An embargo workflow transition was requested from the wrong lifecycle state.
+    EmbargoStateInvalid {
+        action: String,
+        state: String,
+        required: String,
+    },
     /// Org-governed operation was requested before local org governance was enabled.
     OrgNotEnabled,
     /// The first-owner bootstrap command was attempted after an org profile exists.
@@ -326,6 +341,8 @@ impl ForgeError {
             ForgeError::UnsupportedStructuredGate { .. } => "UNSUPPORTED_STRUCTURED_GATE",
             ForgeError::VisibilityPolicyInvalid { .. } => "VISIBILITY_POLICY_INVALID",
             ForgeError::VisibilityPolicyUnmet { .. } => "VISIBILITY_POLICY_UNMET",
+            ForgeError::EmbargoWorkflowRequired { .. } => "EMBARGO_WORKFLOW_REQUIRED",
+            ForgeError::EmbargoStateInvalid { .. } => "EMBARGO_STATE_INVALID",
             ForgeError::OrgNotEnabled => "ORG_NOT_ENABLED",
             ForgeError::OrgAlreadyEnabled { .. } => "ORG_ALREADY_ENABLED",
             ForgeError::OrgAuthorityRequired { .. } => "ORG_AUTHORITY_REQUIRED",
@@ -518,6 +535,25 @@ impl ForgeError {
                 "work_package_id": work_package_id,
                 "capability": capability,
                 "disclosure": disclosure,
+            }),
+            ForgeError::EmbargoWorkflowRequired {
+                operation,
+                work_package_kind,
+                work_package_id,
+            } => json!({
+                "operation": operation,
+                "work_package_kind": work_package_kind,
+                "work_package_id": work_package_id,
+                "recovery_hint": "Use the explicit embargo workflow command for this work package.",
+            }),
+            ForgeError::EmbargoStateInvalid {
+                action,
+                state,
+                required,
+            } => json!({
+                "action": action,
+                "state": state,
+                "required": required,
             }),
             ForgeError::OrgNotEnabled => {
                 json!({ "recovery_hint": "Run `forge org init --actor <id>` to enable org governance for this repository." })
@@ -725,6 +761,22 @@ impl std::fmt::Display for ForgeError {
             } => write!(
                 f,
                 "visibility policy denied {operation}: capability {capability} is unavailable ({disclosure})"
+            ),
+            ForgeError::EmbargoWorkflowRequired {
+                operation,
+                work_package_kind,
+                work_package_id,
+            } => write!(
+                f,
+                "{operation} for embargoed {work_package_kind} {work_package_id} requires the explicit embargo workflow"
+            ),
+            ForgeError::EmbargoStateInvalid {
+                action,
+                state,
+                required,
+            } => write!(
+                f,
+                "embargo {action} requires {required}, but workflow is {state}"
             ),
             ForgeError::OrgNotEnabled => {
                 write!(f, "org governance is not enabled for this repository")
@@ -998,6 +1050,23 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             ],
         },
         ErrorCodeSpec {
+            code: "EMBARGO_WORKFLOW_REQUIRED",
+            retryable: false,
+            after_ms: None,
+            details_keys: &[
+                "operation",
+                "work_package_kind",
+                "work_package_id",
+                "recovery_hint",
+            ],
+        },
+        ErrorCodeSpec {
+            code: "EMBARGO_STATE_INVALID",
+            retryable: false,
+            after_ms: None,
+            details_keys: &["action", "state", "required"],
+        },
+        ErrorCodeSpec {
             code: "ORG_NOT_ENABLED",
             retryable: false,
             after_ms: None,
@@ -1197,6 +1266,24 @@ mod tests {
             "VISIBILITY_POLICY_UNMET"
         );
         assert_eq!(
+            ForgeError::EmbargoWorkflowRequired {
+                operation: "set_visibility".into(),
+                work_package_kind: "proposal".into(),
+                work_package_id: "proposal_x".into(),
+            }
+            .code(),
+            "EMBARGO_WORKFLOW_REQUIRED"
+        );
+        assert_eq!(
+            ForgeError::EmbargoStateInvalid {
+                action: "reveal".into(),
+                state: "active".into(),
+                required: "accepted_under_embargo or released_under_embargo".into(),
+            }
+            .code(),
+            "EMBARGO_STATE_INVALID"
+        );
+        assert_eq!(
             ForgeError::PrivateContentInvalid {
                 reason: "metadata_mismatch".into(),
             }
@@ -1240,6 +1327,16 @@ mod tests {
                 work_package_id: "attempt_x".into(),
                 capability: "sync_materialize".into(),
                 disclosure: "hidden".into(),
+            },
+            ForgeError::EmbargoWorkflowRequired {
+                operation: "set_visibility".into(),
+                work_package_kind: "proposal".into(),
+                work_package_id: "proposal_x".into(),
+            },
+            ForgeError::EmbargoStateInvalid {
+                action: "reveal".into(),
+                state: "active".into(),
+                required: "accepted_under_embargo or released_under_embargo".into(),
             },
             ForgeError::PrivateContentInvalid {
                 reason: "metadata_mismatch".into(),
@@ -1681,6 +1778,16 @@ mod tests {
                 capability: "sync_materialize".into(),
                 disclosure: "hidden".into(),
             },
+            ForgeError::EmbargoWorkflowRequired {
+                operation: "set_visibility".into(),
+                work_package_kind: "proposal".into(),
+                work_package_id: "proposal_x".into(),
+            },
+            ForgeError::EmbargoStateInvalid {
+                action: "reveal".into(),
+                state: "active".into(),
+                required: "accepted_under_embargo or released_under_embargo".into(),
+            },
             ForgeError::OrgNotEnabled,
             ForgeError::OrgAlreadyEnabled {
                 org_id: "org_x".into(),
@@ -1736,6 +1843,8 @@ mod tests {
                 | ForgeError::UnsupportedStructuredGate { .. }
                 | ForgeError::VisibilityPolicyInvalid { .. }
                 | ForgeError::VisibilityPolicyUnmet { .. }
+                | ForgeError::EmbargoWorkflowRequired { .. }
+                | ForgeError::EmbargoStateInvalid { .. }
                 | ForgeError::OrgNotEnabled
                 | ForgeError::OrgAlreadyEnabled { .. }
                 | ForgeError::OrgAuthorityRequired { .. }

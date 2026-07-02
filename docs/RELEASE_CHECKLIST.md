@@ -72,6 +72,13 @@ scenario that uses the release's headline feature. A generic
 `start/save/run/propose/check/accept` lifecycle pass is useful but does not, by
 itself, validate an unrelated new feature.
 
+For embargo, reveal, release projection, visibility, org-governance, or private
+content changes, the dogfood pass must exercise the changed security boundary
+directly. For example, an embargo feature release must cover `embargo mark`,
+authorized `embargo grant`, `embargo release`, blocked public export before
+publish, `embargo reveal`, `embargo publish`, and successful public export
+after publish.
+
 Required setup:
 
 ```bash

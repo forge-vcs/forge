@@ -67,6 +67,8 @@ const ORG_IDENTITY_GOVERNANCE_019: &str =
 /// The 020 encrypted private content migration.
 const ENCRYPTED_PRIVATE_CONTENT_020: &str =
     include_str!("../migrations/020_encrypted_private_content.sql");
+/// The 021 embargo workflow migration.
+const EMBARGO_WORKFLOW_021: &str = include_str!("../migrations/021_embargo_workflow.sql");
 
 /// Initialize a real git repo in a fresh temp dir (so `git rev-parse
 /// --show-toplevel`, which `migrate` uses to resolve the root, succeeds).
@@ -192,6 +194,12 @@ fn apply_through_020(conn: &Connection) {
     apply_through_019(conn);
     conn.execute_batch(ENCRYPTED_PRIVATE_CONTENT_020)
         .expect("apply 020 encrypted private content");
+}
+
+fn apply_through_021(conn: &Connection) {
+    apply_through_020(conn);
+    conn.execute_batch(EMBARGO_WORKFLOW_021)
+        .expect("apply 021 embargo workflow");
 }
 
 fn max_version(conn: &Connection) -> i64 {
@@ -763,7 +771,68 @@ fn behind_db_upgrades_to_head() {
         has_column(&conn, "encrypted_private_payloads", "ciphertext_digest"),
         "020 created encrypted_private_payloads"
     );
-    assert_eq!(max_version(&conn), 20, "reached HEAD=20");
+    assert!(
+        has_column(&conn, "embargo_workflows", "state"),
+        "021 created embargo_workflows"
+    );
+    assert!(
+        has_column(&conn, "embargo_workflow_events", "policy_revision"),
+        "021 created embargo_workflow_events"
+    );
+    assert!(
+        has_column(
+            &conn,
+            "embargo_release_authorizations",
+            "content_classes_json"
+        ),
+        "021 created embargo_release_authorizations"
+    );
+    assert_eq!(max_version(&conn), 21, "reached HEAD=21");
+}
+
+#[test]
+fn migration_021_backfills_existing_embargoed_visibility_rows() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .expect("enable fks");
+    apply_through_020(&conn);
+    conn.execute(
+        "INSERT INTO repositories (id, root_path, git_head, content_backend, created_at_ms)
+         VALUES ('repo_test', '/tmp/forge-test', NULL, 'native', 0)",
+        [],
+    )
+    .expect("insert repository");
+    conn.execute(
+        "INSERT INTO work_package_visibility (
+            repo_id, work_package_kind, work_package_id, visibility, created_at_ms, updated_at_ms
+         ) VALUES ('repo_test', 'proposal', 'proposal_legacy', 'embargoed', 100, 200)",
+        [],
+    )
+    .expect("insert legacy embargo visibility");
+
+    conn.execute_batch(EMBARGO_WORKFLOW_021)
+        .expect("apply 021 embargo workflow");
+
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM embargo_workflows
+             WHERE repo_id = 'repo_test' AND work_package_kind = 'proposal' AND work_package_id = 'proposal_legacy'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("backfilled workflow");
+    assert_eq!(state, "active");
+    let event_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM embargo_workflow_events
+             WHERE repo_id = 'repo_test' AND work_package_kind = 'proposal'
+               AND work_package_id = 'proposal_legacy' AND action = 'mark'
+               AND actor = 'migration' AND new_state = 'active'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("backfilled workflow event");
+    assert_eq!(event_count, 1);
 }
 
 #[test]
@@ -772,7 +841,7 @@ fn at_head_db_is_a_noop() {
     let db = make_forge_db(repo.path());
     {
         let conn = open(&db);
-        apply_through_020(&conn);
+        apply_through_021(&conn);
         stamp_versions(
             &conn,
             &[
@@ -796,15 +865,16 @@ fn at_head_db_is_a_noop() {
                 (18, "018_visibility_policy"),
                 (19, "019_org_identity_governance"),
                 (20, "020_encrypted_private_content"),
+                (21, "021_embargo_workflow"),
             ],
         );
-        assert_eq!(max_version(&conn), 20);
+        assert_eq!(max_version(&conn), 21);
     }
 
     forge_store::migrate(repo.path()).expect("at-head migrate is Ok");
 
     let conn = open(&db);
-    assert_eq!(max_version(&conn), 20, "still at HEAD, unchanged");
+    assert_eq!(max_version(&conn), 21, "still at HEAD, unchanged");
 }
 
 #[test]
@@ -813,8 +883,8 @@ fn head_plus_one_is_refused() {
     let db = make_forge_db(repo.path());
     {
         let conn = open(&db);
-        apply_through_020(&conn);
-        // HEAD is now 20, so the genuinely-ahead stamp is 21.
+        apply_through_021(&conn);
+        // HEAD is now 21, so the genuinely-ahead stamp is 22.
         stamp_versions(
             &conn,
             &[
@@ -838,10 +908,11 @@ fn head_plus_one_is_refused() {
                 (18, "018_visibility_policy"),
                 (19, "019_org_identity_governance"),
                 (20, "020_encrypted_private_content"),
-                (21, "future"),
+                (21, "021_embargo_workflow"),
+                (22, "future"),
             ],
         );
-        assert_eq!(max_version(&conn), 21);
+        assert_eq!(max_version(&conn), 22);
     }
 
     let error = forge_store::migrate(repo.path()).expect_err("HEAD+1 must be refused");
@@ -850,8 +921,8 @@ fn head_plus_one_is_refused() {
             db_version,
             supported_head,
         }) => {
-            assert_eq!(*db_version, 21);
-            assert_eq!(*supported_head, 20);
+            assert_eq!(*db_version, 22);
+            assert_eq!(*supported_head, 21);
         }
         other => panic!("expected UnknownSchemaVersion, got {other:?}"),
     }
