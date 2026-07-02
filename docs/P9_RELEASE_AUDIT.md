@@ -1,8 +1,8 @@
 # Phase 9 Release Audit
 
-Date: 2026-06-25
-Audited candidate: `main` at `2711761` after PR #103 merged. The final
-immutable audited commit is the `v0.1.0-rc7` tag after release-prep docs are
+Date: 2026-07-03
+Audited candidate: `main` at `d7c3e01` after PR #105 merged. The final
+immutable audited commit is the `v0.1.0-rc8` tag after release-prep docs are
 committed and tagged.
 
 This document maps the Phase 9 roadmap exit criteria to current executable
@@ -24,11 +24,11 @@ the public release check usable from a plain shell:
 bash scripts/dogfood-release-gate.sh
 ```
 
-Latest local run while preparing `v0.1.0-rc7` passed:
+Latest local run while preparing `v0.1.0-rc8` passed:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: 589 passed
+- `cargo test --workspace`: 596 passed
 - `scripts/e2e-eval.sh`: PASS=95 FAIL=0
 - `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
 - `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
@@ -44,7 +44,8 @@ redaction before the rc3 audit refresh, PR #97 fixed the second dogfood
 feedback pass before the rc4 audit refresh, and PR #99 added permissioned sync
 projections before the rc5 audit refresh. PR #101 adds the first organization
 identity and key-governance bootstrap slice before the rc6 audit refresh. PR
-#103 adds encrypted private content overlays before this rc7 audit refresh.
+#103 adds encrypted private content overlays before the rc7 audit refresh. PR
+#105 adds embargoed security-fix workflows before this rc8 audit refresh.
 
 ## External Dogfood Validation
 
@@ -210,6 +211,53 @@ and private-label preservation on re-save. It does not yet prove hosted key
 distribution, multi-admin key rotation UX, same-user zero-trust after local
 materialization, or sanitized public reveal/evidence workflows.
 
+## Feature-Specific Embargoed Security-Fix Dogfood
+
+Follow-up dogfood explicitly exercised the rc8 embargoed security-fix workflow
+in a detached `forge-dogfood` worktree at `6b24be5`, using an installed
+candidate binary from `main` at `d7c3e01`.
+
+Baseline app checks:
+
+- `npm run typecheck`: passed.
+- `npm test`: passed.
+- `npm run build`: passed.
+- `npm run lint`: passed.
+
+Sanitized-source embargo checks:
+
+- `forge init --content-backend native`: initialized the dogfood repository.
+- `forge visibility set --visibility embargoed`: preserved the compatibility
+  alias by marking a selected proposal as embargoed.
+- `forge embargo mark`: marked accepted work as embargoed.
+- A generic `forge visibility grant` against the embargoed proposal failed with
+  `EMBARGO_WORKFLOW_REQUIRED`.
+- `forge embargo release` before accept failed with `EMBARGO_STATE_INVALID`.
+- A release with only `sync_materialize` failed with `VISIBILITY_POLICY_UNMET`.
+- A release after both `sync_materialize` and `publish_reveal` emitted a
+  metadata-only `embargo-release.v1` manifest.
+- Releasing to an occupied path failed without advancing release state.
+- `forge sync inspect` accepted the release manifest, while generic `forge sync
+  import` and `forge sync clone` refused it fail-closed.
+- Tampering with the release digest failed inspection.
+- `forge embargo reveal --mode sanitized-source` and `forge embargo publish`
+  succeeded, but Git branch export stayed blocked because sanitized publication
+  does not satisfy the full-source export policy.
+
+Full-source and closure checks:
+
+- A full-source embargo flow proved release, full-source reveal, full-source
+  publish, and successful `forge export branch` after publication.
+- A closed embargo flow proved reveal remains blocked after close with
+  `EMBARGO_STATE_INVALID`.
+
+Conclusion: rc8 proves a local embargoed security-fix workflow with explicit
+release capability grants, no-clobber metadata release output, digest-checked
+inspection, fail-closed generic sync import/clone, source-mode publication
+guards, and Git export only after full-source publication. It does not yet
+prove hosted advisory coordination, CVE workflows, cross-organization receiver
+identity, or resumable embargo transport.
+
 ## Exit Criteria
 
 | Roadmap criterion | Evidence | Status |
@@ -239,6 +287,9 @@ The local/native release claim is supportable:
 - Forge can store exact private source/config paths as encrypted overlays,
   omit them from unauthorized projections and Git export, and materialize them
   for an authorized local org-bound recipient.
+- Forge can run a local embargoed security-fix workflow, produce metadata-only
+  release manifests, keep generic sync import/clone fail-closed, and gate Git
+  branch export on full-source reveal/publish audit records.
 - Forge can still export accepted work to Git branches for existing PR workflows.
 
 The supported public wording should avoid claiming a hosted multi-tenant service,

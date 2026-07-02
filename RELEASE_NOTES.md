@@ -1,5 +1,85 @@
 # Forge Public Release Notes
 
+## v0.1.0-rc8
+
+Forge v0.1.0-rc8 is a public release candidate focused on embargoed
+security-fix workflows. It lets agents mark accepted work as embargoed, require
+explicit release capabilities before publication, emit metadata-only release
+manifests for authorized reviewers, and keep branch export blocked until an
+audited reveal/publish step allows the source mode that was chosen.
+
+### What Changed Since rc7
+
+- Added schema migration 21 for embargo workflow state, events, authorized
+  release capabilities, release manifests, and publish records.
+- Added `forge embargo mark`, `grant`, `release`, `reveal`, `publish`, and
+  `close` commands for a local embargo lifecycle around accepted proposals.
+- Added a compatibility path so `forge visibility set --visibility embargoed`
+  marks the selected proposal as embargoed while the general visibility grant
+  path refuses to bypass the embargo workflow.
+- Added release guards that require both `sync_materialize` and `publish_reveal`
+  before a metadata-only embargo release manifest can be emitted.
+- Added fail-closed receiver behavior for generic sync import/clone of embargo
+  release manifests, plus digest verification for release-manifest inspection.
+- Added source-mode publication controls: sanitized-source publication remains
+  blocked from Git branch export, while full-source publication allows export
+  after the reveal/publish audit trail is recorded.
+- Moved GitHub Actions setup to Node 24 for the supported CI runtime.
+
+### Installation
+
+```bash
+cargo install --git https://github.com/forge-vcs/forge --tag v0.1.0-rc8 forge-cli
+```
+
+### Release Validation
+
+The rc8 preparation ran the aggregate release dogfood gate on `main` at
+`d7c3e01` after PR #105 merged:
+
+```bash
+rtk bash scripts/dogfood-release-gate.sh
+```
+
+Gate results:
+
+- `cargo fmt --all -- --check`: passed
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed
+- `cargo test --workspace`: 596 passed
+- `scripts/e2e-eval.sh`: PASS=95 FAIL=0
+- `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
+- `scripts/dogfood-native-sync-peer.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-peer-nogit.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0
+- `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
+
+Feature-specific dogfood ran with an installed candidate binary from current
+`main` against the real `forge-dogfood` checkout at `6b24be5`:
+
+- `npm run typecheck`: passed.
+- `npm test`: passed.
+- `npm run build`: passed.
+- `npm run lint`: passed.
+- A sanitized-source embargo flow proved `mark`, compatibility visibility
+  marking, release-capability grants, accepted proposal gating, no-clobber
+  release output, metadata-only release inspection, generic sync import/clone
+  fail-closed behavior, tamper-digest rejection, sanitized reveal/publish, and
+  blocked Git branch export after sanitized publication.
+- A full-source embargo flow proved release, full-source reveal/publish, and
+  successful Git branch export after publication.
+- A closed embargo flow proved reveal remains blocked after close.
+
+### Current Boundary
+
+This RC proves the first local embargoed security-fix path: accepted work can be
+kept out of Git export until explicit release capabilities, reveal mode, and
+publish audit records exist. Release manifests are metadata-only and generic
+sync import/clone intentionally refuse them fail-closed pending a fuller
+authorized receiver flow. Forge still does not provide hosted advisory
+coordination, CVE issuance, multi-tenant identity, revocation infrastructure, or
+resumable transport.
+
 ## v0.1.0-rc7
 
 Forge v0.1.0-rc7 is a public release candidate focused on encrypted private
