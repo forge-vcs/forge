@@ -438,6 +438,99 @@ pub struct ProjectionDecision {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ProposalReview {
+    pub proposal: ProposalMetadata,
+    pub attempt: AttemptRecord,
+    pub intent: IntentDetail,
+    pub readiness: ReviewReadiness,
+    pub lifecycle: ReviewLifecycle,
+    pub visibility: ReviewVisibility,
+    pub evidence_audit: ReviewEvidenceAudit,
+    pub diff: ReviewDiff,
+    pub terminal_handoffs: Vec<ReviewTerminalHandoff>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewReadiness {
+    pub status: String,
+    pub summary: String,
+    pub deciding_factors: Vec<ReviewFactor>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewFactor {
+    pub severity: String,
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewLifecycle {
+    pub check_status: Option<String>,
+    pub decision_status: Option<String>,
+    pub publication_status: Option<String>,
+    pub publication: Option<PublicationRecord>,
+    pub sibling_attempts: Vec<ReviewAttemptContext>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewAttemptContext {
+    pub attempt_id: String,
+    pub status: String,
+    pub is_owner: bool,
+    pub proposal_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewVisibility {
+    pub projection: String,
+    pub visibility: String,
+    pub disclosure: String,
+    pub private_path_label_count: i64,
+    pub private_path_detail: String,
+    pub embargo: Option<ReviewEmbargo>,
+    pub projection_checks: Vec<ProjectionDecision>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewEmbargo {
+    pub state: String,
+    pub public_projection_mode: Option<String>,
+    pub release_allowed: bool,
+    pub reveal_allowed: bool,
+    pub publish_allowed: bool,
+    pub export_allowed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewEvidenceAudit {
+    pub latest_evidence: Option<EvidenceSummary>,
+    pub latest_check: Option<CheckSummary>,
+    pub trust_policy: TrustPolicy,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewDiff {
+    pub content_ref: String,
+    pub changed_paths: Vec<ReviewChangedPath>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewChangedPath {
+    pub path: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewTerminalHandoff {
+    pub label: String,
+    pub command: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct OrgEncryptionKeyBindingRecord {
     pub binding_id: String,
     pub principal_id: String,
@@ -11155,6 +11248,14 @@ pub fn intents_list(cwd: &Path) -> Result<Vec<IntentSummary>> {
 pub fn intent_detail(cwd: &Path, intent_id: &str) -> Result<IntentDetail> {
     let context = open_repository(cwd)?;
     let connection = open_connection(&context.database_path)?;
+    intent_detail_on(&connection, &context, intent_id)
+}
+
+fn intent_detail_on(
+    connection: &Connection,
+    context: &RepositoryContext,
+    intent_id: &str,
+) -> Result<IntentDetail> {
     let title: Option<String> = connection
         .query_row(
             "SELECT text FROM intents WHERE repo_id = ?1 AND id = ?2",
@@ -11168,12 +11269,12 @@ pub fn intent_detail(cwd: &Path, intent_id: &str) -> Result<IntentDetail> {
         }
         .into());
     };
-    let gates = intent_gates(&connection, intent_id)?;
-    let attempt_ids = attempts_for_intent(&connection, &context.repo_id, intent_id)?
+    let gates = intent_gates(connection, intent_id)?;
+    let attempt_ids = attempts_for_intent(connection, &context.repo_id, intent_id)?
         .into_iter()
         .map(|attempt| attempt.attempt_id)
         .collect();
-    let status = intent_derived_status(&connection, &context.repo_id, intent_id)?;
+    let status = intent_derived_status(connection, &context.repo_id, intent_id)?;
     Ok(IntentDetail {
         intent_id: intent_id.to_string(),
         title,
@@ -11946,6 +12047,377 @@ pub fn list_proposals(cwd: &Path, attempt_id: Option<&str>) -> Result<Vec<Propos
     proposal_metadata_for_attempt(&context, &attempt.attempt_id)
 }
 
+pub fn proposal_review(
+    cwd: &Path,
+    proposal_id: &str,
+    recipient: Option<&str>,
+) -> Result<ProposalReview> {
+    let context = open_repository(cwd)?;
+    let connection = open_connection(&context.database_path)?;
+    let proposal = proposal_by_id_on(&connection, &context, proposal_id)?.ok_or_else(|| {
+        ForgeError::UnknownProposal {
+            selector: proposal_id.to_string(),
+        }
+    })?;
+    let attempt = attempt_by_id(&context, &proposal.attempt_id)?.ok_or_else(|| {
+        ForgeError::UnknownProposal {
+            selector: proposal_id.to_string(),
+        }
+    })?;
+    let intent = intent_detail_on(&connection, &context, &attempt.intent_id)?;
+    let check = latest_check_for_proposal_revision(&context, &proposal.proposal_revision_id)?;
+    let decision = latest_decision_for_proposal_revision(&context, &proposal.proposal_revision_id)?;
+    let publication =
+        latest_publication_for_proposal_revision(&context, &proposal.proposal_revision_id)?;
+    let latest_evidence = latest_evidence_for_attempt(&context, &attempt.attempt_id)?;
+    let trust_policy = trust_policy_on(&connection)?;
+    let private_labels = local_private_path_labels(cwd, "proposal", &proposal.proposal_id)?;
+    let private_path_count = private_labels.len() as i64;
+    let visibility = review_visibility(
+        &connection,
+        &context,
+        &proposal.proposal_id,
+        recipient,
+        private_path_count,
+    )?;
+    let changed_paths = sanitize_review_changed_paths(&proposal.changed_paths, &private_labels);
+    let metadata = ProposalMetadata {
+        proposal_id: proposal.proposal_id.clone(),
+        proposal_revision_id: proposal.proposal_revision_id.clone(),
+        attempt_id: proposal.attempt_id.clone(),
+        snapshot_id: proposal.snapshot_id.clone(),
+        base_head: proposal.base_head.clone(),
+        content_ref: proposal.content_ref.clone(),
+        changed_paths: changed_paths.iter().map(|path| path.path.clone()).collect(),
+        check_status: check.as_ref().map(|check| check.status.clone()),
+        decision_status: decision.clone(),
+        publication_status: publication.as_ref().map(|_| "published".to_string()),
+    };
+    let sibling_attempts = attempts_for_intent(&connection, &context.repo_id, &attempt.intent_id)?
+        .into_iter()
+        .map(|candidate| {
+            let proposal_count = proposals_for_attempt(&context, &candidate.attempt_id)
+                .map(|proposals| proposals.len())
+                .unwrap_or(0);
+            ReviewAttemptContext {
+                is_owner: candidate.attempt_id == attempt.attempt_id,
+                attempt_id: candidate.attempt_id,
+                status: candidate.status,
+                proposal_count,
+            }
+        })
+        .collect();
+    let lifecycle = ReviewLifecycle {
+        check_status: metadata.check_status.clone(),
+        decision_status: decision.clone(),
+        publication_status: metadata.publication_status.clone(),
+        publication,
+        sibling_attempts,
+    };
+    let evidence_audit = ReviewEvidenceAudit {
+        latest_evidence: latest_evidence.clone(),
+        latest_check: check.clone(),
+        trust_policy: trust_policy.clone(),
+    };
+    let (readiness, terminal_handoffs) = review_readiness(
+        &proposal.proposal_id,
+        check.as_ref(),
+        latest_evidence.as_ref(),
+        decision.as_deref(),
+        metadata.publication_status.as_deref(),
+        &trust_policy,
+        &visibility,
+    );
+    let diff = ReviewDiff {
+        content_ref: proposal.content_ref,
+        changed_paths,
+    };
+    Ok(ProposalReview {
+        proposal: metadata,
+        attempt,
+        intent,
+        readiness,
+        lifecycle,
+        visibility,
+        evidence_audit,
+        diff,
+        terminal_handoffs,
+    })
+}
+
+fn sanitize_review_changed_paths(
+    changed_paths: &[String],
+    private_labels: &[LocalPrivatePathLabel],
+) -> Vec<ReviewChangedPath> {
+    changed_paths
+        .iter()
+        .map(|path| {
+            if private_labels.iter().any(|label| label.path == *path) {
+                ReviewChangedPath {
+                    path: "[restricted private path]".to_string(),
+                    status: "restricted".to_string(),
+                }
+            } else {
+                ReviewChangedPath {
+                    path: path.clone(),
+                    status: "changed".to_string(),
+                }
+            }
+        })
+        .collect()
+}
+
+fn review_visibility(
+    connection: &Connection,
+    context: &RepositoryContext,
+    proposal_id: &str,
+    recipient: Option<&str>,
+    private_path_label_count: i64,
+) -> Result<ReviewVisibility> {
+    let visibility = effective_work_package_visibility_on(
+        connection,
+        &context.repo_id,
+        "proposal",
+        proposal_id,
+    )?;
+    let embargo = embargo_workflow_on(connection, &context.repo_id, "proposal", proposal_id)?.map(
+        |workflow| ReviewEmbargo {
+            release_allowed: workflow.state == EMBARGO_STATE_ACCEPTED_UNDER_EMBARGO
+                || workflow.state == EMBARGO_STATE_RELEASED_UNDER_EMBARGO,
+            reveal_allowed: workflow.state == EMBARGO_STATE_RELEASED_UNDER_EMBARGO,
+            publish_allowed: workflow.state == EMBARGO_STATE_REVEALED,
+            export_allowed: workflow.state == EMBARGO_STATE_PUBLISHED
+                && workflow.public_projection_mode.as_deref()
+                    == Some(PUBLIC_PROJECTION_FULL_SOURCE),
+            state: workflow.state,
+            public_projection_mode: workflow.public_projection_mode,
+        },
+    );
+    let mut projection_checks = Vec::new();
+    let (projection, disclosure) = if let Some(recipient) = recipient {
+        for capability in [
+            CAPABILITY_SEE_STUB,
+            CAPABILITY_INSPECT_CONTENT,
+            CAPABILITY_INSPECT_EVIDENCE,
+            CAPABILITY_SYNC_MATERIALIZE,
+            CAPABILITY_PUBLISH_REVEAL,
+        ] {
+            projection_checks.push(projection_decision_on(
+                connection,
+                &context.repo_id,
+                "proposal",
+                proposal_id,
+                recipient,
+                capability,
+            )?);
+        }
+        let disclosure = projection_checks
+            .iter()
+            .find(|decision| decision.capability == CAPABILITY_INSPECT_CONTENT)
+            .map(|decision| decision.disclosure.clone())
+            .unwrap_or_else(|| "hidden".to_string());
+        (format!("recipient:{recipient}"), disclosure)
+    } else {
+        ("sanitized".to_string(), "redacted".to_string())
+    };
+    let private_path_detail = if private_path_label_count > 0 {
+        "restricted_count_only".to_string()
+    } else {
+        "none".to_string()
+    };
+    Ok(ReviewVisibility {
+        projection,
+        visibility,
+        disclosure,
+        private_path_label_count,
+        private_path_detail,
+        embargo,
+        projection_checks,
+    })
+}
+
+fn review_readiness(
+    proposal_id: &str,
+    check: Option<&CheckSummary>,
+    evidence: Option<&EvidenceSummary>,
+    decision: Option<&str>,
+    publication_status: Option<&str>,
+    trust_policy: &TrustPolicy,
+    visibility: &ReviewVisibility,
+) -> (ReviewReadiness, Vec<ReviewTerminalHandoff>) {
+    let mut factors = Vec::new();
+    let mut handoffs = Vec::new();
+    match check {
+        Some(check) if check.status == "passed" => factors.push(review_factor(
+            "info",
+            "check_passed",
+            "latest check passed",
+            Some("check"),
+        )),
+        Some(check) => factors.push(review_factor(
+            "blocker",
+            "check_not_passed",
+            format!("latest check is {}: {}", check.status, check.reason),
+            Some("check"),
+        )),
+        None => factors.push(review_factor(
+            "blocker",
+            "missing_check",
+            "no check result exists for this proposal revision",
+            Some("evidence_audit"),
+        )),
+    }
+    if let Some(evidence) = evidence {
+        let evidence_rank = trust_rank(&evidence.trust).unwrap_or(0);
+        let required_rank = trust_rank(&trust_policy.min_accept_trust).unwrap_or(u8::MAX);
+        if evidence_rank < required_rank {
+            factors.push(review_factor(
+                "blocker",
+                "trust_policy_unmet",
+                format!(
+                    "latest evidence trust `{}` is below accept policy `{}`",
+                    evidence.trust, trust_policy.min_accept_trust
+                ),
+                Some("evidence_audit"),
+            ));
+        } else {
+            factors.push(review_factor(
+                "info",
+                "trust_policy_met",
+                format!(
+                    "latest evidence trust `{}` satisfies accept policy `{}`",
+                    evidence.trust, trust_policy.min_accept_trust
+                ),
+                Some("evidence_audit"),
+            ));
+        }
+    } else {
+        factors.push(review_factor(
+            "blocker",
+            "missing_evidence",
+            "no command evidence exists for the owning attempt",
+            Some("evidence_audit"),
+        ));
+    }
+    if visibility.private_path_label_count > 0 {
+        factors.push(review_factor(
+            "risk",
+            "restricted_content",
+            format!(
+                "{} private path label(s) are represented by restricted metadata only",
+                visibility.private_path_label_count
+            ),
+            Some("visibility"),
+        ));
+    }
+    if let Some(embargo) = &visibility.embargo {
+        if !embargo.export_allowed {
+            factors.push(review_factor(
+                "risk",
+                "embargo_not_public_exportable",
+                format!("embargo workflow is `{}`", embargo.state),
+                Some("visibility"),
+            ));
+        }
+    }
+    match decision {
+        Some("rejected") => factors.push(review_factor(
+            "blocker",
+            "proposal_rejected",
+            "proposal has been rejected",
+            Some("lifecycle"),
+        )),
+        Some("accepted") => {
+            if publication_status == Some("published") {
+                factors.push(review_factor(
+                    "info",
+                    "published",
+                    "accepted proposal has been exported or published",
+                    Some("lifecycle"),
+                ));
+            } else {
+                factors.push(review_factor(
+                    "risk",
+                    "accepted_not_published",
+                    "proposal is accepted but not yet published/exported",
+                    Some("lifecycle"),
+                ));
+                handoffs.push(review_handoff(
+                    "Export branch",
+                    format!("forge export branch --proposal {proposal_id} <branch-name>"),
+                    "accepted proposals still need an explicit terminal export",
+                ));
+            }
+        }
+        _ => {
+            handoffs.push(review_handoff(
+                "Accept proposal",
+                format!("forge accept --proposal {proposal_id}"),
+                "accept remains a terminal-enforced trust-bearing action",
+            ));
+            handoffs.push(review_handoff(
+                "Reject proposal",
+                format!("forge reject --proposal {proposal_id}"),
+                "reject remains a terminal-enforced decision",
+            ));
+        }
+    }
+    if check.is_none() || check.is_some_and(|check| check.status != "passed") {
+        handoffs.insert(
+            0,
+            review_handoff(
+                "Run check",
+                format!("forge check --proposal {proposal_id}"),
+                "a passing check is required before normal acceptance",
+            ),
+        );
+    }
+    let has_blocker = factors.iter().any(|factor| factor.severity == "blocker");
+    let has_risk = factors.iter().any(|factor| factor.severity == "risk");
+    let status = if has_blocker {
+        "blocked"
+    } else if has_risk {
+        "risky"
+    } else {
+        "ready"
+    };
+    let summary = match status {
+        "ready" => "proposal is ready for the next terminal action",
+        "risky" => "proposal can be reviewed, but visibility, embargo, or lifecycle risks remain",
+        _ => "proposal is blocked until the listed factors are resolved",
+    };
+    (
+        ReviewReadiness {
+            status: status.to_string(),
+            summary: summary.to_string(),
+            deciding_factors: factors,
+        },
+        handoffs,
+    )
+}
+
+fn review_factor(
+    severity: &str,
+    code: &str,
+    message: impl Into<String>,
+    source: Option<&str>,
+) -> ReviewFactor {
+    ReviewFactor {
+        severity: severity.to_string(),
+        code: code.to_string(),
+        message: message.into(),
+        source: source.map(str::to_string),
+    }
+}
+
+fn review_handoff(label: &str, command: impl Into<String>, reason: &str) -> ReviewTerminalHandoff {
+    ReviewTerminalHandoff {
+        label: label.to_string(),
+        command: command.into(),
+        reason: reason.to_string(),
+    }
+}
+
 fn proposal_metadata_for_attempt(
     context: &RepositoryContext,
     attempt_id: &str,
@@ -12529,6 +13001,31 @@ mod tests {
             rank: None,
             rank_reason: String::new(),
         }
+    }
+
+    #[test]
+    fn review_changed_paths_redact_local_private_labels() {
+        let paths = vec![
+            "src/public.rs".to_string(),
+            "src/private.rs".to_string(),
+            "docs/notes.md".to_string(),
+        ];
+        let labels = vec![LocalPrivatePathLabel {
+            work_package_kind: "proposal".to_string(),
+            work_package_id: "proposal_1".to_string(),
+            path: "src/private.rs".to_string(),
+            path_label_id: "path_label_1".to_string(),
+            path_hash: "sha256:private".to_string(),
+            visibility: "private".to_string(),
+        }];
+
+        let sanitized = sanitize_review_changed_paths(&paths, &labels);
+
+        assert_eq!(sanitized[0].path, "src/public.rs");
+        assert_eq!(sanitized[0].status, "changed");
+        assert_eq!(sanitized[1].path, "[restricted private path]");
+        assert_eq!(sanitized[1].status, "restricted");
+        assert_eq!(sanitized[2].path, "docs/notes.md");
     }
 
     #[test]

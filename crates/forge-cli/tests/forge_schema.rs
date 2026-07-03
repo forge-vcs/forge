@@ -120,6 +120,22 @@ fn registry_contains_every_forge_error_code_plus_lock_timeout() {
 }
 
 #[test]
+fn schema_includes_review_surface_commands() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let doc = schema_in(temp.path());
+    let commands: HashSet<String> = doc["commands"]
+        .as_array()
+        .expect("commands array")
+        .iter()
+        .map(|entry| entry["command"].as_str().expect("command").to_string())
+        .collect();
+
+    assert!(commands.contains("review show"));
+    assert!(commands.contains("review export"));
+    assert!(commands.contains("review open"));
+}
+
+#[test]
 fn conflict_and_lock_timeout_are_retryable() {
     let temp = tempfile::tempdir().expect("temp dir");
     let doc = schema_in(temp.path());
