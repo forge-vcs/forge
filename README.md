@@ -160,6 +160,20 @@ forge attempt attach <attempt-id>
 forge compare --intent <intent-id>
 ```
 
+To review one proposal through a local read-only surface:
+
+```bash
+forge review show --proposal <proposal-id>
+forge review export --proposal <proposal-id> --output review.html
+forge review open --proposal <proposal-id>
+```
+
+The review aggregate and exported HTML start with proposal readiness
+(`ready`, `risky`, or `blocked`), lifecycle state, evidence audit, visibility
+and embargo status, projection-safe diff metadata, and copyable terminal
+handoff commands. The browser surface does not accept, reject, reveal, publish,
+export, or mutate Forge state; trust-bearing actions still run through the CLI.
+
 ## Native Sync
 
 Native sync moves Forge history and ledger provenance between Forge repositories:
@@ -212,7 +226,8 @@ silently satisfy local, hosted-runner, or third-party policy.
 - lifecycle: `init`, `start`, `save`, `run`, `propose`, `check`, `accept`,
   `reject`, `show`
 - attempts and review: `attempt start`, `attempt list`, `attempt show`,
-  `attempt attach`, `proposal list`, `compare`, `attempt compare`, `diff`
+  `attempt attach`, `proposal list`, `review show`, `review export`,
+  `review open`, `compare`, `attempt compare`, `diff`
 - intents: `intent list`, `intent show`
 - worktree/history: `restore`, `checkout`, `log`, `undo`
 - native merge: `merge`, `conflict list`, `conflict show`,

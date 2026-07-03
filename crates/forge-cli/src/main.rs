@@ -1,3 +1,4 @@
+mod review;
 mod schema;
 
 use anyhow::{Context, Result};
@@ -44,6 +45,8 @@ enum Command {
     Reject(ProposalScopedArgs),
     Show(AttemptScopedArgs),
     Proposal(ProposalArgs),
+    /// Build a read-only local review surface for one proposal.
+    Review(review::ReviewArgs),
     /// Compare competing attempts (per intent) on verified evidence + rank them.
     Compare(CompareArgs),
     /// Diff native or git content refs, or the working tree against a native snapshot.
@@ -851,6 +854,7 @@ fn main() -> ExitCode {
         Command::Reject(args) => reject_response(request_id, args),
         Command::Show(args) => show_response(request_id, args),
         Command::Proposal(args) => proposal_response(request_id, args),
+        Command::Review(args) => review::review_response(request_id, args),
         Command::Compare(args) => compare_response(request_id, "compare", args),
         Command::Diff(args) => diff_response(request_id, args),
         Command::Merge(args) => merge_response(request_id, args),

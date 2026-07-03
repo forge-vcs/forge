@@ -1,5 +1,28 @@
 # Forge Public Release Notes
 
+## Unreleased
+
+### Added
+
+- Added the read-only `forge review` command group for local proposal review:
+  `review show` emits the machine-readable review aggregate, `review export`
+  writes a self-contained static HTML review page, and `review open` exports the
+  same page before a best-effort browser launch.
+- The review surface summarizes readiness as `ready`, `risky`, or `blocked`
+  from existing Forge facts: proposal lifecycle, latest check/evidence, trust
+  policy, visibility/projection state, private-path restrictions, embargo state,
+  publication state, and terminal handoff commands.
+- Added projection-safe JSON and HTML egress for review. Sanitized review output
+  remains the default; private paths, payloads, and embargo-sensitive details
+  are represented as restricted metadata unless existing policy grants allow a
+  recipient-specific projection check.
+
+### Current Boundary
+
+The review surface is local-first and read-only. It does not add hosted
+accounts, comments, teams, notifications, cloud execution, or browser-triggered
+accept/reject/reveal/publish/export actions.
+
 ## v0.1.0-rc8
 
 Forge v0.1.0-rc8 is a public release candidate focused on embargoed
