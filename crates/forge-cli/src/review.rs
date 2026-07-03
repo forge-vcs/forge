@@ -274,7 +274,7 @@ main {{ width: min(1180px, 100%); margin: 0 auto; padding: 28px 24px 44px; }}
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(240px, 360px);
   gap: 24px;
-  align-items: stretch;
+  align-items: start;
   padding: 24px;
   border: 1px solid var(--line-strong);
   border-radius: 8px;
@@ -288,6 +288,30 @@ h2 {{ margin: 0; font-size: 21px; line-height: 1.2; }}
 h3 {{ margin: 18px 0 10px; font-size: 15px; }}
 p {{ margin: 0; }}
 .summary {{ margin-top: 14px; max-width: 760px; color: var(--muted); font-size: 17px; }}
+.snapshot-grid {{
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 22px;
+  max-width: 820px;
+}}
+.snapshot-card {{
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfb;
+}}
+.snapshot-card span {{
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}}
+.snapshot-card strong {{ display: block; overflow-wrap: anywhere; font-size: 15px; }}
 .status {{
   display: inline-flex;
   align-items: center;
@@ -317,6 +341,7 @@ p {{ margin: 0; }}
 .hero-aside strong {{ display: block; overflow-wrap: anywhere; }}
 .layout {{ display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 20px; margin-top: 20px; align-items: start; }}
 .stack, .side-stack {{ display: grid; gap: 16px; min-width: 0; }}
+.side-stack {{ position: sticky; top: 18px; }}
 section, aside.panel {{
   min-width: 0;
   border: 1px solid var(--line);
@@ -359,6 +384,7 @@ section, aside.panel {{
 .handoff {{
   padding: 14px;
   border: 1px solid var(--line);
+  border-left: 4px solid var(--ready);
   border-radius: 8px;
   background: #fbfcfb;
 }}
@@ -411,10 +437,12 @@ a:focus, button:focus, code:focus {{ outline: 2px solid #1a73e8; outline-offset:
   .hero, .layout {{ grid-template-columns: minmax(0, 1fr); }}
   .layout {{ gap: 16px; }}
   aside.panel {{ order: -1; }}
+  .side-stack {{ position: static; }}
 }}
 @media (max-width: 560px) {{
   h1 {{ font-size: 28px; }}
   .summary {{ font-size: 15px; }}
+  .snapshot-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
   .hero, section, aside.panel {{ padding: 16px; }}
   .section-head {{ display: block; }}
   .factor {{ grid-template-columns: minmax(0, 1fr); }}
@@ -431,6 +459,12 @@ a:focus, button:focus, code:focus {{ outline: 2px solid #1a73e8; outline-offset:
 <p class="eyebrow">Proposal Review</p>
 <h1>Forge Review</h1>
 <p class="summary"><span class="status {readiness_class}">{status}</span> {summary}</p>
+<div class="snapshot-grid" aria-label="Review snapshot">
+<div class="snapshot-card"><span>Check</span><strong>{check_status}</strong></div>
+<div class="snapshot-card"><span>Decision</span><strong>{decision_status}</strong></div>
+<div class="snapshot-card"><span>Trust</span><strong>{trust}</strong></div>
+<div class="snapshot-card"><span>Projection</span><strong>{projection}</strong></div>
+</div>
 </div>
 <div class="hero-aside" aria-label="Review identity">
 <div><span>Proposal</span><code>{proposal_id}</code></div>
