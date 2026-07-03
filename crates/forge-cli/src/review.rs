@@ -155,9 +155,9 @@ fn render_review_html(review: &ProposalReview) -> String {
         .iter()
         .map(|attempt| {
             format!(
-                "<li><strong>{}</strong> {} - {} proposal(s)</li>",
+                "<li class=\"list-row\"><code>{}</code><span>{}{} proposal(s)</span></li>",
                 escape_html(&attempt.attempt_id),
-                if attempt.is_owner { "(owner)" } else { "" },
+                if attempt.is_owner { "owner - " } else { "" },
                 attempt.proposal_count
             )
         })
@@ -168,7 +168,7 @@ fn render_review_html(review: &ProposalReview) -> String {
         .iter()
         .map(|path| {
             format!(
-                "<li><code>{}</code> <span>{}</span></li>",
+                "<li class=\"list-row\"><code>{}</code><span class=\"tag\">{}</span></li>",
                 escape_html(&path.path),
                 escape_html(&path.status)
             )
@@ -180,7 +180,7 @@ fn render_review_html(review: &ProposalReview) -> String {
         .iter()
         .map(|decision| {
             format!(
-                "<li><code>{}</code>: {} / {}</li>",
+                "<li class=\"list-row\"><code>{}</code><span>{} / {}</span></li>",
                 escape_html(&decision.capability),
                 if decision.allowed {
                     "allowed"
@@ -197,7 +197,7 @@ fn render_review_html(review: &ProposalReview) -> String {
         .as_ref()
         .map(|embargo| {
             format!(
-                "<p>Embargo: <strong>{}</strong>. release={} reveal={} publish={} export={}</p>",
+                "<div class=\"notice\"><span>Embargo</span><strong>{}</strong><small>release={} reveal={} publish={} export={}</small></div>",
                 escape_html(&embargo.state),
                 embargo.release_allowed,
                 embargo.reveal_allowed,
@@ -205,7 +205,9 @@ fn render_review_html(review: &ProposalReview) -> String {
                 embargo.export_allowed
             )
         })
-        .unwrap_or_else(|| "<p>Embargo: none</p>".to_string());
+        .unwrap_or_else(|| {
+            "<div class=\"notice\"><span>Embargo</span><strong>none</strong><small>No embargo workflow is active.</small></div>".to_string()
+        });
     let check = optional_value(review.evidence_audit.latest_check.as_ref().map(|check| {
         format!(
             "{} ({})",
@@ -236,47 +238,224 @@ fn render_review_html(review: &ProposalReview) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Forge Review {proposal_id}</title>
 <style>
-:root {{ color-scheme: light; --border: #c9c4b5; --bg: #f7f7f3; --ink: #202124; --muted: #5f6368; --ready: #176b4d; --risky: #8a5a00; --blocked: #a32929; }}
+:root {{
+  color-scheme: light;
+  --bg: #f5f6f3;
+  --surface: #ffffff;
+  --surface-soft: #f0f4f1;
+  --ink: #17191c;
+  --muted: #5d6670;
+  --subtle: #737b84;
+  --line: #d8ddd7;
+  --line-strong: #bcc7c0;
+  --ready: #116149;
+  --ready-soft: #e3f3ec;
+  --risky: #8a5a00;
+  --risky-soft: #fff2cc;
+  --blocked: #aa2e2e;
+  --blocked-soft: #fde7e7;
+  --info: #255f99;
+  --info-soft: #e6f0fa;
+  --shadow: 0 18px 46px rgba(23, 25, 28, 0.08);
+}}
 * {{ box-sizing: border-box; }}
-body {{ margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--ink); background: var(--bg); line-height: 1.45; }}
-main {{ max-width: 1120px; margin: 0 auto; padding: 24px; }}
-header, section {{ border-bottom: 1px solid var(--border); padding: 18px 0; }}
-h1, h2 {{ margin: 0 0 10px; letter-spacing: 0; }}
-h1 {{ font-size: 30px; }}
-h2 {{ font-size: 20px; }}
-.decision {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, 360px); gap: 20px; align-items: start; }}
-.status {{ display: inline-block; padding: 4px 8px; border-radius: 6px; color: white; font-weight: 700; }}
+html, body {{ min-width: 0; overflow-x: hidden; }}
+body {{
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background:
+    linear-gradient(180deg, #eef2ee 0, var(--bg) 360px),
+    var(--bg);
+  line-height: 1.45;
+}}
+main {{ width: min(1180px, 100%); margin: 0 auto; padding: 28px 24px 44px; }}
+.hero {{
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 360px);
+  gap: 24px;
+  align-items: stretch;
+  padding: 24px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}}
+.eyebrow {{ margin: 0 0 6px; color: var(--muted); font-size: 12px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }}
+h1, h2, h3, p {{ letter-spacing: 0; }}
+h1 {{ margin: 0; font-size: 34px; line-height: 1.1; }}
+h2 {{ margin: 0; font-size: 21px; line-height: 1.2; }}
+h3 {{ margin: 18px 0 10px; font-size: 15px; }}
+p {{ margin: 0; }}
+.summary {{ margin-top: 14px; max-width: 760px; color: var(--muted); font-size: 17px; }}
+.status {{
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  color: white;
+  font-size: 14px;
+  font-weight: 800;
+  text-transform: uppercase;
+}}
 .ready {{ background: var(--ready); }}
 .risky {{ background: var(--risky); }}
 .blocked {{ background: var(--blocked); }}
-dl {{ display: grid; grid-template-columns: minmax(130px, 220px) minmax(0, 1fr); gap: 8px 14px; }}
+.hero-aside {{
+  display: grid;
+  gap: 12px;
+  align-content: start;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  min-width: 0;
+}}
+.hero-aside span {{ color: var(--muted); font-size: 12px; font-weight: 800; text-transform: uppercase; }}
+.hero-aside code {{ display: block; }}
+.hero-aside strong {{ display: block; overflow-wrap: anywhere; }}
+.layout {{ display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 20px; margin-top: 20px; align-items: start; }}
+.stack, .side-stack {{ display: grid; gap: 16px; min-width: 0; }}
+section, aside.panel {{
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 20px;
+}}
+.section-head {{ display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 14px; }}
+.section-head p {{ margin-top: 5px; color: var(--muted); }}
+.factor-list, .handoff-list, .plain-list {{ display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }}
+.factor {{
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfb;
+}}
+.factor strong, .handoff strong {{ display: block; overflow-wrap: anywhere; }}
+.factor span:last-child, .handoff span, .list-row span {{ color: var(--muted); }}
+.factor small {{ display: block; margin: 2px 0 4px; color: var(--subtle); font-size: 12px; font-weight: 700; text-transform: uppercase; }}
+.pill, .tag {{
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+  overflow-wrap: anywhere;
+}}
+.pill.info {{ color: var(--info); background: var(--info-soft); }}
+.pill.risk {{ color: var(--risky); background: var(--risky-soft); }}
+.pill.blocker {{ color: var(--blocked); background: var(--blocked-soft); }}
+.tag {{ color: var(--info); background: var(--info-soft); text-transform: none; }}
+.handoff {{
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfb;
+}}
+.command {{
+  display: block;
+  width: 100%;
+  margin: 8px 0;
+  padding: 10px;
+  border: 1px solid #dfe4df;
+  border-radius: 6px;
+  background: #eef1ee;
+  color: #1f2933;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}}
+dl {{ display: grid; grid-template-columns: minmax(120px, 180px) minmax(0, 1fr); gap: 10px 14px; margin: 0; }}
 dt {{ color: var(--muted); }}
-dd {{ margin: 0; overflow-wrap: anywhere; }}
-ul {{ padding-left: 18px; }}
-li {{ margin: 6px 0; }}
-code {{ background: #ecebe4; padding: 2px 4px; border-radius: 4px; overflow-wrap: anywhere; }}
+dd {{ margin: 0; min-width: 0; overflow-wrap: anywhere; }}
+.list-row {{ display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; min-width: 0; overflow-wrap: anywhere; }}
+.notice {{
+  display: grid;
+  gap: 4px;
+  margin: 12px 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}}
+.notice span {{ color: var(--muted); font-size: 12px; font-weight: 800; text-transform: uppercase; }}
+.notice small {{ color: var(--muted); overflow-wrap: anywhere; }}
+code {{
+  max-width: 100%;
+  min-width: 0;
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: #eef1ee;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.92em;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}}
 a:focus, button:focus, code:focus {{ outline: 2px solid #1a73e8; outline-offset: 2px; }}
-@media (max-width: 760px) {{ main {{ padding: 16px; }} .decision, dl {{ display: block; }} dd {{ margin-bottom: 8px; }} }}
+@media (max-width: 900px) {{
+  main {{ padding: 18px 14px 32px; }}
+  .hero, .layout {{ grid-template-columns: minmax(0, 1fr); }}
+  .layout {{ gap: 16px; }}
+  aside.panel {{ order: -1; }}
+}}
+@media (max-width: 560px) {{
+  h1 {{ font-size: 28px; }}
+  .summary {{ font-size: 15px; }}
+  .hero, section, aside.panel {{ padding: 16px; }}
+  .section-head {{ display: block; }}
+  .factor {{ grid-template-columns: minmax(0, 1fr); }}
+  dl {{ display: block; }}
+  dt {{ margin-top: 10px; }}
+  dd {{ margin-top: 3px; }}
+}}
 </style>
 </head>
 <body>
 <main>
-<header>
+<header class="hero">
+<div>
+<p class="eyebrow">Proposal Review</p>
 <h1>Forge Review</h1>
-<p><span class="status {readiness_class}">{status}</span> {summary}</p>
+<p class="summary"><span class="status {readiness_class}">{status}</span> {summary}</p>
+</div>
+<div class="hero-aside" aria-label="Review identity">
+<div><span>Proposal</span><code>{proposal_id}</code></div>
+<div><span>Attempt</span><code>{attempt_id}</code></div>
+<div><span>Intent</span><strong>{intent}</strong></div>
+</div>
 </header>
+<div class="layout">
+<div class="stack">
 <section class="decision" aria-labelledby="decision-console">
+<div class="section-head">
 <div>
 <h2 id="decision-console">Decision Console</h2>
-<ul>{factors}</ul>
+<p>Readiness factors derived from check, evidence, trust, visibility, and lifecycle state.</p>
 </div>
-<aside aria-labelledby="terminal-handoff">
-<h2 id="terminal-handoff">Terminal Handoff</h2>
-<ul>{handoffs}</ul>
-</aside>
+</div>
+<ul class="factor-list">{factors}</ul>
 </section>
 <section aria-labelledby="story">
+<div class="section-head">
+<div>
 <h2 id="story">Work Package Story</h2>
+<p>Where this proposal sits in the Forge lifecycle.</p>
+</div>
+</div>
 <dl>
 <dt>Proposal</dt><dd><code>{proposal_id}</code></dd>
 <dt>Revision</dt><dd><code>{proposal_revision_id}</code></dd>
@@ -287,17 +466,15 @@ a:focus, button:focus, code:focus {{ outline: 2px solid #1a73e8; outline-offset:
 <dt>Publication</dt><dd>{publication_status}</dd>
 </dl>
 <h3>Attempt Context</h3>
-<ul>{attempts}</ul>
-</section>
-<section aria-labelledby="visibility">
-<h2 id="visibility">Visibility and Embargo</h2>
-<p>Projection: <strong>{projection}</strong>; visibility: <strong>{visibility}</strong>; disclosure: <strong>{disclosure}</strong>.</p>
-<p>Private path detail: {private_detail}; count: {private_count}</p>
-{embargo}
-<ul>{projection_checks}</ul>
+<ul class="plain-list">{attempts}</ul>
 </section>
 <section aria-labelledby="audit">
+<div class="section-head">
+<div>
 <h2 id="audit">Evidence Audit</h2>
+<p>The proof material that backs the review conclusion.</p>
+</div>
+</div>
 <dl>
 <dt>Latest check</dt><dd>{check}</dd>
 <dt>Latest evidence</dt><dd>{evidence}</dd>
@@ -305,10 +482,46 @@ a:focus, button:focus, code:focus {{ outline: 2px solid #1a73e8; outline-offset:
 </dl>
 </section>
 <section aria-labelledby="diff">
+<div class="section-head">
+<div>
 <h2 id="diff">Diff and Content Review</h2>
-<p>Content ref: <code>{content_ref}</code></p>
-<ul>{paths}</ul>
+<p>Projection-safe content summary for this proposal.</p>
+</div>
+</div>
+<dl>
+<dt>Content ref</dt><dd><code>{content_ref}</code></dd>
+</dl>
+<ul class="plain-list">{paths}</ul>
 </section>
+</div>
+<div class="side-stack">
+<aside class="panel" aria-labelledby="terminal-handoff">
+<div class="section-head">
+<div>
+<h2 id="terminal-handoff">Terminal Handoff</h2>
+<p>Trust-bearing actions stay in the terminal.</p>
+</div>
+</div>
+<ul class="handoff-list">{handoffs}</ul>
+</aside>
+<section aria-labelledby="visibility">
+<div class="section-head">
+<div>
+<h2 id="visibility">Visibility and Embargo</h2>
+<p>What this local projection is allowed to reveal.</p>
+</div>
+</div>
+<dl>
+<dt>Projection</dt><dd><strong>{projection}</strong></dd>
+<dt>Visibility</dt><dd><strong>{visibility}</strong></dd>
+<dt>Disclosure</dt><dd><strong>{disclosure}</strong></dd>
+<dt>Private paths</dt><dd>{private_detail}; count: {private_count}</dd>
+</dl>
+{embargo}
+<ul class="plain-list">{projection_checks}</ul>
+</section>
+</div>
+</div>
 </main>
 </body>
 </html>
@@ -322,7 +535,8 @@ a:focus, button:focus, code:focus {{ outline: 2px solid #1a73e8; outline-offset:
         summary = escape_html(&review.readiness.summary),
         factors = factors,
         handoffs = if handoffs.is_empty() {
-            "<li>No terminal action suggested by this review state.</li>".to_string()
+            "<li class=\"handoff\">No terminal action suggested by this review state.</li>"
+                .to_string()
         } else {
             handoffs
         },
@@ -344,7 +558,8 @@ a:focus, button:focus, code:focus {{ outline: 2px solid #1a73e8; outline-offset:
         private_count = review.visibility.private_path_label_count,
         embargo = embargo,
         projection_checks = if projection_checks.is_empty() {
-            "<li>Sanitized projection; no recipient-specific grants evaluated.</li>".to_string()
+            "<li class=\"list-row\">Sanitized projection; no recipient-specific grants evaluated.</li>"
+                .to_string()
         } else {
             projection_checks
         },
@@ -353,7 +568,7 @@ a:focus, button:focus, code:focus {{ outline: 2px solid #1a73e8; outline-offset:
         trust = escape_html(&review.evidence_audit.trust_policy.min_accept_trust),
         content_ref = escape_html(&review.diff.content_ref),
         paths = if paths.is_empty() {
-            "<li>No changed paths recorded.</li>".to_string()
+            "<li class=\"list-row\">No changed paths recorded.</li>".to_string()
         } else {
             paths
         },
@@ -364,19 +579,20 @@ fn render_factor(factor: &ReviewFactor) -> String {
     let source = factor
         .source
         .as_ref()
-        .map(|source| format!(" <span>({})</span>", escape_html(source)))
+        .map(|source| format!("<small>{}</small>", escape_html(source)))
         .unwrap_or_default();
     format!(
-        "<li><strong>{}</strong>: {}{}</li>",
+        "<li class=\"factor\"><span class=\"pill {severity}\">{severity}</span><span><strong>{}</strong>{}<span>{}</span></span></li>",
         escape_html(&factor.code),
+        source,
         escape_html(&factor.message),
-        source
+        severity = escape_html(&factor.severity)
     )
 }
 
 fn render_handoff(handoff: &ReviewTerminalHandoff) -> String {
     format!(
-        "<li><strong>{}</strong><br><code>{}</code><br><span>{}</span></li>",
+        "<li class=\"handoff\"><strong>{}</strong><code class=\"command\">{}</code><span>{}</span></li>",
         escape_html(&handoff.label),
         escape_html(&handoff.command),
         escape_html(&handoff.reason)
