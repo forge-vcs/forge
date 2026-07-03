@@ -1,8 +1,8 @@
 # Phase 9 Release Audit
 
 Date: 2026-07-03
-Audited candidate: `main` at `d7c3e01` after PR #105 merged. The final
-immutable audited commit is the `v0.1.0-rc8` tag after release-prep docs are
+Audited candidate: `main` at `be0f458` after PR #106 merged. The final
+immutable audited commit is the `v0.1.0-rc9` tag after release-prep docs are
 committed and tagged.
 
 This document maps the Phase 9 roadmap exit criteria to current executable
@@ -24,11 +24,11 @@ the public release check usable from a plain shell:
 bash scripts/dogfood-release-gate.sh
 ```
 
-Latest local run while preparing `v0.1.0-rc8` passed:
+Latest local run while preparing `v0.1.0-rc9` passed:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: 596 passed
+- `cargo test --workspace`: 603 passed
 - `scripts/e2e-eval.sh`: PASS=95 FAIL=0
 - `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
 - `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
@@ -45,7 +45,9 @@ feedback pass before the rc4 audit refresh, and PR #99 added permissioned sync
 projections before the rc5 audit refresh. PR #101 adds the first organization
 identity and key-governance bootstrap slice before the rc6 audit refresh. PR
 #103 adds encrypted private content overlays before the rc7 audit refresh. PR
-#105 adds embargoed security-fix workflows before this rc8 audit refresh.
+#105 adds embargoed security-fix workflows before the rc8 audit refresh. PR
+#106 adds the local read-only proposal review surface before this rc9 audit
+refresh.
 
 ## External Dogfood Validation
 
@@ -257,6 +259,54 @@ inspection, fail-closed generic sync import/clone, source-mode publication
 guards, and Git export only after full-source publication. It does not yet
 prove hosted advisory coordination, CVE workflows, cross-organization receiver
 identity, or resumable embargo transport.
+
+## Feature-Specific Local Review Surface Dogfood
+
+Follow-up dogfood explicitly exercised the rc9 local proposal review surface in
+a temporary clone of the `forge-dogfood` checkout at `6b24be5`, using the
+candidate binary from `main` at `be0f458` after PR #106 merged.
+
+Baseline app checks:
+
+- `npm run typecheck`: passed.
+- `npm test`: passed.
+- `npm run build`: passed.
+- `npm run lint`: passed.
+
+Review-surface workflow checks:
+
+- `forge init`: initialized the dogfood repository.
+- `forge start` used the dogfood app checks as required gates.
+- A tracked README change was saved, proposed, and checked as
+  `proposal_019f291ade5572928a3388f0bffb5ef4`.
+- `forge run -- npm run typecheck`: passed.
+- `forge run -- npm test`: passed.
+- `forge run -- npm run build`: passed.
+- `forge run -- npm run lint`: passed.
+- `forge review show --proposal <proposal>` reported readiness `ready` and
+  emitted a read-only JSON aggregate.
+- `forge review export --proposal <proposal> --output review.html` wrote a
+  static HTML artifact with readiness `ready`.
+- `forge review open --proposal <proposal> --output review-open.html
+  --no-browser` wrote the same artifact path without browser launch.
+- `forge accept --proposal <proposal>` kept the trust-bearing decision in the
+  terminal.
+
+Projection and browser checks:
+
+- CLI integration tests prove private proposal paths are represented as
+  restricted metadata in both JSON and HTML and do not leak private path
+  sentinels or payloads.
+- The generated HTML was opened in the in-app browser and checked at desktop and
+  mobile widths for readable hierarchy, command/id wrapping, six content
+  sections, no forms, no scripts, no buttons, and absence of horizontal
+  overflow.
+
+Conclusion: rc9 proves the first local, read-only proposal review surface over
+existing Forge ledger facts: readiness, lifecycle, evidence, trust, visibility,
+embargo status, diff summary, and terminal handoff. It does not yet prove hosted
+accounts, hosted comments, cloud execution, UI-triggered trust-bearing
+mutations, or a full GitHub PR replacement.
 
 ## Exit Criteria
 

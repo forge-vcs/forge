@@ -129,8 +129,8 @@ are green, and the external dogfood pass is complete:
 ```bash
 git checkout main
 git pull --ff-only origin main
-git tag -a v0.1.0-rc8 -m "Forge v0.1.0-rc8"
-git push origin v0.1.0-rc8
+git tag -a v0.1.0-rc9 -m "Forge v0.1.0-rc9"
+git push origin v0.1.0-rc9
 ```
 
 ## Publish

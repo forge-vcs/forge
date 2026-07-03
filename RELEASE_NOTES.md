@@ -1,6 +1,12 @@
 # Forge Public Release Notes
 
-## Unreleased
+## v0.1.0-rc9
+
+Forge v0.1.0-rc9 is a public release candidate focused on the first local
+proposal review surface. It gives maintainers a read-only review command group
+and a self-contained static HTML page for deciding whether one proposal is
+ready, risky, or blocked without parsing raw JSON or mutating Forge state from a
+browser.
 
 ### Added
 
@@ -22,6 +28,56 @@
 The review surface is local-first and read-only. It does not add hosted
 accounts, comments, teams, notifications, cloud execution, or browser-triggered
 accept/reject/reveal/publish/export actions.
+
+### Installation
+
+```bash
+cargo install --git https://github.com/forge-vcs/forge --tag v0.1.0-rc9 forge-cli
+```
+
+### Release Validation
+
+The rc9 preparation ran the aggregate release dogfood gate on `main` at
+`be0f458` after PR #106 merged:
+
+```bash
+rtk bash scripts/dogfood-release-gate.sh
+```
+
+Gate results:
+
+- `cargo fmt --all -- --check`: passed
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed
+- `cargo test --workspace`: 603 passed
+- `scripts/e2e-eval.sh`: PASS=95 FAIL=0
+- `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
+- `scripts/dogfood-native-sync-peer.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-peer-nogit.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0
+- `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
+
+Feature-specific review-surface validation covered:
+
+- `forge review show` returns a read-only JSON aggregate with no operation row.
+- Missing checks render a blocked review and unknown proposal ids return
+  `UNKNOWN_PROPOSAL`.
+- `forge review export` writes escaped static HTML with no mutating controls,
+  forms, or scripts.
+- `forge review open --no-browser` writes the same HTML artifact without
+  launching a browser.
+- Private proposal paths are represented as restricted metadata in both JSON
+  and HTML and do not leak the private path sentinel or payload.
+- A real dogfood proposal in `forge-dogfood` at `6b24be5`, using the candidate
+  binary from `main` at `be0f458`, exercised `npm run typecheck`, `npm test`,
+  `npm run build`, `npm run lint`, `forge review show`, `forge review export`,
+  `forge review open --no-browser`, and terminal `forge accept`.
+- The dogfood proposal was
+  `proposal_019f291ade5572928a3388f0bffb5ef4`.
+- The generated HTML review surface was opened in the in-app browser and
+  checked on desktop and mobile widths, including long id/command wrapping,
+  six content sections, no forms, no scripts, no buttons, and no horizontal
+  overflow.
 
 ## v0.1.0-rc8
 
