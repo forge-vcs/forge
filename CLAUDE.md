@@ -61,6 +61,12 @@ Work is tracked in the **Forge** Linear project (id `2b5e82f7-7a78-4354-af7d-686
 
 Single Cargo workspace. The binary is `forge` (`crates/forge-cli`). Library crates under `crates/` are split by concern: `forge-core` (ID types), `forge-store` (SQLite persistence, migrations, operations/views, trust/signature policy), `forge-content` (backend trait + secret-risk helpers), `forge-content-git` / `forge-content-native` (Git interop and Forge-native object storage/history/diff/merge/pack primitives), `forge-evidence` (command capture and parsers), `forge-policy` (check evaluation), `forge-protocol` (JSON envelope), `forge-export-git` (Git branch/PR-body/provenance export), and `forge-sync` (versioned native sync manifests plus local/file/SSH/HTTPS peer transport). Integration tests live in `crates/forge-cli/tests/` and use `assert_cmd` + `tempfile` against the compiled binary in real temp repos.
 
+## Domain module rule
+
+`docs/adr/0001-domain-modules.md` is the architecture contract for splitting the largest crates by domain. Treat `crates/forge-store/src/lib.rs` and `crates/forge-cli/src/main.rs` as facade files: crate/binary docs, module declarations, public re-exports, top-level dispatch, and narrow shared wiring only. New domain behavior should land in a domain module, not in a facade file.
+
+Structural refactor slices must be behavior-preserving moves: no renames, signature changes, CLI output changes, schema changes, or opportunistic cleanup mixed into the move. Public paths stay stable through `pub use` re-exports. Create module files when real code moves into them; do not add an empty module forest unless a reviewed scaffolding slice has a concrete benefit. Rust files have a soft 3,000-line ceiling, with current exceptions tracked in the ADR until the facade split is complete enough for enforcement.
+
 ## Conventions
 
 - Commit messages follow Conventional Commits (`feat:`, `fix:`, `chore:` …).
