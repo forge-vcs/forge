@@ -34,6 +34,9 @@ NER-370 audit update: the storage and store-sync slices created `crates/forge-st
 NER-372 audit update: the visibility policy/grant/projection surface moved into `crates/forge-store/src/visibility.rs`.
 `crates/forge-store/src/lib.rs` is now capped at 12,917 lines and remains the primary store monolith until the remaining domains move.
 
+NER-373 audit update: embargo workflow, release, reveal, publish, close, and accept-hook helpers moved into `crates/forge-store/src/embargo.rs`.
+`crates/forge-store/src/lib.rs` is now capped at 11,776 lines and remains the primary store monolith until the remaining domains move.
+
 ## Decision
 
 Forge crates should be organized by domain modules as well as by layer.
@@ -129,7 +132,7 @@ Allowlisted files may shrink, but they may not grow past their recorded cap.
 
 Current allowlisted breaches are known exceptions while this refactor is underway:
 
-- `crates/forge-store/src/lib.rs` at 12,917 lines.
+- `crates/forge-store/src/lib.rs` at 11,776 lines.
 - `crates/forge-content-native/src/lib.rs` at 4,721 lines. This predates ADR-0001 and should be split or justified in a later content-native follow-up; it is not part of the store/CLI facade slice.
 - `crates/forge-cli/tests/forge_sync.rs` at 4,683 lines. This is integration coverage, not a facade, but it should split by sync scenario group in a later test-maintenance slice.
 
