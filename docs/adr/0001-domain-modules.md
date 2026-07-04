@@ -13,7 +13,7 @@ Related issue: NER-366
 Forge is architected well by layer: core types, store, content backends, evidence, policy, protocol, sync, export, and CLI live in separate crates.
 Inside the two largest crates, the code has not stayed separated by domain.
 
-Current hotspots:
+Hotspots at the start of this refactor:
 
 | File | Current size | Problem |
 | --- | ---: | --- |
@@ -26,6 +26,10 @@ A large mixed-domain file makes agents load irrelevant code, makes edit anchors 
 
 The immediate pressure point is NER-360.
 Resumable sync and lazy hydration should land in a sync domain module, not deepen the current store and CLI monoliths.
+
+NER-370 audit update: the storage and store-sync slices created `crates/forge-store/src/storage.rs` and `crates/forge-store/src/sync.rs`; the CLI sync/export slice created `crates/forge-cli/src/commands/sync.rs` and `crates/forge-cli/src/commands/export.rs`.
+`crates/forge-cli/src/main.rs` is now at the 3,000-line ceiling, but it still contains shared replay, locking, worktree, and remaining command-family wiring.
+`crates/forge-store/src/lib.rs` remains the primary monolith at 13,576 lines and is not yet a facade.
 
 ## Decision
 
@@ -92,7 +96,7 @@ Attestation policy belongs in `trust.rs` or `org.rs`, while Ed25519 mechanics re
 | `commands/trust.rs` | trust, key, org, hosted-runner, and third-party attestation handlers. |
 | `commands/visibility.rs` | visibility and embargo handlers, split to `commands/embargo.rs` if the file grows. |
 | `commands/sync.rs` | sync clone/fetch/pull/push/serve handlers. |
-| `commands/export.rs` | export branch/pr/body handlers and replay if publication ownership proves aligned. |
+| `commands/export.rs` | export branch/pr/body handlers. |
 | `main.rs` | main entrypoint, top-level dispatch, and minimal shared wiring only. |
 
 ## Sequencing
@@ -104,7 +108,7 @@ Refactor in small, reviewable slices:
 3. Sync-adjacent store extraction before NER-360 adds resumable sync or lazy hydration.
 4. CLI sync/export extraction after store sync has a home.
 5. Visibility, embargo, private overlay, trust/org, publication, conflict, evidence, proposals, snapshots, attempts, and repository extraction.
-6. Final facade audit.
+6. Repeat facade audits as large domains move, removing line-count allowlist entries as they fall under the ceiling.
 
 Repository lifecycle moves last because it owns central open/init/migration/lock helpers.
 
@@ -116,13 +120,18 @@ Each slice should move code in original order where practical, preserve public r
 The soft ceiling for Rust source files is 3,000 lines, including inline tests.
 Crossing it requires either an immediate split or a short top-of-file justification explaining why cohesion beats size.
 
-Current breaches are known exceptions while this refactor is underway:
+CI now enforces this rule with an allowlist in `scripts/check-rust-line-count.sh`.
+Non-allowlisted Rust files over 3,000 lines fail CI.
+Allowlisted files may shrink, but they may not grow past their recorded cap.
 
-- `crates/forge-store/src/lib.rs`
-- `crates/forge-cli/src/main.rs`
+Current allowlisted breaches are known exceptions while this refactor is underway:
 
-This rule starts as documented review policy.
-Hard CI enforcement is deferred until the facade split has progressed or until a later slice adds an explicit allowlist or warning-style check that keeps the current baseline green.
+- `crates/forge-store/src/lib.rs` at 13,576 lines.
+- `crates/forge-content-native/src/lib.rs` at 4,721 lines. This predates ADR-0001 and should be split or justified in a later content-native follow-up; it is not part of the store/CLI facade slice.
+- `crates/forge-cli/tests/forge_sync.rs` at 4,683 lines. This is integration coverage, not a facade, but it should split by sync scenario group in a later test-maintenance slice.
+
+`crates/forge-cli/src/main.rs` is no longer allowlisted because it is exactly at the ceiling.
+Any growth above 3,000 lines should move into an existing command module or a new domain module.
 
 ## Test Relocation
 
@@ -159,6 +168,6 @@ Split by CLI command in the store.
 Rejected for store logic because several commands share lifecycle domains.
 Command-shaped modules remain appropriate inside `forge-cli`.
 
-Enforce the 3,000-line rule in CI immediately.
-Rejected because it would fail the current baseline before the refactor can proceed.
-The rule starts as review policy and becomes enforceable once the known exceptions have a credible allowlist or are resolved.
+Enforce the 3,000-line rule in CI without an allowlist.
+Rejected because it would fail the current baseline before the remaining store/content-native refactors can proceed.
+The accepted compromise is hard enforcement for new or growing oversized files with explicit caps for known exceptions.

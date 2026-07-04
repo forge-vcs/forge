@@ -22,6 +22,9 @@ cargo test --workspace
 echo "==> clippy (cargo clippy --workspace --all-targets -- -D warnings)"
 cargo clippy --workspace --all-targets -- -D warnings
 
+echo "==> lines  (scripts/check-rust-line-count.sh)"
+bash scripts/check-rust-line-count.sh
+
 echo "==> e2e    (scripts/e2e-eval.sh)"
 bash scripts/e2e-eval.sh
 
