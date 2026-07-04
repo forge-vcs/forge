@@ -65,7 +65,7 @@ Single Cargo workspace. The binary is `forge` (`crates/forge-cli`). Library crat
 
 `docs/adr/0001-domain-modules.md` is the architecture contract for splitting the largest crates by domain. Treat `crates/forge-store/src/lib.rs` and `crates/forge-cli/src/main.rs` as facade files: crate/binary docs, module declarations, public re-exports, top-level dispatch, and narrow shared wiring only. New domain behavior should land in a domain module, not in a facade file.
 
-Structural refactor slices must be behavior-preserving moves: no renames, signature changes, CLI output changes, schema changes, or opportunistic cleanup mixed into the move. Public paths stay stable through `pub use` re-exports. Create module files when real code moves into them; do not add an empty module forest unless a reviewed scaffolding slice has a concrete benefit. Rust files have a soft 3,000-line ceiling, with current exceptions tracked in the ADR until the facade split is complete enough for enforcement.
+Structural refactor slices must be behavior-preserving moves: no renames, signature changes, CLI output changes, schema changes, or opportunistic cleanup mixed into the move. Public paths stay stable through `pub use` re-exports. Create module files when real code moves into them; do not add an empty module forest unless a reviewed scaffolding slice has a concrete benefit. Rust files have a 3,000-line ceiling enforced by `scripts/check-rust-line-count.sh`; current oversized exceptions are allowlisted there and may shrink, but must not grow.
 
 ## Conventions
 
