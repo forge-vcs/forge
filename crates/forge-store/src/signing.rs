@@ -712,7 +712,7 @@ fn expected_signed_subjects(conn: &Connection) -> Result<ExpectedSignedSubjects>
           WHERE o.kind IN ({})
             AND json_extract(v.state_json, '$.commit_id') IS NOT NULL
           ORDER BY o.rowid",
-        crate::SYNC_MERGED_OP_KIND_SQL_IN
+        crate::sync::SYNC_MERGED_OP_KIND_SQL_IN
     );
     let mut sync_merges = conn.prepare(&query)?;
     for row in sync_merges.query_map([], |row| row.get::<_, String>(0))? {
@@ -773,7 +773,7 @@ fn current_subject_digest(
                       WHERE o.kind IN ({})
                         AND json_extract(v.state_json, '$.commit_id') = ?1
                      LIMIT 1",
-                crate::SYNC_MERGED_OP_KIND_SQL_IN
+                crate::sync::SYNC_MERGED_OP_KIND_SQL_IN
             );
             let exists = conn
                 .query_row(&query, params![subject_id], |_| Ok(()))
