@@ -310,6 +310,61 @@ fn native_restore_refuses_unsaved_dirty_worktree() {
     );
 }
 
+#[test]
+fn native_save_and_propose_warn_when_changed_paths_are_clean_in_git() {
+    let repo = TestRepo::new_git();
+    repo.forge()
+        .args(["--json", "init", "--content-backend", "native"])
+        .assert()
+        .success();
+    repo.forge()
+        .args(["--json", "start", "native git drift"])
+        .assert()
+        .success();
+
+    std::fs::write(repo.path().join("git_only.txt"), "committed only to git\n")
+        .expect("write git-only file");
+    git(repo.path(), &["add", "git_only.txt"]);
+    git(repo.path(), &["commit", "-m", "git-only change"]);
+    std::fs::write(repo.path().join("README.md"), "actual attempt edit\n").expect("write readme");
+
+    let saved = json_output(repo.forge().args(["--json", "save"]).assert().success());
+    assert!(saved["data"]["changed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path == "README.md"));
+    assert!(saved["data"]["changed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path == "git_only.txt"));
+    assert_native_git_drift_warning(&saved, "git_only.txt");
+    assert!(!saved["warnings"][0].as_str().unwrap().contains("README.md"));
+
+    let proposed = json_output(
+        repo.forge()
+            .args(["--json", "propose", "--summary", "native git drift"])
+            .assert()
+            .success(),
+    );
+    assert_native_git_drift_warning(&proposed, "git_only.txt");
+}
+
+fn assert_native_git_drift_warning(output: &Value, path: &str) {
+    let warnings = output["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.as_str().is_some_and(|message| {
+                message.contains("Forge native base")
+                    && message.contains("clean in Git")
+                    && message.contains(path)
+            })
+        }),
+        "expected native/Git drift warning for {path}, got {warnings:?}"
+    );
+}
+
 fn assert_native_objects_do_not_contain(repo_path: &std::path::Path, needle: &str) {
     let objects = repo_path.join(".forge/objects/sha256");
     for prefix in std::fs::read_dir(objects).expect("object prefixes") {
