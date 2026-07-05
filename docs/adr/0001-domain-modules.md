@@ -52,6 +52,9 @@ NER-377 audit update: evidence capture/summary types moved into `crates/forge-st
 NER-378 audit update: attempt lifecycle, attempt workspace paths/markers, attempt resolution/list/show/attach, snapshot save/restore/checkout/undo, expected content refs, and native history log/head walking moved into `crates/forge-store/src/attempts.rs` and `crates/forge-store/src/snapshots.rs`.
 `crates/forge-store/src/lib.rs` is now capped at 4,624 lines and remains the primary store monolith until the repository facade move lands.
 
+NER-379 audit update: repository init/open/migrate/lock/request-id lookup, operation-view helpers, failed-operation recording, intent list/detail, compare/ranking, merge-success recording, show summaries, doctor checks, GC planning/deletion, and remaining cross-domain tests moved into domain modules under `crates/forge-store/src/`.
+`crates/forge-store/src/lib.rs` is now a facade under the 500-line target and is no longer allowlisted.
+
 ## Decision
 
 Forge crates should be organized by domain modules as well as by layer.
@@ -83,10 +86,17 @@ Extraction slices may adjust ownership when code inspection proves a different b
 | Module | Owns |
 | --- | --- |
 | `repository.rs` | init/open/migrate/root/backend/lock helpers, request-id operation lookup, central repository context helpers. |
+| `internal.rs` | shared operation-view insertion, request-id replay guard, transaction retry helpers, visibility constants, and work-package validation used by several domains. |
+| `intents.rs` | intent list/detail records, gate projection, derived intent status, and intent detail helpers. |
 | `attempts.rs` | start/list/show/attach/detach attempts, attempt workspace paths and markers, attempt materialization helpers. |
 | `snapshots.rs` | save, restore, checkout, expected content refs, snapshot content refs, and snapshot restore helpers. |
 | `proposals.rs` | propose/check/accept/reject metadata, proposal review records, decision lookup, and proposal readiness helpers. |
 | `evidence.rs` | evidence recording, structured run capture summaries, and integrity verification entry points that delegate to `integrity.rs`. |
+| `compare.rs` | evidence-backed attempt comparison, structured metrics aggregation, and advisory ranking helpers. |
+| `merge.rs` | successful merge recording and merge-success response records. |
+| `show.rs` | store-level show summary projection. |
+| `doctor.rs` | repository health report, integrity-chain checks, native-history verification, signature findings, and warning discovery. |
+| `gc.rs` | dry-run/delete GC planning, plan digests, protected native-object classification, and ledger reachability roots. |
 | `trust.rs` | trust policy, enforcement, local key status, hosted-runner and third-party attestation policy calls, and trust-rank helpers. |
 | `org.rs` | organization governance status and initialization when extraction shows it is clearer than folding org into trust. |
 | `visibility.rs` | visibility policy, grants/revocations, projection decisions, and work-package visibility state. |
@@ -96,7 +106,6 @@ Extraction slices may adjust ownership when code inspection proves a different b
 | `storage.rs` | storage accounting, storage budget status, and pack/GC accounting helpers that remain in store. |
 | `conflict.rs` | conflict set, failed operations with conflict, merge conflict recording, and preflight conflict resolution. |
 | `publication.rs` | publication trailers, exportable proposal metadata, publication records, and branch publication checks. |
-| `internal.rs` | shared row mappers, transaction helpers, canonical JSON helpers, and small utilities used by several domains. |
 
 Existing modules `error.rs`, `integrity.rs`, `migrations.rs`, `repo_lock.rs`, and `signing.rs` stay module-owned.
 Attestation policy belongs in `trust.rs` or `org.rs`, while Ed25519 mechanics remain in `signing.rs`.
@@ -147,10 +156,10 @@ Allowlisted files may shrink, but they may not grow past their recorded cap.
 
 Current allowlisted breaches are known exceptions while this refactor is underway:
 
-- `crates/forge-store/src/lib.rs` at 4,624 lines.
 - `crates/forge-content-native/src/lib.rs` at 4,721 lines. This predates ADR-0001 and should be split or justified in a later content-native follow-up; it is not part of the store/CLI facade slice.
 - `crates/forge-cli/tests/forge_sync.rs` at 4,683 lines. This is integration coverage, not a facade, but it should split by sync scenario group in a later test-maintenance slice.
 
+`crates/forge-store/src/lib.rs` is no longer allowlisted because NER-379 reduced it below the facade target.
 `crates/forge-cli/src/main.rs` is no longer allowlisted because it is exactly at the ceiling.
 Any growth above 3,000 lines should move into an existing command module or a new domain module.
 

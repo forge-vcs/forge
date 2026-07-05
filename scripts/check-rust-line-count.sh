@@ -11,7 +11,6 @@ allowed_cap() {
   # Known exceptions are allowed to shrink, but not grow. Remove entries as
   # domain-split slices bring them under the global ceiling.
   case "$1" in
-    crates/forge-store/src/lib.rs) echo 4624 ;;
     crates/forge-content-native/src/lib.rs) echo 4721 ;;
     crates/forge-cli/tests/forge_sync.rs) echo 4683 ;;
     *) echo "" ;;
