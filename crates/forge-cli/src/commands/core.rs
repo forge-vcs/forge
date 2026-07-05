@@ -8,9 +8,11 @@ use forge_protocol::{
 };
 use forge_store::ForgeError;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::args::*;
 use crate::schema;
@@ -481,6 +483,82 @@ pub(crate) fn collect_diff_warnings(
     }
 }
 
+fn native_git_drift_warnings(cwd: &Path, changed_paths: &[String]) -> Vec<String> {
+    if changed_paths.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(context) = forge_store::open_repository(cwd) else {
+        return Vec::new();
+    };
+    if context.content_backend != "native" || context.worktree_path != context.root_path {
+        return Vec::new();
+    }
+
+    let Some(git_changed_paths) = git_status_changed_paths(&context.root_path) else {
+        return Vec::new();
+    };
+    let git_clean_paths: Vec<&str> = changed_paths
+        .iter()
+        .map(String::as_str)
+        .filter(|path| !git_changed_paths.contains(*path))
+        .collect();
+    if git_clean_paths.is_empty() {
+        return Vec::new();
+    }
+
+    let preview = git_clean_paths
+        .iter()
+        .take(5)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = git_clean_paths.len().saturating_sub(5);
+    let more_suffix = if more == 0 {
+        String::new()
+    } else {
+        format!(" (+{more} more)")
+    };
+    vec![format!(
+        "{} changed path(s) are clean in Git but changed relative to Forge native base: {}{}. This usually means Forge native history and Git HEAD have drifted; review these paths before accepting.",
+        git_clean_paths.len(),
+        preview,
+        more_suffix
+    )]
+}
+
+fn git_status_changed_paths(repo_root: &Path) -> Option<HashSet<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut paths = HashSet::new();
+    let mut entries = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty());
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+        let status = &entry[..2];
+        let path = String::from_utf8_lossy(&entry[3..]).into_owned();
+        paths.insert(path);
+        if status.contains(&b'R') || status.contains(&b'C') {
+            if let Some(source_path) = entries.next() {
+                paths.insert(String::from_utf8_lossy(source_path).into_owned());
+            }
+        }
+    }
+    Some(paths)
+}
+
 pub(crate) fn save_response(
     request_id: Option<String>,
     args: AttemptScopedArgs,
@@ -517,10 +595,11 @@ pub(crate) fn save_response(
         // not yet checkpointed. On reopen, WAL recovery must show the committed ref
         // AND its durably-retained object.
         forge_content::maybe_crash("after_db_commit_before_checkpoint");
+        let warnings = native_git_drift_warnings(&cwd, &saved.changed_paths);
         Ok((
             Some(saved.operation_id.clone()),
             serde_json::to_value(saved)?,
-            Vec::new(),
+            warnings,
         ))
     })
 }
@@ -732,10 +811,11 @@ pub(crate) fn propose_response(request_id: Option<String>, args: ProposeArgs) ->
             args.attempt.as_deref(),
             args.summary.as_deref(),
         )?;
+        let warnings = native_git_drift_warnings(&cwd, &proposal.changed_paths);
         Ok((
             Some(proposal.operation_id.clone()),
             serde_json::to_value(proposal)?,
-            Vec::new(),
+            warnings,
         ))
     })
 }
