@@ -1,3 +1,12 @@
+//! Native content object store, tree materialization, diff, and merge engine.
+//!
+//! ADR-0001's 3,000-line ceiling allows justified exceptions when cohesion beats
+//! size. This file is intentionally capped as one native-content engine because
+//! the object framing, tree walking/materialization, diff fingerprinting, and
+//! three-way merge code share private invariants. Splitting it mechanically
+//! would widen those invariants before there is a behavior change to validate.
+//! New native-content domains should still land in sibling modules.
+
 use anyhow::{anyhow, bail, Context, Result};
 use forge_content::{
     is_ignored_by_policy, ContentBackend, DiffLine, DiffLineTag, DiffWarning, FileDiff, HunkDiff,

@@ -58,6 +58,10 @@ NER-379 audit update: repository init/open/migrate/lock/request-id lookup, opera
 NER-380 audit update: CLI clap definitions moved into `crates/forge-cli/src/args.rs`; remaining non-sync/export command response handlers, replay/envelope helpers, worktree healing, and CLI content-backend helpers moved into `crates/forge-cli/src/commands/core.rs`.
 `crates/forge-cli/src/main.rs` is now a dispatch/output facade under the 500-line target.
 
+NER-381 audit update: native sync integration coverage split `crates/forge-cli/tests/forge_sync.rs` by scenario group and moved shared helpers into `crates/forge-cli/tests/sync_support.rs`.
+`crates/forge-cli/tests/forge_sync.rs` is no longer allowlisted.
+`crates/forge-content-native/src/lib.rs` remains the only allowlisted Rust source file; it carries a top-of-file justification because its object framing, tree materialization, diff fingerprinting, and three-way merge code share private native-content invariants.
+
 ## Decision
 
 Forge crates should be organized by domain modules as well as by layer.
@@ -160,11 +164,11 @@ Allowlisted files may shrink, but they may not grow past their recorded cap.
 
 Current allowlisted breaches are known exceptions while this refactor is underway:
 
-- `crates/forge-content-native/src/lib.rs` at 4,721 lines. This predates ADR-0001 and should be split or justified in a later content-native follow-up; it is not part of the store/CLI facade slice.
-- `crates/forge-cli/tests/forge_sync.rs` at 4,683 lines. This is integration coverage, not a facade, but it should split by sync scenario group in a later test-maintenance slice.
+- `crates/forge-content-native/src/lib.rs` at 4,730 lines. This is a cohesive native-content engine, not a facade or mixed-domain crate root. It is allowed to shrink but not grow, and it carries the required top-of-file justification.
 
 `crates/forge-store/src/lib.rs` is no longer allowlisted because NER-379 reduced it below the facade target.
 `crates/forge-cli/src/main.rs` is no longer allowlisted because NER-380 reduced it below the facade target.
+`crates/forge-cli/tests/forge_sync.rs` is no longer allowlisted because NER-381 split it by sync scenario group.
 Any growth above 3,000 lines should move into an existing command module or a new domain module.
 
 ## Test Relocation
