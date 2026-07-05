@@ -1,8 +1,8 @@
 # Phase 9 Release Audit
 
-Date: 2026-07-03
-Audited candidate: `main` at `be0f458` after PR #106 merged. The final
-immutable audited commit is the `v0.1.0-rc9` tag after release-prep docs are
+Date: 2026-07-05
+Audited candidate: `main` at `d480e94` after PR #122 merged. The final
+immutable audited commit is the `v0.1.0-rc10` tag after release-prep docs are
 committed and tagged.
 
 This document maps the Phase 9 roadmap exit criteria to current executable
@@ -24,11 +24,11 @@ the public release check usable from a plain shell:
 bash scripts/dogfood-release-gate.sh
 ```
 
-Latest local run while preparing `v0.1.0-rc9` passed:
+Latest local run while preparing `v0.1.0-rc10` passed:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo test --workspace`: 603 passed
+- `cargo test --workspace`: 604 passed
 - `scripts/e2e-eval.sh`: PASS=95 FAIL=0
 - `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
 - `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
@@ -46,8 +46,8 @@ projections before the rc5 audit refresh. PR #101 adds the first organization
 identity and key-governance bootstrap slice before the rc6 audit refresh. PR
 #103 adds encrypted private content overlays before the rc7 audit refresh. PR
 #105 adds embargoed security-fix workflows before the rc8 audit refresh. PR
-#106 adds the local read-only proposal review surface before this rc9 audit
-refresh.
+#106 adds the local read-only proposal review surface before the rc9 audit
+refresh. PR #122 adds native/Git drift warnings before this rc10 audit refresh.
 
 ## External Dogfood Validation
 
@@ -307,6 +307,52 @@ existing Forge ledger facts: readiness, lifecycle, evidence, trust, visibility,
 embargo status, diff summary, and terminal handoff. It does not yet prove hosted
 accounts, hosted comments, cloud execution, UI-triggered trust-bearing
 mutations, or a full GitHub PR replacement.
+
+## Feature-Specific Native/Git Drift Warning Dogfood
+
+Follow-up dogfood explicitly exercised the rc10 native/Git drift warning in a
+temporary copy of the `forge-dogfood` checkout, using an installed candidate
+binary from `main` at `d480e94` after PR #122 merged. The live dogfood checkout
+was left untouched.
+
+Baseline app checks:
+
+- `npm run typecheck`: passed.
+- `npm test -- --run`: passed, 1 file / 3 tests.
+- `npm run build`: passed.
+- `npm run lint`: passed.
+
+Workflow checks:
+
+- `forge init --content-backend native`: initialized a fresh native Forge repo
+  in the copied dogfood checkout.
+- `forge doctor`: passed before the workflow.
+- `forge start` declared `npm run typecheck`, `npm test -- --run`,
+  `npm run build`, and `npm run lint` as required gates.
+- A Git-only commit added `docs/rc10-git-only.txt`, then an unsaved README edit
+  represented the actual attempt work.
+- `forge save` reported `changed_paths` as `README.md` and
+  `docs/rc10-git-only.txt`.
+- The same `forge save` response emitted a top-level warning naming only
+  `docs/rc10-git-only.txt` as clean in Git but changed relative to Forge native
+  base; the warning did not name the actually dirty `README.md` edit.
+- `forge run -- npm run typecheck`: passed.
+- `forge run -- npm test -- --run`: passed.
+- `forge run -- npm run build`: passed.
+- `forge run -- npm run lint`: passed.
+- `forge propose --summary ...`, `forge check`, `forge accept --actor
+  rc10-dogfood`, and final `forge doctor`: passed.
+
+Accepted proposal:
+`proposal_019f3296a1c07e70ad847de0e7bcd7f3`.
+
+Accepted native commit:
+`f1:commit:sha256:f0e2798b37439931ee350384a176601653be75952a07cff04bcc525c25eb38cd`.
+
+Conclusion: rc10 preserves native `changed_paths` as a Forge-native-base diff
+while giving agents a clear warning when a path is clean in Git and likely comes
+from native/Git history drift. It does not automatically reconcile Git HEAD into
+Forge native history or block acceptance after the warning.
 
 ## Exit Criteria
 

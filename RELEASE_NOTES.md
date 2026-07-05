@@ -1,5 +1,85 @@
 # Forge Public Release Notes
 
+## v0.1.0-rc10
+
+Forge v0.1.0-rc10 is a public release candidate focused on making native
+history/Git drift visible before agents accept work. Native `changed_paths`
+remain ledger-accurate, but `forge save` and `forge propose` now warn when a
+reported path is clean in Git and differs only because Forge's native base and
+Git HEAD have drifted.
+
+### Changed
+
+- Added a best-effort native-backend warning for paths that are clean in Git but
+  changed relative to Forge's native base.
+- Surfaced the warning from both `forge save` and `forge propose`, so agents see
+  stale native-base drift before `check` or `accept`.
+- Kept the native snapshot contract unchanged: `changed_paths` still reports the
+  diff against the Forge native base, and the warning explains how to interpret
+  Git-clean paths rather than hiding them.
+
+### Current Boundary
+
+This RC improves local agent UX for repositories that use both Git and Forge
+native history. It does not automatically reconcile Git HEAD into Forge native
+history, rewrite `changed_paths`, or prevent a user from accepting a proposal
+after reviewing the warning.
+
+### Installation
+
+```bash
+cargo install --git https://github.com/forge-vcs/forge --tag v0.1.0-rc10 forge-cli
+```
+
+### Release Validation
+
+The rc10 preparation ran the aggregate release dogfood gate on `main` at
+`d480e94` after PR #122 merged:
+
+```bash
+rtk bash scripts/dogfood-release-gate.sh
+```
+
+Gate results:
+
+- `cargo fmt --all -- --check`: passed
+- `cargo clippy --workspace --all-targets -- -D warnings`: passed
+- `cargo test --workspace`: 604 passed
+- `scripts/e2e-eval.sh`: PASS=95 FAIL=0
+- `scripts/dogfood-hosted-runner-attestation.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-release-litmus.sh`: PASS=32 FAIL=0
+- `scripts/dogfood-native-sync-peer.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-native-sync-peer-nogit.sh`: PASS=26 FAIL=0
+- `scripts/dogfood-typescript-native.sh`: PASS=44 FAIL=0
+- `scripts/dogfood-native-storage-scale.sh --smoke`: PASS=30 FAIL=0
+
+External dogfood ran with an installed candidate binary from current `main`
+against a temporary copy of the real `forge-dogfood` checkout, leaving the live
+checkout untouched:
+
+- `npm run typecheck`: passed.
+- `npm test -- --run`: passed, 1 file / 3 tests.
+- `npm run build`: passed.
+- `npm run lint`: passed.
+- `forge init --content-backend native` and `forge doctor`: passed.
+- `forge start` declared the dogfood app checks as required gates.
+- A Git-only commit added `docs/rc10-git-only.txt`, then an unsaved README edit
+  represented the actual attempt work.
+- `forge save` reported `changed_paths` as `README.md` and
+  `docs/rc10-git-only.txt`, and emitted a warning naming only
+  `docs/rc10-git-only.txt` as clean in Git but changed relative to Forge native
+  base.
+- `forge run -- npm run typecheck`: passed.
+- `forge run -- npm test -- --run`: passed.
+- `forge run -- npm run build`: passed.
+- `forge run -- npm run lint`: passed.
+- `forge propose --summary ...`, `forge check`, `forge accept --actor
+  rc10-dogfood`, and final `forge doctor`: passed.
+- Accepted dogfood proposal:
+  `proposal_019f3296a1c07e70ad847de0e7bcd7f3`.
+- Accepted native commit:
+  `f1:commit:sha256:f0e2798b37439931ee350384a176601653be75952a07cff04bcc525c25eb38cd`.
+
 ## v0.1.0-rc9
 
 Forge v0.1.0-rc9 is a public release candidate focused on the first local
