@@ -28,7 +28,7 @@ The immediate pressure point is NER-360.
 Resumable sync and lazy hydration should land in a sync domain module, not deepen the current store and CLI monoliths.
 
 NER-370 audit update: the storage and store-sync slices created `crates/forge-store/src/storage.rs` and `crates/forge-store/src/sync.rs`; the CLI sync/export slice created `crates/forge-cli/src/commands/sync.rs` and `crates/forge-cli/src/commands/export.rs`.
-`crates/forge-cli/src/main.rs` is now at the 3,000-line ceiling, but it still contains shared replay, locking, worktree, and remaining command-family wiring.
+`crates/forge-cli/src/main.rs` was brought down to the 3,000-line ceiling, but it still contained shared replay, locking, worktree, and remaining command-family wiring.
 `crates/forge-store/src/lib.rs` remains the primary monolith at 13,576 lines and is not yet a facade.
 
 NER-372 audit update: the visibility policy/grant/projection surface moved into `crates/forge-store/src/visibility.rs`.
@@ -54,6 +54,9 @@ NER-378 audit update: attempt lifecycle, attempt workspace paths/markers, attemp
 
 NER-379 audit update: repository init/open/migrate/lock/request-id lookup, operation-view helpers, failed-operation recording, intent list/detail, compare/ranking, merge-success recording, show summaries, doctor checks, GC planning/deletion, and remaining cross-domain tests moved into domain modules under `crates/forge-store/src/`.
 `crates/forge-store/src/lib.rs` is now a facade under the 500-line target and is no longer allowlisted.
+
+NER-380 audit update: CLI clap definitions moved into `crates/forge-cli/src/args.rs`; remaining non-sync/export command response handlers, replay/envelope helpers, worktree healing, and CLI content-backend helpers moved into `crates/forge-cli/src/commands/core.rs`.
+`crates/forge-cli/src/main.rs` is now a dispatch/output facade under the 500-line target.
 
 ## Decision
 
@@ -125,6 +128,7 @@ Attestation policy belongs in `trust.rs` or `org.rs`, while Ed25519 mechanics re
 | `commands/run.rs` | run and evidence capture response handling. |
 | `commands/trust.rs` | trust, key, org, hosted-runner, and third-party attestation handlers. |
 | `commands/visibility.rs` | visibility and embargo handlers, split to `commands/embargo.rs` if the file grows. |
+| `commands/core.rs` | transitional home for remaining non-sync/export handlers after NER-380; future slices may split it into the narrower command-family files above when behavior changes create a reason. |
 | `commands/sync.rs` | sync clone/fetch/pull/push/serve handlers. |
 | `commands/export.rs` | export branch/pr/body handlers. |
 | `main.rs` | main entrypoint, top-level dispatch, and minimal shared wiring only. |
@@ -160,7 +164,7 @@ Current allowlisted breaches are known exceptions while this refactor is underwa
 - `crates/forge-cli/tests/forge_sync.rs` at 4,683 lines. This is integration coverage, not a facade, but it should split by sync scenario group in a later test-maintenance slice.
 
 `crates/forge-store/src/lib.rs` is no longer allowlisted because NER-379 reduced it below the facade target.
-`crates/forge-cli/src/main.rs` is no longer allowlisted because it is exactly at the ceiling.
+`crates/forge-cli/src/main.rs` is no longer allowlisted because NER-380 reduced it below the facade target.
 Any growth above 3,000 lines should move into an existing command module or a new domain module.
 
 ## Test Relocation
