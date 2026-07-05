@@ -46,6 +46,9 @@ NER-375 audit update: trust policy, trust enforcement, local key status/rotation
 NER-376 audit update: conflict-set recording, failed operations with stale-base conflict data, merge-conflict recording, conflict resolution/preflight/list/show, and publication trailer/export/publication row code moved into `crates/forge-store/src/conflict.rs` and `crates/forge-store/src/publication.rs`.
 `crates/forge-store/src/lib.rs` is now capped at 7,982 lines and remains the primary store monolith until the remaining domains move.
 
+NER-377 audit update: evidence capture/summary types moved into `crates/forge-store/src/evidence.rs`; proposal creation, checks, decisions, review/readiness metadata, PR body rendering, proposal lookup, and evidence-backed policy evaluation moved into `crates/forge-store/src/proposals.rs`.
+`crates/forge-store/src/lib.rs` is now capped at 5,962 lines and remains the primary store monolith until the remaining domains move.
+
 ## Decision
 
 Forge crates should be organized by domain modules as well as by layer.
@@ -141,7 +144,7 @@ Allowlisted files may shrink, but they may not grow past their recorded cap.
 
 Current allowlisted breaches are known exceptions while this refactor is underway:
 
-- `crates/forge-store/src/lib.rs` at 7,982 lines.
+- `crates/forge-store/src/lib.rs` at 5,962 lines.
 - `crates/forge-content-native/src/lib.rs` at 4,721 lines. This predates ADR-0001 and should be split or justified in a later content-native follow-up; it is not part of the store/CLI facade slice.
 - `crates/forge-cli/tests/forge_sync.rs` at 4,683 lines. This is integration coverage, not a facade, but it should split by sync scenario group in a later test-maintenance slice.
 
