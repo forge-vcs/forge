@@ -12,11 +12,18 @@ RUNS="$CCX/runs"
 mkdir -p "$RUNS"
 
 first=1
+STACKED=""
 for task in "$@"; do
   out="$RUNS/B-$task"; mkdir -p "$out"
   echo "=== ARM B :: $TICKET :: $task :: $(date +%H:%M:%S)"
   git -C "$CLONE" reset --hard --quiet pilot-run
   git -C "$CLONE" clean -fdq -e target
+  git -C "$CLONE" checkout --quiet --detach pilot-run
+  # P1 stacking: this arm's own prior task patches form the base.
+  for prev in $STACKED; do
+    git -C "$CLONE" apply --index --3way "$RUNS/$prev/patch.diff" || { echo "FATAL: stack $prev failed"; exit 1; }
+  done
+  [[ -n "$STACKED" ]] && git -C "$CLONE" commit --quiet -m "pilot stack: $STACKED"
 
   {
     if [[ $first -eq 1 ]]; then
@@ -31,8 +38,8 @@ for task in "$@"; do
 
 Rules for this task:
 - Implement only this task now (later tasks come next in this session).
-- The worktree has been reset to the base branch; prior tasks' diffs are
-  not present (they are being integrated separately).
+- The worktree already contains your previous tasks' changes, applied and
+  committed; build this task on top of them.
 - Run the repo's verify gates for what you build and make them pass.
 - Do not create git commits; leave changes uncommitted.
 EOF
@@ -56,5 +63,6 @@ EOF
   git -C "$CLONE" add -A
   git -C "$CLONE" diff --cached > "$out/patch.diff"
   echo "    exit=$status wall=$((end-start))s patch=$(wc -l < "$out/patch.diff") lines"
+  STACKED="$STACKED B-$task"
 done
 echo "ARM B $TICKET COMPLETE $(date +%H:%M:%S)"

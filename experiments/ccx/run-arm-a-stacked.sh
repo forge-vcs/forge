@@ -18,11 +18,13 @@ for spec in "$@"; do
 
   git -C "$CLONE" reset --hard --quiet pilot-run
   git -C "$CLONE" clean -fdq -e target
+  # Stack commits go on a detached HEAD so the pilot-run base never moves.
+  git -C "$CLONE" checkout --quiet --detach pilot-run
 
   if [[ -n "$stack" ]]; then
     IFS=',' read -ra PARTS <<< "$stack"
     for part in "${PARTS[@]}"; do
-      if ! git -C "$CLONE" apply --index "$RUNS/$part/patch.diff"; then
+      if ! git -C "$CLONE" apply --index --3way "$RUNS/$part/patch.diff"; then
         echo "FATAL: stack patch $part failed to apply for $task"; exit 1
       fi
     done

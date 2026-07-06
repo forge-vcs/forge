@@ -1,0 +1,425 @@
+diff --git a/crates/forge-content-native/src/lib.rs b/crates/forge-content-native/src/lib.rs
+index 5e93c05..df1d562 100644
+--- a/crates/forge-content-native/src/lib.rs
++++ b/crates/forge-content-native/src/lib.rs
+@@ -29,7 +29,7 @@ mod pack;
+ pub mod provenance;
+ mod status_cache;
+ 
+-pub use provenance::{path_provenance, PathProvenanceEntry};
++pub use provenance::{attribute_lines, path_provenance, LineAttribution, PathProvenanceEntry};
+ 
+ const SCHEMA_VERSION: u32 = 1;
+ const HUNK_LIMIT: usize = 4096;
+diff --git a/crates/forge-content-native/src/provenance.rs b/crates/forge-content-native/src/provenance.rs
+index e62faf1..4232e02 100644
+--- a/crates/forge-content-native/src/provenance.rs
++++ b/crates/forge-content-native/src/provenance.rs
+@@ -8,7 +8,7 @@
+ use crate::{
+     diff_native_trees, CommitObject, DiffOptions, NativeObjectStore, NativeRefStore, ObjectId,
+ };
+-use anyhow::{bail, Result};
++use anyhow::{bail, Context, Result};
+ 
+ /// One commit's touch of the queried path, tip-first. Provenance fields are copied
+ /// verbatim from [`CommitObject`] — never synthesized or defaulted to non-`None`.
+@@ -73,6 +73,192 @@ pub fn path_provenance(store: &NativeObjectStore, path: &str) -> Result<Vec<Path
+     Ok(entries)
+ }
+ 
++/// One HEAD line attributed to the most recent first-parent commit that introduced
++/// or last changed its content.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct LineAttribution {
++    pub line_number: usize,
++    pub content: String,
++    pub commit_id: String,
++}
++
++/// Attribute every line of the file at `HEAD` to the most recent commit (tip→genesis,
++/// first parent only) in which that line's content was introduced or last changed,
++/// computed from line matches (LCS) between consecutive blob versions of the path.
++/// Renames are followed through the OLD name, matching [`path_provenance`]. Read-only
++/// over the object store. Non-UTF-8 blobs and a path missing at `HEAD` are typed errors.
++pub fn attribute_lines(store: &NativeObjectStore, path: &str) -> Result<Vec<LineAttribution>> {
++    let Some(head) = NativeRefStore::new(&store.root).read_head()? else {
++        bail!("path {path} does not exist at HEAD (no native HEAD yet)");
++    };
++    let head_tree = ObjectId::parse(&store.read_commit(&head)?.tree)?;
++    let mut current_lines = match blob_lines(store, &head_tree, path)? {
++        Some(lines) => lines,
++        None => bail!("path {path} does not exist at HEAD"),
++    };
++    // pending[i] = Some(h): line i of the version at the walk cursor is (so far)
++    // unchanged since HEAD line h and still awaits an owning commit.
++    let mut pending: Vec<Option<usize>> = (0..current_lines.len()).map(Some).collect();
++    let mut attributions: Vec<Option<String>> = vec![None; current_lines.len()];
++    let head_lines = current_lines.clone();
++    let options = DiffOptions {
++        include_hunks: false,
++        ..DiffOptions::default()
++    };
++    let mut tracked = path.to_string();
++    let mut cursor = head;
++    loop {
++        let commit = store.read_commit(&cursor)?;
++        let tree = ObjectId::parse(&commit.tree)?;
++        let Some(first_parent) = commit.parents.first() else {
++            // Genesis: every line still pending was introduced here.
++            attribute_pending(&pending, &cursor, &mut attributions);
++            break;
++        };
++        let parent_id = ObjectId::parse(first_parent)?;
++        let parent_tree = ObjectId::parse(&store.read_commit(&parent_id)?.tree)?;
++        let diff = diff_native_trees(store, &parent_tree, &tree, &options)?;
++        if let Some(file) = diff.files.iter().find(|f| f.path == tracked) {
++            match change_label(&file.status)? {
++                "added" => {
++                    attribute_pending(&pending, &cursor, &mut attributions);
++                    break;
++                }
++                "modified" | "renamed" => {
++                    let parent_path = file.old_path.as_deref().unwrap_or(&tracked).to_string();
++                    let Some(parent_lines) = blob_lines(store, &parent_tree, &parent_path)? else {
++                        bail!(
++                            "native line attribution walk lost path {parent_path} \
++                             in parent of commit {cursor}"
++                        );
++                    };
++                    let matched = match_lines(&parent_lines, &current_lines);
++                    let mut next_pending: Vec<Option<usize>> = vec![None; parent_lines.len()];
++                    for (child_idx, head_idx) in pending.iter().enumerate() {
++                        let Some(head_idx) = head_idx else { continue };
++                        match matched[child_idx] {
++                            // Unchanged here: keep waiting at the parent's position.
++                            Some(parent_idx) => next_pending[parent_idx] = Some(*head_idx),
++                            // Introduced or last changed by this commit.
++                            None => attributions[*head_idx] = Some(cursor.to_string()),
++                        }
++                    }
++                    tracked = parent_path;
++                    current_lines = parent_lines;
++                    pending = next_pending;
++                }
++                other => bail!(
++                    "unsupported change {other} for path {tracked} \
++                     in native line attribution walk at commit {cursor}"
++                ),
++            }
++        }
++        if attributions.iter().all(Option::is_some) {
++            break;
++        }
++        cursor = parent_id;
++    }
++    head_lines
++        .into_iter()
++        .zip(attributions)
++        .enumerate()
++        .map(|(idx, (content, commit_id))| {
++            let commit_id = commit_id.with_context(|| {
++                format!(
++                    "native line attribution walk left line {} of {path} unattributed",
++                    idx + 1
++                )
++            })?;
++            Ok(LineAttribution {
++                line_number: idx + 1,
++                content,
++                commit_id,
++            })
++        })
++        .collect()
++}
++
++fn attribute_pending(
++    pending: &[Option<usize>],
++    commit_id: &ObjectId,
++    attributions: &mut [Option<String>],
++) {
++    for head_idx in pending.iter().flatten() {
++        attributions[*head_idx] = Some(commit_id.to_string());
++    }
++}
++
++/// Read the blob at `path` inside `tree` and split it into lines (trailing newline
++/// dropped; a missing final newline still yields a last line). `None` when the path
++/// has no file leaf in the tree; a typed error when the blob is not UTF-8 text.
++fn blob_lines(
++    store: &NativeObjectStore,
++    tree: &ObjectId,
++    path: &str,
++) -> Result<Option<Vec<String>>> {
++    let fingerprints = store.tree_fingerprints(tree)?;
++    let Some((blob_id, _mode)) = fingerprints.get(path) else {
++        return Ok(None);
++    };
++    let bytes = store.read_object(&ObjectId::parse(blob_id)?)?;
++    let Ok(text) = String::from_utf8(bytes) else {
++        bail!("cannot attribute lines of {path}: blob is binary (not UTF-8 text)");
++    };
++    Ok(Some(
++        text.split_terminator('\n').map(str::to_string).collect(),
++    ))
++}
++
++/// For each child line index, the parent line index it matches (same content, order
++/// preserved), or `None` when the line has no match — i.e. it changed in the child.
++/// Common prefix/suffix are matched directly; the middle uses a classic LCS table.
++fn match_lines(parent: &[String], child: &[String]) -> Vec<Option<usize>> {
++    let mut matched = vec![None; child.len()];
++    let max_prefix = parent.len().min(child.len());
++    let mut prefix = 0;
++    while prefix < max_prefix && parent[prefix] == child[prefix] {
++        matched[prefix] = Some(prefix);
++        prefix += 1;
++    }
++    let mut suffix = 0;
++    while suffix < max_prefix - prefix
++        && parent[parent.len() - 1 - suffix] == child[child.len() - 1 - suffix]
++    {
++        matched[child.len() - 1 - suffix] = Some(parent.len() - 1 - suffix);
++        suffix += 1;
++    }
++    let parent_mid = &parent[prefix..parent.len() - suffix];
++    let child_mid = &child[prefix..child.len() - suffix];
++    if parent_mid.is_empty() || child_mid.is_empty() {
++        return matched;
++    }
++    // LCS length table over the trimmed middle; lcs[i][j] covers parent_mid[i..],
++    // child_mid[j..].
++    let mut lcs = vec![vec![0usize; child_mid.len() + 1]; parent_mid.len() + 1];
++    for i in (0..parent_mid.len()).rev() {
++        for j in (0..child_mid.len()).rev() {
++            lcs[i][j] = if parent_mid[i] == child_mid[j] {
++                lcs[i + 1][j + 1] + 1
++            } else {
++                lcs[i + 1][j].max(lcs[i][j + 1])
++            };
++        }
++    }
++    let (mut i, mut j) = (0, 0);
++    while i < parent_mid.len() && j < child_mid.len() {
++        if parent_mid[i] == child_mid[j] {
++            matched[prefix + j] = Some(prefix + i);
++            i += 1;
++            j += 1;
++        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
++            i += 1;
++        } else {
++            j += 1;
++        }
++    }
++    matched
++}
++
+ /// Map the diff engine's git name-status letter encoding (`A`/`M`/`D`, `R<score>`)
+ /// onto the provenance change vocabulary.
+ fn change_label(status: &str) -> Result<&'static str> {
+@@ -319,4 +505,205 @@ mod tests {
+         assert_eq!(entry.actor.as_deref(), Some("agent"));
+         assert_eq!(entry.authored_time, Some(1_234_567_890));
+     }
++
++    fn blame(entries: &[LineAttribution]) -> Vec<(usize, &str, &str)> {
++        entries
++            .iter()
++            .map(|e| (e.line_number, e.content.as_str(), e.commit_id.as_str()))
++            .collect()
++    }
++
++    #[test]
++    fn attribution_keeps_unchanged_lines_on_the_introducing_commit() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let genesis_tree = write_tree(repo, &[("app.txt", b"alpha\nbeta\ngamma\n")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        let modified_tree = write_tree(repo, &[("app.txt", b"alpha\nBETA\ngamma\n")]);
++        let tip = commit(&store, &modified_tree, &[&genesis]);
++        set_head(repo, &tip);
++
++        let lines = attribute_lines(&store, "app.txt").unwrap();
++
++        let genesis_id = genesis.to_string();
++        let tip_id = tip.to_string();
++        assert_eq!(
++            blame(&lines),
++            vec![
++                (1, "alpha", genesis_id.as_str()),
++                (2, "BETA", tip_id.as_str()),
++                (3, "gamma", genesis_id.as_str()),
++            ]
++        );
++    }
++
++    #[test]
++    fn attribution_assigns_inserted_lines_to_the_inserting_commit() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let genesis_tree = write_tree(repo, &[("app.txt", b"one\ntwo\n")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        let inserted_tree = write_tree(repo, &[("app.txt", b"zero\none\nmid\ntwo\n")]);
++        let inserted = commit(&store, &inserted_tree, &[&genesis]);
++        // A commit that touches another file must not steal attribution.
++        let unrelated_tree = write_tree(
++            repo,
++            &[("app.txt", b"zero\none\nmid\ntwo\n"), ("other.txt", b"x\n")],
++        );
++        let tip = commit(&store, &unrelated_tree, &[&inserted]);
++        set_head(repo, &tip);
++
++        let lines = attribute_lines(&store, "app.txt").unwrap();
++
++        let genesis_id = genesis.to_string();
++        let inserted_id = inserted.to_string();
++        assert_eq!(
++            blame(&lines),
++            vec![
++                (1, "zero", inserted_id.as_str()),
++                (2, "one", genesis_id.as_str()),
++                (3, "mid", inserted_id.as_str()),
++                (4, "two", genesis_id.as_str()),
++            ]
++        );
++    }
++
++    #[test]
++    fn attribution_follows_renames_back_to_the_original_lines() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let content = b"line one\nline two\nline three\n";
++        let genesis_tree = write_tree(repo, &[("old.txt", content), ("keep.txt", b"k\n")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        let renamed_tree = write_tree(repo, &[("new.txt", content), ("keep.txt", b"k\n")]);
++        let renamed = commit(&store, &renamed_tree, &[&genesis]);
++        let modified_tree = write_tree(
++            repo,
++            &[
++                ("new.txt", b"line one\nline TWO\nline three\n".as_slice()),
++                ("keep.txt", b"k\n"),
++            ],
++        );
++        let tip = commit(&store, &modified_tree, &[&renamed]);
++        set_head(repo, &tip);
++
++        let lines = attribute_lines(&store, "new.txt").unwrap();
++
++        let genesis_id = genesis.to_string();
++        let tip_id = tip.to_string();
++        assert_eq!(
++            blame(&lines),
++            vec![
++                (1, "line one", genesis_id.as_str()),
++                (2, "line TWO", tip_id.as_str()),
++                (3, "line three", genesis_id.as_str()),
++            ]
++        );
++    }
++
++    #[test]
++    fn attribution_assigns_everything_to_a_readd_after_deletion() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let genesis_tree = write_tree(repo, &[("app.txt", b"one\ntwo\n"), ("keep.txt", b"k\n")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        let deleted_tree = write_tree(repo, &[("keep.txt", b"k\n")]);
++        let deleted = commit(&store, &deleted_tree, &[&genesis]);
++        let readded_tree = write_tree(repo, &[("app.txt", b"one\ntwo\n"), ("keep.txt", b"k\n")]);
++        let tip = commit(&store, &readded_tree, &[&deleted]);
++        set_head(repo, &tip);
++
++        let lines = attribute_lines(&store, "app.txt").unwrap();
++
++        let tip_id = tip.to_string();
++        assert_eq!(
++            blame(&lines),
++            vec![(1, "one", tip_id.as_str()), (2, "two", tip_id.as_str())]
++        );
++    }
++
++    #[test]
++    fn attribution_counts_a_final_line_without_trailing_newline() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let genesis_tree = write_tree(repo, &[("app.txt", b"one\ntwo")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        set_head(repo, &genesis);
++
++        let lines = attribute_lines(&store, "app.txt").unwrap();
++
++        let genesis_id = genesis.to_string();
++        assert_eq!(
++            blame(&lines),
++            vec![
++                (1, "one", genesis_id.as_str()),
++                (2, "two", genesis_id.as_str())
++            ]
++        );
++    }
++
++    #[test]
++    fn attribution_rejects_binary_blobs_with_a_typed_error() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let genesis_tree = write_tree(repo, &[("app.bin", b"\xff\xfe\x00\x01".as_slice())]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        set_head(repo, &genesis);
++
++        let err = attribute_lines(&store, "app.bin").unwrap_err();
++
++        assert!(
++            err.to_string().contains("binary"),
++            "unexpected error: {err}"
++        );
++    }
++
++    #[test]
++    fn attribution_errors_when_the_path_is_missing_at_head() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let missing_before_head = attribute_lines(&store, "app.txt").unwrap_err();
++        assert!(
++            missing_before_head.to_string().contains("app.txt"),
++            "unexpected error: {missing_before_head}"
++        );
++
++        let genesis_tree = write_tree(repo, &[("other.txt", b"x\n")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        set_head(repo, &genesis);
++
++        let err = attribute_lines(&store, "app.txt").unwrap_err();
++        assert!(
++            err.to_string().contains("app.txt"),
++            "unexpected error: {err}"
++        );
++    }
++
++    #[test]
++    fn attribution_is_deterministic_for_a_given_store_state() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let genesis_tree = write_tree(repo, &[("app.txt", b"a\nb\nc\nd\n")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        let tip_tree = write_tree(repo, &[("app.txt", b"a\nB\nc\nd\ne\n")]);
++        let tip = commit(&store, &tip_tree, &[&genesis]);
++        set_head(repo, &tip);
++
++        let first = attribute_lines(&store, "app.txt").unwrap();
++        let second = attribute_lines(&store, "app.txt").unwrap();
++
++        assert_eq!(first, second);
++        assert_eq!(
++            first.iter().map(|l| l.line_number).collect::<Vec<_>>(),
++            vec![1, 2, 3, 4, 5]
++        );
++    }
+ }

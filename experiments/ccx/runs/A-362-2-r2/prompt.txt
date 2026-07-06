@@ -1,0 +1,186 @@
+--- GLOBAL POLICY (normative) ---
+# Global policy — included in EVERY brief, before any contract.
+# Normative. Byte-stable: no timestamps, stable key order, stable list order.
+schema: ccx.contract.v0
+kind: global_policy
+mechanics:
+  build_system: cargo (single workspace; no Makefile/justfile)
+  toolchain: rust 1.92.0 pinned via rust-toolchain.toml (rustfmt + clippy components)
+  verify:                       # all three must pass before any task is done
+    - cargo fmt --all --check
+    - cargo test --workspace
+    - cargo clippy --workspace --all-targets -- -D warnings
+  layout: >
+    Binary crate crates/forge-cli (binary name: forge). Library crates under
+    crates/: forge-core (ID types), forge-store (SQLite persistence),
+    forge-content (backend trait + secret-risk helpers), forge-content-git /
+    forge-content-native (backends), forge-evidence (command capture),
+    forge-policy (check evaluation), forge-protocol (JSON envelope),
+    forge-export-git (Git export), forge-sync (native sync + peer transport).
+    Integration tests: crates/forge-cli/tests/ (assert_cmd + tempfile).
+rules:
+  - Error handling is anyhow throughout; no custom error types.
+  - Serde JSON uses rename_all = "snake_case"; the --json envelope carries
+    schema_version "forge.cli.v0"; changes to serialized output are
+    additive-only.
+  - Conventional Commits (feat:/fix:/chore:/refactor:/docs: ...).
+  - Rust files have a 3000-line ceiling (scripts/check-rust-line-count.sh).
+  - Facade files (crates/forge-store/src/lib.rs, crates/forge-cli/src/main.rs)
+    take no new domain behavior; new behavior lands in domain modules
+    (docs/adr/0001-domain-modules.md).
+security_defaults:  # do not weaken; weakening requires explicit human approval
+  - Snapshots/exports exclude .forge, .env, .env.*, private-key files,
+    credential paths.
+  - Evidence excerpts are capped at 4096 bytes and redacted before storage.
+  - Evidence, decisions, native accepted commits, sync merge commits carry
+    local Ed25519 signatures; forge doctor verifies the tamper-evident chain.
+unknown_rule: >
+  If this brief plus the task contract does not license a decision you need
+  to make, STOP and surface the unknown instead of guessing. Surfacing an
+  unknown is a successful outcome, not a failure.
+
+--- TASK CONTRACT (normative) ---
+schema: ccx.contract.v0
+id: ccx-task-362-2-line-attribution
+revision: 1
+ticket: NER-362
+task: Line attribution engine (blame core)
+
+interface: |
+  Extend `crates/forge-content-native/src/provenance.rs`:
+
+    pub struct LineAttribution {
+        pub line_number: usize,          // 1-based, in the HEAD version
+        pub content: String,             // the line text, no trailing newline
+        pub commit_id: String,           // commit that last changed this line
+    }
+
+    pub fn attribute_lines(store: &NativeObjectStore, path: &str)
+        -> anyhow::Result<Vec<LineAttribution>>
+
+  Semantics: for the file at HEAD, attribute every line to the most recent
+  commit (tip→genesis walk, first-parent) in which that line's content was
+  introduced or last changed, computed from blob content diffs between
+  consecutive versions of the path (line-based LCS/Myers over the blob
+  text; a simple line-hash match-up is acceptable — the contract fixes
+  observable behavior, not the algorithm).
+
+invariants:
+  - Result covers EVERY line of the HEAD blob exactly once, in order.
+  - A line unchanged since a commit C is attributed to C, not to later
+    commits that touched other lines of the file.
+  - Binary blobs (non-UTF-8) => typed error (anyhow) with a message
+    containing "binary", not a panic or lossy attribution.
+  - Missing path at HEAD => typed error mentioning the path.
+  - Deterministic for a given store state + path.
+  - Read-only; no ledger access (enrichment is 362-4).
+
+acceptance:
+  - cargo test -p forge-content-native provenance
+  - cargo clippy -p forge-content-native --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: Do not grow crates/forge-content-native/src/lib.rs (module decl +
+      re-export lines only).
+    scope: {paths: [crates/forge-content-native/src/lib.rs], operations: [grow-file]}
+    reason: Allowlisted line cap must not grow.
+    source_evidence: scripts/check-rust-line-count.sh; NER-381.
+  - rule: No new external crate dependencies for the diff/LCS.
+    scope: {paths: [crates/forge-content-native/Cargo.toml], operations: [add-dependency]}
+    reason: Supply-chain surface is a reviewed decision; a hand-rolled
+      line matcher is acceptable and sufficient here.
+    source_evidence: workspace dependency policy (Cargo workspace, minimal deps).
+
+neighbors:
+  - ccx-task-362-1-provenance-walk
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-content-native/src/provenance.rs,
+          crates/forge-content-native/src/lib.rs]
+  forbidden_paths: [crates/forge-store/**, crates/forge-cli/**]
+  public_api_change_policy: contract-update-required
+
+--- NEIGHBOR CONTRACT (normative): ccx-task-362-1-provenance-walk ---
+schema: ccx.contract.v0
+id: ccx-task-362-1-provenance-walk
+revision: 1
+ticket: NER-362
+task: Path provenance walk over native history
+
+interface: |
+  New file `crates/forge-content-native/src/provenance.rs` (declared from
+  lib.rs with a one-line `pub mod provenance;` + re-export only):
+
+    pub struct PathProvenanceEntry {
+        pub commit_id: String,          // ObjectId display form (f1:commit:sha256:…)
+        pub change: String,             // "added" | "modified" | "deleted" | "renamed"
+        pub intent_id: Option<String>,
+        pub proposal_revision_id: Option<String>,
+        pub decision_id: Option<String>,
+        pub evidence_digest: Option<String>,   // Hex64 display form
+        pub actor: Option<String>,
+        pub authored_time: Option<i64>,
+    }
+
+    pub fn path_provenance(store: &NativeObjectStore, path: &str)
+        -> anyhow::Result<Vec<PathProvenanceEntry>>
+
+  Semantics: walk commits tip→genesis (read_head → read_commit → first
+  parent), emit one entry per commit whose tree diff AGAINST ITS FIRST
+  PARENT touches `path` (use the existing diff_native_trees / DiffOptions
+  primitives — do not write a new diff). Genesis counts as "added" if the
+  path exists in its tree. Order: tip first. Empty result if the path never
+  existed. Rename detection: report the commit as "renamed" when the diff
+  classifies it so; continue following the OLD name further back.
+
+invariants:
+  - Read-only over the object store; no ledger/SQLite access from this
+    module (ledger enrichment is task 362-4, in forge-store).
+  - Provenance fields are copied verbatim from CommitObject; never
+    synthesized or defaulted to non-None.
+  - Deterministic: same store state + path => byte-identical result.
+  - Multi-parent (merge) commits: diff against FIRST parent only, matching
+    the existing `forge log` walk convention.
+
+acceptance:
+  - cargo test -p forge-content-native provenance
+  - cargo clippy -p forge-content-native --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: Do not add code to crates/forge-content-native/src/lib.rs beyond
+      the module declaration + re-export lines.
+    scope: {paths: [crates/forge-content-native/src/lib.rs], operations: [grow-file]}
+    reason: lib.rs sits on an allowlisted line cap (4730) that may shrink
+      but MUST NOT grow (scripts/check-rust-line-count.sh).
+    source_evidence: NER-381 resolution; check-rust-line-count.sh allowlist.
+  - rule: Do not implement a new tree-diff; use diff_native_trees/DiffOptions.
+    scope: {paths: [crates/forge-content-native/src/provenance.rs], operations: [add-logic]}
+    reason: One diff engine is a correctness invariant (rename detection,
+      mode handling live there); a second drifts.
+    source_evidence: forge-content-native/src/lib.rs:71-110.
+
+neighbors:
+  - ccx-task-362-2-line-attribution
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-content-native/src/provenance.rs,
+          crates/forge-content-native/src/lib.rs]
+  forbidden_paths: [crates/forge-store/**, crates/forge-cli/**]
+  public_api_change_policy: contract-update-required
+
+
+--- TASK INSTRUCTION ---
+Implement exactly the task specified in the TASK CONTRACT above, in this
+repository (you are at the repo root). Rules:
+- Touch only paths inside the contract's allowed_changes.
+- If the brief does not license a decision you need to make, STOP: write
+  UNKNOWN.md at the repo root (what you need to know, why the brief does
+  not answer it, your best guess of kind: blocking/assumption/observation,
+  file:line evidence) and end without making further edits.
+- When done, run the contract's acceptance commands and make them pass.
+- Do not create git commits; leave all changes uncommitted in the worktree.
+- Do not read or write anything outside this repository.
