@@ -1,0 +1,2 @@
+PASS cargo test -p forge-content-native provenance::
+PASS cargo clippy -p forge-content-native --all-targets -- -D warnings

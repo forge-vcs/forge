@@ -1,0 +1,24 @@
+{
+ "scorer": "blinded general-purpose agent, static review, no runs/ or key access",
+ "unblinded_totals": {
+  "A": {
+   "defects": 5,
+   "by_class": {
+    "contract": 5
+   },
+   "unlicensed": 3
+  },
+  "B": {
+   "defects": 31,
+   "by_class": {
+    "implementation": 21,
+    "verifier": 4,
+    "workflow": 3,
+    "model_behavior": 1,
+    "contract": 2
+   },
+   "unlicensed": 40
+  }
+ },
+ "note": "Full per-task verdict prose lives in the session transcript and RESULTS.md verdict sheet; per-task defect/unlicensed counts in RESULTS.md table."
+}

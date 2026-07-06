@@ -1,0 +1,2 @@
+- **362-3** CLI surface: a `forge blame <path>` command with human and
+  --json output following the repo's envelope conventions.

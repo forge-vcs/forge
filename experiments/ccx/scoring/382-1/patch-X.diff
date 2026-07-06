@@ -1,0 +1,127 @@
+diff --git a/crates/forge-cli/src/args.rs b/crates/forge-cli/src/args.rs
+index 9dfac52..8c4d167 100644
+--- a/crates/forge-cli/src/args.rs
++++ b/crates/forge-cli/src/args.rs
+@@ -18,6 +18,9 @@ pub(crate) struct Cli {
+ #[derive(Debug, Subcommand)]
+ pub(crate) enum Command {
+     Init(InitArgs),
++    /// Start an intent + its first attempt (attached). The reported workspace_path is a
++    /// Forge-managed materialization target, not an editing surface: edit the repository
++    /// worktree while an attempt is attached.
+     Start(IntentArgs),
+     Attempt(AttemptArgs),
+     /// List intents or show one intent's declared gate spec + linked attempts.
+@@ -217,6 +220,10 @@ pub(crate) struct AttemptArgs {
+ 
+ #[derive(Debug, Subcommand)]
+ pub(crate) enum AttemptCommand {
++    /// Start a new (unattached) attempt for an existing intent. The reported
++    /// workspace_path is a Forge-managed materialization target, not an editing surface:
++    /// edits made there before `attempt attach` are overwritten when attach
++    /// re-materializes it. Attach the attempt first, then edit the repository worktree.
+     Start(AttemptStartArgs),
+     List,
+     Show {
+diff --git a/crates/forge-cli/src/schema.rs b/crates/forge-cli/src/schema.rs
+index 796b025..81844eb 100644
+--- a/crates/forge-cli/src/schema.rs
++++ b/crates/forge-cli/src/schema.rs
+@@ -55,8 +55,8 @@ fn envelope_shape() -> Value {
+ fn command_shapes() -> Value {
+     let commands = [
+         ("init", "Initializes a .forge repository; data carries root_path and the genesis operation."),
+-        ("start", "Starts an intent + its first attempt; accepts repeatable --require <command> gates and --require-tests-pass <command> structured gates (which also require zero parsed failures) persisted on the intent, and an optional --actor; data carries the started attempt + operation_id."),
+-        ("attempt start", "Starts a new attempt for an existing intent; data carries the attempt + operation_id."),
++        ("start", "Starts an intent + its first attempt; accepts repeatable --require <command> gates and --require-tests-pass <command> structured gates (which also require zero parsed failures) persisted on the intent, and an optional --actor; data carries the started attempt + operation_id. workspace_path is a Forge-managed materialization target (workspace_role=materialization_target), not an editing surface: edit the repository worktree while the attempt is attached."),
++        ("attempt start", "Starts a new (unattached) attempt for an existing intent; data carries the attempt + operation_id. workspace_path is a Forge-managed materialization target (workspace_role=materialization_target), not an editing surface: edits made there before attempt attach are overwritten when attach re-materializes it."),
+         ("attempt list", "Lists attempts; data carries { attempts: [...] }."),
+         ("attempt show", "Shows one attempt; data carries the attempt detail."),
+         ("attempt attach", "Attaches the active view to an attempt; data carries attempt_id, content_ref, current_view_id."),
+diff --git a/crates/forge-cli/tests/forge_attempts.rs b/crates/forge-cli/tests/forge_attempts.rs
+index 92c810f..2020548 100644
+--- a/crates/forge-cli/tests/forge_attempts.rs
++++ b/crates/forge-cli/tests/forge_attempts.rs
+@@ -80,6 +80,10 @@ fn attempt_start_lists_and_shows_competing_attempts() {
+     );
+ 
+     assert_eq!(second["data"]["intent_id"], intent_id);
++    // NER-382: both start and attempt start qualify workspace_path as a
++    // materialization target, not an editing surface.
++    assert_eq!(first["data"]["workspace_role"], "materialization_target");
++    assert_eq!(second["data"]["workspace_role"], "materialization_target");
+     let listed = json_output(
+         repo.forge()
+             .args(["--json", "attempt", "list"])
+diff --git a/crates/forge-cli/tests/forge_start_save.rs b/crates/forge-cli/tests/forge_start_save.rs
+index 8a39ac5..2f5fe56 100644
+--- a/crates/forge-cli/tests/forge_start_save.rs
++++ b/crates/forge-cli/tests/forge_start_save.rs
+@@ -502,6 +502,12 @@ fn start_request_id_replay_returns_original_payload() {
+         replay["data"]["workspace_path"],
+         first["data"]["workspace_path"]
+     );
++    // NER-382: the materialization-target qualifier survives idempotent replay.
++    assert_eq!(first["data"]["workspace_role"], "materialization_target");
++    assert_eq!(
++        replay["data"]["workspace_role"],
++        first["data"]["workspace_role"]
++    );
+     assert_eq!(replay["operation_id"], first["operation_id"]);
+ }
+ 
+diff --git a/crates/forge-store/src/attempts.rs b/crates/forge-store/src/attempts.rs
+index 396b5d2..6efd310 100644
+--- a/crates/forge-store/src/attempts.rs
++++ b/crates/forge-store/src/attempts.rs
+@@ -8,6 +8,12 @@ pub(crate) struct WorkspaceMarker {
+     pub(crate) attempt_id: String,
+ }
+ 
++/// The only value `StartAttempt::workspace_role` carries today (NER-382): the
++/// workspace dir under `workspace_path` is a Forge-managed materialization
++/// target, not an editing surface — `attempt attach` re-materializes it and
++/// overwrites any edits made there beforehand.
++pub const WORKSPACE_ROLE_MATERIALIZATION_TARGET: &str = "materialization_target";
++
+ #[derive(Debug, Clone, Serialize)]
+ pub struct StartAttempt {
+     pub intent_id: String,
+@@ -15,6 +21,9 @@ pub struct StartAttempt {
+     pub base_head: String,
+     pub attached: bool,
+     pub workspace_path: String,
++    /// Always [`WORKSPACE_ROLE_MATERIALIZATION_TARGET`] (NER-382): qualifies
++    /// `workspace_path` in the payload so it does not read as an editing surface.
++    pub workspace_role: &'static str,
+     pub operation_id: String,
+     pub current_view_id: String,
+ }
+@@ -209,6 +218,7 @@ fn create_attempt(
+                         "base_head": base_head,
+                         "attached": attach,
+                         "workspace_path": workspace_rel_path_for_attempt(&attempt_id),
++                        "workspace_role": WORKSPACE_ROLE_MATERIALIZATION_TARGET,
+                     }
+                 }),
+             },
+@@ -225,6 +235,7 @@ fn create_attempt(
+     Ok(StartAttempt {
+         intent_id,
+         workspace_path: workspace_rel_path_for_attempt(&attempt_id),
++        workspace_role: WORKSPACE_ROLE_MATERIALIZATION_TARGET,
+         attempt_id,
+         base_head,
+         attached: attach,
+diff --git a/crates/forge-store/src/lib.rs b/crates/forge-store/src/lib.rs
+index 81833ad..71f1cf3 100644
+--- a/crates/forge-store/src/lib.rs
++++ b/crates/forge-store/src/lib.rs
+@@ -44,6 +44,7 @@ pub use attempts::{
+     ensure_attempt_workspace_marker, list_attempts, record_attempt_workspace_materialized,
+     resolve_attempt, show_attempt, start_attempt, start_attempt_for_intent, verify_save_target,
+     AttemptRecord, AttemptShowRecord, AttemptSummary, ResolvedAttempt, StartAttempt,
++    WORKSPACE_ROLE_MATERIALIZATION_TARGET,
+ };
+ pub(crate) use attempts::{
+     attempt_by_id, resolve_attempt_in_context, verify_worktree_binding, WorkspaceMarker,

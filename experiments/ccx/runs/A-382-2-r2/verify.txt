@@ -1,0 +1,2 @@
+PASS cargo test -p forge-store
+PASS cargo test -p forge-cli --test forge_attempts

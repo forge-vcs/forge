@@ -1,0 +1,375 @@
+diff --git a/crates/forge-content-native/src/lib.rs b/crates/forge-content-native/src/lib.rs
+index 841ead6..5e93c05 100644
+--- a/crates/forge-content-native/src/lib.rs
++++ b/crates/forge-content-native/src/lib.rs
+@@ -3,9 +3,8 @@
+ //! ADR-0001's 3,000-line ceiling allows justified exceptions when cohesion beats
+ //! size. This file is intentionally capped as one native-content engine because
+ //! the object framing, tree walking/materialization, diff fingerprinting, and
+-//! three-way merge code share private invariants. Splitting it mechanically
+-//! would widen those invariants before there is a behavior change to validate.
+-//! New native-content domains should still land in sibling modules.
++//! three-way merge code share private invariants. Splitting it mechanically would
++//! widen those invariants first. New native-content domains land in sibling modules.
+ 
+ use anyhow::{anyhow, bail, Context, Result};
+ use forge_content::{
+@@ -22,14 +21,16 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+ #[cfg(unix)]
+ use std::os::unix::fs::PermissionsExt;
+ use std::path::{Path, PathBuf};
+-// `Command` is now used only by the `#[cfg(test)]` differential harness (slice-1 parity
+-// proofs); native base/changed-paths no longer shell git (NER-138 Phase 7 slice 2).
++// `Command` is used only by the `#[cfg(test)]` differential harness (slice-1 parity proofs); native base/changed-paths no longer shell git (NER-138 Phase 7 slice 2).
+ #[cfg(test)]
+ use std::process::Command;
+ 
+ mod pack;
++pub mod provenance;
+ mod status_cache;
+ 
++pub use provenance::{path_provenance, PathProvenanceEntry};
++
+ const SCHEMA_VERSION: u32 = 1;
+ const HUNK_LIMIT: usize = 4096;
+ const BINARY_SCAN_LIMIT: usize = 8000;
+@@ -44,9 +45,8 @@ const LARGE_BLOB_STREAM_THRESHOLD_BYTES: u64 = 1024 * 1024;
+ pub const COMMIT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
+ 
+ /// Re-exported from `forge_content` so `forge_store::doctor` keeps referencing
+-/// `forge_content_native::RESTORE_TEMP_PREFIX`, while the canonical definition and
+-/// its matching `is_restore_temp_path` exclusion predicate live in the shared base
+-/// crate both backends depend on (NER-132 U4).
++/// `forge_content_native::RESTORE_TEMP_PREFIX`, while the canonical definition and its
++/// matching `is_restore_temp_path` exclusion predicate live in the shared base crate both backends depend on (NER-132 U4).
+ pub use forge_content::RESTORE_TEMP_PREFIX;
+ 
+ #[derive(Debug, Clone)]
+diff --git a/crates/forge-content-native/src/provenance.rs b/crates/forge-content-native/src/provenance.rs
+new file mode 100644
+index 0000000..e62faf1
+--- /dev/null
++++ b/crates/forge-content-native/src/provenance.rs
+@@ -0,0 +1,322 @@
++//! Path provenance walk over native history (NER-362).
++//!
++//! Walks commits tip→genesis along the FIRST-parent chain (matching the `forge log`
++//! walk convention) and emits one entry per commit whose tree diff against its first
++//! parent touches the queried path. Read-only over the object store; ledger
++//! enrichment is a separate concern (task 362-4, in `forge_store`).
++
++use crate::{
++    diff_native_trees, CommitObject, DiffOptions, NativeObjectStore, NativeRefStore, ObjectId,
++};
++use anyhow::{bail, Result};
++
++/// One commit's touch of the queried path, tip-first. Provenance fields are copied
++/// verbatim from [`CommitObject`] — never synthesized or defaulted to non-`None`.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct PathProvenanceEntry {
++    pub commit_id: String,
++    pub change: String,
++    pub intent_id: Option<String>,
++    pub proposal_revision_id: Option<String>,
++    pub decision_id: Option<String>,
++    pub evidence_digest: Option<String>,
++    pub actor: Option<String>,
++    pub authored_time: Option<i64>,
++}
++
++/// Walk native history from `HEAD` back to genesis (first parent only, so a merge
++/// commit is diffed against its first parent — the `forge log` convention) and return
++/// the commits that touched `path`, tip first. Genesis counts as `"added"` when the
++/// path exists in its tree. A rename reports the commit as `"renamed"` and the walk
++/// continues following the OLD name further back. Empty when the path never existed
++/// (or no `HEAD` has been written yet).
++pub fn path_provenance(store: &NativeObjectStore, path: &str) -> Result<Vec<PathProvenanceEntry>> {
++    let mut entries = Vec::new();
++    let Some(head) = NativeRefStore::new(&store.root).read_head()? else {
++        return Ok(entries);
++    };
++    // Hunks are never surfaced by provenance entries; skipping them keeps the walk
++    // from reading every touched blob's content at each commit.
++    let options = DiffOptions {
++        include_hunks: false,
++        ..DiffOptions::default()
++    };
++    let mut tracked = path.to_string();
++    let mut cursor = Some(head);
++    while let Some(commit_id) = cursor {
++        let commit = store.read_commit(&commit_id)?;
++        let tree = ObjectId::parse(&commit.tree)?;
++        let Some(first_parent) = commit.parents.first() else {
++            // Genesis: no parent to diff against; the path counts as added iff it
++            // exists in the genesis tree.
++            if store.tree_fingerprints(&tree)?.contains_key(&tracked) {
++                entries.push(entry_for(&commit_id, &commit, "added"));
++            }
++            break;
++        };
++        let parent_id = ObjectId::parse(first_parent)?;
++        let parent_tree = ObjectId::parse(&store.read_commit(&parent_id)?.tree)?;
++        let diff = diff_native_trees(store, &parent_tree, &tree, &options)?;
++        for file in &diff.files {
++            if file.path != tracked {
++                continue;
++            }
++            entries.push(entry_for(&commit_id, &commit, change_label(&file.status)?));
++            if let Some(old_path) = &file.old_path {
++                // Renamed here: keep following the OLD name further back.
++                tracked = old_path.clone();
++            }
++            break;
++        }
++        cursor = Some(parent_id);
++    }
++    Ok(entries)
++}
++
++/// Map the diff engine's git name-status letter encoding (`A`/`M`/`D`, `R<score>`)
++/// onto the provenance change vocabulary.
++fn change_label(status: &str) -> Result<&'static str> {
++    match status {
++        "A" => Ok("added"),
++        "M" => Ok("modified"),
++        "D" => Ok("deleted"),
++        _ if status.starts_with('R') => Ok("renamed"),
++        _ => bail!("unsupported native diff status in provenance walk: {status}"),
++    }
++}
++
++fn entry_for(commit_id: &ObjectId, commit: &CommitObject, change: &str) -> PathProvenanceEntry {
++    PathProvenanceEntry {
++        commit_id: commit_id.to_string(),
++        change: change.to_string(),
++        intent_id: commit.intent_id.clone(),
++        proposal_revision_id: commit.proposal_revision_id.clone(),
++        decision_id: commit.decision_id.clone(),
++        evidence_digest: commit.evidence_digest.as_ref().map(|d| d.to_string()),
++        actor: commit.actor.clone(),
++        authored_time: commit.authored_time,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::{FileEntry, Hex64, NativeObjectStore, NativeRefStore, COMMIT_SCHEMA_VERSION};
++    use std::fs;
++    use std::path::Path;
++
++    fn write_tree(repo: &Path, files: &[(&str, &[u8])]) -> ObjectId {
++        for (path, bytes) in files {
++            let full = repo.join(path);
++            fs::create_dir_all(full.parent().unwrap()).unwrap();
++            fs::write(&full, bytes).unwrap();
++        }
++        let entries: Vec<FileEntry> = files
++            .iter()
++            .map(|(path, _)| FileEntry {
++                path: (*path).to_string(),
++                executable: false,
++                symlink_target: None,
++            })
++            .collect();
++        crate::write_tree(&NativeObjectStore::new(repo), repo, &entries, "").unwrap()
++    }
++
++    fn commit(store: &NativeObjectStore, tree: &ObjectId, parents: &[&ObjectId]) -> ObjectId {
++        store
++            .write_commit(&CommitObject {
++                schema_version: COMMIT_SCHEMA_VERSION,
++                tree: tree.to_string(),
++                parents: parents.iter().map(|p| p.to_string()).collect(),
++                intent_id: None,
++                proposal_revision_id: None,
++                decision_id: None,
++                evidence_digest: None,
++                actor: None,
++                authored_time: None,
++            })
++            .unwrap()
++    }
++
++    fn set_head(repo: &Path, tip: &ObjectId) {
++        NativeRefStore::new(repo).set_head(tip).unwrap();
++    }
++
++    fn changes(entries: &[PathProvenanceEntry]) -> Vec<(&str, &str)> {
++        entries
++            .iter()
++            .map(|e| (e.commit_id.as_str(), e.change.as_str()))
++            .collect()
++    }
++
++    #[test]
++    fn provenance_walks_added_then_modified_tip_first() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let genesis_tree = write_tree(repo, &[("app.txt", b"one\n"), ("other.txt", b"x\n")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        let modified_tree = write_tree(repo, &[("app.txt", b"two\n"), ("other.txt", b"x\n")]);
++        let tip = commit(&store, &modified_tree, &[&genesis]);
++        set_head(repo, &tip);
++
++        let entries = path_provenance(&store, "app.txt").unwrap();
++
++        assert_eq!(
++            changes(&entries),
++            vec![
++                (tip.to_string().as_str(), "modified"),
++                (genesis.to_string().as_str(), "added"),
++            ]
++        );
++    }
++
++    #[test]
++    fn provenance_skips_commits_that_do_not_touch_the_path() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let genesis_tree = write_tree(repo, &[("other.txt", b"x\n")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        let added_tree = write_tree(repo, &[("other.txt", b"x\n"), ("app.txt", b"one\n")]);
++        let added = commit(&store, &added_tree, &[&genesis]);
++        let unrelated_tree = write_tree(repo, &[("other.txt", b"y\n"), ("app.txt", b"one\n")]);
++        let tip = commit(&store, &unrelated_tree, &[&added]);
++        set_head(repo, &tip);
++
++        let entries = path_provenance(&store, "app.txt").unwrap();
++
++        assert_eq!(
++            changes(&entries),
++            vec![(added.to_string().as_str(), "added")]
++        );
++    }
++
++    #[test]
++    fn provenance_reports_deletion_and_the_prior_history() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let genesis_tree = write_tree(repo, &[("app.txt", b"one\n"), ("keep.txt", b"k\n")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        let deleted_tree = write_tree(repo, &[("keep.txt", b"k\n")]);
++        let tip = commit(&store, &deleted_tree, &[&genesis]);
++        set_head(repo, &tip);
++
++        let entries = path_provenance(&store, "app.txt").unwrap();
++
++        assert_eq!(
++            changes(&entries),
++            vec![
++                (tip.to_string().as_str(), "deleted"),
++                (genesis.to_string().as_str(), "added"),
++            ]
++        );
++    }
++
++    #[test]
++    fn provenance_follows_the_old_name_back_through_a_rename() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let content = b"line one\nline two\nline three\n";
++        let genesis_tree = write_tree(repo, &[("old.txt", content), ("keep.txt", b"k\n")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        let renamed_tree = write_tree(repo, &[("new.txt", content), ("keep.txt", b"k\n")]);
++        let renamed = commit(&store, &renamed_tree, &[&genesis]);
++        let modified_tree = write_tree(
++            repo,
++            &[
++                ("new.txt", b"line one\nline TWO\nline three\n".as_slice()),
++                ("keep.txt", b"k\n"),
++            ],
++        );
++        let tip = commit(&store, &modified_tree, &[&renamed]);
++        set_head(repo, &tip);
++
++        let entries = path_provenance(&store, "new.txt").unwrap();
++
++        assert_eq!(
++            changes(&entries),
++            vec![
++                (tip.to_string().as_str(), "modified"),
++                (renamed.to_string().as_str(), "renamed"),
++                (genesis.to_string().as_str(), "added"),
++            ]
++        );
++    }
++
++    #[test]
++    fn provenance_is_empty_when_the_path_never_existed_or_head_is_unset() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        assert!(path_provenance(&store, "app.txt").unwrap().is_empty());
++
++        let genesis_tree = write_tree(repo, &[("other.txt", b"x\n")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        set_head(repo, &genesis);
++        assert!(path_provenance(&store, "app.txt").unwrap().is_empty());
++    }
++
++    #[test]
++    fn provenance_diffs_merge_commits_against_first_parent_only() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let ours_tree = write_tree(repo, &[("app.txt", b"ours\n")]);
++        let ours = commit(&store, &ours_tree, &[]);
++        let theirs_tree = write_tree(repo, &[("app.txt", b"theirs\n")]);
++        let theirs = commit(&store, &theirs_tree, &[]);
++        // The merge keeps the first parent's tree: against `ours` the path is
++        // untouched, so the merge must not emit an entry even though the diff
++        // against `theirs` would classify it as modified.
++        let merge = commit(&store, &ours_tree, &[&ours, &theirs]);
++        set_head(repo, &merge);
++
++        let entries = path_provenance(&store, "app.txt").unwrap();
++
++        assert_eq!(
++            changes(&entries),
++            vec![(ours.to_string().as_str(), "added")]
++        );
++    }
++
++    #[test]
++    fn provenance_copies_justification_fields_verbatim() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let store = NativeObjectStore::new(repo);
++        let genesis_tree = write_tree(repo, &[("keep.txt", b"k\n")]);
++        let genesis = commit(&store, &genesis_tree, &[]);
++        let added_tree = write_tree(repo, &[("keep.txt", b"k\n"), ("app.txt", b"one\n")]);
++        let digest = "a".repeat(64);
++        let tip = store
++            .write_commit(&CommitObject {
++                schema_version: COMMIT_SCHEMA_VERSION,
++                tree: added_tree.to_string(),
++                parents: vec![genesis.to_string()],
++                intent_id: Some("intent_1".to_string()),
++                proposal_revision_id: Some("rev_1".to_string()),
++                decision_id: Some("decision_1".to_string()),
++                evidence_digest: Some(Hex64::new(&digest).unwrap()),
++                actor: Some("agent".to_string()),
++                authored_time: Some(1_234_567_890),
++            })
++            .unwrap();
++        set_head(repo, &tip);
++
++        let entries = path_provenance(&store, "app.txt").unwrap();
++
++        assert_eq!(entries.len(), 1);
++        let entry = &entries[0];
++        assert_eq!(entry.commit_id, tip.to_string());
++        assert_eq!(entry.change, "added");
++        assert_eq!(entry.intent_id.as_deref(), Some("intent_1"));
++        assert_eq!(entry.proposal_revision_id.as_deref(), Some("rev_1"));
++        assert_eq!(entry.decision_id.as_deref(), Some("decision_1"));
++        assert_eq!(entry.evidence_digest.as_deref(), Some(digest.as_str()));
++        assert_eq!(entry.actor.as_deref(), Some("agent"));
++        assert_eq!(entry.authored_time, Some(1_234_567_890));
++    }
++}

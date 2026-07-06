@@ -1,0 +1,262 @@
+diff --git a/crates/forge-cli/src/args.rs b/crates/forge-cli/src/args.rs
+index 9dfac52..561289f 100644
+--- a/crates/forge-cli/src/args.rs
++++ b/crates/forge-cli/src/args.rs
+@@ -43,6 +43,8 @@ pub(crate) enum Command {
+     Conflict(ConflictArgs),
+     /// Walk the native commit history (tip→genesis) and the evidence that justified it.
+     Log(LogArgs),
++    /// Attribute every line of a file at HEAD to the native commit that last changed it.
++    Blame(BlameArgs),
+     /// Materialize a past commit's tree into the worktree (does not move the base anchor).
+     Checkout(CheckoutArgs),
+     /// Undo the last save, restoring the prior snapshot (recorded in the op-log).
+@@ -137,6 +139,12 @@ pub(crate) struct LogArgs {
+     pub(crate) intent: Option<String>,
+ }
+ 
++#[derive(Debug, Args)]
++pub(crate) struct BlameArgs {
++    /// Repo-relative path of the file to attribute at HEAD.
++    pub(crate) path: String,
++}
++
+ #[derive(Debug, Args)]
+ pub(crate) struct CheckoutArgs {
+     /// The native commit id (`f1:commit:sha256:...`) whose tree to materialize.
+diff --git a/crates/forge-cli/src/commands/blame.rs b/crates/forge-cli/src/commands/blame.rs
+new file mode 100644
+index 0000000..1f0c492
+--- /dev/null
++++ b/crates/forge-cli/src/commands/blame.rs
+@@ -0,0 +1,185 @@
++use forge_content_native::{LineAttribution, NativeObjectStore, PathProvenanceEntry};
++use forge_protocol::ResponseEnvelope;
++use serde_json::{json, Value};
++use std::collections::HashMap;
++
++use crate::{command_result, BlameArgs};
++
++pub(crate) fn blame_response(request_id: Option<String>, args: BlameArgs) -> ResponseEnvelope {
++    // Read-only like `log`: command_result takes no repo lock and runs no reconcile.
++    command_result("blame", request_id, |cwd, _request_id| {
++        let context = forge_store::open_repository(&cwd)?;
++        let store = NativeObjectStore::new(&context.root_path);
++        let provenance = forge_content_native::path_provenance(&store, &args.path)?;
++        let attributions = forge_content_native::attribute_lines(&store, &args.path)?;
++        let lines = join_blame_lines(&provenance, attributions);
++        Ok((
++            None,
++            json!({ "path": args.path, "lines": lines }),
++            Vec::new(),
++        ))
++    })
++}
++
++/// Join per line via commit_id: each attributed line picks up the provenance
++/// fields of the commit that last changed it, copied verbatim from the
++/// CommitObject via the provenance module — ledger enrichment is a later
++/// slice, so absent commit-level provenance stays null here. A commit missing
++/// from the provenance walk (cannot happen for a consistent store) keeps null
++/// fields rather than failing the whole blame.
++fn join_blame_lines(
++    provenance: &[PathProvenanceEntry],
++    attributions: Vec<LineAttribution>,
++) -> Vec<Value> {
++    let by_commit: HashMap<&str, &PathProvenanceEntry> = provenance
++        .iter()
++        .map(|entry| (entry.commit_id.as_str(), entry))
++        .collect();
++    attributions
++        .into_iter()
++        .map(|attribution| {
++            let entry = by_commit.get(attribution.commit_id.as_str()).copied();
++            json!({
++                "line_number": attribution.line_number,
++                "content": attribution.content,
++                "commit_id": attribution.commit_id,
++                "intent_id": entry.and_then(|e| e.intent_id.clone()),
++                "proposal_revision_id": entry.and_then(|e| e.proposal_revision_id.clone()),
++                "decision_id": entry.and_then(|e| e.decision_id.clone()),
++                "actor": entry.and_then(|e| e.actor.clone()),
++                "authored_time": entry.and_then(|e| e.authored_time),
++            })
++        })
++        .collect()
++}
++
++/// Human row: `<short-commit> <intent-or-"-"> <line#> <content>`.
++pub(crate) fn print_blame_human(data: &Value) {
++    let Some(lines) = data.get("lines").and_then(Value::as_array) else {
++        return;
++    };
++    for line in lines {
++        let commit_id = line.get("commit_id").and_then(Value::as_str).unwrap_or("-");
++        let intent = line.get("intent_id").and_then(Value::as_str).unwrap_or("-");
++        let line_number = line.get("line_number").and_then(Value::as_u64).unwrap_or(0);
++        let content = line.get("content").and_then(Value::as_str).unwrap_or("");
++        println!(
++            "{} {} {} {}",
++            short_commit_id(commit_id),
++            intent,
++            line_number,
++            content
++        );
++    }
++}
++
++/// Abbreviate a native commit id (`f1:commit:sha256:<hex64>`) to the first 12
++/// digest characters; anything unrecognized passes through untruncated enough
++/// to stay identifiable.
++fn short_commit_id(commit_id: &str) -> &str {
++    let digest = commit_id.rsplit(':').next().unwrap_or(commit_id);
++    digest.get(..12).unwrap_or(digest)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn entry(commit_id: &str, intent_id: Option<&str>) -> PathProvenanceEntry {
++        PathProvenanceEntry {
++            commit_id: commit_id.to_string(),
++            change: "modified".to_string(),
++            intent_id: intent_id.map(str::to_string),
++            proposal_revision_id: intent_id.map(|id| format!("{id}-rev")),
++            decision_id: intent_id.map(|id| format!("{id}-dec")),
++            evidence_digest: None,
++            actor: intent_id.map(|_| "agent".to_string()),
++            authored_time: intent_id.map(|_| 1_000),
++        }
++    }
++
++    fn attribution(line_number: usize, content: &str, commit_id: &str) -> LineAttribution {
++        LineAttribution {
++            line_number,
++            content: content.to_string(),
++            commit_id: commit_id.to_string(),
++        }
++    }
++
++    #[test]
++    fn blame_join_carries_provenance_per_line_commit() {
++        let provenance = vec![
++            entry("f1:commit:sha256:aa", Some("intent-1")),
++            entry("f1:commit:sha256:bb", None),
++        ];
++        let lines = join_blame_lines(
++            &provenance,
++            vec![
++                attribution(1, "alpha", "f1:commit:sha256:aa"),
++                attribution(2, "beta", "f1:commit:sha256:bb"),
++            ],
++        );
++        assert_eq!(
++            lines,
++            vec![
++                json!({
++                    "line_number": 1,
++                    "content": "alpha",
++                    "commit_id": "f1:commit:sha256:aa",
++                    "intent_id": "intent-1",
++                    "proposal_revision_id": "intent-1-rev",
++                    "decision_id": "intent-1-dec",
++                    "actor": "agent",
++                    "authored_time": 1_000
++                }),
++                json!({
++                    "line_number": 2,
++                    "content": "beta",
++                    "commit_id": "f1:commit:sha256:bb",
++                    "intent_id": null,
++                    "proposal_revision_id": null,
++                    "decision_id": null,
++                    "actor": null,
++                    "authored_time": null
++                }),
++            ]
++        );
++    }
++
++    #[test]
++    fn blame_join_keeps_null_fields_for_unknown_commit() {
++        let lines = join_blame_lines(&[], vec![attribution(1, "orphan", "f1:commit:sha256:cc")]);
++        assert_eq!(lines[0]["commit_id"], "f1:commit:sha256:cc");
++        assert_eq!(lines[0]["intent_id"], Value::Null);
++        assert_eq!(lines[0]["actor"], Value::Null);
++    }
++
++    #[test]
++    fn blame_payload_serializes_snake_case_with_nulls() {
++        let lines = join_blame_lines(&[], vec![attribution(1, "x", "f1:commit:sha256:dd")]);
++        assert_eq!(
++            Value::Array(lines),
++            json!([{
++                "line_number": 1,
++                "content": "x",
++                "commit_id": "f1:commit:sha256:dd",
++                "intent_id": null,
++                "proposal_revision_id": null,
++                "decision_id": null,
++                "actor": null,
++                "authored_time": null
++            }])
++        );
++    }
++
++    #[test]
++    fn blame_short_commit_id_abbreviates_digest() {
++        assert_eq!(
++            short_commit_id(
++                "f1:commit:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
++            ),
++            "0123456789ab"
++        );
++        assert_eq!(short_commit_id("short"), "short");
++    }
++}
+diff --git a/crates/forge-cli/src/commands/core.rs b/crates/forge-cli/src/commands/core.rs
+index 1b6568f..35a5c09 100644
+--- a/crates/forge-cli/src/commands/core.rs
++++ b/crates/forge-cli/src/commands/core.rs
+@@ -2103,6 +2103,7 @@ pub(crate) fn print_human(response: &ResponseEnvelope) {
+             "schema" => {
+                 println!("{}", serde_json::to_string_pretty(&response.data).unwrap());
+             }
++            "blame" => super::blame::print_blame_human(&response.data),
+             command => println!("{command} succeeded"),
+         }
+     } else if let Some(error) = response.errors.first() {
+diff --git a/crates/forge-cli/src/commands/mod.rs b/crates/forge-cli/src/commands/mod.rs
+index f7582fb..d3358ba 100644
+--- a/crates/forge-cli/src/commands/mod.rs
++++ b/crates/forge-cli/src/commands/mod.rs
+@@ -1,3 +1,4 @@
++pub(super) mod blame;
+ pub(super) mod core;
+ pub(super) mod export;
+ pub(super) mod sync;
+diff --git a/crates/forge-cli/src/main.rs b/crates/forge-cli/src/main.rs
+index da8f879..ceedffe 100644
+--- a/crates/forge-cli/src/main.rs
++++ b/crates/forge-cli/src/main.rs
+@@ -70,6 +70,7 @@ fn main() -> ExitCode {
+         Command::Merge(args) => merge_response(request_id, args),
+         Command::Conflict(args) => conflict_response(request_id, args),
+         Command::Log(args) => log_response(request_id, args),
++        Command::Blame(args) => commands::blame::blame_response(request_id, args),
+         Command::Checkout(args) => checkout_response(request_id, args),
+         Command::Undo => undo_response(request_id),
+         Command::Trust(args) => trust_response(request_id, args),
+diff --git a/crates/forge-cli/src/schema.rs b/crates/forge-cli/src/schema.rs
+index 796b025..bfb6932 100644
+--- a/crates/forge-cli/src/schema.rs
++++ b/crates/forge-cli/src/schema.rs
+@@ -82,6 +82,7 @@ fn command_shapes() -> Value {
+         ("conflict resolve", "Resolves a persisted conflict set with --tree <forge-tree-ref>. Data carries { conflict_set_id, proposal_id, proposal_revision_id, snapshot_id, evidence_id, resolution_ref, operation_id, view_id }. The resolution creates a new snapshot, proposal revision, and tamper-evident evidence row; agents should run evidence and check again before accept."),
+         ("attempt compare", "Alias of `compare` scoped to attempts; same data shape."),
+         ("log", "Walks the native commit history tip→genesis via the JSON contract; data carries { commits: [{ commit_id, tree, parents, intent_id, proposal_revision_id, decision_id, actor, authored_time, evidence_digest }] }. Read-only; --intent <id> filters to commits under one intent (\"show every change under this intent\"). Native-backend repos only (a git-backend repo has no native history)."),
++        ("blame", "Attributes every line of a file at HEAD to the native commit that last changed it, joined per line with that commit's provenance; data carries { path, lines: [{ line_number, content, commit_id, intent_id, proposal_revision_id, decision_id, actor, authored_time }] }. Provenance fields come verbatim from the commit object (no ledger enrichment). Read-only; native-backend repos only. Non-UTF-8 blobs and a path missing at HEAD are errors."),
+         ("checkout", "Materializes a past commit's tree into the worktree (refuses a dirty worktree with DIRTY_WORKTREE; an unknown commit is rejected, a ledger-referenced-but-missing one is NATIVE_HISTORY_CORRUPT); data carries { commit_id, content_ref, base_unchanged: true, current_view_id }. Materialize-only: does NOT move the base anchor (a save afterward still diffs against the unchanged base HEAD), and is recorded in the op-log so forge undo can reverse it. Native-backend repos only."),
+         ("undo", "Undoes the last save, restoring the worktree to the prior snapshot (the latest snapshot's parent) and recording the undo as a forward op-log operation; refuses a dirty worktree with DIRTY_WORKTREE; data carries { undone_operation_id, restored_snapshot_id, content_ref, current_view_id }. Append-only — never deletes a decision or op-log row. \"nothing to undo\" when there is no earlier snapshot."),
+         ("trust policy", "Shows or updates the local trust policy. With no flags, data carries { min_accept_trust, min_export_trust, supported_trust_levels }. With --accept/--export, updates the configured minimum trust for accept/export. Supported levels are self_reported, locally_observed, locally_signed, hosted_runner_observed, hosted_runner_signed, third_party_attested. Hosted-runner levels require valid hosted-runner signatures; third_party_attested requires valid third-party signatures."),

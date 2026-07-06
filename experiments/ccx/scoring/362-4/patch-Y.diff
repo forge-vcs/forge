@@ -1,0 +1,533 @@
+diff --git a/crates/forge-cli/src/commands/blame.rs b/crates/forge-cli/src/commands/blame.rs
+index 1f0c492..0669fbc 100644
+--- a/crates/forge-cli/src/commands/blame.rs
++++ b/crates/forge-cli/src/commands/blame.rs
+@@ -1,10 +1,16 @@
+ use forge_content_native::{LineAttribution, NativeObjectStore, PathProvenanceEntry};
+ use forge_protocol::ResponseEnvelope;
++use forge_store::ProvenanceDetail;
+ use serde_json::{json, Value};
+ use std::collections::HashMap;
++use std::path::Path;
+ 
+ use crate::{command_result, BlameArgs};
+ 
++/// One distinct commit-level provenance tuple; ledger enrichment is fetched
++/// once per key, never per line.
++type LedgerKey = (String, Option<String>, Option<String>);
++
+ pub(crate) fn blame_response(request_id: Option<String>, args: BlameArgs) -> ResponseEnvelope {
+     // Read-only like `log`: command_result takes no repo lock and runs no reconcile.
+     command_result("blame", request_id, |cwd, _request_id| {
+@@ -12,7 +18,8 @@ pub(crate) fn blame_response(request_id: Option<String>, args: BlameArgs) -> Res
+         let store = NativeObjectStore::new(&context.root_path);
+         let provenance = forge_content_native::path_provenance(&store, &args.path)?;
+         let attributions = forge_content_native::attribute_lines(&store, &args.path)?;
+-        let lines = join_blame_lines(&provenance, attributions);
++        let details = ledger_details(&cwd, &provenance)?;
++        let lines = join_blame_lines(&provenance, attributions, &details);
+         Ok((
+             None,
+             json!({ "path": args.path, "lines": lines }),
+@@ -21,15 +28,57 @@ pub(crate) fn blame_response(request_id: Option<String>, args: BlameArgs) -> Res
+     })
+ }
+ 
++fn ledger_key(entry: &PathProvenanceEntry) -> Option<LedgerKey> {
++    entry.intent_id.as_ref().map(|intent_id| {
++        (
++            intent_id.clone(),
++            entry.proposal_revision_id.clone(),
++            entry.decision_id.clone(),
++        )
++    })
++}
++
++/// Ledger enrichment (NER-362): resolve intent title, decision status, and
++/// latest check status once per distinct (intent, revision, decision) tuple —
++/// provenance already carries one entry per distinct commit, so the query
++/// count stays O(distinct commits), not O(lines). Entries without an intent
++/// carry no ledger reference and are skipped (their enrichment fields stay
++/// null); unknown ids degrade to null fields inside `provenance_detail`
++/// rather than erroring, so blame on pre-ledger history still renders.
++fn ledger_details(
++    cwd: &Path,
++    provenance: &[PathProvenanceEntry],
++) -> anyhow::Result<HashMap<LedgerKey, ProvenanceDetail>> {
++    let mut details = HashMap::new();
++    for entry in provenance {
++        let Some(key) = ledger_key(entry) else {
++            continue;
++        };
++        if details.contains_key(&key) {
++            continue;
++        }
++        let detail = forge_store::provenance_detail(
++            cwd,
++            &key.0,
++            entry.proposal_revision_id.as_deref(),
++            entry.decision_id.as_deref(),
++        )?;
++        details.insert(key, detail);
++    }
++    Ok(details)
++}
++
+ /// Join per line via commit_id: each attributed line picks up the provenance
+ /// fields of the commit that last changed it, copied verbatim from the
+-/// CommitObject via the provenance module — ledger enrichment is a later
+-/// slice, so absent commit-level provenance stays null here. A commit missing
+-/// from the provenance walk (cannot happen for a consistent store) keeps null
+-/// fields rather than failing the whole blame.
++/// CommitObject via the provenance module, plus the additive ledger
++/// enrichment fields (intent_title, decision_status, check_status) resolved
++/// per distinct tuple in `details`. A commit missing from the provenance walk
++/// (cannot happen for a consistent store) keeps null fields rather than
++/// failing the whole blame.
+ fn join_blame_lines(
+     provenance: &[PathProvenanceEntry],
+     attributions: Vec<LineAttribution>,
++    details: &HashMap<LedgerKey, ProvenanceDetail>,
+ ) -> Vec<Value> {
+     let by_commit: HashMap<&str, &PathProvenanceEntry> = provenance
+         .iter()
+@@ -39,6 +88,7 @@ fn join_blame_lines(
+         .into_iter()
+         .map(|attribution| {
+             let entry = by_commit.get(attribution.commit_id.as_str()).copied();
++            let detail = entry.and_then(ledger_key).and_then(|key| details.get(&key));
+             json!({
+                 "line_number": attribution.line_number,
+                 "content": attribution.content,
+@@ -48,12 +98,18 @@ fn join_blame_lines(
+                 "decision_id": entry.and_then(|e| e.decision_id.clone()),
+                 "actor": entry.and_then(|e| e.actor.clone()),
+                 "authored_time": entry.and_then(|e| e.authored_time),
++                "intent_title": detail.and_then(|d| d.intent_title.clone()),
++                "decision_status": detail.and_then(|d| d.decision_status.clone()),
++                "check_status": detail.and_then(|d| d.check_status.clone()),
+             })
+         })
+         .collect()
+ }
+ 
+-/// Human row: `<short-commit> <intent-or-"-"> <line#> <content>`.
++/// Human row: `<short-commit> <intent-or-"-"> <line#> <content>`, with the
++/// ledger intent title appended in parentheses after the intent id when the
++/// enrichment resolved one (NER-362); rows without a title keep the 362-3
++/// shape unchanged.
+ pub(crate) fn print_blame_human(data: &Value) {
+     let Some(lines) = data.get("lines").and_then(Value::as_array) else {
+         return;
+@@ -63,10 +119,14 @@ pub(crate) fn print_blame_human(data: &Value) {
+         let intent = line.get("intent_id").and_then(Value::as_str).unwrap_or("-");
+         let line_number = line.get("line_number").and_then(Value::as_u64).unwrap_or(0);
+         let content = line.get("content").and_then(Value::as_str).unwrap_or("");
++        let intent_column = match line.get("intent_title").and_then(Value::as_str) {
++            Some(title) => format!("{intent} ({title})"),
++            None => intent.to_string(),
++        };
+         println!(
+             "{} {} {} {}",
+             short_commit_id(commit_id),
+-            intent,
++            intent_column,
+             line_number,
+             content
+         );
+@@ -106,18 +166,41 @@ mod tests {
+         }
+     }
+ 
++    fn detail(intent_id: &str) -> ProvenanceDetail {
++        ProvenanceDetail {
++            intent_id: intent_id.to_string(),
++            intent_title: Some(format!("{intent_id} title")),
++            decision_id: Some(format!("{intent_id}-dec")),
++            decision_status: Some("accepted".to_string()),
++            check_status: Some("passed".to_string()),
++        }
++    }
++
++    fn details_for(entries: &[PathProvenanceEntry]) -> HashMap<LedgerKey, ProvenanceDetail> {
++        entries
++            .iter()
++            .filter_map(|e| {
++                let key = ledger_key(e)?;
++                let detail = detail(&key.0);
++                Some((key, detail))
++            })
++            .collect()
++    }
++
+     #[test]
+     fn blame_join_carries_provenance_per_line_commit() {
+         let provenance = vec![
+             entry("f1:commit:sha256:aa", Some("intent-1")),
+             entry("f1:commit:sha256:bb", None),
+         ];
++        let details = details_for(&provenance);
+         let lines = join_blame_lines(
+             &provenance,
+             vec![
+                 attribution(1, "alpha", "f1:commit:sha256:aa"),
+                 attribution(2, "beta", "f1:commit:sha256:bb"),
+             ],
++            &details,
+         );
+         assert_eq!(
+             lines,
+@@ -130,7 +213,10 @@ mod tests {
+                     "proposal_revision_id": "intent-1-rev",
+                     "decision_id": "intent-1-dec",
+                     "actor": "agent",
+-                    "authored_time": 1_000
++                    "authored_time": 1_000,
++                    "intent_title": "intent-1 title",
++                    "decision_status": "accepted",
++                    "check_status": "passed"
+                 }),
+                 json!({
+                     "line_number": 2,
+@@ -140,7 +226,10 @@ mod tests {
+                     "proposal_revision_id": null,
+                     "decision_id": null,
+                     "actor": null,
+-                    "authored_time": null
++                    "authored_time": null,
++                    "intent_title": null,
++                    "decision_status": null,
++                    "check_status": null
+                 }),
+             ]
+         );
+@@ -148,15 +237,43 @@ mod tests {
+ 
+     #[test]
+     fn blame_join_keeps_null_fields_for_unknown_commit() {
+-        let lines = join_blame_lines(&[], vec![attribution(1, "orphan", "f1:commit:sha256:cc")]);
++        let lines = join_blame_lines(
++            &[],
++            vec![attribution(1, "orphan", "f1:commit:sha256:cc")],
++            &HashMap::new(),
++        );
+         assert_eq!(lines[0]["commit_id"], "f1:commit:sha256:cc");
+         assert_eq!(lines[0]["intent_id"], Value::Null);
+         assert_eq!(lines[0]["actor"], Value::Null);
++        assert_eq!(lines[0]["intent_title"], Value::Null);
++        assert_eq!(lines[0]["decision_status"], Value::Null);
++        assert_eq!(lines[0]["check_status"], Value::Null);
++    }
++
++    #[test]
++    fn blame_join_enrichment_degrades_to_null_when_ledger_rows_missing() {
++        // A commit that names an intent whose ledger rows are gone (history
++        // predating the ledger): the tuple resolves no detail and the
++        // enrichment fields stay null while commit-level fields survive.
++        let provenance = vec![entry("f1:commit:sha256:aa", Some("intent-old"))];
++        let lines = join_blame_lines(
++            &provenance,
++            vec![attribution(1, "alpha", "f1:commit:sha256:aa")],
++            &HashMap::new(),
++        );
++        assert_eq!(lines[0]["intent_id"], "intent-old");
++        assert_eq!(lines[0]["intent_title"], Value::Null);
++        assert_eq!(lines[0]["decision_status"], Value::Null);
++        assert_eq!(lines[0]["check_status"], Value::Null);
+     }
+ 
+     #[test]
+     fn blame_payload_serializes_snake_case_with_nulls() {
+-        let lines = join_blame_lines(&[], vec![attribution(1, "x", "f1:commit:sha256:dd")]);
++        let lines = join_blame_lines(
++            &[],
++            vec![attribution(1, "x", "f1:commit:sha256:dd")],
++            &HashMap::new(),
++        );
+         assert_eq!(
+             Value::Array(lines),
+             json!([{
+@@ -167,11 +284,29 @@ mod tests {
+                 "proposal_revision_id": null,
+                 "decision_id": null,
+                 "actor": null,
+-                "authored_time": null
++                "authored_time": null,
++                "intent_title": null,
++                "decision_status": null,
++                "check_status": null
+             }])
+         );
+     }
+ 
++    #[test]
++    fn blame_ledger_key_requires_intent() {
++        let with_intent = entry("f1:commit:sha256:aa", Some("intent-1"));
++        assert_eq!(
++            ledger_key(&with_intent),
++            Some((
++                "intent-1".to_string(),
++                Some("intent-1-rev".to_string()),
++                Some("intent-1-dec".to_string()),
++            ))
++        );
++        let without_intent = entry("f1:commit:sha256:bb", None);
++        assert_eq!(ledger_key(&without_intent), None);
++    }
++
+     #[test]
+     fn blame_short_commit_id_abbreviates_digest() {
+         assert_eq!(
+diff --git a/crates/forge-store/src/lib.rs b/crates/forge-store/src/lib.rs
+index 81833ad..ff2ce8e 100644
+--- a/crates/forge-store/src/lib.rs
++++ b/crates/forge-store/src/lib.rs
+@@ -27,6 +27,7 @@ mod merge;
+ mod migrations;
+ mod private_overlay;
+ mod proposals;
++mod provenance;
+ mod publication;
+ mod repo_lock;
+ mod repository;
+@@ -133,6 +134,7 @@ pub(crate) use proposals::{
+     latest_proposal_for_attempt, proposal_by_id, proposal_by_id_on, proposal_metadata_for_attempt,
+     redact_gate_result, resolve_proposal, verify_evidence_integrity, IntegrityStatus,
+ };
++pub use provenance::{provenance_detail, ProvenanceDetail};
+ pub(crate) use publication::latest_publication_for_proposal_revision;
+ pub use publication::{
+     accepted_commit_id_for_revision, build_publication_trailer, decision_for_proposal_revision,
+diff --git a/crates/forge-store/src/provenance.rs b/crates/forge-store/src/provenance.rs
+new file mode 100644
+index 0000000..f7620e2
+--- /dev/null
++++ b/crates/forge-store/src/provenance.rs
+@@ -0,0 +1,227 @@
++use super::*;
++
++/// Ledger enrichment for one distinct provenance tuple as carried by native
++/// commit objects (NER-362): the intent's title, the referenced decision's
++/// status, and the latest check status recorded for the proposal revision.
++/// A read model over existing rows — every field an id fails to resolve to
++/// degrades to `None` (blame on history that predates some ledger rows must
++/// still render), so only infrastructure failures surface as errors.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ProvenanceDetail {
++    pub intent_id: String,
++    pub intent_title: Option<String>,
++    pub decision_id: Option<String>,
++    pub decision_status: Option<String>,
++    pub check_status: Option<String>,
++}
++
++/// Resolve ledger detail for one (intent, proposal revision, decision) tuple
++/// (NER-362). Read-only: one connection, one point query per provided id —
++/// callers enriching a blame must call this once per distinct tuple (the
++/// commit-object provenance repeats per line), keeping the query count
++/// O(distinct commits). Unknown or missing ids yield `None` fields, never an
++/// error; `intent_id`/`decision_id` echo the caller's ids verbatim. All
++/// queries are repo-scoped so a multi-repo DB never leaks another repo's
++/// ledger rows.
++pub fn provenance_detail(
++    cwd: &Path,
++    intent_id: &str,
++    proposal_revision_id: Option<&str>,
++    decision_id: Option<&str>,
++) -> Result<ProvenanceDetail> {
++    let context = open_repository(cwd)?;
++    let connection = open_connection(&context.database_path)?;
++    let intent_title: Option<String> = connection
++        .query_row(
++            "SELECT text FROM intents WHERE repo_id = ?1 AND id = ?2",
++            params![context.repo_id, intent_id],
++            |row| row.get(0),
++        )
++        .optional()?;
++    let decision_status: Option<String> = match decision_id {
++        Some(id) => connection
++            .query_row(
++                "SELECT decision FROM decisions WHERE repo_id = ?1 AND id = ?2",
++                params![context.repo_id, id],
++                |row| row.get(0),
++            )
++            .optional()?,
++        None => None,
++    };
++    // Latest check for the revision, mirroring the tie-break used by
++    // `latest_check_for_proposal_revision` (created_at_ms then rowid).
++    let check_status: Option<String> = match proposal_revision_id {
++        Some(revision_id) => connection
++            .query_row(
++                "SELECT status FROM check_results
++                 WHERE repo_id = ?1 AND proposal_revision_id = ?2
++                 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
++                params![context.repo_id, revision_id],
++                |row| row.get(0),
++            )
++            .optional()?,
++        None => None,
++    };
++    Ok(ProvenanceDetail {
++        intent_id: intent_id.to_string(),
++        intent_title,
++        decision_id: decision_id.map(str::to_string),
++        decision_status,
++        check_status,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn run_git(cwd: &Path, args: &[&str]) {
++        let status = Command::new("git")
++            .args(args)
++            .current_dir(cwd)
++            .status()
++            .expect("run git");
++        assert!(status.success(), "git {args:?} failed");
++    }
++
++    /// Initialized repo with one intent + attempt; returns the started ids.
++    fn seeded_repo(root: &Path) -> StartAttempt {
++        run_git(root, &["init"]);
++        run_git(root, &["config", "user.email", "forge@example.test"]);
++        run_git(root, &["config", "user.name", "Forge Test"]);
++        fs::write(root.join("README.md"), "hello\n").expect("write readme");
++        run_git(root, &["add", "README.md"]);
++        run_git(root, &["commit", "-m", "initial"]);
++        init_repository(root, None, "git".to_string()).expect("init repository");
++        start_attempt(
++            root,
++            None,
++            "Add blame support".to_string(),
++            "HEAD0".to_string(),
++            None,
++        )
++        .expect("start attempt")
++    }
++
++    /// Insert the proposal → revision chain plus decision and check rows the
++    /// read model joins against (foreign keys are ON, so the full chain is
++    /// required). Returns (proposal_revision_id, decision_id).
++    fn seed_ledger_rows(root: &Path, attempt_id: &str) -> (String, String) {
++        let context = open_repository(root).expect("open repository");
++        let connection = open_connection(&context.database_path).expect("open connection");
++        connection
++            .execute(
++                "INSERT INTO snapshots
++                 (id, repo_id, attempt_id, parent_snapshot_id, content_ref,
++                  changed_paths_json, created_at_ms)
++                 VALUES ('snap_1', ?1, ?2, NULL, 'git-tree:deadbeef', '[]', 1000)",
++                params![context.repo_id, attempt_id],
++            )
++            .expect("insert snapshot");
++        connection
++            .execute(
++                "INSERT INTO proposals
++                 (id, repo_id, attempt_id, snapshot_id, base_head, content_ref,
++                  status, created_at_ms)
++                 VALUES ('prop_1', ?1, ?2, 'snap_1', 'HEAD0', 'git-tree:deadbeef',
++                         'open', 1000)",
++                params![context.repo_id, attempt_id],
++            )
++            .expect("insert proposal");
++        connection
++            .execute(
++                "INSERT INTO proposal_revisions
++                 (id, proposal_id, snapshot_id, content_ref, changed_paths_json,
++                  created_at_ms)
++                 VALUES ('rev_1', 'prop_1', 'snap_1', 'git-tree:deadbeef', '[]', 1000)",
++                [],
++            )
++            .expect("insert proposal revision");
++        connection
++            .execute(
++                "INSERT INTO check_results
++                 (id, repo_id, proposal_id, proposal_revision_id, status, reason,
++                  evidence_id, created_at_ms)
++                 VALUES ('check_1', ?1, 'prop_1', 'rev_1', 'failed', 'gate failed',
++                         NULL, 1000)",
++                params![context.repo_id],
++            )
++            .expect("insert older check");
++        connection
++            .execute(
++                "INSERT INTO check_results
++                 (id, repo_id, proposal_id, proposal_revision_id, status, reason,
++                  evidence_id, created_at_ms)
++                 VALUES ('check_2', ?1, 'prop_1', 'rev_1', 'passed', 'all gates passed',
++                         NULL, 2000)",
++                params![context.repo_id],
++            )
++            .expect("insert newer check");
++        connection
++            .execute(
++                "INSERT INTO decisions
++                 (id, repo_id, proposal_id, proposal_revision_id, decision,
++                  created_at_ms)
++                 VALUES ('dec_1', ?1, 'prop_1', 'rev_1', 'accepted', 2000)",
++                params![context.repo_id],
++            )
++            .expect("insert decision");
++        ("rev_1".to_string(), "dec_1".to_string())
++    }
++
++    #[test]
++    fn provenance_detail_resolves_title_decision_and_latest_check() {
++        let temp = tempfile::tempdir().expect("temp dir");
++        let root = temp.path();
++        let started = seeded_repo(root);
++        let (revision_id, decision_id) = seed_ledger_rows(root, &started.attempt_id);
++
++        let detail = provenance_detail(
++            root,
++            &started.intent_id,
++            Some(&revision_id),
++            Some(&decision_id),
++        )
++        .expect("provenance detail");
++        assert_eq!(detail.intent_id, started.intent_id);
++        assert_eq!(detail.intent_title.as_deref(), Some("Add blame support"));
++        assert_eq!(detail.decision_id.as_deref(), Some("dec_1"));
++        assert_eq!(detail.decision_status.as_deref(), Some("accepted"));
++        // Two checks exist for the revision; the newer one wins.
++        assert_eq!(detail.check_status.as_deref(), Some("passed"));
++    }
++
++    #[test]
++    fn provenance_detail_unknown_ids_degrade_to_none() {
++        let temp = tempfile::tempdir().expect("temp dir");
++        let root = temp.path();
++        seeded_repo(root);
++
++        let detail = provenance_detail(
++            root,
++            "intent_missing",
++            Some("rev_missing"),
++            Some("dec_missing"),
++        )
++        .expect("unknown ids must not error");
++        assert_eq!(detail.intent_id, "intent_missing");
++        assert_eq!(detail.intent_title, None);
++        assert_eq!(detail.decision_id.as_deref(), Some("dec_missing"));
++        assert_eq!(detail.decision_status, None);
++        assert_eq!(detail.check_status, None);
++    }
++
++    #[test]
++    fn provenance_detail_without_optional_ids_only_resolves_title() {
++        let temp = tempfile::tempdir().expect("temp dir");
++        let root = temp.path();
++        let started = seeded_repo(root);
++
++        let detail =
++            provenance_detail(root, &started.intent_id, None, None).expect("provenance detail");
++        assert_eq!(detail.intent_title.as_deref(), Some("Add blame support"));
++        assert_eq!(detail.decision_id, None);
++        assert_eq!(detail.decision_status, None);
++        assert_eq!(detail.check_status, None);
++    }
++}

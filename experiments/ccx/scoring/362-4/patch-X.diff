@@ -1,0 +1,207 @@
+diff --git a/README.md b/README.md
+index 3749a9f..11fc3f5 100644
+--- a/README.md
++++ b/README.md
+@@ -174,6 +174,21 @@ and embargo status, projection-safe diff metadata, and copyable terminal
+ handoff commands. The browser surface does not accept, reject, reveal, publish,
+ export, or mutate Forge state; trust-bearing actions still run through the CLI.
+ 
++To ask why a path or line looks the way it does (intent-aware blame/annotate):
++
++```bash
++forge log --path src/billing.rs    # commits that changed the path, with provenance
++forge blame src/billing.rs         # per-line: which commit last changed each line
++forge blame src/billing.rs --json  # full ledger enrichment per blamed commit
++```
++
++`forge blame` walks the accepted native history (first-parent), attributes every
++line to the commit that last changed it, and reports each blamed commit's
++provenance: intent title, proposal and attempt, decision status, latest check
++status, actor, authored time, and the deciding evidence's command and exit code.
++Rejected proposals and unsaved worktree edits never appear — blame reads the
++accepted tip, not the working tree. Text files only; binary content is refused.
++
+ ## Native Sync
+ 
+ Native sync moves Forge history and ledger provenance between Forge repositories:
+@@ -229,7 +244,7 @@ silently satisfy local, hosted-runner, or third-party policy.
+   `attempt attach`, `proposal list`, `review show`, `review export`,
+   `review open`, `compare`, `attempt compare`, `diff`
+ - intents: `intent list`, `intent show`
+-- worktree/history: `restore`, `checkout`, `log`, `undo`
++- worktree/history: `restore`, `checkout`, `log`, `blame`, `undo`
+ - native merge: `merge`, `conflict list`, `conflict show`,
+   `conflict show --suggest`, `conflict resolve`
+ - maintenance: `doctor`, `gc`
+diff --git a/crates/forge-cli/src/commands/core.rs b/crates/forge-cli/src/commands/core.rs
+index f4ccc6b..019f5aa 100644
+--- a/crates/forge-cli/src/commands/core.rs
++++ b/crates/forge-cli/src/commands/core.rs
+@@ -2125,7 +2125,8 @@ pub(crate) fn print_human(response: &ResponseEnvelope) {
+                 // Git-style annotate: `<short-commit> (<actor> <line>) content`, where the
+                 // actor comes from the blamed commit's recorded provenance ("-" for the
+                 // unjustified genesis). A legend above the lines expands each blamed
+-                // commit with its ledger enrichment (decision verdict + intent title).
++                // commit with its ledger enrichment (decision verdict, check status,
++                // intent title).
+                 let empty = Vec::new();
+                 let commits = response
+                     .data
+@@ -2147,9 +2148,10 @@ pub(crate) fn print_human(response: &ResponseEnvelope) {
+                     let digest = commit_id.rsplit(':').next().unwrap_or(commit_id);
+                     let short = &digest[..digest.len().min(8)];
+                     println!(
+-                        "{short} {} {} {}",
++                        "{short} {} {} {} {}",
+                         str_of(commit, "actor"),
+                         str_of(commit, "decision"),
++                        str_of(commit, "check_status"),
+                         str_of(commit, "intent_title"),
+                     );
+                 }
+diff --git a/crates/forge-cli/src/schema.rs b/crates/forge-cli/src/schema.rs
+index ddf1569..81aff6b 100644
+--- a/crates/forge-cli/src/schema.rs
++++ b/crates/forge-cli/src/schema.rs
+@@ -82,7 +82,7 @@ fn command_shapes() -> Value {
+         ("conflict resolve", "Resolves a persisted conflict set with --tree <forge-tree-ref>. Data carries { conflict_set_id, proposal_id, proposal_revision_id, snapshot_id, evidence_id, resolution_ref, operation_id, view_id }. The resolution creates a new snapshot, proposal revision, and tamper-evident evidence row; agents should run evidence and check again before accept."),
+         ("attempt compare", "Alias of `compare` scoped to attempts; same data shape."),
+         ("log", "Walks the native commit history tip→genesis via the JSON contract; data carries { commits: [{ commit_id, tree, parents, intent_id, proposal_revision_id, decision_id, actor, authored_time, evidence_digest }] }. Read-only; --intent <id> filters to commits under one intent (\"show every change under this intent\"). --path <repo-relative file or directory> is the path provenance walk (NER-362): only commits that changed the path are returned, each with an extra change field (added|modified|removed); a merge whose path state matches any parent is skipped (git-parity history simplification). Native-backend repos only (a git-backend repo has no native history)."),
+-        ("blame", "Attributes every line of a repo-relative file at the native tip to the commit that last changed it (NER-362 intent-aware blame); data carries { path, tip_commit_id, lines: [{ line_number, commit_id, content }], commits: [...] } where commits lists each distinct blamed commit's provenance (intent_id, proposal_revision_id, decision_id, actor, authored_time, evidence_digest), newest first, enriched from the local ledger with intent_title, proposal_id, attempt_id, decision, decided_at_ms, evidence_command, and evidence_exit_code (each enrichment field is omitted when the referenced ledger row does not resolve locally, e.g. genesis or peer-imported commits). First-parent attribution: lines a merge brought in from its second parent attribute to the merge commit. Read-only; text files only (binary content is refused); without --json prints a commit legend ('<short-commit> <actor> <decision> <intent-title>') followed by git-style '<short-commit> (<actor> <line>) content' lines. Native-backend repos only."),
++        ("blame", "Attributes every line of a repo-relative file at the native tip to the commit that last changed it (NER-362 intent-aware blame); data carries { path, tip_commit_id, lines: [{ line_number, commit_id, content }], commits: [...] } where commits lists each distinct blamed commit's provenance (intent_id, proposal_revision_id, decision_id, actor, authored_time, evidence_digest), newest first, enriched from the local ledger with intent_title, proposal_id, attempt_id, decision, decided_at_ms, check_status (latest check verdict for the blamed revision, matching compare's vocabulary), evidence_command, and evidence_exit_code (each enrichment field is omitted when the referenced ledger row does not resolve locally, e.g. genesis or peer-imported commits). First-parent attribution: lines a merge brought in from its second parent attribute to the merge commit. Read-only; text files only (binary content is refused); without --json prints a commit legend ('<short-commit> <actor> <decision> <check-status> <intent-title>') followed by git-style '<short-commit> (<actor> <line>) content' lines. Native-backend repos only."),
+         ("checkout", "Materializes a past commit's tree into the worktree (refuses a dirty worktree with DIRTY_WORKTREE; an unknown commit is rejected, a ledger-referenced-but-missing one is NATIVE_HISTORY_CORRUPT); data carries { commit_id, content_ref, base_unchanged: true, current_view_id }. Materialize-only: does NOT move the base anchor (a save afterward still diffs against the unchanged base HEAD), and is recorded in the op-log so forge undo can reverse it. Native-backend repos only."),
+         ("undo", "Undoes the last save, restoring the worktree to the prior snapshot (the latest snapshot's parent) and recording the undo as a forward op-log operation; refuses a dirty worktree with DIRTY_WORKTREE; data carries { undone_operation_id, restored_snapshot_id, content_ref, current_view_id }. Append-only — never deletes a decision or op-log row. \"nothing to undo\" when there is no earlier snapshot."),
+         ("trust policy", "Shows or updates the local trust policy. With no flags, data carries { min_accept_trust, min_export_trust, supported_trust_levels }. With --accept/--export, updates the configured minimum trust for accept/export. Supported levels are self_reported, locally_observed, locally_signed, hosted_runner_observed, hosted_runner_signed, third_party_attested. Hosted-runner levels require valid hosted-runner signatures; third_party_attested requires valid third-party signatures."),
+diff --git a/crates/forge-cli/tests/forge_native_history.rs b/crates/forge-cli/tests/forge_native_history.rs
+index 4378dfd..db76a62 100644
+--- a/crates/forge-cli/tests/forge_native_history.rs
++++ b/crates/forge-cli/tests/forge_native_history.rs
+@@ -633,6 +633,7 @@ fn blame_attributes_each_line_to_the_commit_that_last_changed_it() {
+         assert!(commit["attempt_id"].is_string());
+         assert_eq!(commit["decision"], "accepted");
+         assert!(commit["decided_at_ms"].is_i64());
++        assert_eq!(commit["check_status"], "passed");
+         assert_eq!(commit["evidence_command"], "sh -c true");
+         assert_eq!(commit["evidence_exit_code"], 0);
+     }
+@@ -705,6 +706,7 @@ fn blame_attributes_untouched_genesis_content_and_prints_human_lines() {
+     // Genesis carries no justification ids, so no ledger enrichment applies either.
+     assert!(commits[0].get("intent_title").is_none());
+     assert!(commits[0].get("decision").is_none());
++    assert!(commits[0].get("check_status").is_none());
+     assert!(commits[0].get("evidence_command").is_none());
+ 
+     // Human mode (no --json): git-style `<short-commit> (<actor> <line>) content`, with
+@@ -725,6 +727,51 @@ fn blame_attributes_untouched_genesis_content_and_prints_human_lines() {
+     );
+ }
+ 
++#[test]
++fn blame_reflects_only_accepted_history_not_rejections_or_worktree_edits() {
++    let repo = TestRepo::new_git();
++    repo.forge()
++        .args(["--json", "init", "--content-backend", "native"])
++        .assert()
++        .success();
++    let accepted_commit = accept_native_round(&repo, "accepted change", |root| {
++        std::fs::write(root.join("story.txt"), "accepted line\n").expect("write story");
++    });
++
++    // A full proposal round that is REJECTED: it must never enter blame history.
++    repo.forge()
++        .args(["--json", "start", "rejected change"])
++        .assert()
++        .success();
++    std::fs::write(repo.path().join("story.txt"), "rejected line\n").expect("rewrite story");
++    repo.forge().args(["--json", "save"]).assert().success();
++    repo.forge()
++        .args(["--json", "run", "--", "sh", "-c", "true"])
++        .assert()
++        .success();
++    repo.forge().args(["--json", "propose"]).assert().success();
++    repo.forge().args(["--json", "check"]).assert().success();
++    repo.forge().args(["--json", "reject"]).assert().success();
++
++    // The worktree still holds the rejected edit; blame reads the accepted tip tree.
++    let blamed = json_output(
++        repo.forge()
++            .args(["--json", "blame", "story.txt"])
++            .assert()
++            .success(),
++    );
++    assert_eq!(blamed["data"]["tip_commit_id"], accepted_commit);
++    let lines = blamed["data"]["lines"].as_array().unwrap();
++    assert_eq!(lines.len(), 1);
++    assert_eq!(lines[0]["content"], "accepted line");
++    assert_eq!(lines[0]["commit_id"], accepted_commit);
++    let commits = blamed["data"]["commits"].as_array().unwrap();
++    assert_eq!(commits.len(), 1);
++    assert_eq!(commits[0]["intent_title"], "accepted change");
++    assert_eq!(commits[0]["decision"], "accepted");
++    assert_eq!(commits[0]["check_status"], "passed");
++}
++
+ #[test]
+ fn blame_rejects_missing_directory_binary_and_escaping_paths() {
+     let repo = TestRepo::new_git();
+diff --git a/crates/forge-store/src/snapshots.rs b/crates/forge-store/src/snapshots.rs
+index 2248509..abd6cbd 100644
+--- a/crates/forge-store/src/snapshots.rs
++++ b/crates/forge-store/src/snapshots.rs
+@@ -883,6 +883,10 @@ pub struct BlameCommitView {
+     /// Wall-clock time (ms) the decision row was recorded.
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub decided_at_ms: Option<i64>,
++    /// The latest check verdict recorded for the blamed revision (e.g. `passed`),
++    /// matching `compare`'s `check_status` vocabulary.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub check_status: Option<String>,
+     /// The deciding evidence's command line (command + args), matched by content hash.
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub evidence_command: Option<String>,
+@@ -946,6 +950,18 @@ fn enrich_blame_commit(
+             .optional()?,
+         None => None,
+     };
++    let check_status = match commit.proposal_revision_id.as_deref() {
++        Some(revision_id) => connection
++            .query_row(
++                "SELECT status FROM check_results
++                 WHERE proposal_revision_id = ?1 AND repo_id = ?2
++                 ORDER BY created_at_ms DESC, rowid DESC LIMIT 1",
++                params![revision_id, repo_id],
++                |row| row.get::<_, String>(0),
++            )
++            .optional()?,
++        None => None,
++    };
+     let evidence = match commit.evidence_digest.as_deref() {
+         Some(digest) => connection
+             .query_row(
+@@ -991,6 +1007,7 @@ fn enrich_blame_commit(
+         attempt_id,
+         decision,
+         decided_at_ms,
++        check_status,
+         evidence_command,
+         evidence_exit_code,
+     })
+diff --git a/scripts/e2e-eval.sh b/scripts/e2e-eval.sh
+index b86a6fe..3f3879d 100755
+--- a/scripts/e2e-eval.sh
++++ b/scripts/e2e-eval.sh
+@@ -113,6 +113,14 @@ F run -- true; ck "native run success" "$(pg "d['status']")" "success"
+ F propose; ck "native propose success" "$(pg "d['status']")" "success"
+ F check; ck "native check success" "$(pg "d['status']")" "success"
+ F accept; ck "native accept success" "$(pg "d['status']")" "success"
++# Intent-aware blame/annotate (NER-362): path provenance walk + per-line attribution
++# with ledger enrichment, driven through the shipped binary.
++F log --path feature.txt; ck "log --path reports the accepting commit as added" "$(pg "d['data']['commits'][0]['change']")" "added"
++ck "log --path skips commits that did not touch the path" "$(pg "len(d['data']['commits'])")" "1"
++F blame feature.txt; ck "blame attributes the line to the accepting commit's intent" "$(pg "d['data']['commits'][0]['intent_title']")" "native feature"
++ck "blame line content is the tip content" "$(pg "d['data']['lines'][0]['content']")" "feature"
++ck "blame carries the decision status" "$(pg "d['data']['commits'][0]['decision']")" "accepted"
++ck "blame carries the latest check status" "$(pg "d['data']['commits'][0]['check_status']")" "passed"
+ # Export interop: a native f1:commit: base resolves to a synthesized git parent (slice 2).
+ F export branch native-pub; ck "native export branch success (git interop on a native base)" "$(pg "d['status']")" "success"
+ git rev-parse --verify native-pub >/dev/null 2>&1 && nb=yes || nb=no

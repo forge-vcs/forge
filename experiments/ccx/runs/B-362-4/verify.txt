@@ -1,0 +1,2 @@
+PASS cargo test -p forge-store provenance
+PASS cargo test -p forge-cli blame

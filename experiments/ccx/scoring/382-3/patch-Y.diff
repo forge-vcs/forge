@@ -1,0 +1,205 @@
+diff --git a/crates/forge-cli/tests/forge_attempts.rs b/crates/forge-cli/tests/forge_attempts.rs
+index cc860f6..234c836 100644
+--- a/crates/forge-cli/tests/forge_attempts.rs
++++ b/crates/forge-cli/tests/forge_attempts.rs
+@@ -1002,3 +1002,200 @@ fn attach_refuses_drifted_workspace_unless_discard_flag() {
+     );
+     assert!(clean["warnings"].as_array().unwrap().is_empty());
+ }
++
++/// NER-382 repro: the exact silent-loss sequence from the ticket now fails loudly.
++/// Before the drift guard, step 5 (`attempt attach`) silently re-materialized the
++/// workspace over the pre-attach edit and step 6 (`save`) reported changed_paths: []
++/// — the work was gone with no signal. Now attach refuses, and the deliberate
++/// recovery path (discard, redo the edit in the repository worktree, save) records
++/// the edit instead of losing it.
++#[test]
++fn attach_drift_guard_prevents_silent_workspace_edit_loss() {
++    let repo = TestRepo::new_git();
++    std::fs::create_dir_all(repo.path().join("src")).expect("mkdir src");
++    std::fs::write(repo.path().join("src/App.css"), "body {}\n").expect("write css");
++    repo.forge()
++        .args(["--json", "init", "--content-backend", "native"])
++        .assert()
++        .success();
++    // (2) start "intent A" — attempt 1, attached.
++    let first = json_output(
++        repo.forge()
++            .args(["--json", "start", "intent A"])
++            .assert()
++            .success(),
++    );
++    let intent_id = first["data"]["intent_id"].as_str().unwrap();
++    // (3) attempt start — attempt 2, attached: false, workspace_path materialized.
++    let second = json_output(
++        repo.forge()
++            .args(["--json", "attempt", "start", "--intent", intent_id])
++            .assert()
++            .success(),
++    );
++    assert_eq!(second["data"]["attached"], false);
++    let second_attempt = second["data"]["attempt_id"].as_str().unwrap();
++    let workspace = repo
++        .path()
++        .join(second["data"]["workspace_path"].as_str().unwrap());
++    // (4) the footgun edit, written into the workspace before attach.
++    std::fs::write(workspace.join("src/App.css"), "body {}\nedit\n").expect("edit workspace");
++
++    // (5) attach no longer succeeds silently — it fails loudly, naming the path.
++    let refused = json_output(
++        repo.forge()
++            .args(["--json", "attempt", "attach", second_attempt])
++            .assert()
++            .failure(),
++    );
++    assert_eq!(refused["errors"][0]["code"], "ATTEMPT_WORKSPACE_DRIFT");
++    assert_eq!(refused["errors"][0]["details"]["paths"][0], "src/App.css");
++    assert_eq!(
++        std::fs::read_to_string(workspace.join("src/App.css")).unwrap(),
++        "body {}\nedit\n",
++        "the refused attach must leave the pre-attach edit readable for recovery"
++    );
++
++    // Deliberate recovery: discard the workspace copy, redo the edit on the real
++    // editing surface (the repository worktree), and save — the edit is recorded.
++    repo.forge()
++        .args([
++            "--json",
++            "attempt",
++            "attach",
++            second_attempt,
++            "--discard-workspace-edits",
++        ])
++        .assert()
++        .success();
++    std::fs::write(repo.path().join("src/App.css"), "body {}\nedit\n").expect("redo edit");
++    let saved = json_output(
++        repo.forge()
++            .args(["--json", "save", "--attempt", second_attempt])
++            .assert()
++            .success(),
++    );
++    let changed_paths: Vec<&str> = saved["data"]["changed_paths"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|path| path.as_str().unwrap())
++        .collect();
++    assert!(
++        changed_paths.contains(&"src/App.css"),
++        "the redone edit must be recorded, not silently dropped: {changed_paths:?}"
++    );
++}
++
++/// NER-382: attach without workspace drift is unchanged — no error, no warning,
++/// same materialization behavior. A wholesale-removed workspace dir is also not
++/// drift (re-materialization recreates it without losing edits).
++#[test]
++fn attach_without_workspace_drift_is_unchanged() {
++    let repo = TestRepo::new_git();
++    repo.forge()
++        .args(["--json", "init", "--content-backend", "native"])
++        .assert()
++        .success();
++    let first = json_output(
++        repo.forge()
++            .args(["--json", "start", "no drift"])
++            .assert()
++            .success(),
++    );
++    let intent_id = first["data"]["intent_id"].as_str().unwrap();
++    let second = json_output(
++        repo.forge()
++            .args(["--json", "attempt", "start", "--intent", intent_id])
++            .assert()
++            .success(),
++    );
++    let second_attempt = second["data"]["attempt_id"].as_str().unwrap();
++
++    // Untouched workspace: attach succeeds with no warnings.
++    let attached = json_output(
++        repo.forge()
++            .args(["--json", "attempt", "attach", second_attempt])
++            .assert()
++            .success(),
++    );
++    assert_eq!(attached["status"], "success");
++    assert!(attached["warnings"].as_array().unwrap().is_empty());
++    assert_eq!(
++        std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
++        "hello\n"
++    );
++
++    // Wholesale-removed workspace dir: not drift; attach recreates it.
++    let third = json_output(
++        repo.forge()
++            .args(["--json", "attempt", "start", "--intent", intent_id])
++            .assert()
++            .success(),
++    );
++    let third_attempt = third["data"]["attempt_id"].as_str().unwrap();
++    let third_workspace = repo
++        .path()
++        .join(third["data"]["workspace_path"].as_str().unwrap());
++    std::fs::remove_dir_all(&third_workspace).expect("remove workspace dir");
++    let reattached = json_output(
++        repo.forge()
++            .args(["--json", "attempt", "attach", third_attempt])
++            .assert()
++            .success(),
++    );
++    assert!(reattached["warnings"].as_array().unwrap().is_empty());
++    assert!(third_workspace
++        .join(forge_content::WORKSPACE_MARKER_FILE)
++        .exists());
++    assert_eq!(
++        std::fs::read_to_string(third_workspace.join("README.md")).unwrap(),
++        "hello\n"
++    );
++}
++
++/// NER-382: a never-materialized workspace has no recorded baseline, so attach is
++/// unchecked. The git backend never materializes workspace dirs (only the marker is
++/// written), so even a stray file in the workspace dir does not block attach — and
++/// the git attach path leaves it alone.
++#[test]
++fn git_backend_attach_skips_drift_check_for_never_materialized_workspace() {
++    let repo = TestRepo::new_git();
++    repo.forge().args(["--json", "init"]).assert().success();
++    let first = json_output(
++        repo.forge()
++            .args(["--json", "start", "git backend"])
++            .assert()
++            .success(),
++    );
++    let intent_id = first["data"]["intent_id"].as_str().unwrap();
++    let second = json_output(
++        repo.forge()
++            .args(["--json", "attempt", "start", "--intent", intent_id])
++            .assert()
++            .success(),
++    );
++    let second_attempt = second["data"]["attempt_id"].as_str().unwrap();
++    let workspace = repo
++        .path()
++        .join(second["data"]["workspace_path"].as_str().unwrap());
++    // Marker only — the git backend never materialized content here.
++    assert!(workspace
++        .join(forge_content::WORKSPACE_MARKER_FILE)
++        .exists());
++    assert!(!workspace.join("README.md").exists());
++
++    std::fs::write(workspace.join("stray.txt"), "stray\n").expect("write stray file");
++    let attached = json_output(
++        repo.forge()
++            .args(["--json", "attempt", "attach", second_attempt])
++            .assert()
++            .success(),
++    );
++    assert!(attached["warnings"].as_array().unwrap().is_empty());
++    assert_eq!(
++        std::fs::read_to_string(workspace.join("stray.txt")).unwrap(),
++        "stray\n",
++        "an unchecked git-backend attach must not touch the workspace dir"
++    );
++}

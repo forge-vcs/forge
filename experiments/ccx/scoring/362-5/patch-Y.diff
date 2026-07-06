@@ -1,0 +1,215 @@
+diff --git a/README.md b/README.md
+index 3749a9f..6178e31 100644
+--- a/README.md
++++ b/README.md
+@@ -229,7 +229,7 @@ silently satisfy local, hosted-runner, or third-party policy.
+   `attempt attach`, `proposal list`, `review show`, `review export`,
+   `review open`, `compare`, `attempt compare`, `diff`
+ - intents: `intent list`, `intent show`
+-- worktree/history: `restore`, `checkout`, `log`, `undo`
++- worktree/history: `restore`, `checkout`, `log`, `blame`, `undo`
+ - native merge: `merge`, `conflict list`, `conflict show`,
+   `conflict show --suggest`, `conflict resolve`
+ - maintenance: `doctor`, `gc`
+diff --git a/crates/forge-cli/tests/forge_blame.rs b/crates/forge-cli/tests/forge_blame.rs
+new file mode 100644
+index 0000000..c711945
+--- /dev/null
++++ b/crates/forge-cli/tests/forge_blame.rs
+@@ -0,0 +1,196 @@
++//! NER-362: `forge blame` end-to-end through the compiled binary — line
++//! attribution to accepting commits, per-line provenance join, the JSON
++//! envelope contract, and the typed error paths.
++
++mod common;
++
++use common::TestRepo;
++use serde_json::Value;
++
++fn json_output(assert: assert_cmd::assert::Assert) -> Value {
++    serde_json::from_slice(&assert.get_output().stdout).expect("valid json")
++}
++
++fn forge_ok(repo: &TestRepo, args: &[&str]) -> Value {
++    let mut full = vec!["--json"];
++    full.extend_from_slice(args);
++    json_output(repo.forge().args(&full).assert().success())
++}
++
++fn init_native(repo: &TestRepo) {
++    forge_ok(repo, &["init", "--content-backend", "native"]);
++}
++
++/// Drive one full intent through the local loop and return
++/// (intent_id, accepting commit_id).
++fn accept_intent(repo: &TestRepo, title: &str, file: &str, content: &str) -> (String, String) {
++    let started = forge_ok(repo, &["start", title]);
++    let intent_id = started["data"]["intent_id"].as_str().unwrap().to_string();
++    std::fs::write(repo.path().join(file), content).expect("write file");
++    forge_ok(repo, &["save"]);
++    forge_ok(repo, &["run", "--", "sh", "-c", "true"]);
++    forge_ok(repo, &["propose"]);
++    forge_ok(repo, &["check"]);
++    let accepted = forge_ok(repo, &["accept"]);
++    let commit_id = accepted["data"]["commit_id"]
++        .as_str()
++        .expect("native accept surfaces commit_id")
++        .to_string();
++    (intent_id, commit_id)
++}
++
++#[test]
++fn blame_attributes_every_line_to_the_accepting_commit() {
++    let repo = TestRepo::new_git();
++    init_native(&repo);
++    let (intent_id, commit_id) = accept_intent(&repo, "first", "app.txt", "one\ntwo\nthree\n");
++
++    let out = forge_ok(&repo, &["blame", "app.txt"]);
++    let lines = out["data"]["lines"].as_array().unwrap();
++    assert_eq!(lines.len(), 3);
++    for (index, line) in lines.iter().enumerate() {
++        assert_eq!(line["line_number"], (index + 1) as u64);
++        assert_eq!(line["commit_id"], commit_id.as_str());
++        assert_eq!(line["intent_id"], intent_id.as_str());
++    }
++    assert_eq!(lines[0]["content"], "one");
++    assert_eq!(lines[1]["content"], "two");
++    assert_eq!(lines[2]["content"], "three");
++
++    // Human output: `<short-commit> <intent> <line#> <content>` per line.
++    let human = repo
++        .forge()
++        .args(["blame", "app.txt"])
++        .assert()
++        .success()
++        .get_output()
++        .stdout
++        .clone();
++    let human = String::from_utf8(human).expect("utf-8 human output");
++    let digest = commit_id.rsplit(':').next().unwrap();
++    let short = &digest[..12];
++    let rows: Vec<&str> = human.lines().collect();
++    assert_eq!(rows.len(), 3);
++    for row in &rows {
++        assert!(
++            row.starts_with(short),
++            "row starts with short commit: {row}"
++        );
++        assert!(row.contains(&intent_id), "row carries intent id: {row}");
++    }
++    assert!(rows[0].ends_with("1 one"));
++    assert!(rows[2].ends_with("3 three"));
++}
++
++#[test]
++fn blame_attributes_changed_lines_to_the_second_commit_only() {
++    let repo = TestRepo::new_git();
++    init_native(&repo);
++    let (intent_one, commit_one) = accept_intent(&repo, "first", "app.txt", "one\ntwo\nthree\n");
++    let (intent_two, commit_two) =
++        accept_intent(&repo, "second", "app.txt", "one\nchanged\nthree\n");
++    assert_ne!(commit_one, commit_two);
++
++    let out = forge_ok(&repo, &["blame", "app.txt"]);
++    let lines = out["data"]["lines"].as_array().unwrap();
++    assert_eq!(lines.len(), 3);
++
++    // Unchanged lines keep the first accepting commit's attribution.
++    assert_eq!(lines[0]["content"], "one");
++    assert_eq!(lines[0]["commit_id"], commit_one.as_str());
++    assert_eq!(lines[0]["intent_id"], intent_one.as_str());
++    assert_eq!(lines[2]["content"], "three");
++    assert_eq!(lines[2]["commit_id"], commit_one.as_str());
++    assert_eq!(lines[2]["intent_id"], intent_one.as_str());
++
++    // The modified line moves to the second intent's accepting commit.
++    assert_eq!(lines[1]["content"], "changed");
++    assert_eq!(lines[1]["commit_id"], commit_two.as_str());
++    assert_eq!(lines[1]["intent_id"], intent_two.as_str());
++}
++
++#[test]
++fn blame_json_envelope_and_payload_shape() {
++    let repo = TestRepo::new_git();
++    init_native(&repo);
++    let (intent_id, commit_id) = accept_intent(&repo, "shape", "app.txt", "alpha\n");
++
++    let out = forge_ok(&repo, &["blame", "app.txt"]);
++
++    // Standard forge.cli.v0 envelope.
++    assert_eq!(out["schema_version"], "forge.cli.v0");
++    assert_eq!(out["command"], "blame");
++    assert_eq!(out["status"], "success");
++    assert!(out["errors"].as_array().unwrap().is_empty());
++
++    // Payload per the 362-3 contract: { path, lines: [...] } with every
++    // snake_case field present on each line (nullable fields included).
++    assert_eq!(out["data"]["path"], "app.txt");
++    let line = &out["data"]["lines"][0];
++    let object = line.as_object().unwrap();
++    for field in [
++        "line_number",
++        "content",
++        "commit_id",
++        "intent_id",
++        "proposal_revision_id",
++        "decision_id",
++        "actor",
++        "authored_time",
++    ] {
++        assert!(object.contains_key(field), "line carries field {field}");
++    }
++    assert_eq!(line["line_number"], 1);
++    assert_eq!(line["content"], "alpha");
++    assert_eq!(line["commit_id"], commit_id.as_str());
++    assert_eq!(line["intent_id"], intent_id.as_str());
++    assert!(line["proposal_revision_id"].is_string());
++    assert!(line["decision_id"].is_string());
++    assert!(line["actor"].is_string());
++    assert!(line["authored_time"].is_u64());
++
++    // 362-4 ledger enrichment fields are additive and, on a fully ledgered
++    // accept, resolved: the intent title and decision status come from the
++    // ledger rows written during the loop above.
++    assert_eq!(line["intent_title"], "shape");
++    assert_eq!(line["decision_status"], "accepted");
++    assert!(line["check_status"].is_string());
++}
++
++#[test]
++fn blame_path_missing_at_head_is_a_typed_error() {
++    let repo = TestRepo::new_git();
++    init_native(&repo);
++    accept_intent(&repo, "first", "app.txt", "one\n");
++
++    let out = json_output(
++        repo.forge()
++            .args(["--json", "blame", "missing.txt"])
++            .assert()
++            .failure(),
++    );
++    assert_eq!(out["status"], "error");
++    let error = &out["errors"][0];
++    assert_eq!(error["code"], "COMMAND_FAILED");
++    assert!(
++        error["message"]
++            .as_str()
++            .unwrap()
++            .contains("does not exist at HEAD"),
++        "message names the missing path condition: {error}"
++    );
++}
++
++#[test]
++fn blame_without_initialized_repo_is_not_initialized() {
++    let repo = TestRepo::new_git();
++    // No `forge init`: no .forge/forge.db.
++    let out = json_output(
++        repo.forge()
++            .args(["--json", "blame", "README.md"])
++            .assert()
++            .failure(),
++    );
++    assert_eq!(out["errors"][0]["code"], "NOT_INITIALIZED");
++    assert_eq!(out["retry"]["retryable"], false);
++}
