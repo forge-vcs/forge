@@ -20,5 +20,38 @@
    "unlicensed": 40
   }
  },
- "note": "Full per-task verdict prose lives in the session transcript and RESULTS.md verdict sheet; per-task defect/unlicensed counts in RESULTS.md table."
+ "note": "Full per-task verdict prose lives in the session transcript and RESULTS.md verdict sheet; per-task defect/unlicensed counts in RESULTS.md table.",
+ "scorer_2": {
+  "scorer": "second independent blinded agent, same protocol",
+  "unblinded_totals": {
+   "A": {
+    "defects": 0,
+    "unlicensed": 2
+   },
+   "B": {
+    "defects": 18,
+    "by_class": {
+     "implementation": 13,
+     "workflow": 1,
+     "model_behavior": 1,
+     "contract": 1,
+     "other": 2
+    },
+    "unlicensed": 27
+   }
+  },
+  "agreement_with_scorer_1": {
+   "per_task_direction": "8/8 \u2014 both scorers agree which arm is cleaner on every task",
+   "headline_findings_replicated": [
+    "B-362-5 wrong-ticket substitution (independently found)",
+    "B-382-2 renamed error code + flag + store-write detection (all three)",
+    "B lossy non-UTF-8 attribution",
+    "B rename semantics dropped",
+    "B merge semantics divergence",
+    "A-382-3 zero defects / B-382-3 codified divergent names instead of stopping"
+   ],
+   "divergence": "classification strictness only: scorer 1 charged A's 5 issues to the contract class; scorer 2 scored A at zero defects (treating e.g. comment-compression as an unlicensed decision, not a defect) and merged more of B's findings. Direction and every marquee finding identical.",
+   "caveat": "both scorers same model family; human spot-check still valuable"
+  }
+ }
 }
