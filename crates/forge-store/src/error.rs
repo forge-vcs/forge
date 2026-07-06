@@ -402,8 +402,17 @@ impl ForgeError {
                     "forge accept"
                 ]
             }),
-            ForgeError::DirtyWorktree { paths } | ForgeError::WorkspaceDrift { paths } => {
-                redact_paths(paths)
+            ForgeError::DirtyWorktree { paths } => redact_paths(paths),
+            ForgeError::WorkspaceDrift { paths } => {
+                // Same secret-redacted paths payload as DirtyWorktree, plus additive
+                // recovery keys (NER-382 review): name the explicit override flag so
+                // an agent can act on the refusal without parsing the human message.
+                let mut details = redact_paths(paths);
+                details["override_flag"] = json!("--discard-workspace-changes");
+                details["recovery_hint"] = json!(
+                    "Save the drifted workspace edits elsewhere, then re-run `attempt attach` with --discard-workspace-changes to explicitly discard them."
+                );
+                details
             }
             ForgeError::AmbiguousAttempt { candidate_ids }
             | ForgeError::AmbiguousProposal { candidate_ids } => {
@@ -1117,7 +1126,7 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
             code: "WORKSPACE_DRIFT",
             retryable: false,
             after_ms: None,
-            details_keys: &["paths", "redacted_count"],
+            details_keys: &["paths", "redacted_count", "override_flag", "recovery_hint"],
         },
     ]
 }
@@ -1699,6 +1708,16 @@ mod tests {
             "secret filename must not appear in details"
         );
         assert_eq!(details["redacted_count"], 2);
+        // Additive recovery keys (NER-382 review): the override flag is structured,
+        // not only prose, and matches the registry's details_keys.
+        assert_eq!(details["override_flag"], "--discard-workspace-changes");
+        assert!(
+            details["recovery_hint"]
+                .as_str()
+                .expect("recovery_hint string")
+                .contains("--discard-workspace-changes"),
+            "recovery_hint must name the override flag"
+        );
         // The human-readable message must name the override flag and never a path.
         let message = error.to_string();
         assert!(message.contains("--discard-workspace-changes"));

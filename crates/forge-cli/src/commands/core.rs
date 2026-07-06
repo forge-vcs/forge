@@ -1557,6 +1557,18 @@ pub(crate) fn replay_response(
                     for (key, value) in replay_data {
                         object.insert(key.clone(), value.clone());
                     }
+                    // NER-382 replay gap: `attempt_started` rows recorded before the
+                    // workspace_role upgrade carry workspace_path in replay_data but no
+                    // workspace_role. Inject the constant so a replayed payload matches
+                    // the schema promise (workspace_path is always role-qualified).
+                    if replay_data.contains_key("workspace_path")
+                        && !replay_data.contains_key("workspace_role")
+                    {
+                        object.insert(
+                            "workspace_role".to_string(),
+                            json!(forge_store::WORKSPACE_ROLE_MATERIALIZATION_TARGET),
+                        );
+                    }
                     object.insert(
                         "operation_id".to_string(),
                         json!(existing.operation_id.clone()),

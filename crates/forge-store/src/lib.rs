@@ -44,7 +44,7 @@ pub use attempts::{
     ensure_attempt_workspace_marker, list_attempts, record_attempt_workspace_materialized,
     resolve_attempt, show_attempt, start_attempt, start_attempt_for_intent,
     verify_attempt_workspace_undrifted, verify_save_target, AttemptRecord, AttemptShowRecord,
-    AttemptSummary, ResolvedAttempt, StartAttempt,
+    AttemptSummary, ResolvedAttempt, StartAttempt, WORKSPACE_ROLE_MATERIALIZATION_TARGET,
 };
 pub(crate) use attempts::{
     attempt_by_id, resolve_attempt_in_context, verify_worktree_binding, WorkspaceMarker,
