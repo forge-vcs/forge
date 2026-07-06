@@ -1,0 +1,719 @@
+diff --git a/crates/forge-cli/src/args.rs b/crates/forge-cli/src/args.rs
+index b4cf960..18bacd1 100644
+--- a/crates/forge-cli/src/args.rs
++++ b/crates/forge-cli/src/args.rs
+@@ -43,6 +43,9 @@ pub(crate) enum Command {
+     Conflict(ConflictArgs),
+     /// Walk the native commit history (tip→genesis) and the evidence that justified it.
+     Log(LogArgs),
++    /// Attribute every line of a file at the native tip to the commit (and its intent,
++    /// proposal, decision, actor, and evidence) that last changed it.
++    Blame(BlameArgs),
+     /// Materialize a past commit's tree into the worktree (does not move the base anchor).
+     Checkout(CheckoutArgs),
+     /// Undo the last save, restoring the prior snapshot (recorded in the op-log).
+@@ -141,6 +144,12 @@ pub(crate) struct LogArgs {
+     pub(crate) path: Option<String>,
+ }
+ 
++#[derive(Debug, Args)]
++pub(crate) struct BlameArgs {
++    /// Repo-relative file to blame at the native tip (text files only).
++    pub(crate) path: String,
++}
++
+ #[derive(Debug, Args)]
+ pub(crate) struct CheckoutArgs {
+     /// The native commit id (`f1:commit:sha256:...`) whose tree to materialize.
+diff --git a/crates/forge-cli/src/commands/core.rs b/crates/forge-cli/src/commands/core.rs
+index bde3d0f..f4c1bba 100644
+--- a/crates/forge-cli/src/commands/core.rs
++++ b/crates/forge-cli/src/commands/core.rs
+@@ -1040,6 +1040,15 @@ pub(crate) fn log_response(request_id: Option<String>, args: LogArgs) -> Respons
+     })
+ }
+ 
++pub(crate) fn blame_response(request_id: Option<String>, args: BlameArgs) -> ResponseEnvelope {
++    // Read-only, like `log`: no lock, no reconcile — blame resolves the authoritative tip
++    // from the ledger directly, tolerating a not-yet-reconciled HEAD.
++    command_result("blame", request_id, |cwd, _request_id| {
++        let report = forge_store::native_blame(&cwd, &args.path)?;
++        Ok((None, serde_json::to_value(report)?, Vec::new()))
++    })
++}
++
+ pub(crate) fn doctor_response(request_id: Option<String>) -> ResponseEnvelope {
+     command_result("doctor", request_id, |cwd, _request_id| {
+         let report = forge_store::doctor(&cwd)?;
+@@ -2112,6 +2121,51 @@ pub(crate) fn print_human(response: &ResponseEnvelope) {
+             "schema" => {
+                 println!("{}", serde_json::to_string_pretty(&response.data).unwrap());
+             }
++            "blame" => {
++                // Git-style annotate: `<short-commit> (<actor> <line>) content`, where the
++                // actor comes from the blamed commit's recorded provenance ("-" for the
++                // unjustified genesis).
++                let empty = Vec::new();
++                let commits = response
++                    .data
++                    .get("commits")
++                    .and_then(Value::as_array)
++                    .unwrap_or(&empty);
++                let actor_of = |commit_id: &str| -> &str {
++                    commits
++                        .iter()
++                        .find(|c| c.get("commit_id").and_then(Value::as_str) == Some(commit_id))
++                        .and_then(|c| c.get("actor"))
++                        .and_then(Value::as_str)
++                        .unwrap_or("-")
++                };
++                let actor_width = commits
++                    .iter()
++                    .filter_map(|c| c.get("actor").and_then(Value::as_str))
++                    .map(str::len)
++                    .max()
++                    .unwrap_or(1);
++                for line in response
++                    .data
++                    .get("lines")
++                    .and_then(Value::as_array)
++                    .unwrap_or(&empty)
++                {
++                    let commit_id = line
++                        .get("commit_id")
++                        .and_then(Value::as_str)
++                        .unwrap_or("<unknown>");
++                    // Short form: the first 8 hex chars of the commit digest.
++                    let digest = commit_id.rsplit(':').next().unwrap_or(commit_id);
++                    let short = &digest[..digest.len().min(8)];
++                    let number = line.get("line_number").and_then(Value::as_u64).unwrap_or(0);
++                    let content = line.get("content").and_then(Value::as_str).unwrap_or("");
++                    println!(
++                        "{short} ({:<actor_width$} {number:>4}) {content}",
++                        actor_of(commit_id)
++                    );
++                }
++            }
+             command => println!("{command} succeeded"),
+         }
+     } else if let Some(error) = response.errors.first() {
+diff --git a/crates/forge-cli/src/main.rs b/crates/forge-cli/src/main.rs
+index da8f879..4409e62 100644
+--- a/crates/forge-cli/src/main.rs
++++ b/crates/forge-cli/src/main.rs
+@@ -70,6 +70,7 @@ fn main() -> ExitCode {
+         Command::Merge(args) => merge_response(request_id, args),
+         Command::Conflict(args) => conflict_response(request_id, args),
+         Command::Log(args) => log_response(request_id, args),
++        Command::Blame(args) => blame_response(request_id, args),
+         Command::Checkout(args) => checkout_response(request_id, args),
+         Command::Undo => undo_response(request_id),
+         Command::Trust(args) => trust_response(request_id, args),
+diff --git a/crates/forge-cli/src/schema.rs b/crates/forge-cli/src/schema.rs
+index b1b8c0f..6a32f85 100644
+--- a/crates/forge-cli/src/schema.rs
++++ b/crates/forge-cli/src/schema.rs
+@@ -82,6 +82,7 @@ fn command_shapes() -> Value {
+         ("conflict resolve", "Resolves a persisted conflict set with --tree <forge-tree-ref>. Data carries { conflict_set_id, proposal_id, proposal_revision_id, snapshot_id, evidence_id, resolution_ref, operation_id, view_id }. The resolution creates a new snapshot, proposal revision, and tamper-evident evidence row; agents should run evidence and check again before accept."),
+         ("attempt compare", "Alias of `compare` scoped to attempts; same data shape."),
+         ("log", "Walks the native commit history tip→genesis via the JSON contract; data carries { commits: [{ commit_id, tree, parents, intent_id, proposal_revision_id, decision_id, actor, authored_time, evidence_digest }] }. Read-only; --intent <id> filters to commits under one intent (\"show every change under this intent\"). --path <repo-relative file or directory> is the path provenance walk (NER-362): only commits that changed the path are returned, each with an extra change field (added|modified|removed); a merge whose path state matches any parent is skipped (git-parity history simplification). Native-backend repos only (a git-backend repo has no native history)."),
++        ("blame", "Attributes every line of a repo-relative file at the native tip to the commit that last changed it (NER-362 intent-aware blame); data carries { path, tip_commit_id, lines: [{ line_number, commit_id, content }], commits: [...] } where commits lists each distinct blamed commit's provenance (intent_id, proposal_revision_id, decision_id, actor, authored_time, evidence_digest), newest first. First-parent attribution: lines a merge brought in from its second parent attribute to the merge commit. Read-only; text files only (binary content is refused); without --json prints git-style '<short-commit> (<actor> <line>) content' lines. Native-backend repos only."),
+         ("checkout", "Materializes a past commit's tree into the worktree (refuses a dirty worktree with DIRTY_WORKTREE; an unknown commit is rejected, a ledger-referenced-but-missing one is NATIVE_HISTORY_CORRUPT); data carries { commit_id, content_ref, base_unchanged: true, current_view_id }. Materialize-only: does NOT move the base anchor (a save afterward still diffs against the unchanged base HEAD), and is recorded in the op-log so forge undo can reverse it. Native-backend repos only."),
+         ("undo", "Undoes the last save, restoring the worktree to the prior snapshot (the latest snapshot's parent) and recording the undo as a forward op-log operation; refuses a dirty worktree with DIRTY_WORKTREE; data carries { undone_operation_id, restored_snapshot_id, content_ref, current_view_id }. Append-only — never deletes a decision or op-log row. \"nothing to undo\" when there is no earlier snapshot."),
+         ("trust policy", "Shows or updates the local trust policy. With no flags, data carries { min_accept_trust, min_export_trust, supported_trust_levels }. With --accept/--export, updates the configured minimum trust for accept/export. Supported levels are self_reported, locally_observed, locally_signed, hosted_runner_observed, hosted_runner_signed, third_party_attested. Hosted-runner levels require valid hosted-runner signatures; third_party_attested requires valid third-party signatures."),
+diff --git a/crates/forge-cli/tests/forge_native_history.rs b/crates/forge-cli/tests/forge_native_history.rs
+index 433ad5a..1f12872 100644
+--- a/crates/forge-cli/tests/forge_native_history.rs
++++ b/crates/forge-cli/tests/forge_native_history.rs
+@@ -566,6 +566,167 @@ fn log_path_scopes_to_a_directory_and_composes_with_intent() {
+     assert_eq!(filtered_commits[0]["commit_id"], first_commit);
+ }
+ 
++#[test]
++fn blame_attributes_each_line_to_the_commit_that_last_changed_it() {
++    let repo = TestRepo::new_git();
++    repo.forge()
++        .args(["--json", "init", "--content-backend", "native"])
++        .assert()
++        .success();
++    let c1 = accept_native_round(&repo, "add poem", |root| {
++        std::fs::write(root.join("poem.txt"), "alpha\nbeta\ngamma\n").expect("write poem");
++    });
++    let c2 = accept_native_round(&repo, "revise beta", |root| {
++        std::fs::write(root.join("poem.txt"), "alpha\nBETA\ngamma\ndelta\n").expect("revise");
++    });
++    let c3 = accept_native_round(&repo, "add opening line", |root| {
++        std::fs::write(root.join("poem.txt"), "zero\nalpha\nBETA\ngamma\ndelta\n")
++            .expect("prepend");
++    });
++
++    let blamed = json_output(
++        repo.forge()
++            .args(["--json", "blame", "poem.txt"])
++            .assert()
++            .success(),
++    );
++    assert_eq!(blamed["data"]["path"], "poem.txt");
++    assert_eq!(blamed["data"]["tip_commit_id"], c3);
++
++    let lines = blamed["data"]["lines"].as_array().expect("lines array");
++    let got: Vec<(u64, &str, &str)> = lines
++        .iter()
++        .map(|l| {
++            (
++                l["line_number"].as_u64().unwrap(),
++                l["commit_id"].as_str().unwrap(),
++                l["content"].as_str().unwrap(),
++            )
++        })
++        .collect();
++    assert_eq!(
++        got,
++        vec![
++            (1, c3.as_str(), "zero"),
++            (2, c1.as_str(), "alpha"),
++            (3, c2.as_str(), "BETA"),
++            (4, c1.as_str(), "gamma"),
++            (5, c2.as_str(), "delta"),
++        ]
++    );
++
++    // The report carries the provenance of every distinct blamed commit, newest first.
++    let commits = blamed["data"]["commits"].as_array().expect("commits array");
++    let ids: Vec<&str> = commits
++        .iter()
++        .map(|c| c["commit_id"].as_str().unwrap())
++        .collect();
++    assert_eq!(ids, vec![c3.as_str(), c2.as_str(), c1.as_str()]);
++    for commit in commits {
++        assert!(commit["intent_id"].is_string());
++        assert!(commit["proposal_revision_id"].is_string());
++        assert!(commit["decision_id"].is_string());
++        assert!(commit["actor"].is_string());
++        assert!(commit["authored_time"].is_i64());
++    }
++}
++
++#[test]
++fn blame_attributes_untouched_genesis_content_and_prints_human_lines() {
++    let repo = TestRepo::new_git();
++    prepare_native_proposal(&repo);
++    repo.forge().args(["--json", "accept"]).assert().success();
++
++    // README.md is untouched since the genesis snapshot: every line attributes to the
++    // genesis commit, which carries no justification fields.
++    let blamed = json_output(
++        repo.forge()
++            .args(["--json", "blame", "README.md"])
++            .assert()
++            .success(),
++    );
++    let lines = blamed["data"]["lines"].as_array().unwrap();
++    assert_eq!(lines.len(), 1);
++    assert_eq!(lines[0]["content"], "hello");
++    let genesis_id = lines[0]["commit_id"].as_str().unwrap();
++    let commits = blamed["data"]["commits"].as_array().unwrap();
++    assert_eq!(commits.len(), 1);
++    assert_eq!(commits[0]["commit_id"], genesis_id);
++    assert!(commits[0].get("decision_id").is_none());
++
++    // Human mode (no --json): git-style `<short-commit> (<actor> <line>) content`, with
++    // "-" standing in for the genesis' absent actor.
++    let human = repo
++        .forge()
++        .args(["blame", "README.md"])
++        .assert()
++        .success()
++        .get_output()
++        .stdout
++        .clone();
++    let human = String::from_utf8(human).expect("utf8 stdout");
++    let digest_short = &genesis_id.rsplit(':').next().unwrap()[..8];
++    assert!(
++        human.contains(digest_short) && human.contains("hello") && human.contains("(-"),
++        "unexpected human blame output: {human:?}"
++    );
++}
++
++#[test]
++fn blame_rejects_missing_directory_binary_and_escaping_paths() {
++    let repo = TestRepo::new_git();
++    repo.forge()
++        .args(["--json", "init", "--content-backend", "native"])
++        .assert()
++        .success();
++    accept_native_round(&repo, "add mixed content", |root| {
++        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
++        std::fs::write(root.join("src/app.txt"), "app\n").expect("write app");
++        std::fs::write(root.join("logo.bin"), b"\x00\x01\x02binary").expect("write binary");
++    });
++
++    for (path, needle) in [
++        ("missing.txt", "no history"),
++        ("src", "directory"),
++        ("logo.bin", "binary"),
++        ("../outside.txt", "repo-relative"),
++    ] {
++        let rejected = json_output(
++            repo.forge()
++                .args(["--json", "blame", path])
++                .assert()
++                .failure(),
++        );
++        assert_eq!(rejected["errors"][0]["code"], "COMMAND_FAILED", "{path}");
++        assert!(
++            rejected["errors"][0]["message"]
++                .as_str()
++                .unwrap()
++                .contains(needle),
++            "blame {path}: {:?}",
++            rejected["errors"][0]["message"]
++        );
++    }
++}
++
++#[test]
++fn blame_without_native_history_is_a_clear_error() {
++    let repo = TestRepo::new_git();
++    // Default (git) content backend: no native commits are ever recorded.
++    repo.forge().args(["--json", "init"]).assert().success();
++    let rejected = json_output(
++        repo.forge()
++            .args(["--json", "blame", "README.md"])
++            .assert()
++            .failure(),
++    );
++    assert_eq!(rejected["errors"][0]["code"], "COMMAND_FAILED");
++    assert!(rejected["errors"][0]["message"]
++        .as_str()
++        .unwrap()
++        .contains("no native history"));
++}
++
+ #[test]
+ fn log_path_rejects_absolute_and_escaping_paths() {
+     let repo = TestRepo::new_git();
+diff --git a/crates/forge-content-native/src/lib.rs b/crates/forge-content-native/src/lib.rs
+index a1a2c5f..4c4dd1a 100644
+--- a/crates/forge-content-native/src/lib.rs
++++ b/crates/forge-content-native/src/lib.rs
+@@ -50,7 +50,7 @@ pub const COMMIT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
+ /// crate both backends depend on (NER-132 U4).
+ pub use forge_content::RESTORE_TEMP_PREFIX;
+ 
+-pub use provenance::{tree_path_fingerprints, Hex64};
++pub use provenance::{attribute_file_lines, tree_path_fingerprints, AttributedLine, Hex64};
+ 
+ #[derive(Debug, Clone)]
+ pub struct DiffOptions {
+diff --git a/crates/forge-content-native/src/provenance.rs b/crates/forge-content-native/src/provenance.rs
+index dad9ddd..33ea179 100644
+--- a/crates/forge-content-native/src/provenance.rs
++++ b/crates/forge-content-native/src/provenance.rs
+@@ -3,13 +3,141 @@
+ //! engine file `lib.rs` is at its allowlisted line-count cap, so new NER-362 behavior
+ //! lands here.
+ 
+-use anyhow::{bail, Result};
++use anyhow::{anyhow, bail, Result};
+ use serde::{Deserialize, Serialize};
+ use std::collections::BTreeMap;
+ use std::fmt;
+ 
+ use crate::{NativeObjectStore, ObjectId};
+ 
++/// One attributed line of a blamed file (NER-362 line attribution engine): the 1-based
++/// line number at the blamed tip, the commit that last changed the line, and the line
++/// content (lossy UTF-8, without the trailing newline).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct AttributedLine {
++    pub line_number: usize,
++    pub commit_id: String,
++    pub content: String,
++}
++
++/// Read the exact-file blob at `path` under `root` as lines (raw bytes, trailing `\n`
++/// retained so line identity matches the differ's). `Ok(None)` when the tree carries no
++/// exact file entry at `path` (absent, or a directory). Line attribution is text-only:
++/// binary content errors.
++fn exact_file_lines(
++    store: &NativeObjectStore,
++    root: &ObjectId,
++    path: &str,
++) -> Result<Option<Vec<Vec<u8>>>> {
++    let fingerprints = tree_path_fingerprints(store, root, path)?;
++    let Some((object, _mode)) = fingerprints.get(path) else {
++        return Ok(None);
++    };
++    let bytes = store.read_object(&ObjectId::parse(object)?)?;
++    if crate::is_binary(&bytes) {
++        bail!("cannot attribute lines of binary content at {path:?}");
++    }
++    Ok(Some(crate::split_lines(&bytes)))
++}
++
++/// Attribute every line of `path` at `history[0]`'s tree to the commit that last changed
++/// it (NER-362). `history` is the path-scoped **first-parent** chain, newest first: each
++/// entry `(commit_id, tree_root)` is a commit whose tree changed the path vs its first
++/// parent, and entry k+1's tree is exactly the parent-side content of entry k (nothing
++/// between them on the first-parent chain touched the path — so on a merge commit,
++/// lines brought in from the second parent attribute to the merge itself, like
++/// `git blame --first-parent`). Line matching uses the same Patience diff the tree
++/// differ uses: a tip line is carried backward through every older version that keeps
++/// it verbatim, and attributed to the newest commit where no matching older line exists.
++pub fn attribute_file_lines(
++    store: &NativeObjectStore,
++    history: &[(String, ObjectId)],
++    path: &str,
++) -> Result<Vec<AttributedLine>> {
++    let (_, tip_root) = history
++        .first()
++        .ok_or_else(|| anyhow!("cannot attribute lines with an empty path history"))?;
++    let Some(tip_lines) = exact_file_lines(store, tip_root, path)? else {
++        if !tree_path_fingerprints(store, tip_root, path)?.is_empty() {
++            bail!("cannot blame a directory: {path:?}");
++        }
++        bail!("path {path:?} is not present at the blamed commit");
++    };
++
++    let mut attributions: Vec<Option<&str>> = vec![None; tip_lines.len()];
++    // Each pending tip line, paired with its line index in the version currently being
++    // matched (`newer_lines`); matched lines migrate backward version by version.
++    let mut pending: Vec<(usize, usize)> = (0..tip_lines.len()).map(|i| (i, i)).collect();
++    let mut newer_lines = tip_lines.clone();
++
++    for (k, (commit_id, _)) in history.iter().enumerate() {
++        if pending.is_empty() {
++            break;
++        }
++        let older_lines = if let Some((_, older_root)) = history.get(k + 1) {
++            exact_file_lines(store, older_root, path)?
++        } else {
++            // The oldest changing commit: its first-parent side has no path content
++            // (either it is the genesis, or the commit re-added the path after a
++            // deletion, whose tree the previous iteration already consulted).
++            None
++        };
++        let Some(older_lines) = older_lines else {
++            for (tip_idx, _) in pending.drain(..) {
++                attributions[tip_idx] = Some(commit_id);
++            }
++            break;
++        };
++        let ops =
++            similar::capture_diff_slices(similar::Algorithm::Patience, &older_lines, &newer_lines);
++        let mut to_older: BTreeMap<usize, usize> = BTreeMap::new();
++        for op in ops {
++            if let similar::DiffOp::Equal {
++                old_index,
++                new_index,
++                len,
++            } = op
++            {
++                for offset in 0..len {
++                    to_older.insert(new_index + offset, old_index + offset);
++                }
++            }
++        }
++        let mut still_pending = Vec::with_capacity(pending.len());
++        for (tip_idx, newer_idx) in pending {
++            match to_older.get(&newer_idx) {
++                Some(older_idx) => still_pending.push((tip_idx, *older_idx)),
++                None => attributions[tip_idx] = Some(commit_id),
++            }
++        }
++        pending = still_pending;
++        newer_lines = older_lines;
++    }
++
++    tip_lines
++        .iter()
++        .zip(attributions)
++        .enumerate()
++        .map(|(idx, (line, commit_id))| {
++            let commit_id = commit_id
++                .ok_or_else(|| anyhow!("line {} of {path:?} was never attributed", idx + 1))?
++                .to_string();
++            let mut content = String::from_utf8_lossy(line).into_owned();
++            if content.ends_with('\n') {
++                content.pop();
++                if content.ends_with('\r') {
++                    content.pop();
++                }
++            }
++            Ok(AttributedLine {
++                line_number: idx + 1,
++                commit_id,
++                content,
++            })
++        })
++        .collect()
++}
++
+ /// An opaque lowercase 64-hex digest (e.g. an evidence `content_hash`). Constructing one
+ /// validates the shape, so the commit-build path (slice 3's `accept`) can only assign a
+ /// real digest — excerpt text is structurally unrepresentable in
+@@ -112,4 +240,79 @@ mod tests {
+             .unwrap()
+             .is_empty());
+     }
++
++    /// Snapshot successive versions of one file and return the version tree roots.
++    fn version_roots(repo: &std::path::Path, path: &str, versions: &[&str]) -> Vec<ObjectId> {
++        versions
++            .iter()
++            .map(|content| {
++                fs::write(repo.join(path), content).unwrap();
++                snapshot_root(repo)
++            })
++            .collect()
++    }
++
++    #[test]
++    fn attribute_file_lines_tracks_last_change_per_line() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        let roots = version_roots(
++            repo,
++            "poem.txt",
++            &[
++                "alpha\nbeta\ngamma\n",
++                // c2 rewrites beta and appends delta; alpha/gamma survive verbatim.
++                "alpha\nBETA\ngamma\ndelta\n",
++                // c3 inserts a new first line; everything else survives verbatim.
++                "zero\nalpha\nBETA\ngamma\ndelta\n",
++            ],
++        );
++        let store = NativeObjectStore::new(repo);
++        // Newest first, as the first-parent path chain hands it over.
++        let history = vec![
++            ("c3".to_string(), roots[2].clone()),
++            ("c2".to_string(), roots[1].clone()),
++            ("c1".to_string(), roots[0].clone()),
++        ];
++
++        let lines = attribute_file_lines(&store, &history, "poem.txt").unwrap();
++        let got: Vec<(usize, &str, &str)> = lines
++            .iter()
++            .map(|l| (l.line_number, l.commit_id.as_str(), l.content.as_str()))
++            .collect();
++        assert_eq!(
++            got,
++            vec![
++                (1, "c3", "zero"),
++                (2, "c1", "alpha"),
++                (3, "c2", "BETA"),
++                (4, "c1", "gamma"),
++                (5, "c2", "delta"),
++            ]
++        );
++    }
++
++    #[test]
++    fn attribute_file_lines_rejects_missing_directory_and_binary_paths() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        fs::create_dir_all(repo.join("src")).unwrap();
++        fs::write(repo.join("src/app.rs"), "fn main() {}\n").unwrap();
++        fs::write(repo.join("blob.bin"), b"\x00\x01binary").unwrap();
++        let store = NativeObjectStore::new(repo);
++        let root = snapshot_root(repo);
++
++        let missing =
++            attribute_file_lines(&store, &[("c1".to_string(), root.clone())], "missing.txt")
++                .unwrap_err();
++        assert!(missing.to_string().contains("not present"));
++
++        let directory =
++            attribute_file_lines(&store, &[("c1".to_string(), root.clone())], "src").unwrap_err();
++        assert!(directory.to_string().contains("directory"));
++
++        let binary =
++            attribute_file_lines(&store, &[("c1".to_string(), root)], "blob.bin").unwrap_err();
++        assert!(binary.to_string().contains("binary"));
++    }
+ }
+diff --git a/crates/forge-store/src/lib.rs b/crates/forge-store/src/lib.rs
+index 1c43841..0a968f1 100644
+--- a/crates/forge-store/src/lib.rs
++++ b/crates/forge-store/src/lib.rs
+@@ -148,11 +148,12 @@ pub use repository::{
+ };
+ pub use show::{show, ShowRecord};
+ pub use snapshots::{
+-    checkout_target_content_ref, expected_content_ref, latest_snapshot_content_ref, native_log,
+-    native_path_log, reconcile_native_head, record_checkout, record_restore, record_undo,
+-    save_snapshot, save_snapshot_with_private_overlays, set_materialized_expected_content_ref,
+-    snapshot_content_ref, snapshot_owner_attempt_id, undo_target, CommitView, PathCommitView,
+-    SnapshotRecord, SnapshotSummary, UndoTarget,
++    checkout_target_content_ref, expected_content_ref, latest_snapshot_content_ref, native_blame,
++    native_log, native_path_log, reconcile_native_head, record_checkout, record_restore,
++    record_undo, save_snapshot, save_snapshot_with_private_overlays,
++    set_materialized_expected_content_ref, snapshot_content_ref, snapshot_owner_attempt_id,
++    undo_target, BlameLine, BlameReport, CommitView, PathCommitView, SnapshotRecord,
++    SnapshotSummary, UndoTarget,
+ };
+ pub(crate) use snapshots::{
+     latest_snapshot_for_attempt, latest_snapshot_on, native_tip, set_context_expected_content_ref,
+diff --git a/crates/forge-store/src/snapshots.rs b/crates/forge-store/src/snapshots.rs
+index 6373869..48e78ed 100644
+--- a/crates/forge-store/src/snapshots.rs
++++ b/crates/forge-store/src/snapshots.rs
+@@ -786,18 +786,9 @@ pub fn native_path_log(
+         .iter()
+         .map(|(cid, commit)| (cid.to_string(), commit.tree.clone()))
+         .collect();
+-    // Memoize path fingerprints per tree id: each commit's tree is also consulted as its
+-    // children's parent tree, and unrelated commits can share identical trees.
+-    let mut memo: BTreeMap<String, BTreeMap<String, (String, u32)>> = BTreeMap::new();
+-    let mut fingerprints_at = |tree: &str| -> Result<BTreeMap<String, (String, u32)>> {
+-        if let Some(hit) = memo.get(tree) {
+-            return Ok(hit.clone());
+-        }
+-        let root = forge_content_native::ObjectId::parse(tree)?;
+-        let fingerprints = forge_content_native::tree_path_fingerprints(&store, &root, &path)?;
+-        memo.insert(tree.to_string(), fingerprints.clone());
+-        Ok(fingerprints)
+-    };
++    let mut memo = BTreeMap::new();
++    let mut fingerprints_at =
++        |tree: &str| path_fingerprints_memoized(&store, &mut memo, tree, &path);
+     for (cid, commit) in &commits {
+         let matches = intent
+             .map(|want| commit.intent_id.as_deref() == Some(want))
+@@ -839,6 +830,135 @@ pub fn native_path_log(
+     Ok(out)
+ }
+ 
++/// Path fingerprints for `path` under a tree, memoized per tree id: each commit's tree is
++/// also consulted as its children's parent tree, and unrelated commits can share
++/// identical trees.
++fn path_fingerprints_memoized(
++    store: &forge_content_native::NativeObjectStore,
++    memo: &mut BTreeMap<String, BTreeMap<String, (String, u32)>>,
++    tree: &str,
++    path: &str,
++) -> Result<BTreeMap<String, (String, u32)>> {
++    if let Some(hit) = memo.get(tree) {
++        return Ok(hit.clone());
++    }
++    let root = forge_content_native::ObjectId::parse(tree)?;
++    let fingerprints = forge_content_native::tree_path_fingerprints(store, &root, path)?;
++    memo.insert(tree.to_string(), fingerprints.clone());
++    Ok(fingerprints)
++}
++
++/// One line of a blamed file, as surfaced by `forge blame` through the JSON contract.
++#[derive(Debug, Clone, Serialize)]
++pub struct BlameLine {
++    pub line_number: u64,
++    /// The commit that last changed this line (first-parent attribution).
++    pub commit_id: String,
++    /// The line content at the blamed tip, without the trailing newline.
++    pub content: String,
++}
++
++/// The `forge blame` result: every line of `path` at the native tip attributed to the
++/// commit that last changed it, plus the provenance (intent, proposal revision,
++/// decision, actor, authored time, evidence digest) of each distinct blamed commit.
++#[derive(Debug, Clone, Serialize)]
++pub struct BlameReport {
++    pub path: String,
++    /// The native tip commit whose tree was blamed.
++    pub tip_commit_id: String,
++    pub lines: Vec<BlameLine>,
++    /// Provenance for every distinct commit referenced by `lines`, newest first.
++    pub commits: Vec<CommitView>,
++}
++
++/// Attribute every line of `path` (a repo-relative file) at the native tip to the commit
++/// that last changed it (NER-362 intent-aware blame). Read-only, like [`native_log`].
++/// The walk follows the **first-parent** chain and keeps only commits whose tree changed
++/// the path, so lines a merge brought in from its second parent attribute to the merge
++/// commit itself (`git blame --first-parent` semantics); line matching is the engine's
++/// Patience diff (see `forge_content_native::attribute_file_lines`).
++pub fn native_blame(cwd: &Path, path: &str) -> Result<BlameReport> {
++    let path = normalize_repo_relative_path(path)?;
++    let context = open_repository(cwd)?;
++    let connection = open_connection(&context.database_path)?;
++    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
++    let Some(tip) = native_tip(&context, &connection)? else {
++        bail!("no native history to blame (native-backend repos record commits at accept)");
++    };
++    // The full walk validates the DAG (dangling/cycle checks) and lets the first-parent
++    // chain below resolve parents without re-reading commit objects.
++    let commits = walk_native_commits(&store, &tip)?;
++    let by_id: BTreeMap<String, &forge_content_native::CommitObject> = commits
++        .iter()
++        .map(|(cid, commit)| (cid.to_string(), commit))
++        .collect();
++
++    // First-parent chain, newest first, keeping only commits whose tree changed the path
++    // vs their first parent — the shape `attribute_file_lines` expects.
++    let mut memo = BTreeMap::new();
++    let mut history: Vec<(String, forge_content_native::ObjectId)> = Vec::new();
++    let mut cursor = Some(tip.to_string());
++    while let Some(id) = cursor {
++        let commit = by_id
++            .get(&id)
++            .expect("walk_native_commits returns every first-parent ancestor");
++        let current = path_fingerprints_memoized(&store, &mut memo, &commit.tree, &path)?;
++        let parent_state = match commit.parents.first() {
++            Some(parent) => {
++                let parent_tree = &by_id
++                    .get(parent)
++                    .expect("walk_native_commits returns every first-parent ancestor")
++                    .tree;
++                path_fingerprints_memoized(&store, &mut memo, parent_tree, &path)?
++            }
++            None => BTreeMap::new(),
++        };
++        if current != parent_state {
++            history.push((
++                id.clone(),
++                forge_content_native::ObjectId::parse(&commit.tree)?,
++            ));
++        }
++        cursor = commit.parents.first().cloned();
++    }
++    if history.is_empty() {
++        bail!("path {path:?} has no history at the native tip");
++    }
++
++    let attributed = forge_content_native::attribute_file_lines(&store, &history, &path)?;
++
++    // Distinct blamed commits, in history (newest-first) order, with full provenance.
++    let referenced: std::collections::BTreeSet<&str> = attributed
++        .iter()
++        .map(|line| line.commit_id.as_str())
++        .collect();
++    let commit_ids_by_string: BTreeMap<String, &forge_content_native::ObjectId> = commits
++        .iter()
++        .map(|(cid, _)| (cid.to_string(), cid))
++        .collect();
++    let mut blamed_commits = Vec::new();
++    for (id, _) in &history {
++        if referenced.contains(id.as_str()) {
++            let cid = commit_ids_by_string[id];
++            blamed_commits.push(commit_view(cid, by_id[id]));
++        }
++    }
++
++    Ok(BlameReport {
++        path,
++        tip_commit_id: tip.to_string(),
++        lines: attributed
++            .into_iter()
++            .map(|line| BlameLine {
++                line_number: line.line_number as u64,
++                commit_id: line.commit_id,
++                content: line.content,
++            })
++            .collect(),
++        commits: blamed_commits,
++    })
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub(crate) enum NativeVisitState {
+     Visiting,

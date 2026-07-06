@@ -1,0 +1,11 @@
+--- CURRENT TASK ---
+- **362-3** CLI surface: a `forge blame <path>` command with human and
+  --json output following the repo's envelope conventions.
+- **362-4** Ledger enrichment: enrich blame output with intent title,
+
+Rules for this task:
+- Implement only this task now (later tasks come next in this session).
+- The worktree already contains your previous tasks' changes, applied and
+  committed; build this task on top of them.
+- Run the repo's verify gates for what you build and make them pass.
+- Do not create git commits; leave changes uncommitted.

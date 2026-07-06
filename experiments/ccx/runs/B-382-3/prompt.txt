@@ -1,0 +1,11 @@
+--- CURRENT TASK ---
+- **382-3** Integration tests for the drift guard: the silent-loss repro
+  now fails loudly; override discards; no-drift attach unchanged;
+  never-materialized attach unchecked.
+
+Rules for this task:
+- Implement only this task now (later tasks come next in this session).
+- The worktree already contains your previous tasks' changes, applied and
+  committed; build this task on top of them.
+- Run the repo's verify gates for what you build and make them pass.
+- Do not create git commits; leave changes uncommitted.

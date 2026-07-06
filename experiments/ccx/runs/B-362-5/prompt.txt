@@ -1,0 +1,11 @@
+--- CURRENT TASK ---
+- **362-5** Integration tests + docs for blame: end-to-end scenarios
+  driving the real binary in temp repos, plus CLI docs.
+- **382-1** Payload/docs honesty: qualify the workspace_path emitted by
+
+Rules for this task:
+- Implement only this task now (later tasks come next in this session).
+- The worktree already contains your previous tasks' changes, applied and
+  committed; build this task on top of them.
+- Run the repo's verify gates for what you build and make them pass.
+- Do not create git commits; leave changes uncommitted.

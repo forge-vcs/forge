@@ -1,0 +1,627 @@
+diff --git a/crates/forge-cli/src/args.rs b/crates/forge-cli/src/args.rs
+index 9dfac52..b4cf960 100644
+--- a/crates/forge-cli/src/args.rs
++++ b/crates/forge-cli/src/args.rs
+@@ -135,6 +135,10 @@ pub(crate) struct LogArgs {
+     /// Show only commits recorded under this intent ("show every change under this intent").
+     #[arg(long)]
+     pub(crate) intent: Option<String>,
++    /// Show only commits that changed this repo-relative file or directory, each with a
++    /// `change` field (added|modified|removed) — the path provenance walk (NER-362).
++    #[arg(long)]
++    pub(crate) path: Option<String>,
+ }
+ 
+ #[derive(Debug, Args)]
+diff --git a/crates/forge-cli/src/commands/core.rs b/crates/forge-cli/src/commands/core.rs
+index 1b6568f..bde3d0f 100644
+--- a/crates/forge-cli/src/commands/core.rs
++++ b/crates/forge-cli/src/commands/core.rs
+@@ -1026,7 +1026,16 @@ pub(crate) fn log_response(request_id: Option<String>, args: LogArgs) -> Respons
+     // no reconcile — `native_log` resolves the authoritative tip from the ledger directly,
+     // tolerating a not-yet-reconciled HEAD.
+     command_result("log", request_id, |cwd, _request_id| {
+-        let commits = forge_store::native_log(&cwd, args.intent.as_deref())?;
++        let commits = if let Some(path) = args.path.as_deref() {
++            // Path provenance walk (NER-362): entries additionally carry `change`.
++            serde_json::to_value(forge_store::native_path_log(
++                &cwd,
++                path,
++                args.intent.as_deref(),
++            )?)?
++        } else {
++            serde_json::to_value(forge_store::native_log(&cwd, args.intent.as_deref())?)?
++        };
+         Ok((None, json!({ "commits": commits }), Vec::new()))
+     })
+ }
+diff --git a/crates/forge-cli/src/schema.rs b/crates/forge-cli/src/schema.rs
+index 796b025..b1b8c0f 100644
+--- a/crates/forge-cli/src/schema.rs
++++ b/crates/forge-cli/src/schema.rs
+@@ -81,7 +81,7 @@ fn command_shapes() -> Value {
+         ("conflict show", "Shows one persisted conflict set plus redacted path-conflict summaries. Data carries { conflict, path_conflicts: [{ path_conflict_id, path_fingerprint, kind, base_ref, ours_ref, theirs_ref, side status/mode fields, resolution_ref, status }] }. With --suggest on unresolved native_merge conflicts, data also carries ranked advisory suggestions with provenance and requires_explicit_resolve=true. Raw paths and inline blob excerpts are never emitted."),
+         ("conflict resolve", "Resolves a persisted conflict set with --tree <forge-tree-ref>. Data carries { conflict_set_id, proposal_id, proposal_revision_id, snapshot_id, evidence_id, resolution_ref, operation_id, view_id }. The resolution creates a new snapshot, proposal revision, and tamper-evident evidence row; agents should run evidence and check again before accept."),
+         ("attempt compare", "Alias of `compare` scoped to attempts; same data shape."),
+-        ("log", "Walks the native commit history tip→genesis via the JSON contract; data carries { commits: [{ commit_id, tree, parents, intent_id, proposal_revision_id, decision_id, actor, authored_time, evidence_digest }] }. Read-only; --intent <id> filters to commits under one intent (\"show every change under this intent\"). Native-backend repos only (a git-backend repo has no native history)."),
++        ("log", "Walks the native commit history tip→genesis via the JSON contract; data carries { commits: [{ commit_id, tree, parents, intent_id, proposal_revision_id, decision_id, actor, authored_time, evidence_digest }] }. Read-only; --intent <id> filters to commits under one intent (\"show every change under this intent\"). --path <repo-relative file or directory> is the path provenance walk (NER-362): only commits that changed the path are returned, each with an extra change field (added|modified|removed); a merge whose path state matches any parent is skipped (git-parity history simplification). Native-backend repos only (a git-backend repo has no native history)."),
+         ("checkout", "Materializes a past commit's tree into the worktree (refuses a dirty worktree with DIRTY_WORKTREE; an unknown commit is rejected, a ledger-referenced-but-missing one is NATIVE_HISTORY_CORRUPT); data carries { commit_id, content_ref, base_unchanged: true, current_view_id }. Materialize-only: does NOT move the base anchor (a save afterward still diffs against the unchanged base HEAD), and is recorded in the op-log so forge undo can reverse it. Native-backend repos only."),
+         ("undo", "Undoes the last save, restoring the worktree to the prior snapshot (the latest snapshot's parent) and recording the undo as a forward op-log operation; refuses a dirty worktree with DIRTY_WORKTREE; data carries { undone_operation_id, restored_snapshot_id, content_ref, current_view_id }. Append-only — never deletes a decision or op-log row. \"nothing to undo\" when there is no earlier snapshot."),
+         ("trust policy", "Shows or updates the local trust policy. With no flags, data carries { min_accept_trust, min_export_trust, supported_trust_levels }. With --accept/--export, updates the configured minimum trust for accept/export. Supported levels are self_reported, locally_observed, locally_signed, hosted_runner_observed, hosted_runner_signed, third_party_attested. Hosted-runner levels require valid hosted-runner signatures; third_party_attested requires valid third-party signatures."),
+diff --git a/crates/forge-cli/tests/forge_native_history.rs b/crates/forge-cli/tests/forge_native_history.rs
+index 9c4a640..433ad5a 100644
+--- a/crates/forge-cli/tests/forge_native_history.rs
++++ b/crates/forge-cli/tests/forge_native_history.rs
+@@ -395,6 +395,204 @@ fn native_log_filters_by_intent() {
+     );
+ }
+ 
++/// Drive one more full native round (start → save → run → propose → check → accept) on top
++/// of an already-initialized repo, mutating the worktree via `mutate` before the save.
++/// Returns the accepted commit id.
++fn accept_native_round(repo: &TestRepo, intent_text: &str, mutate: impl FnOnce(&Path)) -> String {
++    repo.forge()
++        .args(["--json", "start", intent_text])
++        .assert()
++        .success();
++    mutate(repo.path());
++    repo.forge().args(["--json", "save"]).assert().success();
++    repo.forge()
++        .args(["--json", "run", "--", "sh", "-c", "true"])
++        .assert()
++        .success();
++    repo.forge().args(["--json", "propose"]).assert().success();
++    repo.forge().args(["--json", "check"]).assert().success();
++    let accepted = json_output(repo.forge().args(["--json", "accept"]).assert().success());
++    accepted["data"]["commit_id"]
++        .as_str()
++        .expect("accept surfaces commit_id")
++        .to_string()
++}
++
++#[test]
++fn log_path_reports_only_commits_that_changed_the_path_with_their_provenance() {
++    let repo = TestRepo::new_git();
++    prepare_native_proposal(&repo);
++    let first = json_output(repo.forge().args(["--json", "accept"]).assert().success());
++    let first_commit = first["data"]["commit_id"].as_str().unwrap().to_string();
++
++    // A second accepted round that does NOT touch feature.txt.
++    let second_commit = accept_native_round(&repo, "unrelated change", |root| {
++        std::fs::write(root.join("other.txt"), "other\n").expect("write other");
++    });
++
++    // feature.txt was added by the first accepted commit only — the walk skips the
++    // unrelated commit and the genesis, and carries the commit's full provenance.
++    let logged = json_output(
++        repo.forge()
++            .args(["--json", "log", "--path", "feature.txt"])
++            .assert()
++            .success(),
++    );
++    let commits = logged["data"]["commits"].as_array().expect("commits array");
++    assert_eq!(commits.len(), 1, "only the commit that changed the path");
++    assert_eq!(commits[0]["commit_id"], first_commit);
++    assert_eq!(commits[0]["change"], "added");
++    assert!(commits[0]["intent_id"].is_string());
++    assert!(commits[0]["proposal_revision_id"].is_string());
++    assert!(commits[0]["decision_id"].is_string());
++    assert!(commits[0]["actor"].is_string());
++    assert!(commits[0]["authored_time"].is_i64());
++
++    // other.txt belongs to the second commit only.
++    let other = json_output(
++        repo.forge()
++            .args(["--json", "log", "--path", "other.txt"])
++            .assert()
++            .success(),
++    );
++    let other_commits = other["data"]["commits"].as_array().unwrap();
++    assert_eq!(other_commits.len(), 1);
++    assert_eq!(other_commits[0]["commit_id"], second_commit);
++    assert_eq!(other_commits[0]["change"], "added");
++
++    // README.md existed at genesis and never changed: attributed to the genesis commit,
++    // which carries no justification fields.
++    let readme = json_output(
++        repo.forge()
++            .args(["--json", "log", "--path", "README.md"])
++            .assert()
++            .success(),
++    );
++    let readme_commits = readme["data"]["commits"].as_array().unwrap();
++    assert_eq!(readme_commits.len(), 1);
++    assert_eq!(readme_commits[0]["change"], "added");
++    assert_eq!(readme_commits[0]["parents"].as_array().unwrap().len(), 0);
++    assert!(readme_commits[0].get("decision_id").is_none());
++
++    // A path never present in any commit is an empty list (git parity), not an error.
++    let missing = json_output(
++        repo.forge()
++            .args(["--json", "log", "--path", "no-such-file.txt"])
++            .assert()
++            .success(),
++    );
++    assert!(missing["data"]["commits"].as_array().unwrap().is_empty());
++}
++
++#[test]
++fn log_path_walks_add_modify_remove_tip_to_genesis() {
++    let repo = TestRepo::new_git();
++    prepare_native_proposal(&repo);
++    let added = json_output(repo.forge().args(["--json", "accept"]).assert().success());
++    let added_commit = added["data"]["commit_id"].as_str().unwrap().to_string();
++
++    let modified_commit = accept_native_round(&repo, "modify feature", |root| {
++        std::fs::write(root.join("feature.txt"), "native v2\n").expect("rewrite feature");
++    });
++    let removed_commit = accept_native_round(&repo, "remove feature", |root| {
++        std::fs::remove_file(root.join("feature.txt")).expect("remove feature");
++    });
++
++    let logged = json_output(
++        repo.forge()
++            .args(["--json", "log", "--path", "feature.txt"])
++            .assert()
++            .success(),
++    );
++    let commits = logged["data"]["commits"].as_array().unwrap();
++    // Tip→genesis order: removal first, then the modification, then the original add.
++    assert_eq!(commits.len(), 3);
++    assert_eq!(commits[0]["commit_id"], removed_commit);
++    assert_eq!(commits[0]["change"], "removed");
++    assert_eq!(commits[1]["commit_id"], modified_commit);
++    assert_eq!(commits[1]["change"], "modified");
++    assert_eq!(commits[2]["commit_id"], added_commit);
++    assert_eq!(commits[2]["change"], "added");
++}
++
++#[test]
++fn log_path_scopes_to_a_directory_and_composes_with_intent() {
++    let repo = TestRepo::new_git();
++    repo.forge()
++        .args(["--json", "init", "--content-backend", "native"])
++        .assert()
++        .success();
++    let first_commit = accept_native_round(&repo, "add app", |root| {
++        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
++        std::fs::write(root.join("src/app.txt"), "app\n").expect("write app");
++    });
++    let second_commit = accept_native_round(&repo, "add lib", |root| {
++        std::fs::write(root.join("src/lib.txt"), "lib\n").expect("write lib");
++    });
++
++    // A directory path selects every commit that changed anything under it; a trailing
++    // slash spells the same path.
++    for path in ["src", "src/"] {
++        let logged = json_output(
++            repo.forge()
++                .args(["--json", "log", "--path", path])
++                .assert()
++                .success(),
++        );
++        let commits = logged["data"]["commits"].as_array().unwrap();
++        assert_eq!(commits.len(), 2, "--path {path}");
++        assert_eq!(commits[0]["commit_id"], second_commit);
++        assert_eq!(commits[1]["commit_id"], first_commit);
++    }
++
++    // --intent composes with --path: only the matching intent's commit remains.
++    let intent_id = json_output(
++        repo.forge()
++            .args(["--json", "log", "--path", "src/app.txt"])
++            .assert()
++            .success(),
++    )["data"]["commits"][0]["intent_id"]
++        .as_str()
++        .expect("first commit carries an intent id")
++        .to_string();
++    let filtered = json_output(
++        repo.forge()
++            .args(["--json", "log", "--path", "src", "--intent", &intent_id])
++            .assert()
++            .success(),
++    );
++    let filtered_commits = filtered["data"]["commits"].as_array().unwrap();
++    assert_eq!(filtered_commits.len(), 1);
++    assert_eq!(filtered_commits[0]["commit_id"], first_commit);
++}
++
++#[test]
++fn log_path_rejects_absolute_and_escaping_paths() {
++    let repo = TestRepo::new_git();
++    prepare_native_proposal(&repo);
++    repo.forge().args(["--json", "accept"]).assert().success();
++
++    for path in ["/etc/passwd", "../outside.txt", "src/../feature.txt", ""] {
++        let rejected = json_output(
++            repo.forge()
++                .args(["--json", "log", "--path", path])
++                .assert()
++                .failure(),
++        );
++        assert_eq!(
++            rejected["errors"][0]["code"], "COMMAND_FAILED",
++            "--path {path:?}"
++        );
++        assert!(
++            rejected["errors"][0]["message"]
++                .as_str()
++                .unwrap()
++                .contains("repo-relative"),
++            "--path {path:?}"
++        );
++    }
++}
++
+ #[test]
+ fn checkout_materializes_a_past_commit_without_moving_the_base() {
+     let repo = TestRepo::new_git();
+diff --git a/crates/forge-content-native/src/lib.rs b/crates/forge-content-native/src/lib.rs
+index 841ead6..a1a2c5f 100644
+--- a/crates/forge-content-native/src/lib.rs
++++ b/crates/forge-content-native/src/lib.rs
+@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
+ use std::process::Command;
+ 
+ mod pack;
++mod provenance;
+ mod status_cache;
+ 
+ const SCHEMA_VERSION: u32 = 1;
+@@ -49,6 +50,8 @@ pub const COMMIT_SCHEMA_VERSION: u32 = SCHEMA_VERSION;
+ /// crate both backends depend on (NER-132 U4).
+ pub use forge_content::RESTORE_TEMP_PREFIX;
+ 
++pub use provenance::{tree_path_fingerprints, Hex64};
++
+ #[derive(Debug, Clone)]
+ pub struct DiffOptions {
+     pub include_hunks: bool,
+@@ -1031,43 +1034,6 @@ struct TreeObject {
+     entries: Vec<TreeEntry>,
+ }
+ 
+-/// An opaque lowercase 64-hex digest (e.g. an evidence `content_hash`). Constructing one
+-/// validates the shape, so the commit-build path (slice 3's `accept`) can only assign a
+-/// real digest — excerpt text is structurally unrepresentable in
+-/// [`CommitObject::evidence_digest`] (the commit payload is written via `write_object` and
+-/// never passes through `redact_evidence_excerpt`, so this newtype is the secret-hygiene
+-/// guard). `#[serde(transparent)]` so it serializes/deserializes as the bare hex string —
+-/// byte-identical to the prior `Option<String>` field, preserving genesis-hash stability.
+-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+-#[serde(transparent)]
+-pub struct Hex64(String);
+-
+-impl Hex64 {
+-    /// Validate and wrap a lowercase 64-hex digest. Errors (path-free) on any other shape,
+-    /// so a non-digest (e.g. excerpt text) can never reach the commit payload.
+-    pub fn new(value: impl Into<String>) -> Result<Self> {
+-        let value = value.into();
+-        if value.len() != 64
+-            || !value
+-                .bytes()
+-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+-        {
+-            bail!("evidence digest must be exactly 64 lowercase hex characters");
+-        }
+-        Ok(Self(value))
+-    }
+-
+-    pub fn as_str(&self) -> &str {
+-        &self.0
+-    }
+-}
+-
+-impl fmt::Display for Hex64 {
+-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        f.write_str(&self.0)
+-    }
+-}
+-
+ /// A native commit/Change object (NER-138 Phase 7 slice 2; justified commits land in
+ /// slice 3). Content-addressed and domain-separated via `ObjectId::new(ObjectKind::Commit,
+ /// ..)`. `pub` (with `pub` fields) so `forge_store` can build justified commits at `accept`
+diff --git a/crates/forge-content-native/src/provenance.rs b/crates/forge-content-native/src/provenance.rs
+new file mode 100644
+index 0000000..dad9ddd
+--- /dev/null
++++ b/crates/forge-content-native/src/provenance.rs
+@@ -0,0 +1,115 @@
++//! Path-scoped provenance primitives (NER-362 intent-aware blame/annotate). This module
++//! holds the tree-level lookups the path provenance walk in `forge_store` builds on; the
++//! engine file `lib.rs` is at its allowlisted line-count cap, so new NER-362 behavior
++//! lands here.
++
++use anyhow::{bail, Result};
++use serde::{Deserialize, Serialize};
++use std::collections::BTreeMap;
++use std::fmt;
++
++use crate::{NativeObjectStore, ObjectId};
++
++/// An opaque lowercase 64-hex digest (e.g. an evidence `content_hash`). Constructing one
++/// validates the shape, so the commit-build path (slice 3's `accept`) can only assign a
++/// real digest — excerpt text is structurally unrepresentable in
++/// [`crate::CommitObject::evidence_digest`] (the commit payload is written via
++/// `write_object` and never passes through `redact_evidence_excerpt`, so this newtype is
++/// the secret-hygiene guard). `#[serde(transparent)]` so it serializes/deserializes as
++/// the bare hex string — byte-identical to the prior `Option<String>` field, preserving
++/// genesis-hash stability.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(transparent)]
++pub struct Hex64(String);
++
++impl Hex64 {
++    /// Validate and wrap a lowercase 64-hex digest. Errors (path-free) on any other shape,
++    /// so a non-digest (e.g. excerpt text) can never reach the commit payload.
++    pub fn new(value: impl Into<String>) -> Result<Self> {
++        let value = value.into();
++        if value.len() != 64
++            || !value
++                .bytes()
++                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
++        {
++            bail!("evidence digest must be exactly 64 lowercase hex characters");
++        }
++        Ok(Self(value))
++    }
++
++    pub fn as_str(&self) -> &str {
++        &self.0
++    }
++}
++
++impl fmt::Display for Hex64 {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(&self.0)
++    }
++}
++
++/// Fingerprints for one repo path under a tree root: the exact entry when `path` names a
++/// file, or every file under `path/` when it names a directory. Empty when the path is
++/// absent from the tree. Fingerprints are `(blob object id, mode)` — the same identity
++/// the differ keys on — so a mode-only or symlink-vs-file change at the path counts as a
++/// change.
++pub fn tree_path_fingerprints(
++    store: &NativeObjectStore,
++    root: &ObjectId,
++    path: &str,
++) -> Result<BTreeMap<String, (String, u32)>> {
++    let prefix = format!("{path}/");
++    Ok(store
++        .tree_fingerprints(root)?
++        .into_iter()
++        .filter(|(entry, _)| entry == path || entry.starts_with(&prefix))
++        .collect())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::{snapshot_worktree_into_store, FORGE_TREE_PREFIX};
++    use std::fs;
++
++    fn snapshot_root(repo: &std::path::Path) -> ObjectId {
++        let snapshot = snapshot_worktree_into_store(repo, repo).expect("snapshot worktree");
++        ObjectId::parse(
++            snapshot
++                .content_ref
++                .strip_prefix(FORGE_TREE_PREFIX)
++                .expect("forge-tree ref"),
++        )
++        .expect("parse tree id")
++    }
++
++    #[test]
++    fn tree_path_fingerprints_scope_to_a_file_or_directory() {
++        let temp = tempfile::tempdir().unwrap();
++        let repo = temp.path();
++        fs::create_dir_all(repo.join("src")).unwrap();
++        fs::write(repo.join("README.md"), b"readme\n").unwrap();
++        fs::write(repo.join("src/app.rs"), b"fn main() {}\n").unwrap();
++        fs::write(repo.join("src/lib.rs"), b"pub fn lib() {}\n").unwrap();
++        fs::write(repo.join("srcdir.txt"), b"not under src\n").unwrap();
++        let store = NativeObjectStore::new(repo);
++        let root = snapshot_root(repo);
++
++        // A file path selects exactly that entry.
++        let file = tree_path_fingerprints(&store, &root, "src/app.rs").unwrap();
++        assert_eq!(file.keys().collect::<Vec<_>>(), vec!["src/app.rs"]);
++
++        // A directory path selects every file under it — but not `srcdir.txt`, which merely
++        // shares the string prefix without the `/` separator.
++        let dir = tree_path_fingerprints(&store, &root, "src").unwrap();
++        assert_eq!(
++            dir.keys().collect::<Vec<_>>(),
++            vec!["src/app.rs", "src/lib.rs"]
++        );
++
++        // An absent path is empty, not an error.
++        assert!(tree_path_fingerprints(&store, &root, "missing.txt")
++            .unwrap()
++            .is_empty());
++    }
++}
+diff --git a/crates/forge-store/src/lib.rs b/crates/forge-store/src/lib.rs
+index 81833ad..1c43841 100644
+--- a/crates/forge-store/src/lib.rs
++++ b/crates/forge-store/src/lib.rs
+@@ -149,10 +149,10 @@ pub use repository::{
+ pub use show::{show, ShowRecord};
+ pub use snapshots::{
+     checkout_target_content_ref, expected_content_ref, latest_snapshot_content_ref, native_log,
+-    reconcile_native_head, record_checkout, record_restore, record_undo, save_snapshot,
+-    save_snapshot_with_private_overlays, set_materialized_expected_content_ref,
+-    snapshot_content_ref, snapshot_owner_attempt_id, undo_target, CommitView, SnapshotRecord,
+-    SnapshotSummary, UndoTarget,
++    native_path_log, reconcile_native_head, record_checkout, record_restore, record_undo,
++    save_snapshot, save_snapshot_with_private_overlays, set_materialized_expected_content_ref,
++    snapshot_content_ref, snapshot_owner_attempt_id, undo_target, CommitView, PathCommitView,
++    SnapshotRecord, SnapshotSummary, UndoTarget,
+ };
+ pub(crate) use snapshots::{
+     latest_snapshot_for_attempt, latest_snapshot_on, native_tip, set_context_expected_content_ref,
+diff --git a/crates/forge-store/src/snapshots.rs b/crates/forge-store/src/snapshots.rs
+index 9af4a7e..6373869 100644
+--- a/crates/forge-store/src/snapshots.rs
++++ b/crates/forge-store/src/snapshots.rs
+@@ -1,4 +1,5 @@
+ use serde::Serialize;
++use std::collections::BTreeMap;
+ 
+ use super::*;
+ 
+@@ -702,21 +703,138 @@ pub fn native_log(cwd: &Path, intent: Option<&str>) -> Result<Vec<CommitView>> {
+             .map(|want| commit.intent_id.as_deref() == Some(want))
+             .unwrap_or(true);
+         if matches {
+-            out.push(CommitView {
+-                commit_id: cid.to_string(),
+-                tree: commit.tree.clone(),
+-                parents: commit.parents.clone(),
+-                intent_id: commit.intent_id.clone(),
+-                proposal_revision_id: commit.proposal_revision_id.clone(),
+-                decision_id: commit.decision_id.clone(),
+-                actor: commit.actor.clone(),
+-                authored_time: commit.authored_time,
+-                evidence_digest: commit
+-                    .evidence_digest
+-                    .as_ref()
+-                    .map(|h| h.as_str().to_string()),
+-            });
++            out.push(commit_view(&cid, &commit));
++        }
++    }
++    Ok(out)
++}
++
++fn commit_view(
++    cid: &forge_content_native::ObjectId,
++    commit: &forge_content_native::CommitObject,
++) -> CommitView {
++    CommitView {
++        commit_id: cid.to_string(),
++        tree: commit.tree.clone(),
++        parents: commit.parents.clone(),
++        intent_id: commit.intent_id.clone(),
++        proposal_revision_id: commit.proposal_revision_id.clone(),
++        decision_id: commit.decision_id.clone(),
++        actor: commit.actor.clone(),
++        authored_time: commit.authored_time,
++        evidence_digest: commit
++            .evidence_digest
++            .as_ref()
++            .map(|h| h.as_str().to_string()),
++    }
++}
++
++/// One commit in a path-scoped native history walk (NER-362 intent-aware blame/annotate,
++/// slice 1): the commit's full provenance plus how it changed the queried path relative
++/// to its first parent.
++#[derive(Debug, Clone, Serialize)]
++pub struct PathCommitView {
++    #[serde(flatten)]
++    pub commit: CommitView,
++    /// How this commit changed the path vs its first parent: `added`, `modified`, or
++    /// `removed`. A genesis commit that contains the path reports `added`.
++    pub change: String,
++}
++
++/// Reject anything that is not a plain repo-relative path — absolute paths, backslashes,
++/// and `.`/`..`/empty components — and trim a leading `./` plus trailing `/` so file and
++/// directory spellings of the same path compare equal against tree entries.
++fn normalize_repo_relative_path(path: &str) -> Result<String> {
++    let trimmed = path.strip_prefix("./").unwrap_or(path);
++    let trimmed = trimmed.trim_end_matches('/');
++    if trimmed.is_empty()
++        || path.starts_with('/')
++        || trimmed.contains('\\')
++        || trimmed
++            .split('/')
++            .any(|component| component.is_empty() || component == "." || component == "..")
++    {
++        bail!("path must be repo-relative without '.', '..', or absolute components: {path:?}");
++    }
++    Ok(trimmed.to_string())
++}
++
++/// Walk the native commit DAG tip→genesis and return only the commits that changed
++/// `path` (a repo-relative file or directory), each carrying the provenance recorded on
++/// the commit — the "which intent/proposal/decision/actor/evidence last justified this
++/// path" query (NER-362). Read-only, like [`native_log`]. Git-parity history
++/// simplification: a merge commit whose path state matches ANY parent did not change
++/// the path and is skipped. When `intent` is `Some`, only matching commits are returned.
++pub fn native_path_log(
++    cwd: &Path,
++    path: &str,
++    intent: Option<&str>,
++) -> Result<Vec<PathCommitView>> {
++    let path = normalize_repo_relative_path(path)?;
++    let context = open_repository(cwd)?;
++    let connection = open_connection(&context.database_path)?;
++    let store = forge_content_native::NativeObjectStore::new(&context.root_path);
++    let mut out = Vec::new();
++    let Some(tip) = native_tip(&context, &connection)? else {
++        return Ok(out);
++    };
++    let commits = walk_native_commits(&store, &tip)?;
++    // Every parent id resolves inside the walk output (walk_native_commits visits all
++    // ancestors and errors on a dangling parent), so parent trees are looked up here
++    // instead of re-reading commit objects.
++    let tree_by_commit: BTreeMap<String, String> = commits
++        .iter()
++        .map(|(cid, commit)| (cid.to_string(), commit.tree.clone()))
++        .collect();
++    // Memoize path fingerprints per tree id: each commit's tree is also consulted as its
++    // children's parent tree, and unrelated commits can share identical trees.
++    let mut memo: BTreeMap<String, BTreeMap<String, (String, u32)>> = BTreeMap::new();
++    let mut fingerprints_at = |tree: &str| -> Result<BTreeMap<String, (String, u32)>> {
++        if let Some(hit) = memo.get(tree) {
++            return Ok(hit.clone());
++        }
++        let root = forge_content_native::ObjectId::parse(tree)?;
++        let fingerprints = forge_content_native::tree_path_fingerprints(&store, &root, &path)?;
++        memo.insert(tree.to_string(), fingerprints.clone());
++        Ok(fingerprints)
++    };
++    for (cid, commit) in &commits {
++        let matches = intent
++            .map(|want| commit.intent_id.as_deref() == Some(want))
++            .unwrap_or(true);
++        if !matches {
++            continue;
+         }
++        let current = fingerprints_at(&commit.tree)?;
++        let change = if commit.parents.is_empty() {
++            if current.is_empty() {
++                continue;
++            }
++            "added"
++        } else {
++            let mut parent_states = Vec::with_capacity(commit.parents.len());
++            for parent in &commit.parents {
++                let parent_tree = tree_by_commit
++                    .get(parent)
++                    .expect("walk_native_commits returns every ancestor");
++                parent_states.push(fingerprints_at(parent_tree)?);
++            }
++            if parent_states.contains(&current) {
++                continue;
++            }
++            let first_parent = &parent_states[0];
++            if first_parent.is_empty() {
++                "added"
++            } else if current.is_empty() {
++                "removed"
++            } else {
++                "modified"
++            }
++        };
++        out.push(PathCommitView {
++            commit: commit_view(cid, commit),
++            change: change.to_string(),
++        });
+     }
+     Ok(out)
+ }

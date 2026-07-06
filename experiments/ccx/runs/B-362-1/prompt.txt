@@ -1,0 +1,17 @@
+You are working through ticket NER-362 in this repository, task by task. The full ticket:
+
+# NER-362: Add intent-aware blame and annotate
+
+Design blame/annotate on top of Forge native history: report which intent, attempt, proposal, evidence, actor, and decision last justified a line/path change. Treat as Git parity plus agent-native provenance, not just author/date.
+
+--- CURRENT TASK ---
+- **362-1** Path provenance walk: given a repo path, walk native commit
+  history (tip to genesis) and report, per commit that touched the path,
+  the provenance recorded on the commit (intent, proposal revision,
+
+Rules for this task:
+- Implement only this task now (later tasks come next in this session).
+- The worktree already contains your previous tasks' changes, applied and
+  committed; build this task on top of them.
+- Run the repo's verify gates for what you build and make them pass.
+- Do not create git commits; leave changes uncommitted.

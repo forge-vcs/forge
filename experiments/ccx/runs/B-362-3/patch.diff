@@ -1,0 +1,325 @@
+diff --git a/crates/forge-cli/src/commands/core.rs b/crates/forge-cli/src/commands/core.rs
+index f4c1bba..f4ccc6b 100644
+--- a/crates/forge-cli/src/commands/core.rs
++++ b/crates/forge-cli/src/commands/core.rs
+@@ -2124,13 +2124,38 @@ pub(crate) fn print_human(response: &ResponseEnvelope) {
+             "blame" => {
+                 // Git-style annotate: `<short-commit> (<actor> <line>) content`, where the
+                 // actor comes from the blamed commit's recorded provenance ("-" for the
+-                // unjustified genesis).
++                // unjustified genesis). A legend above the lines expands each blamed
++                // commit with its ledger enrichment (decision verdict + intent title).
+                 let empty = Vec::new();
+                 let commits = response
+                     .data
+                     .get("commits")
+                     .and_then(Value::as_array)
+                     .unwrap_or(&empty);
++                let str_of = |commit: &Value, field: &str| -> String {
++                    commit
++                        .get(field)
++                        .and_then(Value::as_str)
++                        .unwrap_or("-")
++                        .to_string()
++                };
++                for commit in commits {
++                    let commit_id = commit
++                        .get("commit_id")
++                        .and_then(Value::as_str)
++                        .unwrap_or("<unknown>");
++                    let digest = commit_id.rsplit(':').next().unwrap_or(commit_id);
++                    let short = &digest[..digest.len().min(8)];
++                    println!(
++                        "{short} {} {} {}",
++                        str_of(commit, "actor"),
++                        str_of(commit, "decision"),
++                        str_of(commit, "intent_title"),
++                    );
++                }
++                if !commits.is_empty() {
++                    println!();
++                }
+                 let actor_of = |commit_id: &str| -> &str {
+                     commits
+                         .iter()
+diff --git a/crates/forge-cli/src/schema.rs b/crates/forge-cli/src/schema.rs
+index 6a32f85..ddf1569 100644
+--- a/crates/forge-cli/src/schema.rs
++++ b/crates/forge-cli/src/schema.rs
+@@ -82,7 +82,7 @@ fn command_shapes() -> Value {
+         ("conflict resolve", "Resolves a persisted conflict set with --tree <forge-tree-ref>. Data carries { conflict_set_id, proposal_id, proposal_revision_id, snapshot_id, evidence_id, resolution_ref, operation_id, view_id }. The resolution creates a new snapshot, proposal revision, and tamper-evident evidence row; agents should run evidence and check again before accept."),
+         ("attempt compare", "Alias of `compare` scoped to attempts; same data shape."),
+         ("log", "Walks the native commit history tip→genesis via the JSON contract; data carries { commits: [{ commit_id, tree, parents, intent_id, proposal_revision_id, decision_id, actor, authored_time, evidence_digest }] }. Read-only; --intent <id> filters to commits under one intent (\"show every change under this intent\"). --path <repo-relative file or directory> is the path provenance walk (NER-362): only commits that changed the path are returned, each with an extra change field (added|modified|removed); a merge whose path state matches any parent is skipped (git-parity history simplification). Native-backend repos only (a git-backend repo has no native history)."),
+-        ("blame", "Attributes every line of a repo-relative file at the native tip to the commit that last changed it (NER-362 intent-aware blame); data carries { path, tip_commit_id, lines: [{ line_number, commit_id, content }], commits: [...] } where commits lists each distinct blamed commit's provenance (intent_id, proposal_revision_id, decision_id, actor, authored_time, evidence_digest), newest first. First-parent attribution: lines a merge brought in from its second parent attribute to the merge commit. Read-only; text files only (binary content is refused); without --json prints git-style '<short-commit> (<actor> <line>) content' lines. Native-backend repos only."),
++        ("blame", "Attributes every line of a repo-relative file at the native tip to the commit that last changed it (NER-362 intent-aware blame); data carries { path, tip_commit_id, lines: [{ line_number, commit_id, content }], commits: [...] } where commits lists each distinct blamed commit's provenance (intent_id, proposal_revision_id, decision_id, actor, authored_time, evidence_digest), newest first, enriched from the local ledger with intent_title, proposal_id, attempt_id, decision, decided_at_ms, evidence_command, and evidence_exit_code (each enrichment field is omitted when the referenced ledger row does not resolve locally, e.g. genesis or peer-imported commits). First-parent attribution: lines a merge brought in from its second parent attribute to the merge commit. Read-only; text files only (binary content is refused); without --json prints a commit legend ('<short-commit> <actor> <decision> <intent-title>') followed by git-style '<short-commit> (<actor> <line>) content' lines. Native-backend repos only."),
+         ("checkout", "Materializes a past commit's tree into the worktree (refuses a dirty worktree with DIRTY_WORKTREE; an unknown commit is rejected, a ledger-referenced-but-missing one is NATIVE_HISTORY_CORRUPT); data carries { commit_id, content_ref, base_unchanged: true, current_view_id }. Materialize-only: does NOT move the base anchor (a save afterward still diffs against the unchanged base HEAD), and is recorded in the op-log so forge undo can reverse it. Native-backend repos only."),
+         ("undo", "Undoes the last save, restoring the worktree to the prior snapshot (the latest snapshot's parent) and recording the undo as a forward op-log operation; refuses a dirty worktree with DIRTY_WORKTREE; data carries { undone_operation_id, restored_snapshot_id, content_ref, current_view_id }. Append-only — never deletes a decision or op-log row. \"nothing to undo\" when there is no earlier snapshot."),
+         ("trust policy", "Shows or updates the local trust policy. With no flags, data carries { min_accept_trust, min_export_trust, supported_trust_levels }. With --accept/--export, updates the configured minimum trust for accept/export. Supported levels are self_reported, locally_observed, locally_signed, hosted_runner_observed, hosted_runner_signed, third_party_attested. Hosted-runner levels require valid hosted-runner signatures; third_party_attested requires valid third-party signatures."),
+diff --git a/crates/forge-cli/tests/forge_native_history.rs b/crates/forge-cli/tests/forge_native_history.rs
+index 1f12872..4378dfd 100644
+--- a/crates/forge-cli/tests/forge_native_history.rs
++++ b/crates/forge-cli/tests/forge_native_history.rs
+@@ -615,7 +615,8 @@ fn blame_attributes_each_line_to_the_commit_that_last_changed_it() {
+         ]
+     );
+ 
+-    // The report carries the provenance of every distinct blamed commit, newest first.
++    // The report carries the provenance of every distinct blamed commit, newest first,
++    // enriched from the ledger (intent title, proposal/attempt, decision, evidence).
+     let commits = blamed["data"]["commits"].as_array().expect("commits array");
+     let ids: Vec<&str> = commits
+         .iter()
+@@ -628,7 +629,55 @@ fn blame_attributes_each_line_to_the_commit_that_last_changed_it() {
+         assert!(commit["decision_id"].is_string());
+         assert!(commit["actor"].is_string());
+         assert!(commit["authored_time"].is_i64());
++        assert!(commit["proposal_id"].is_string());
++        assert!(commit["attempt_id"].is_string());
++        assert_eq!(commit["decision"], "accepted");
++        assert!(commit["decided_at_ms"].is_i64());
++        assert_eq!(commit["evidence_command"], "sh -c true");
++        assert_eq!(commit["evidence_exit_code"], 0);
+     }
++    let titles: Vec<&str> = commits
++        .iter()
++        .map(|c| c["intent_title"].as_str().unwrap())
++        .collect();
++    assert_eq!(titles, vec!["add opening line", "revise beta", "add poem"]);
++}
++
++#[test]
++fn blame_enrichment_degrades_gracefully_when_ledger_rows_are_missing() {
++    let repo = TestRepo::new_git();
++    repo.forge()
++        .args(["--json", "init", "--content-backend", "native"])
++        .assert()
++        .success();
++    accept_native_round(&repo, "enrich me", |root| {
++        std::fs::write(root.join("note.txt"), "note\n").expect("write note");
++    });
++
++    let enriched = json_output(
++        repo.forge()
++            .args(["--json", "blame", "note.txt"])
++            .assert()
++            .success(),
++    );
++    assert_eq!(enriched["data"]["commits"][0]["intent_title"], "enrich me");
++
++    // A commit can reference ledger rows this repository does not hold (peer-imported
++    // history, GC'd rows). Enrichment must degrade to absent fields, never fail blame.
++    db(repo.path())
++        .execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM intents;")
++        .expect("drop intent rows");
++    let degraded = json_output(
++        repo.forge()
++            .args(["--json", "blame", "note.txt"])
++            .assert()
++            .success(),
++    );
++    let commit = &degraded["data"]["commits"][0];
++    assert!(commit.get("intent_title").is_none());
++    // The on-object provenance and the still-resolving ledger joins are untouched.
++    assert!(commit["intent_id"].is_string());
++    assert_eq!(commit["decision"], "accepted");
+ }
+ 
+ #[test]
+@@ -653,6 +702,10 @@ fn blame_attributes_untouched_genesis_content_and_prints_human_lines() {
+     assert_eq!(commits.len(), 1);
+     assert_eq!(commits[0]["commit_id"], genesis_id);
+     assert!(commits[0].get("decision_id").is_none());
++    // Genesis carries no justification ids, so no ledger enrichment applies either.
++    assert!(commits[0].get("intent_title").is_none());
++    assert!(commits[0].get("decision").is_none());
++    assert!(commits[0].get("evidence_command").is_none());
+ 
+     // Human mode (no --json): git-style `<short-commit> (<actor> <line>) content`, with
+     // "-" standing in for the genesis' absent actor.
+diff --git a/crates/forge-store/src/lib.rs b/crates/forge-store/src/lib.rs
+index 0a968f1..04b669c 100644
+--- a/crates/forge-store/src/lib.rs
++++ b/crates/forge-store/src/lib.rs
+@@ -152,8 +152,8 @@ pub use snapshots::{
+     native_log, native_path_log, reconcile_native_head, record_checkout, record_restore,
+     record_undo, save_snapshot, save_snapshot_with_private_overlays,
+     set_materialized_expected_content_ref, snapshot_content_ref, snapshot_owner_attempt_id,
+-    undo_target, BlameLine, BlameReport, CommitView, PathCommitView, SnapshotRecord,
+-    SnapshotSummary, UndoTarget,
++    undo_target, BlameCommitView, BlameLine, BlameReport, CommitView, PathCommitView,
++    SnapshotRecord, SnapshotSummary, UndoTarget,
+ };
+ pub(crate) use snapshots::{
+     latest_snapshot_for_attempt, latest_snapshot_on, native_tip, set_context_expected_content_ref,
+diff --git a/crates/forge-store/src/snapshots.rs b/crates/forge-store/src/snapshots.rs
+index 48e78ed..2248509 100644
+--- a/crates/forge-store/src/snapshots.rs
++++ b/crates/forge-store/src/snapshots.rs
+@@ -858,9 +858,43 @@ pub struct BlameLine {
+     pub content: String,
+ }
+ 
++/// One distinct blamed commit: the provenance recorded ON the commit object, enriched
++/// with what the local ledger records about the referenced rows (NER-362 slice 4).
++/// Every enrichment field is optional and simply absent when the referenced ledger row
++/// does not resolve locally — a genesis commit carries no justification ids at all, and
++/// a peer-imported commit can reference intents/decisions/evidence that were never
++/// synced into this repository's ledger.
++#[derive(Debug, Clone, Serialize)]
++pub struct BlameCommitView {
++    #[serde(flatten)]
++    pub commit: CommitView,
++    /// The intent's recorded title (`intents.text`), like `forge intent`.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub intent_title: Option<String>,
++    /// The proposal the blamed revision belongs to.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub proposal_id: Option<String>,
++    /// The attempt that produced the blamed revision.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub attempt_id: Option<String>,
++    /// The deciding verdict recorded on the commit's decision row (e.g. `accepted`).
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub decision: Option<String>,
++    /// Wall-clock time (ms) the decision row was recorded.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub decided_at_ms: Option<i64>,
++    /// The deciding evidence's command line (command + args), matched by content hash.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub evidence_command: Option<String>,
++    /// The deciding evidence's exit code.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub evidence_exit_code: Option<i64>,
++}
++
+ /// The `forge blame` result: every line of `path` at the native tip attributed to the
+ /// commit that last changed it, plus the provenance (intent, proposal revision,
+-/// decision, actor, authored time, evidence digest) of each distinct blamed commit.
++/// decision, actor, authored time, evidence digest) of each distinct blamed commit,
++/// enriched from the local ledger.
+ #[derive(Debug, Clone, Serialize)]
+ pub struct BlameReport {
+     pub path: String,
+@@ -868,7 +902,98 @@ pub struct BlameReport {
+     pub tip_commit_id: String,
+     pub lines: Vec<BlameLine>,
+     /// Provenance for every distinct commit referenced by `lines`, newest first.
+-    pub commits: Vec<CommitView>,
++    pub commits: Vec<BlameCommitView>,
++}
++
++/// Join one blamed commit's on-object provenance ids against the local ledger. Every
++/// lookup is best-effort (`optional`): an id that does not resolve — GC'd, peer-imported
++/// without its ledger rows, or a genesis `None` — leaves the enrichment field absent
++/// rather than failing the blame.
++fn enrich_blame_commit(
++    connection: &Connection,
++    repo_id: &str,
++    commit: CommitView,
++) -> Result<BlameCommitView> {
++    let intent_title = match commit.intent_id.as_deref() {
++        Some(intent_id) => connection
++            .query_row(
++                "SELECT text FROM intents WHERE id = ?1 AND repo_id = ?2",
++                params![intent_id, repo_id],
++                |row| row.get::<_, String>(0),
++            )
++            .optional()?,
++        None => None,
++    };
++    let proposal = match commit.proposal_revision_id.as_deref() {
++        Some(revision_id) => connection
++            .query_row(
++                "SELECT p.id, p.attempt_id FROM proposal_revisions pr
++                 JOIN proposals p ON p.id = pr.proposal_id
++                 WHERE pr.id = ?1 AND p.repo_id = ?2",
++                params![revision_id, repo_id],
++                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
++            )
++            .optional()?,
++        None => None,
++    };
++    let decision = match commit.decision_id.as_deref() {
++        Some(decision_id) => connection
++            .query_row(
++                "SELECT decision, created_at_ms FROM decisions WHERE id = ?1 AND repo_id = ?2",
++                params![decision_id, repo_id],
++                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
++            )
++            .optional()?,
++        None => None,
++    };
++    let evidence = match commit.evidence_digest.as_deref() {
++        Some(digest) => connection
++            .query_row(
++                "SELECT command, args_json, exit_code FROM evidence
++                 WHERE content_hash = ?1 AND repo_id = ?2
++                 ORDER BY rowid DESC LIMIT 1",
++                params![digest, repo_id],
++                |row| {
++                    Ok((
++                        row.get::<_, String>(0)?,
++                        row.get::<_, String>(1)?,
++                        row.get::<_, i64>(2)?,
++                    ))
++                },
++            )
++            .optional()?,
++        None => None,
++    };
++    let (evidence_command, evidence_exit_code) = match evidence {
++        Some((command, args_json, exit_code)) => {
++            let args: Vec<String> = serde_json::from_str(&args_json).unwrap_or_default();
++            let mut line = command;
++            for arg in args {
++                line.push(' ');
++                line.push_str(&arg);
++            }
++            (Some(line), Some(exit_code))
++        }
++        None => (None, None),
++    };
++    let (proposal_id, attempt_id) = match proposal {
++        Some((proposal_id, attempt_id)) => (Some(proposal_id), Some(attempt_id)),
++        None => (None, None),
++    };
++    let (decision, decided_at_ms) = match decision {
++        Some((verdict, decided_at_ms)) => (Some(verdict), Some(decided_at_ms)),
++        None => (None, None),
++    };
++    Ok(BlameCommitView {
++        commit,
++        intent_title,
++        proposal_id,
++        attempt_id,
++        decision,
++        decided_at_ms,
++        evidence_command,
++        evidence_exit_code,
++    })
+ }
+ 
+ /// Attribute every line of `path` (a repo-relative file) at the native tip to the commit
+@@ -927,7 +1052,8 @@ pub fn native_blame(cwd: &Path, path: &str) -> Result<BlameReport> {
+ 
+     let attributed = forge_content_native::attribute_file_lines(&store, &history, &path)?;
+ 
+-    // Distinct blamed commits, in history (newest-first) order, with full provenance.
++    // Distinct blamed commits, in history (newest-first) order, with full provenance
++    // enriched from the local ledger (intent title, proposal/attempt, decision, evidence).
+     let referenced: std::collections::BTreeSet<&str> = attributed
+         .iter()
+         .map(|line| line.commit_id.as_str())
+@@ -940,7 +1066,11 @@ pub fn native_blame(cwd: &Path, path: &str) -> Result<BlameReport> {
+     for (id, _) in &history {
+         if referenced.contains(id.as_str()) {
+             let cid = commit_ids_by_string[id];
+-            blamed_commits.push(commit_view(cid, by_id[id]));
++            blamed_commits.push(enrich_blame_commit(
++                &connection,
++                &context.repo_id,
++                commit_view(cid, by_id[id]),
++            )?);
+         }
+     }
+ 

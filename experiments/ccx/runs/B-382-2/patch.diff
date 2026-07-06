@@ -1,0 +1,382 @@
+diff --git a/crates/forge-cli/src/args.rs b/crates/forge-cli/src/args.rs
+index 8c4d167..31889f4 100644
+--- a/crates/forge-cli/src/args.rs
++++ b/crates/forge-cli/src/args.rs
+@@ -229,8 +229,17 @@ pub(crate) enum AttemptCommand {
+     Show {
+         attempt_id: String,
+     },
++    /// Attach the active view to an attempt, materializing its content into the
++    /// repository worktree and re-materializing its workspace dir. Refuses with
++    /// ATTEMPT_WORKSPACE_DRIFT when the workspace dir drifted from its recorded
++    /// materialized content (pre-attach edits would be overwritten).
+     Attach {
+         attempt_id: String,
++        /// Discard pre-attach edits found in the attempt's workspace dir: proceed
++        /// even when the workspace drifted from its recorded materialized content,
++        /// overwriting the drifted paths (NER-382).
++        #[arg(long)]
++        discard_workspace_edits: bool,
+     },
+     /// Compare competing attempts (per intent) on verified evidence + rank them.
+     Compare(CompareArgs),
+diff --git a/crates/forge-cli/src/commands/core.rs b/crates/forge-cli/src/commands/core.rs
+index 1b6568f..0d59d81 100644
+--- a/crates/forge-cli/src/commands/core.rs
++++ b/crates/forge-cli/src/commands/core.rs
+@@ -166,7 +166,10 @@ pub(crate) fn attempt_response(request_id: Option<String>, args: AttemptArgs) ->
+                 ))
+             })
+         }
+-        AttemptCommand::Attach { attempt_id } => {
++        AttemptCommand::Attach {
++            attempt_id,
++            discard_workspace_edits,
++        } => {
+             command_result("attempt attach", request_id, |cwd, request_id| {
+                 // NER-134: worktree/base materialization goes through `ContentBackend`,
+                 // not `forge_content_git::` directly, so git-worktree semantics stay out
+@@ -191,6 +194,24 @@ pub(crate) fn attempt_response(request_id: Option<String>, args: AttemptArgs) ->
+                     }
+                     .into());
+                 }
++                // NER-382: the workspace dir is a materialization target, not an editing
++                // surface — re-materializing below would silently overwrite any edits made
++                // in it since it was last materialized. Refuse on drift unless the caller
++                // explicitly opted into discarding those edits.
++                let mut warnings = Vec::new();
++                if let Some(drifted) = detect_attempt_workspace_drift(&cwd, &attempt_id)? {
++                    if !discard_workspace_edits {
++                        return Err(ForgeError::AttemptWorkspaceDrift {
++                            attempt_id: attempt_id.clone(),
++                            paths: drifted,
++                        }
++                        .into());
++                    }
++                    warnings.push(format!(
++                        "discarded {} drifted path(s) in the attempt workspace (--discard-workspace-edits)",
++                        drifted.len()
++                    ));
++                }
+                 let content_ref = match forge_store::attempt_materialization_ref(&cwd, &attempt_id)?
+                 {
+                     Some(content_ref) => content_ref,
+@@ -210,7 +231,7 @@ pub(crate) fn attempt_response(request_id: Option<String>, args: AttemptArgs) ->
+                         "content_ref": content_ref,
+                         "current_view_id": attached.view_id
+                     }),
+-                    Vec::new(),
++                    warnings,
+                 ))
+             })
+         }
+@@ -2026,6 +2047,43 @@ pub(crate) fn owner_base_content_ref(cwd: &Path, base: &str) -> anyhow::Result<S
+     selected_backend(cwd)?.base_content_ref(&context.root_path, base)
+ }
+ 
++/// NER-382 drift guard for `attempt attach`: compare the attempt's workspace dir
++/// against the content ref recorded when it was last materialized. Returns
++/// `Some(drifted_paths)` (name-level, workspace-relative) when the dir was edited
++/// since, `None` when it matches, was never materialized (no recorded ref — e.g.
++/// the git backend, which does not materialize workspace dirs), or was removed
++/// wholesale (re-materialization recreates it without losing edits). The check
++/// snapshots the workspace with the same policy exclusions as materialization, so
++/// policy-excluded paths (marker file, secret-risk names) never read as drift.
++pub(crate) fn detect_attempt_workspace_drift(
++    cwd: &Path,
++    attempt_id: &str,
++) -> anyhow::Result<Option<Vec<String>>> {
++    let Some(recorded_ref) = forge_store::attempt_workspace_materialized_ref(cwd, attempt_id)?
++    else {
++        return Ok(None);
++    };
++    let workspace = forge_store::attempt_workspace_path(cwd, attempt_id)?;
++    if !workspace.is_dir() {
++        return Ok(None);
++    }
++    let repo_root = forge_store::repository_root_path(cwd)?;
++    let actual =
++        forge_content_native::snapshot_worktree_into_store_excluding(&repo_root, &workspace, &[])?;
++    if actual.content_ref == recorded_ref {
++        return Ok(None);
++    }
++    let diff = diff_content_refs(
++        &repo_root,
++        &recorded_ref,
++        &actual.content_ref,
++        native_diff_options(false),
++    )?;
++    Ok(Some(
++        diff.files.iter().map(|file| file.path.clone()).collect(),
++    ))
++}
++
+ pub(crate) fn materialize_attempt_workspace(
+     cwd: &Path,
+     attempt_id: &str,
+diff --git a/crates/forge-cli/src/schema.rs b/crates/forge-cli/src/schema.rs
+index 81844eb..74f1cf3 100644
+--- a/crates/forge-cli/src/schema.rs
++++ b/crates/forge-cli/src/schema.rs
+@@ -59,7 +59,7 @@ fn command_shapes() -> Value {
+         ("attempt start", "Starts a new (unattached) attempt for an existing intent; data carries the attempt + operation_id. workspace_path is a Forge-managed materialization target (workspace_role=materialization_target), not an editing surface: edits made there before attempt attach are overwritten when attach re-materializes it."),
+         ("attempt list", "Lists attempts; data carries { attempts: [...] }."),
+         ("attempt show", "Shows one attempt; data carries the attempt detail."),
+-        ("attempt attach", "Attaches the active view to an attempt; data carries attempt_id, content_ref, current_view_id."),
++        ("attempt attach", "Attaches the active view to an attempt, materializing its content into the repository worktree and re-materializing its workspace dir; data carries attempt_id, content_ref, current_view_id. Refuses a dirty repository worktree with DIRTY_WORKTREE, and refuses with ATTEMPT_WORKSPACE_DRIFT when the attempt's workspace dir drifted from its recorded materialized content (details name the drifted paths) unless --discard-workspace-edits is passed, which overwrites the drifted paths and records a warning."),
+         ("intent list", "Lists intents; data carries { intents: [...] } with id, title, derived status (accepted if any linked attempt was accepted, else open), the declared gate spec ({ program, args, structured } per gate), and linked attempt ids."),
+         ("intent show", "Shows one intent; data carries intent_id, title/text, derived status, the declared gate spec ({ program, args, structured } per gate), and linked attempt ids. Unknown id -> UNKNOWN_INTENT."),
+         ("save", "Snapshots the worktree; data carries the saved snapshot + operation_id. Native repos with local private path labels exclude those exact paths from the public forge-tree and record encrypted private overlay payload metadata."),
+diff --git a/crates/forge-cli/tests/forge_attempts.rs b/crates/forge-cli/tests/forge_attempts.rs
+index 2020548..cc860f6 100644
+--- a/crates/forge-cli/tests/forge_attempts.rs
++++ b/crates/forge-cli/tests/forge_attempts.rs
+@@ -898,3 +898,107 @@ fn restore_rejects_cross_attempt_snapshot() {
+         .assert()
+         .success();
+ }
++
++/// NER-382: the workspace dir under `.forge/worktrees/<attempt>` is a materialization
++/// target, not an editing surface. Pre-attach edits written into it must not be
++/// silently discarded: `attempt attach` refuses with ATTEMPT_WORKSPACE_DRIFT naming
++/// the drifted paths, and proceeds (recording a warning) only under the explicit
++/// --discard-workspace-edits override.
++#[test]
++fn attach_refuses_drifted_workspace_unless_discard_flag() {
++    let repo = TestRepo::new_git();
++    repo.forge()
++        .args(["--json", "init", "--content-backend", "native"])
++        .assert()
++        .success();
++    let first = json_output(
++        repo.forge()
++            .args(["--json", "start", "intent A"])
++            .assert()
++            .success(),
++    );
++    let intent_id = first["data"]["intent_id"].as_str().unwrap();
++    let second = json_output(
++        repo.forge()
++            .args(["--json", "attempt", "start", "--intent", intent_id])
++            .assert()
++            .success(),
++    );
++    let second_attempt = second["data"]["attempt_id"].as_str().unwrap();
++    let workspace = repo
++        .path()
++        .join(second["data"]["workspace_path"].as_str().unwrap());
++
++    // The ticket's footgun: edits written into the workspace BEFORE attach.
++    std::fs::write(workspace.join("README.md"), "edited in workspace\n").expect("edit workspace");
++    std::fs::write(workspace.join("NEW.txt"), "new\n").expect("add workspace file");
++
++    let refused = json_output(
++        repo.forge()
++            .args(["--json", "attempt", "attach", second_attempt])
++            .assert()
++            .failure(),
++    );
++    assert_eq!(refused["errors"][0]["code"], "ATTEMPT_WORKSPACE_DRIFT");
++    assert_eq!(refused["retry"]["retryable"], false);
++    let details = &refused["errors"][0]["details"];
++    assert_eq!(details["attempt_id"], second_attempt);
++    let paths: Vec<&str> = details["paths"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|path| path.as_str().unwrap())
++        .collect();
++    assert!(
++        paths.contains(&"README.md"),
++        "drifted edit named: {paths:?}"
++    );
++    assert!(
++        paths.contains(&"NEW.txt"),
++        "drifted new file named: {paths:?}"
++    );
++    assert_eq!(
++        std::fs::read_to_string(workspace.join("README.md")).unwrap(),
++        "edited in workspace\n",
++        "a refused attach must not clobber the workspace edits"
++    );
++
++    // Explicit override: attach succeeds, records a warning, and re-materializes
++    // the workspace (discarding the drifted paths).
++    let attached = json_output(
++        repo.forge()
++            .args([
++                "--json",
++                "attempt",
++                "attach",
++                second_attempt,
++                "--discard-workspace-edits",
++            ])
++            .assert()
++            .success(),
++    );
++    assert_eq!(attached["data"]["attempt_id"], second_attempt);
++    assert!(
++        attached["warnings"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .any(|warning| warning.as_str().unwrap().contains("drifted")),
++        "override must surface a discard warning: {:?}",
++        attached["warnings"]
++    );
++    assert_eq!(
++        std::fs::read_to_string(workspace.join("README.md")).unwrap(),
++        "hello\n"
++    );
++    assert!(!workspace.join("NEW.txt").exists());
++
++    // No drift after the discard: a clean re-attach passes without a warning.
++    let clean = json_output(
++        repo.forge()
++            .args(["--json", "attempt", "attach", second_attempt])
++            .assert()
++            .success(),
++    );
++    assert!(clean["warnings"].as_array().unwrap().is_empty());
++}
+diff --git a/crates/forge-store/src/attempts.rs b/crates/forge-store/src/attempts.rs
+index 6efd310..a98d92c 100644
+--- a/crates/forge-store/src/attempts.rs
++++ b/crates/forge-store/src/attempts.rs
+@@ -291,6 +291,28 @@ pub fn ensure_attempt_workspace_marker(cwd: &Path, attempt_id: &str) -> Result<P
+     Ok(path)
+ }
+ 
++/// The content ref last materialized into the attempt's workspace dir, or `None`
++/// when the workspace was never materialized (e.g. the git backend, which does not
++/// materialize workspace dirs). This is the drift baseline for the NER-382 attach
++/// guard. Errors `UnknownAttempt` when the attempt does not exist.
++pub fn attempt_workspace_materialized_ref(cwd: &Path, attempt_id: &str) -> Result<Option<String>> {
++    let context = open_repository(cwd)?;
++    attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
++        selector: attempt_id.to_string(),
++    })?;
++    let connection = open_connection(&context.database_path)?;
++    connection
++        .query_row(
++            "SELECT materialized_content_ref FROM attempt_workspaces
++             WHERE repo_id = ?1 AND attempt_id = ?2",
++            params![context.repo_id, attempt_id],
++            |row| row.get::<_, Option<String>>(0),
++        )
++        .optional()
++        .map(Option::flatten)
++        .map_err(Into::into)
++}
++
+ pub fn record_attempt_workspace_materialized(
+     cwd: &Path,
+     attempt_id: &str,
+diff --git a/crates/forge-store/src/error.rs b/crates/forge-store/src/error.rs
+index 21f1b5a..3e2f358 100644
+--- a/crates/forge-store/src/error.rs
++++ b/crates/forge-store/src/error.rs
+@@ -146,6 +146,16 @@ pub enum ForgeError {
+         requested_attempt: String,
+         attached_attempt: String,
+     },
++    /// `attempt attach` found the target attempt's workspace dir drifted from its
++    /// recorded materialized content (NER-382): the workspace is a materialization
++    /// target, so re-materializing would silently overwrite the pre-attach edits.
++    /// Deterministic — move the edits into the repository worktree after attaching,
++    /// or re-run with `--discard-workspace-edits` to overwrite them intentionally.
++    /// `paths` are workspace-relative and secret-redacted by [`ForgeError::details`].
++    AttemptWorkspaceDrift {
++        attempt_id: String,
++        paths: Vec<String>,
++    },
+     /// `accept` is gated on a passing check by default (NER-135 R6) but the
+     /// proposal's check did not pass. `status` is the overall check status
+     /// (`failed`/`missing`/`stale`); `unmet` lists the `"program arg…"` identities
+@@ -326,6 +336,7 @@ impl ForgeError {
+             ForgeError::UnknownSchemaVersion { .. } => "SCHEMA_VERSION_UNSUPPORTED",
+             ForgeError::MigrationFailed { .. } => "MIGRATION_FAILED",
+             ForgeError::AttemptWorktreeMismatch { .. } => "ATTEMPT_WORKTREE_MISMATCH",
++            ForgeError::AttemptWorkspaceDrift { .. } => "ATTEMPT_WORKSPACE_DRIFT",
+             ForgeError::CheckNotPassed { .. } => "CHECK_NOT_PASSED",
+             ForgeError::EvidenceTampered { .. } => "EVIDENCE_TAMPERED",
+             ForgeError::ProvenanceMismatch { .. } => "PROVENANCE_MISMATCH",
+@@ -417,6 +428,13 @@ impl ForgeError {
+                 "requested_attempt": requested_attempt,
+                 "attached_attempt": attached_attempt,
+             }),
++            ForgeError::AttemptWorkspaceDrift { attempt_id, paths } => {
++                // Same secret-path discipline as DirtyWorktree: the drifted names
++                // are worktree paths, so they get the redaction pass.
++                let mut details = redact_paths(paths);
++                details["attempt_id"] = json!(attempt_id);
++                details
++            }
+             ForgeError::CheckNotPassed { status, unmet } => {
+                 // Gate identities are argv strings persisted (intents.check_spec_json)
+                 // and surfaced WITHOUT execution, so — unlike captured evidence, which
+@@ -655,6 +673,11 @@ impl std::fmt::Display for ForgeError {
+                 f,
+                 "worktree is materialized for attempt {attached_attempt}, not the requested {requested_attempt}; run `forge attempt attach {requested_attempt}` first"
+             ),
++            ForgeError::AttemptWorkspaceDrift { attempt_id, paths } => write!(
++                f,
++                "workspace for attempt {attempt_id} drifted from its recorded materialized content ({} path(s)); the workspace is a materialization target, so attaching would overwrite those edits. Re-run with --discard-workspace-edits to overwrite them, or attach a fresh attempt and redo the edits in the repository worktree",
++                paths.len()
++            ),
+             ForgeError::CheckNotPassed { status, unmet } => write!(
+                 f,
+                 "check did not pass (status: {status}); {} required gate(s) unmet",
+@@ -847,6 +870,12 @@ pub fn error_registry() -> &'static [ErrorCodeSpec] {
+             after_ms: None,
+             details_keys: &["paths", "redacted_count"],
+         },
++        ErrorCodeSpec {
++            code: "ATTEMPT_WORKSPACE_DRIFT",
++            retryable: false,
++            after_ms: None,
++            details_keys: &["attempt_id", "paths", "redacted_count"],
++        },
+         ErrorCodeSpec {
+             code: "AMBIGUOUS_ATTEMPT",
+             retryable: false,
+@@ -1712,6 +1741,10 @@ mod tests {
+                 requested_attempt: "attempt_x".into(),
+                 attached_attempt: "attempt_w".into(),
+             },
++            ForgeError::AttemptWorkspaceDrift {
++                attempt_id: "attempt_x".into(),
++                paths: vec!["src/App.css".into()],
++            },
+             ForgeError::CheckNotPassed {
+                 status: "failed".into(),
+                 unmet: vec!["cargo test".into()],
+@@ -1828,6 +1861,7 @@ mod tests {
+                 | ForgeError::UnknownSchemaVersion { .. }
+                 | ForgeError::MigrationFailed { .. }
+                 | ForgeError::AttemptWorktreeMismatch { .. }
++                | ForgeError::AttemptWorkspaceDrift { .. }
+                 | ForgeError::CheckNotPassed { .. }
+                 | ForgeError::EvidenceTampered { .. }
+                 | ForgeError::ProvenanceMismatch { .. }
+diff --git a/crates/forge-store/src/lib.rs b/crates/forge-store/src/lib.rs
+index 71f1cf3..08709f6 100644
+--- a/crates/forge-store/src/lib.rs
++++ b/crates/forge-store/src/lib.rs
+@@ -40,11 +40,11 @@ mod tests;
+ mod trust;
+ mod visibility;
+ pub use attempts::{
+-    attach_attempt, attempt_base_head, attempt_materialization_ref, attempt_workspace_path,
+-    ensure_attempt_workspace_marker, list_attempts, record_attempt_workspace_materialized,
+-    resolve_attempt, show_attempt, start_attempt, start_attempt_for_intent, verify_save_target,
+-    AttemptRecord, AttemptShowRecord, AttemptSummary, ResolvedAttempt, StartAttempt,
+-    WORKSPACE_ROLE_MATERIALIZATION_TARGET,
++    attach_attempt, attempt_base_head, attempt_materialization_ref,
++    attempt_workspace_materialized_ref, attempt_workspace_path, ensure_attempt_workspace_marker,
++    list_attempts, record_attempt_workspace_materialized, resolve_attempt, show_attempt,
++    start_attempt, start_attempt_for_intent, verify_save_target, AttemptRecord, AttemptShowRecord,
++    AttemptSummary, ResolvedAttempt, StartAttempt, WORKSPACE_ROLE_MATERIALIZATION_TARGET,
+ };
+ pub(crate) use attempts::{
+     attempt_by_id, resolve_attempt_in_context, verify_worktree_binding, WorkspaceMarker,

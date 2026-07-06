@@ -1,0 +1,11 @@
+--- CURRENT TASK ---
+- **382-2** Drift guard: make `attempt attach` refuse (typed error, with
+  an explicit override flag) when the target attempt's workspace dir has
+  drifted from its recorded materialized content.
+
+Rules for this task:
+- Implement only this task now (later tasks come next in this session).
+- The worktree already contains your previous tasks' changes, applied and
+  committed; build this task on top of them.
+- Run the repo's verify gates for what you build and make them pass.
+- Do not create git commits; leave changes uncommitted.
