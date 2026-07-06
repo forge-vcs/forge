@@ -1,0 +1,17 @@
+# UNKNOWN
+
+## What I need to know
+The actual TASK CONTRACT: the task description, the `allowed_changes` path list, and the acceptance commands.
+
+## Why the brief does not answer it
+The instruction I received says "Implement exactly the task specified in the TASK CONTRACT above," but no contract was included above the instruction — the message contained only the generic rules. I searched the repository for it and found nothing:
+
+- No file at the repo root or elsewhere matches "TASK CONTRACT" or `allowed_changes` (`grep -ril "allowed_changes\|task contract" .` returns no in-repo hits).
+- The worktree is clean on branch `pilot-run`; the tip commit `b9b3917` ("pilot: strip CLAUDE.md to mechanics (arm A)") only trims `CLAUDE.md:1-13` to build/test mechanics and carries no task payload.
+- `docs/plans/` and `docs/handoffs/` contain prior feature plans (e.g. `docs/plans/2026-07-04-001-refactor-domain-modules-plan.md:1`), but nothing designates any of them as this run's contract, and picking one would be a guess.
+
+## Kind
+blocking — without the contract I cannot know what to implement, which paths I may touch, or which acceptance commands must pass. Any implementation would be unlicensed by the brief.
+
+## Best guess
+The harness that spawned this session was supposed to prepend the contract to the prompt (or drop a contract file into the worktree) and did not. Re-run with the contract included, or add it as a file at the repo root.

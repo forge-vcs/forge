@@ -1,0 +1,32 @@
+# UNKNOWN
+
+## What I need to know
+The actual TASK CONTRACT. The task instruction says "Implement exactly the task
+specified in the TASK CONTRACT above", but no contract was included in the
+prompt, and no contract file exists in the repository. I need:
+
+- the task brief itself (what to implement)
+- `allowed_changes` (which paths I may touch)
+- the acceptance commands to run
+
+## Why the brief does not answer it
+There is no brief. Only the generic "TASK INSTRUCTION" rules block was
+delivered; the contract it references is absent.
+
+## Kind
+blocking
+
+## Evidence
+- Repo root listing shows no TASK/CONTRACT file: only `AGENTS.md`, `CLAUDE.md`,
+  `PRD.md`, `README.md`, etc. (repo root, checked 2026-07-06)
+- `grep -ril "allowed_changes\|task contract"` across `*.md`, `*.yaml`, `*.yml`,
+  `*.json`, `*.toml` (excluding `target/`) returned no matches.
+- `docs/` contains only project docs (`IDEA.md:1`, `ROADMAP.md:1`,
+  `RELEASE_CHECKLIST.md:1`, `P9_RELEASE_AUDIT.md:1`) — none is a task contract.
+- `git status` is clean; latest commit `b9b3917` ("pilot: strip CLAUDE.md to
+  mechanics (arm A)") does not add a contract.
+
+## Best guess
+This pilot-harness run failed to inject the contract into the prompt (or the
+contract file was meant to be committed to the worktree and wasn't). I cannot
+guess the task's substance from repo state, so I made no other edits.

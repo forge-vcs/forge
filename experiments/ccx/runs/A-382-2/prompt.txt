@@ -1,0 +1,133 @@
+--- GLOBAL POLICY (normative) ---
+# Global policy — included in EVERY brief, before any contract.
+# Normative. Byte-stable: no timestamps, stable key order, stable list order.
+schema: ccx.contract.v0
+kind: global_policy
+mechanics:
+  build_system: cargo (single workspace; no Makefile/justfile)
+  toolchain: rust 1.92.0 pinned via rust-toolchain.toml (rustfmt + clippy components)
+  verify:                       # all three must pass before any task is done
+    - cargo fmt --all --check
+    - cargo test --workspace
+    - cargo clippy --workspace --all-targets -- -D warnings
+  layout: >
+    Binary crate crates/forge-cli (binary name: forge). Library crates under
+    crates/: forge-core (ID types), forge-store (SQLite persistence),
+    forge-content (backend trait + secret-risk helpers), forge-content-git /
+    forge-content-native (backends), forge-evidence (command capture),
+    forge-policy (check evaluation), forge-protocol (JSON envelope),
+    forge-export-git (Git export), forge-sync (native sync + peer transport).
+    Integration tests: crates/forge-cli/tests/ (assert_cmd + tempfile).
+rules:
+  - Error handling is anyhow throughout; no custom error types.
+  - Serde JSON uses rename_all = "snake_case"; the --json envelope carries
+    schema_version "forge.cli.v0"; changes to serialized output are
+    additive-only.
+  - Conventional Commits (feat:/fix:/chore:/refactor:/docs: ...).
+  - Rust files have a 3000-line ceiling (scripts/check-rust-line-count.sh).
+  - Facade files (crates/forge-store/src/lib.rs, crates/forge-cli/src/main.rs)
+    take no new domain behavior; new behavior lands in domain modules
+    (docs/adr/0001-domain-modules.md).
+security_defaults:  # do not weaken; weakening requires explicit human approval
+  - Snapshots/exports exclude .forge, .env, .env.*, private-key files,
+    credential paths.
+  - Evidence excerpts are capped at 4096 bytes and redacted before storage.
+  - Evidence, decisions, native accepted commits, sync merge commits carry
+    local Ed25519 signatures; forge doctor verifies the tamper-evident chain.
+unknown_rule: >
+  If this brief plus the task contract does not license a decision you need
+  to make, STOP and surface the unknown instead of guessing. Surfacing an
+  unknown is a successful outcome, not a failure.
+
+--- TASK CONTRACT (normative) ---
+schema: ccx.contract.v0
+id: ccx-task-382-2-drift-guard
+revision: 1
+ticket: NER-382
+task: Refuse attach when the target workspace dir has drifted
+
+interface: |
+  In `forge attempt attach` (store-side logic in
+  crates/forge-store/src/attempts.rs + the attach command path):
+
+  Before re-materializing the target attempt's workspace dir, compare its
+  current content against the recorded
+  `attempt_workspaces.materialized_content_ref` using the existing
+  working-vs-tree diff primitive. If they differ:
+
+    - refuse with a NEW typed error `WORKSPACE_DRIFT` (sibling of
+      DIRTY_WORKTREE / ATTEMPT_WORKTREE_MISMATCH in
+      crates/forge-store/src/error.rs), whose details list the drifted
+      paths (secret-risk filtered like other path lists) and whose message
+      names the override flag;
+    - unless the new flag `--discard-workspace-changes` is passed, in
+      which case attach proceeds as today (drifted content is discarded).
+
+  When `materialized_content_ref` is NULL/absent (never materialized),
+  attach proceeds without the check. Error code registered in the error
+  registry / `forge schema` output.
+
+invariants:
+  - Attach without drift behaves byte-identically to today (no new
+    prompts, no output changes beyond the additive schema registration).
+  - The drift check reads the workspace dir only; it never mutates it.
+  - Refusal happens BEFORE any materialization write — a refused attach
+    leaves both the workspace dir and current_state untouched.
+  - The override flag discards workspace-dir drift ONLY; it must not
+    bypass the repo-root DIRTY_WORKTREE or ATTEMPT_WORKTREE_MISMATCH
+    protections.
+  - New error code follows the existing envelope error shape
+    (code/message/details) and is snake_case in details.
+
+acceptance:
+  - cargo test -p forge-store
+  - cargo test -p forge-cli --test forge_attempts
+  - cargo clippy --workspace --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: No schema/migration changes; materialized_content_ref already
+      exists.
+    scope: {paths: [crates/forge-store/migrations/**], operations: [add-migration]}
+    reason: The substrate is already persisted (record_attempt_workspace_
+      materialized); this task is a guard, not a data model change.
+    source_evidence: crates/forge-store/src/attempts.rs (attempt_workspaces
+      update); NER-382 ticket.
+  - rule: Do not write a new diff; use the existing working-vs-tree diff.
+    scope: {paths: [crates/forge-store/**], operations: [add-logic]}
+    reason: Single diff engine invariant.
+    source_evidence: forge-content-native diff_working_vs_tree.
+  - rule: Do not auto-snapshot drifted content in this task (ticket's
+      optional recovery layer is explicitly deferred).
+    scope: {paths: [crates/forge-store/src/attempts.rs], operations: [add-feature]}
+    reason: Scope pinned by ticket + pilot task isolation.
+    source_evidence: NER-382 "Proposed fix" item 3 (deferred).
+
+neighbors:
+  - ccx-task-382-1-payload-honesty
+  - ccx-task-382-3-tests
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-store/src/attempts.rs, crates/forge-store/src/error.rs,
+          crates/forge-cli/src/args.rs, crates/forge-cli/src/commands/**,
+          crates/forge-cli/src/schema.rs]
+  forbidden_paths: [crates/forge-content-native/**, crates/forge-store/migrations/**]
+  public_api_change_policy: contract-update-required
+
+--- NEIGHBOR CONTRACT MISSING: - ccx-task-382-1-payload-honesty (surface as unknown, do not guess) ---
+
+--- NEIGHBOR CONTRACT MISSING: - ccx-task-382-3-tests (surface as unknown, do not guess) ---
+
+
+--- TASK INSTRUCTION ---
+Implement exactly the task specified in the TASK CONTRACT above, in this
+repository (you are at the repo root). Rules:
+- Touch only paths inside the contract's allowed_changes.
+- If the brief does not license a decision you need to make, STOP: write
+  UNKNOWN.md at the repo root (what you need to know, why the brief does
+  not answer it, your best guess of kind: blocking/assumption/observation,
+  file:line evidence) and end without making further edits.
+- When done, run the contract's acceptance commands and make them pass.
+- Do not create git commits; leave all changes uncommitted in the worktree.
+- Do not read or write anything outside this repository.

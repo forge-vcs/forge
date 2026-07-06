@@ -1,0 +1,121 @@
+--- GLOBAL POLICY (normative) ---
+# Global policy — included in EVERY brief, before any contract.
+# Normative. Byte-stable: no timestamps, stable key order, stable list order.
+schema: ccx.contract.v0
+kind: global_policy
+mechanics:
+  build_system: cargo (single workspace; no Makefile/justfile)
+  toolchain: rust 1.92.0 pinned via rust-toolchain.toml (rustfmt + clippy components)
+  verify:                       # all three must pass before any task is done
+    - cargo fmt --all --check
+    - cargo test --workspace
+    - cargo clippy --workspace --all-targets -- -D warnings
+  layout: >
+    Binary crate crates/forge-cli (binary name: forge). Library crates under
+    crates/: forge-core (ID types), forge-store (SQLite persistence),
+    forge-content (backend trait + secret-risk helpers), forge-content-git /
+    forge-content-native (backends), forge-evidence (command capture),
+    forge-policy (check evaluation), forge-protocol (JSON envelope),
+    forge-export-git (Git export), forge-sync (native sync + peer transport).
+    Integration tests: crates/forge-cli/tests/ (assert_cmd + tempfile).
+rules:
+  - Error handling is anyhow throughout; no custom error types.
+  - Serde JSON uses rename_all = "snake_case"; the --json envelope carries
+    schema_version "forge.cli.v0"; changes to serialized output are
+    additive-only.
+  - Conventional Commits (feat:/fix:/chore:/refactor:/docs: ...).
+  - Rust files have a 3000-line ceiling (scripts/check-rust-line-count.sh).
+  - Facade files (crates/forge-store/src/lib.rs, crates/forge-cli/src/main.rs)
+    take no new domain behavior; new behavior lands in domain modules
+    (docs/adr/0001-domain-modules.md).
+security_defaults:  # do not weaken; weakening requires explicit human approval
+  - Snapshots/exports exclude .forge, .env, .env.*, private-key files,
+    credential paths.
+  - Evidence excerpts are capped at 4096 bytes and redacted before storage.
+  - Evidence, decisions, native accepted commits, sync merge commits carry
+    local Ed25519 signatures; forge doctor verifies the tamper-evident chain.
+unknown_rule: >
+  If this brief plus the task contract does not license a decision you need
+  to make, STOP and surface the unknown instead of guessing. Surfacing an
+  unknown is a successful outcome, not a failure.
+
+--- TASK CONTRACT (normative) ---
+schema: ccx.contract.v0
+id: ccx-task-362-4-ledger-enrichment
+revision: 1
+ticket: NER-362
+task: Ledger enrichment for blame output
+
+interface: |
+  New module `crates/forge-store/src/provenance.rs` (declared from the
+  forge-store facade lib.rs with module decl + re-export only):
+
+    pub struct ProvenanceDetail {
+        pub intent_id: String,
+        pub intent_title: Option<String>,     // intents row, if present
+        pub decision_id: Option<String>,
+        pub decision_status: Option<String>,  // "accepted" | "rejected"
+        pub check_status: Option<String>,     // latest check_results.status
+                                              // for the proposal revision
+    }
+
+    pub fn provenance_detail(cwd: &Path, intent_id: &str,
+                             proposal_revision_id: Option<&str>,
+                             decision_id: Option<&str>)
+        -> anyhow::Result<ProvenanceDetail>
+
+  And: `forge blame --json` payload lines gain OPTIONAL (additive) fields
+  `intent_title`, `decision_status`, `check_status`, populated by calling
+  this per distinct (intent, revision, decision) tuple (deduplicate — do
+  not query per line). Human output gains intent title when available.
+
+invariants:
+  - Read-only SQLite access via the existing open_repository/connection
+    helpers; no schema changes, no migrations.
+  - Unknown/missing ids degrade to None fields, never an error — blame on
+    history that predates some ledger rows must still render.
+  - Query count is O(distinct commits in the blame), not O(lines).
+  - New JSON fields are additive under forge.cli.v0.
+
+acceptance:
+  - cargo test -p forge-store provenance
+  - cargo test -p forge-cli blame
+  - cargo clippy --workspace --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: No new tables, columns, or migrations.
+    scope: {paths: [crates/forge-store/migrations/**], operations: [add-migration]}
+    reason: Enrichment is a read model over existing rows; schema changes
+      need their own reviewed slice.
+    source_evidence: migrations discipline (numbered, checksummed).
+  - rule: Do not grow the forge-store facade lib.rs beyond decl+re-export.
+    scope: {paths: [crates/forge-store/src/lib.rs], operations: [grow-file]}
+    reason: Facade rule, ADR-0001.
+    source_evidence: docs/adr/0001-domain-modules.md.
+
+neighbors:
+  - ccx-task-362-3-cli-blame
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-store/src/provenance.rs, crates/forge-store/src/lib.rs,
+          crates/forge-cli/src/commands/**, crates/forge-cli/src/args.rs]
+  forbidden_paths: [crates/forge-store/migrations/**,
+                    crates/forge-content-native/**]
+  public_api_change_policy: contract-update-required
+
+--- NEIGHBOR CONTRACT MISSING: - ccx-task-362-3-cli-blame (surface as unknown, do not guess) ---
+
+
+--- TASK INSTRUCTION ---
+Implement exactly the task specified in the TASK CONTRACT above, in this
+repository (you are at the repo root). Rules:
+- Touch only paths inside the contract's allowed_changes.
+- If the brief does not license a decision you need to make, STOP: write
+  UNKNOWN.md at the repo root (what you need to know, why the brief does
+  not answer it, your best guess of kind: blocking/assumption/observation,
+  file:line evidence) and end without making further edits.
+- When done, run the contract's acceptance commands and make them pass.
+- Do not create git commits; leave all changes uncommitted in the worktree.
+- Do not read or write anything outside this repository.

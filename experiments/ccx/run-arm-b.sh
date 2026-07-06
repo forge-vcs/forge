@@ -40,13 +40,13 @@ EOF
 
   start=$(date +%s)
   if [[ $first -eq 1 ]]; then
-    (cd "$CLONE" && claude -p "$(cat "$out/prompt.txt")" \
+    (cd "$CLONE" && claude -p \
         --output-format json --dangerously-skip-permissions \
-        > "$out/result.json" 2> "$out/stderr.log")
+        < "$out/prompt.txt" > "$out/result.json" 2> "$out/stderr.log")
   else
-    (cd "$CLONE" && claude -c -p "$(cat "$out/prompt.txt")" \
+    (cd "$CLONE" && claude -c -p \
         --output-format json --dangerously-skip-permissions \
-        > "$out/result.json" 2> "$out/stderr.log")
+        < "$out/prompt.txt" > "$out/result.json" 2> "$out/stderr.log")
   fi
   status=$?
   end=$(date +%s)

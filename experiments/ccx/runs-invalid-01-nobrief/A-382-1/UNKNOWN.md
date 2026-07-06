@@ -1,0 +1,26 @@
+# UNKNOWN
+
+**Kind:** blocking
+
+**What I need to know:** The TASK CONTRACT itself. The task instruction says
+"Implement exactly the task specified in the TASK CONTRACT above", but no
+contract was included in the prompt, and no contract file exists in the
+repository.
+
+**Why the brief does not answer it:** Without the contract I have none of the
+required inputs: no task description, no `allowed_changes` path list, and no
+acceptance commands. Any edit I make would risk touching paths outside the
+(unknown) allowed set, and I have no way to know when the task is done.
+
+**Evidence:**
+- Prompt text: "--- TASK INSTRUCTION --- Implement exactly the task specified
+  in the TASK CONTRACT above" — no contract block precedes it.
+- Repo root listing shows no contract file (TASK*, CONTRACT*, BRIEF*):
+  only AGENTS.md, CLAUDE.md, PRD.md, README.md, etc.
+- `grep -ril "task contract\|allowed_changes"` over the repo (excluding
+  `target/`) returns no matches.
+
+**Best guess:** The harness that composed this prompt failed to inject the
+contract block (template variable left empty), or the contract was meant to
+be committed to the worktree (e.g. at the repo root) and was not. The fix is
+on the orchestration side: re-run with the contract included.

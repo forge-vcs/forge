@@ -1,0 +1,51 @@
+diff --git a/UNKNOWN.md b/UNKNOWN.md
+new file mode 100644
+index 0000000..7274ec1
+--- /dev/null
++++ b/UNKNOWN.md
+@@ -0,0 +1,45 @@
++# UNKNOWN
++
++kind: blocking
++
++## What I need to know
++
++The actual TASK CONTRACT: what to implement, the `allowed_changes` path list,
++and the acceptance commands to run.
++
++## Why the brief does not answer it
++
++The instruction says "Implement exactly the task specified in the TASK
++CONTRACT above," but no contract was included in the message I received —
++the text jumps straight from the environment/context preamble to the
++"TASK INSTRUCTION" rules section. Without the contract I cannot know:
++
++- what feature/fix/change is being requested,
++- which paths are inside `allowed_changes` (any edit I make could violate it),
++- which acceptance commands must pass (beyond the generic CLAUDE.md checks).
++
++## Evidence
++
++Searched the repository for an embedded contract; none exists:
++
++- Repo root listing: no `TASK_CONTRACT*`, `CONTRACT*`, or brief file
++  (only `CLAUDE.md`, `PRD.md`, `README.md`, `CONTRIBUTING.md`, etc.).
++- `grep -ril "task contract\|TASK_CONTRACT\|allowed_changes"` across all
++  `.md/.yaml/.yml/.json/.toml` files in the repo: zero matches.
++- Hidden dirs contain only tooling config, no contract:
++  - `.claude/settings.json:1`
++  - `.claude/skills/verify/SKILL.md:1`
++  - `.agents/plugins/marketplace.json:1`
++  - `.compound-engineering/config.local.example.yaml:1`
++- `git status` is clean and the latest commit (`b9b3917`, "pilot: strip
++  CLAUDE.md to mechanics (arm A)") does not add a contract.
++
++(A `brief-policy.txt` exists one directory above the repo root, but reading
++it is prohibited by the "do not read anything outside this repository" rule,
++and it is a policy file, not a task contract.)
++
++## Best guess
++
++None possible — the contract defines the entire task; there is no safe
++assumption to proceed on. Re-run with the TASK CONTRACT included in the
++prompt (or committed into the repo).

@@ -1,29 +1,40 @@
 #!/usr/bin/env bash
-# Arm A: one fresh headless session per task, brief-only, randomized order.
-# Usage: run-arm-a.sh <scratch-dir> [task-id ...]   (default: ORDER-A.txt)
+# Arm A rerun pipeline (protocol amendment P1, 2026-07-06): dependent tasks
+# run on stacked bases. Each spec is "task=stackrun1,stackrun2,..." where
+# stackruns are runs/ dirs whose patch.diff is applied + committed first.
+# Outputs land in runs/A-<task>-r2/. Aborts if a stack patch fails to apply
+# or a run files UNKNOWN (the chain would be built on sand).
 set -uo pipefail
-SCRATCH="${1:?usage: run-arm-a.sh <scratch-dir> [tasks...]}"; shift || true
+SCRATCH="${1:?usage: run-arm-a-stacked.sh <scratch-dir> task=stack,... ...}"; shift
 CCX="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLONE="$SCRATCH/pilot-a"
 RUNS="$CCX/runs"
-mkdir -p "$RUNS"
 
-TASKS=("${@:-}")
-if [[ -z "${TASKS[0]:-}" ]]; then
-  TASKS=()
-  while IFS= read -r line; do [[ -n "$line" ]] && TASKS[${#TASKS[@]}]="$line"; done < "$CCX/runs/ORDER-A.txt"
-fi
+for spec in "$@"; do
+  task="${spec%%=*}"
+  stack="${spec#*=}"; [[ "$stack" == "$task" ]] && stack=""
+  out="$RUNS/A-$task-r2"; mkdir -p "$out"
+  echo "=== ARM A r2 :: $task :: stack[$stack] :: $(date +%H:%M:%S)"
 
-for task in "${TASKS[@]}"; do
-  out="$RUNS/A-$task"; mkdir -p "$out"
-  echo "=== ARM A :: $task :: $(date +%H:%M:%S)"
   git -C "$CLONE" reset --hard --quiet pilot-run
   git -C "$CLONE" clean -fdq -e target
 
+  if [[ -n "$stack" ]]; then
+    IFS=',' read -ra PARTS <<< "$stack"
+    for part in "${PARTS[@]}"; do
+      if ! git -C "$CLONE" apply --index "$RUNS/$part/patch.diff"; then
+        echo "FATAL: stack patch $part failed to apply for $task"; exit 1
+      fi
+    done
+    git -C "$CLONE" commit --quiet -m "pilot stack: $stack"
+  fi
+
   contract=$(ls "$CCX/contracts/task-$task-"*.yaml 2>/dev/null | head -1)
   if [[ -z "$contract" ]] || ! "$CCX/brief.sh" "$contract" > "$out/brief.txt"; then
-    echo "FATAL: no brief for task $task — aborting arm (no contract-less runs)"
-    exit 1
+    echo "FATAL: no brief for task $task"; exit 1
+  fi
+  if ! grep -q "NEIGHBOR CONTRACT (normative)" "$out/brief.txt" && grep -q "ccx-task" <(grep -A5 '^neighbors:' "$contract"); then
+    echo "WARN: brief for $task resolved no neighbor contracts"
   fi
 
   {
@@ -54,7 +65,11 @@ EOF
 
   git -C "$CLONE" add -A
   git -C "$CLONE" diff --cached > "$out/patch.diff"
-  [[ -f "$CLONE/UNKNOWN.md" ]] && cp "$CLONE/UNKNOWN.md" "$out/UNKNOWN.md"
+  if [[ -f "$CLONE/UNKNOWN.md" ]]; then
+    cp "$CLONE/UNKNOWN.md" "$out/UNKNOWN.md"
+    echo "HALT: $task filed UNKNOWN — chain stops here for author triage"
+    exit 2
+  fi
   echo "    exit=$status wall=$((end-start))s patch=$(wc -l < "$out/patch.diff") lines"
 done
-echo "ARM A COMPLETE $(date +%H:%M:%S)"
+echo "ARM A r2 COMPLETE $(date +%H:%M:%S)"

@@ -1,0 +1,72 @@
+diff --git a/UNKNOWN.md b/UNKNOWN.md
+new file mode 100644
+index 0000000..f2646f0
+--- /dev/null
++++ b/UNKNOWN.md
+@@ -0,0 +1,66 @@
++# UNKNOWN — ccx-task-382-3-tests cannot proceed
++
++kind: blocking
++
++## What I need to know
++
++Whether the neighbor tasks `ccx-task-382-1-payload-honesty` and
++`ccx-task-382-2-drift-guard` were supposed to have landed in this worktree
++before 382-3 runs — and if so, where their output is. None of the production
++behavior the contracted tests must exercise exists here:
++
++1. **No `WORKSPACE_DRIFT` error / drift check on attach.**
++   `crates/forge-cli/src/commands/core.rs:169-217` — the
++   `AttemptCommand::Attach` handler performs only the pre-existing
++   switching-baseline dirty check (`ForgeError::DirtyWorktree`,
++   core.rs:189-193) against the *effective worktree*, then unconditionally
++   calls `restore_effective_worktree` + `materialize_attempt_workspace`.
++   There is no check of `.forge/worktrees/<attempt>/` contents and no
++   `WORKSPACE_DRIFT` error code anywhere:
++   `grep -rni "workspace_drift" crates` → no matches.
++
++2. **No `--discard-workspace-changes` flag.**
++   `crates/forge-cli/src/args.rs:225-227` — `Attach { attempt_id: String }`
++   takes no flags. `grep -rn "discard" crates/forge-cli/src
++   crates/forge-store/src` → no matches.
++
++3. **No `workspace_role` / `materialization_target` in start payloads.**
++   `grep -rni "workspace_role\|materialization_target" crates` → no matches
++   anywhere in the workspace.
++
++## Why the brief does not answer it
++
++The task contract's negative constraint says: "Do not modify production
++code; if a scenario cannot pass because 382-1/382-2 shipped a defect, STOP
++and surface the unknown." This is that situation, in the stronger form: the
++neighbor work is not merely defective, it is **absent** from this worktree
++(branch `pilot-run`, HEAD b9b3917). Both neighbor contracts were also marked
++"NEIGHBOR CONTRACT MISSING … surface as unknown, do not guess" in the brief,
++so I cannot infer the intended interface (exact error-details shape, flag
++spelling, payload placement) well enough to write tests against code that
++does not exist — and all five contracted scenarios (drift → non-zero exit
++with `WORKSPACE_DRIFT`; `--discard-workspace-changes` success; no-drift
++pass-through; never-materialized skip; `workspace_role =
++"materialization_target"` in start payloads) would fail today:
++scenario 2 would not even parse (`clap` rejects the unknown flag), and
++scenarios 1 and 5 assert error codes / fields that no code path emits.
++
++## Best guess
++
++The 382-1 and 382-2 implementation commits were meant to be merged into this
++worktree before 382-3 was dispatched, and this pilot arm received a base
++(`b9b3917 pilot: strip CLAUDE.md to mechanics (arm A)`) that predates or
++excludes them. Resolution is likely: rebase/merge the 382-1 + 382-2 changes
++into this worktree (or point 382-3 at the right base), then re-run this
++task.
++
++## Evidence
++
++- `crates/forge-cli/src/args.rs:225-227` — `Attach { attempt_id: String }`, no flags.
++- `crates/forge-cli/src/commands/core.rs:169-217` — attach handler; only
++  `DirtyWorktree` guard at core.rs:189-193, unconditional materialization after.
++- Repo-wide greps (case-insensitive) for `workspace_drift`,
++  `workspace_role`, `materialization_target`, `discard`: zero matches in
++  `crates/`.
++
++No test edits were made; `crates/forge-cli/tests/forge_attempts.rs` is untouched.

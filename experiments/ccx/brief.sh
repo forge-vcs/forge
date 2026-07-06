@@ -24,7 +24,7 @@ emit "TASK CONTRACT (normative)" "$contract"
 
 # Neighbor contracts: ids listed under `neighbors:` as `- ccx-...`.
 # Resolution: neighbor id `ccx-foo` -> contracts/foo.yaml. Declared order.
-grep -E '^\s*-\s+ccx-' "$contract" | sed -E 's/^\s*-\s+(ccx-[a-z0-9-]+).*/\1/' |
+grep -E '^[[:space:]]*-[[:space:]]+ccx-' "$contract" | sed -E 's/^[[:space:]]*-[[:space:]]+(ccx-[a-z0-9-]+).*/\1/' |
 while read -r nid; do
   nfile="$dir/${nid#ccx-}.yaml"
   if [[ -f "$nfile" ]]; then

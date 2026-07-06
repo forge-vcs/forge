@@ -1,0 +1,112 @@
+--- GLOBAL POLICY (normative) ---
+# Global policy — included in EVERY brief, before any contract.
+# Normative. Byte-stable: no timestamps, stable key order, stable list order.
+schema: ccx.contract.v0
+kind: global_policy
+mechanics:
+  build_system: cargo (single workspace; no Makefile/justfile)
+  toolchain: rust 1.92.0 pinned via rust-toolchain.toml (rustfmt + clippy components)
+  verify:                       # all three must pass before any task is done
+    - cargo fmt --all --check
+    - cargo test --workspace
+    - cargo clippy --workspace --all-targets -- -D warnings
+  layout: >
+    Binary crate crates/forge-cli (binary name: forge). Library crates under
+    crates/: forge-core (ID types), forge-store (SQLite persistence),
+    forge-content (backend trait + secret-risk helpers), forge-content-git /
+    forge-content-native (backends), forge-evidence (command capture),
+    forge-policy (check evaluation), forge-protocol (JSON envelope),
+    forge-export-git (Git export), forge-sync (native sync + peer transport).
+    Integration tests: crates/forge-cli/tests/ (assert_cmd + tempfile).
+rules:
+  - Error handling is anyhow throughout; no custom error types.
+  - Serde JSON uses rename_all = "snake_case"; the --json envelope carries
+    schema_version "forge.cli.v0"; changes to serialized output are
+    additive-only.
+  - Conventional Commits (feat:/fix:/chore:/refactor:/docs: ...).
+  - Rust files have a 3000-line ceiling (scripts/check-rust-line-count.sh).
+  - Facade files (crates/forge-store/src/lib.rs, crates/forge-cli/src/main.rs)
+    take no new domain behavior; new behavior lands in domain modules
+    (docs/adr/0001-domain-modules.md).
+security_defaults:  # do not weaken; weakening requires explicit human approval
+  - Snapshots/exports exclude .forge, .env, .env.*, private-key files,
+    credential paths.
+  - Evidence excerpts are capped at 4096 bytes and redacted before storage.
+  - Evidence, decisions, native accepted commits, sync merge commits carry
+    local Ed25519 signatures; forge doctor verifies the tamper-evident chain.
+unknown_rule: >
+  If this brief plus the task contract does not license a decision you need
+  to make, STOP and surface the unknown instead of guessing. Surfacing an
+  unknown is a successful outcome, not a failure.
+
+--- TASK CONTRACT (normative) ---
+schema: ccx.contract.v0
+id: ccx-task-362-5-tests-docs
+revision: 1
+ticket: NER-362
+task: Blame integration tests + docs
+
+interface: |
+  New integration test file `crates/forge-cli/tests/forge_blame.rs` using
+  the existing assert_cmd + tempfile pattern (mirror forge_attempts.rs):
+
+  Required scenarios (each drives the real binary in a temp native repo):
+    1. init → start → edit file → save → propose → accept → blame shows
+       every line attributed to the accepting commit with its intent_id.
+    2. Second intent modifies SOME lines → blame attributes changed lines
+       to commit 2, unchanged lines still to commit 1.
+    3. blame --json: envelope shape, snake_case fields, additive payload
+       per the 362-3 contract (assert on parsed JSON, not string match).
+    4. blame on a path missing at HEAD → typed error, non-zero exit.
+    5. blame without .forge/forge.db → standard repo-not-found error.
+
+  Docs: add a `forge blame` section to the CLI help/docs where `log` is
+  documented (same location and style).
+
+invariants:
+  - Tests use the compiled binary (assert_cmd), never library shortcuts.
+  - Tests run in temp dirs (tempfile), never in the repo worktree.
+  - No test may weaken or skip existing suites; forge_blame.rs is additive.
+
+acceptance:
+  - cargo test -p forge-cli --test forge_blame
+  - cargo test --workspace
+  - cargo clippy --workspace --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: Do not modify production code in this task; tests + docs only.
+      If a test exposes a defect in 362-1..4, STOP and surface it as an
+      unknown (it is a finding, not your fix).
+    scope: {paths: [crates/forge-cli/src/**, crates/forge-store/src/**,
+                    crates/forge-content-native/src/**], operations: [modify]}
+    reason: The pilot measures per-task defects; cross-task fixes destroy
+      attribution.
+    source_evidence: experiments/ccx/PILOT.md §4 (defect taxonomy).
+
+neighbors:
+  - ccx-task-362-3-cli-blame
+  - ccx-task-362-4-ledger-enrichment
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-cli/tests/forge_blame.rs, docs/**, README.md]
+  forbidden_paths: [crates/**/src/**]
+  public_api_change_policy: none
+
+--- NEIGHBOR CONTRACT MISSING: - ccx-task-362-3-cli-blame (surface as unknown, do not guess) ---
+
+--- NEIGHBOR CONTRACT MISSING: - ccx-task-362-4-ledger-enrichment (surface as unknown, do not guess) ---
+
+
+--- TASK INSTRUCTION ---
+Implement exactly the task specified in the TASK CONTRACT above, in this
+repository (you are at the repo root). Rules:
+- Touch only paths inside the contract's allowed_changes.
+- If the brief does not license a decision you need to make, STOP: write
+  UNKNOWN.md at the repo root (what you need to know, why the brief does
+  not answer it, your best guess of kind: blocking/assumption/observation,
+  file:line evidence) and end without making further edits.
+- When done, run the contract's acceptance commands and make them pass.
+- Do not create git commits; leave all changes uncommitted in the worktree.
+- Do not read or write anything outside this repository.

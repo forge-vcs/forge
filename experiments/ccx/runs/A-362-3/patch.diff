@@ -1,0 +1,65 @@
+diff --git a/UNKNOWN.md b/UNKNOWN.md
+new file mode 100644
+index 0000000..774cce0
+--- /dev/null
++++ b/UNKNOWN.md
+@@ -0,0 +1,59 @@
++# UNKNOWN — ccx-task-362-3-cli-blame (revision 1)
++
++kind: blocking
++
++## What I need to know
++
++The interfaces (and existence) of the two components this task is contractually
++required to compose:
++
++1. **362-1 provenance walk** — the contract says provenance fields "come
++   straight from the CommitObject via the provenance module". No provenance
++   module exists anywhere in the workspace.
++2. **362-2 line attribution** — the contract says the implementation "composes
++   362-1 + 362-2 outputs (join per line via commit_id)". No line-attribution
++   API (per-line → commit_id mapping) exists anywhere in the workspace.
++
++Concretely: which crate/module exposes these, what are the function
++signatures and returned types (in particular where `intent_id`,
++`proposal_revision_id`, `decision_id`, `actor`, `authored_time` are sourced
++per line), and what typed errors they surface that the CLI must map to
++envelope errors.
++
++## Why the brief does not answer it
++
++- The task contract's interface section presupposes both neighbors as inputs
++  ("Implementation composes 362-1 + 362-2 outputs … via the provenance
++  module") but does not define their APIs.
++- Both neighbor contracts are explicitly missing from the brief, each marked
++  "NEIGHBOR CONTRACT MISSING … (surface as unknown, do not guess)":
++  - ccx-task-362-1-provenance-walk
++  - ccx-task-362-2-line-attribution
++- Implementing the walk/attribution myself inside the CLI is not licensed:
++  `allowed_changes.paths` is limited to
++  crates/forge-cli/src/{args.rs,main.rs,commands/**,schema.rs}, and the
++  natural home for such logic (forge-content-native / forge-store) is in
++  `forbidden_paths`. Re-implementing neighbor tasks would also violate the
++  join-on-their-outputs design the contract mandates.
++
++## Evidence that the dependencies are absent
++
++- `grep -rln provenance crates/*/src` matches only doc comments and the
++  existing export-trailer feature (e.g. crates/forge-cli/src/commands/export.rs:13,
++  crates/forge-content-native/src/lib.rs:1082) — no provenance module.
++- crates/forge-content-native/src/lib.rs:30-31 — the only submodules are
++  `pack` and `status_cache`; no walk/attribution module.
++- crates/forge-cli/src/commands/mod.rs — modules are `core`, `export`,
++  `sync` only; no blame/provenance command scaffolding.
++- `grep -rn "blame\|attribute_lines\|line_attribution" crates --include='*.rs'`
++  finds no implementation symbols.
++- `CommitObject` (crates/forge-content-native/src/lib.rs:1087) carries
++  `intent_id` (line 1093), so the data model exists, but no API walks history
++  or attributes lines to commits.
++
++## Best guess
++
++kind: **blocking**. Tasks 362-1 and 362-2 have not landed in this worktree
++(git log shows no NER-362 commits; HEAD is b9b3917). 362-3 cannot be
++implemented as specified until they land or their contracts define the
++interfaces to code against.

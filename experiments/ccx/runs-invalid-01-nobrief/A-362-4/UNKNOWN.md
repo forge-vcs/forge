@@ -1,0 +1,35 @@
+# UNKNOWN
+
+- **Kind:** blocking
+
+## What I need to know
+
+The actual TASK CONTRACT: the task description, `allowed_changes` path list, and
+acceptance commands. The instruction I received says "Implement exactly the task
+specified in the TASK CONTRACT above", but no contract was included above the
+instruction — the message contained only environment context and the generic
+task rules.
+
+## Why the brief does not answer it
+
+Every rule in the brief is parameterized by the contract ("only paths inside the
+contract's allowed_changes", "run the contract's acceptance commands"). Without
+the contract there is no licensed scope: any edit I make could touch a
+disallowed path, and there are no acceptance commands to satisfy.
+
+## Evidence that the contract is not in the repo either
+
+- Repo root listing: no `TASK_CONTRACT*`, `CONTRACT*`, or brief file
+  (`ls -a` at repo root — only CLAUDE.md, PRD.md, README.md, docs/, crates/, etc.)
+- `grep -ril "task contract\|allowed_changes"` across `*.md`, `*.json`,
+  `*.yaml`, `*.toml` in the repo: zero matches.
+- `CLAUDE.md:1` contains only workspace mechanics (crate layout + verify
+  commands), consistent with commit b9b3917 "pilot: strip CLAUDE.md to
+  mechanics (arm A)" — no task content.
+
+## Best guess
+
+This worktree (`scratchpad/pilot-a`, branch `pilot-run`) is one arm of a pilot
+experiment and the contract was meant to be injected into the prompt ahead of
+the TASK INSTRUCTION block, but the injection step was skipped or failed.
+I cannot infer the intended task from the repo state (working tree is clean).

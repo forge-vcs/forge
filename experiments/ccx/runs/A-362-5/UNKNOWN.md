@@ -1,0 +1,53 @@
+# UNKNOWN — ccx-task-362-5-tests-docs (revision 1)
+
+## Kind
+blocking
+
+## What I need to know
+Where is the `forge blame` implementation this task is supposed to test?
+The contract (NER-362, task 362-5) requires integration tests that drive
+the real compiled binary's `blame` subcommand (including `blame --json`
+per "the 362-3 contract"), but **no blame implementation exists anywhere
+in this worktree**.
+
+## Evidence
+- `crates/forge-cli/src/args.rs:19-66` — the `Command` enum has no `Blame`
+  variant (subcommands present: Init, Start, Attempt, Intent, Save,
+  Restore, Run, Propose, Check, Accept, Reject, Show, Proposal, Review,
+  Compare, Diff, Merge, Conflict, Log, Checkout, Undo, Trust, Visibility,
+  Embargo, Key, Org, Doctor, Gc, Sync, Export, Schema).
+- `grep -rn -i "blame" crates/ --include="*.rs"` → zero matches across
+  the entire workspace (sources and tests).
+- The only "blame" references in the repo are roadmap/plan documents
+  noting intent-aware blame is *deferred* to NER-362
+  (`docs/ROADMAP.md:206`, `docs/plans/2026-06-23-001-feat-permissioned-forge-plan.md:362`).
+
+## Why the brief does not answer it
+- The contract's acceptance requires
+  `cargo test -p forge-cli --test forge_blame` to pass, and its
+  negative_constraints forbid modifying any production code
+  (`crates/**/src/**` is in forbidden_paths). With no `blame` command in
+  the binary, every required scenario (1-5) would fail, and I cannot make
+  them pass without violating the "tests + docs only" rule.
+- Both neighbor contracts the tests must conform to are explicitly
+  missing from the brief:
+  - `ccx-task-362-3-cli-blame` — needed for the `--json` envelope /
+    payload shape scenario 3 must assert on, and for the exact typed
+    error semantics of scenarios 4-5.
+  - `ccx-task-362-4-ledger-enrichment` — needed to know what intent_id
+    attribution the accepting commit carries.
+- Scenario 4 requires a "typed error", but the global policy mandates
+  anyhow with no custom error types; without the 362-3 contract I cannot
+  know what "typed" means concretely (error code field in the JSON
+  envelope? specific stderr string?).
+
+## Best guess
+The 362-1..4 branches have not been merged into this pilot worktree
+(current branch `pilot-run` at b9b3917 contains no blame work). This
+task is sequenced after them and cannot start until their output is
+present in the tree, or until the missing neighbor contracts are
+supplied so tests can at least be written against a frozen interface.
+
+## No changes made
+Per the unknown rule, no test or doc edits were made; the worktree is
+left clean except for this file.

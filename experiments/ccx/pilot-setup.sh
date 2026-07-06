@@ -14,7 +14,7 @@ for arm in a b; do
     git clone --quiet "$SRC" "$clone"
   fi
   rm -rf "$clone/target"
-  git -C "$clone" checkout --quiet "$BASE"
+  git -C "$clone" checkout --quiet --detach "$BASE"
   git -C "$clone" branch -f pilot-run "$BASE"
   git -C "$clone" checkout --quiet pilot-run
   rm -f "$clone/.mcp.json"
@@ -39,7 +39,7 @@ Verify before done:
 EOF
 git -C "$SCRATCH/pilot-a" add CLAUDE.md
 git -C "$SCRATCH/pilot-a" commit --quiet -m "pilot: strip CLAUDE.md to mechanics (arm A)"
-git -C "$SCRATCH/pilot-a" branch -f pilot-run HEAD
+# committing on pilot-run already advances the branch; no branch -f needed
 
 for arm in a b; do
   echo "=== cargo build pilot-$arm ($(date +%H:%M:%S))"

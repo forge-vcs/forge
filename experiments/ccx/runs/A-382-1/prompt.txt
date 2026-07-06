@@ -1,0 +1,112 @@
+--- GLOBAL POLICY (normative) ---
+# Global policy — included in EVERY brief, before any contract.
+# Normative. Byte-stable: no timestamps, stable key order, stable list order.
+schema: ccx.contract.v0
+kind: global_policy
+mechanics:
+  build_system: cargo (single workspace; no Makefile/justfile)
+  toolchain: rust 1.92.0 pinned via rust-toolchain.toml (rustfmt + clippy components)
+  verify:                       # all three must pass before any task is done
+    - cargo fmt --all --check
+    - cargo test --workspace
+    - cargo clippy --workspace --all-targets -- -D warnings
+  layout: >
+    Binary crate crates/forge-cli (binary name: forge). Library crates under
+    crates/: forge-core (ID types), forge-store (SQLite persistence),
+    forge-content (backend trait + secret-risk helpers), forge-content-git /
+    forge-content-native (backends), forge-evidence (command capture),
+    forge-policy (check evaluation), forge-protocol (JSON envelope),
+    forge-export-git (Git export), forge-sync (native sync + peer transport).
+    Integration tests: crates/forge-cli/tests/ (assert_cmd + tempfile).
+rules:
+  - Error handling is anyhow throughout; no custom error types.
+  - Serde JSON uses rename_all = "snake_case"; the --json envelope carries
+    schema_version "forge.cli.v0"; changes to serialized output are
+    additive-only.
+  - Conventional Commits (feat:/fix:/chore:/refactor:/docs: ...).
+  - Rust files have a 3000-line ceiling (scripts/check-rust-line-count.sh).
+  - Facade files (crates/forge-store/src/lib.rs, crates/forge-cli/src/main.rs)
+    take no new domain behavior; new behavior lands in domain modules
+    (docs/adr/0001-domain-modules.md).
+security_defaults:  # do not weaken; weakening requires explicit human approval
+  - Snapshots/exports exclude .forge, .env, .env.*, private-key files,
+    credential paths.
+  - Evidence excerpts are capped at 4096 bytes and redacted before storage.
+  - Evidence, decisions, native accepted commits, sync merge commits carry
+    local Ed25519 signatures; forge doctor verifies the tamper-evident chain.
+unknown_rule: >
+  If this brief plus the task contract does not license a decision you need
+  to make, STOP and surface the unknown instead of guessing. Surfacing an
+  unknown is a successful outcome, not a failure.
+
+--- TASK CONTRACT (normative) ---
+schema: ccx.contract.v0
+id: ccx-task-382-1-payload-honesty
+revision: 1
+ticket: NER-382
+task: Qualify workspace_path as a materialization target in payloads/help
+
+interface: |
+  In the JSON payloads of `forge start` and `forge attempt start` (the
+  replay_data/state and the StartAttempt result struct in
+  crates/forge-store/src/attempts.rs), add an ADDITIVE sibling field next
+  to every emitted `workspace_path`:
+
+    "workspace_role": "materialization_target"
+
+  (constant string; enum-ready but only one value today). Update the help
+  text of `attempt start`/`attempt attach` and any docs mentioning
+  `.forge/worktrees/` to state: the workspace dir is materialized state,
+  not an editing surface; the repo root worktree (after `attempt attach`)
+  is where edits belong.
+
+invariants:
+  - Additive only: `workspace_path` keeps its exact key, value, and
+    position semantics; no existing field changes (forge.cli.v0).
+  - The new field appears in BOTH `start` (auto-attach) and
+    `attempt start` payloads, and in the replayed (`--request-id`) result.
+  - `forge schema` output reflects the new field if payload fields are
+    registered there.
+
+acceptance:
+  - cargo test -p forge-cli --test forge_attempts
+  - cargo test -p forge-store
+  - cargo clippy --workspace --all-targets -- -D warnings
+
+negative_constraints:
+  - rule: Do not implement drift detection or change attach behavior in
+      this task (that is task 382-2).
+    scope: {paths: [crates/forge-store/src/attempts.rs], operations: [modify-logic]}
+    reason: Task isolation for the pilot's defect attribution.
+    source_evidence: experiments/ccx/PILOT.md §2.
+  - rule: Do not rename or remove workspace_path.
+    scope: {paths: [crates/**], operations: [modify-serde]}
+    reason: Envelope is additive-only; consumers parse it.
+    source_evidence: CLAUDE.md conventions.
+
+neighbors:
+  - ccx-task-382-2-drift-guard
+
+authority: {source: human, confidence: high, reviewer: Jan Skolte (frozen 2026-07-06)}
+
+allowed_changes:
+  paths: [crates/forge-store/src/attempts.rs, crates/forge-cli/src/args.rs,
+          crates/forge-cli/src/commands/**, crates/forge-cli/src/schema.rs,
+          crates/forge-cli/tests/forge_attempts.rs, docs/**]
+  forbidden_paths: [crates/forge-content-native/**, crates/forge-store/migrations/**]
+  public_api_change_policy: contract-update-required
+
+--- NEIGHBOR CONTRACT MISSING: - ccx-task-382-2-drift-guard (surface as unknown, do not guess) ---
+
+
+--- TASK INSTRUCTION ---
+Implement exactly the task specified in the TASK CONTRACT above, in this
+repository (you are at the repo root). Rules:
+- Touch only paths inside the contract's allowed_changes.
+- If the brief does not license a decision you need to make, STOP: write
+  UNKNOWN.md at the repo root (what you need to know, why the brief does
+  not answer it, your best guess of kind: blocking/assumption/observation,
+  file:line evidence) and end without making further edits.
+- When done, run the contract's acceptance commands and make them pass.
+- Do not create git commits; leave all changes uncommitted in the worktree.
+- Do not read or write anything outside this repository.

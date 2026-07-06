@@ -1,10 +1,48 @@
+--- GLOBAL POLICY (normative) ---
+# Global policy — included in EVERY brief, before any contract.
+# Normative. Byte-stable: no timestamps, stable key order, stable list order.
+schema: ccx.contract.v0
+kind: global_policy
+mechanics:
+  build_system: cargo (single workspace; no Makefile/justfile)
+  toolchain: rust 1.92.0 pinned via rust-toolchain.toml (rustfmt + clippy components)
+  verify:                       # all three must pass before any task is done
+    - cargo fmt --all --check
+    - cargo test --workspace
+    - cargo clippy --workspace --all-targets -- -D warnings
+  layout: >
+    Binary crate crates/forge-cli (binary name: forge). Library crates under
+    crates/: forge-core (ID types), forge-store (SQLite persistence),
+    forge-content (backend trait + secret-risk helpers), forge-content-git /
+    forge-content-native (backends), forge-evidence (command capture),
+    forge-policy (check evaluation), forge-protocol (JSON envelope),
+    forge-export-git (Git export), forge-sync (native sync + peer transport).
+    Integration tests: crates/forge-cli/tests/ (assert_cmd + tempfile).
+rules:
+  - Error handling is anyhow throughout; no custom error types.
+  - Serde JSON uses rename_all = "snake_case"; the --json envelope carries
+    schema_version "forge.cli.v0"; changes to serialized output are
+    additive-only.
+  - Conventional Commits (feat:/fix:/chore:/refactor:/docs: ...).
+  - Rust files have a 3000-line ceiling (scripts/check-rust-line-count.sh).
+  - Facade files (crates/forge-store/src/lib.rs, crates/forge-cli/src/main.rs)
+    take no new domain behavior; new behavior lands in domain modules
+    (docs/adr/0001-domain-modules.md).
+security_defaults:  # do not weaken; weakening requires explicit human approval
+  - Snapshots/exports exclude .forge, .env, .env.*, private-key files,
+    credential paths.
+  - Evidence excerpts are capped at 4096 bytes and redacted before storage.
+  - Evidence, decisions, native accepted commits, sync merge commits carry
+    local Ed25519 signatures; forge doctor verifies the tamper-evident chain.
+unknown_rule: >
+  If this brief plus the task contract does not license a decision you need
+  to make, STOP and surface the unknown instead of guessing. Surfacing an
+  unknown is a successful outcome, not a failure.
+
+--- TASK CONTRACT (normative) ---
 schema: ccx.contract.v0
 id: ccx-task-382-2-drift-guard
-revision: 2
-# rev 2 (2026-07-06): resolves blocking unknown from run A-382-2 —
-# diff_working_vs_tree writes a status cache into the scanned root, so
-# "use the existing diff" and "never mutate the workspace dir" contradicted.
-# Resolution: equality check, not diff; read-only comparison required.
+revision: 1
 ticket: NER-382
 task: Refuse attach when the target workspace dir has drifted
 
@@ -12,14 +50,10 @@ interface: |
   In `forge attempt attach` (store-side logic in
   crates/forge-store/src/attempts.rs + the attach command path):
 
-  Before re-materializing the target attempt's workspace dir, decide
-  whether its current content still equals the recorded
-  `attempt_workspaces.materialized_content_ref`. This is an EQUALITY
-  check, not a diff: read the recorded tree via the existing native-store
-  read primitives and compare workspace file bytes/paths against it
-  (hash or byte comparison per file). Do NOT use `diff_working_vs_tree`
-  here — it writes a status cache into the scanned root, which would
-  violate the read-only invariant below. If content differs:
+  Before re-materializing the target attempt's workspace dir, compare its
+  current content against the recorded
+  `attempt_workspaces.materialized_content_ref` using the existing
+  working-vs-tree diff primitive. If they differ:
 
     - refuse with a NEW typed error `WORKSPACE_DRIFT` (sibling of
       DIRTY_WORKTREE / ATTEMPT_WORKTREE_MISMATCH in
@@ -58,15 +92,10 @@ negative_constraints:
       materialized); this task is a guard, not a data model change.
     source_evidence: crates/forge-store/src/attempts.rs (attempt_workspaces
       update); NER-382 ticket.
-  - rule: Do not write a new diff ENGINE (hunk/rename machinery); a plain
-      per-file equality comparison (tree read + hash/byte compare) is the
-      required approach. Do not call diff_working_vs_tree on the workspace
-      dir.
+  - rule: Do not write a new diff; use the existing working-vs-tree diff.
     scope: {paths: [crates/forge-store/**], operations: [add-logic]}
-    reason: diff_working_vs_tree mutates the scanned root (status cache),
-      violating the read-only invariant; equality needs no diff engine.
-    source_evidence: run A-382-2 UNKNOWN (2026-07-06) — contract rev 1
-      contradiction; forge-content-native diff_working_vs_tree side effect.
+    reason: Single diff engine invariant.
+    source_evidence: forge-content-native diff_working_vs_tree.
   - rule: Do not auto-snapshot drifted content in this task (ticket's
       optional recovery layer is explicitly deferred).
     scope: {paths: [crates/forge-store/src/attempts.rs], operations: [add-feature]}
@@ -85,3 +114,8 @@ allowed_changes:
           crates/forge-cli/src/schema.rs]
   forbidden_paths: [crates/forge-content-native/**, crates/forge-store/migrations/**]
   public_api_change_policy: contract-update-required
+
+--- NEIGHBOR CONTRACT MISSING: - ccx-task-382-1-payload-honesty (surface as unknown, do not guess) ---
+
+--- NEIGHBOR CONTRACT MISSING: - ccx-task-382-3-tests (surface as unknown, do not guess) ---
+
