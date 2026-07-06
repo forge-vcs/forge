@@ -8,6 +8,11 @@ pub(crate) struct WorkspaceMarker {
     pub(crate) attempt_id: String,
 }
 
+/// Role qualifier emitted next to `workspace_path` (NER-382): the workspace dir
+/// is materialized state, not an editing surface. Enum-ready, but this is the
+/// only value today.
+pub const WORKSPACE_ROLE_MATERIALIZATION_TARGET: &str = "materialization_target";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StartAttempt {
     pub intent_id: String,
@@ -15,6 +20,7 @@ pub struct StartAttempt {
     pub base_head: String,
     pub attached: bool,
     pub workspace_path: String,
+    pub workspace_role: &'static str,
     pub operation_id: String,
     pub current_view_id: String,
 }
@@ -209,6 +215,7 @@ fn create_attempt(
                         "base_head": base_head,
                         "attached": attach,
                         "workspace_path": workspace_rel_path_for_attempt(&attempt_id),
+                        "workspace_role": WORKSPACE_ROLE_MATERIALIZATION_TARGET,
                     }
                 }),
             },
@@ -225,6 +232,7 @@ fn create_attempt(
     Ok(StartAttempt {
         intent_id,
         workspace_path: workspace_rel_path_for_attempt(&attempt_id),
+        workspace_role: WORKSPACE_ROLE_MATERIALIZATION_TARGET,
         attempt_id,
         base_head,
         attached: attach,
@@ -560,4 +568,231 @@ pub fn attempt_base_head(cwd: &Path, attempt_id: &str) -> Result<String> {
             selector: attempt_id.to_string(),
         })?
         .base_head)
+}
+
+/// NER-382 workspace drift guard: refuse `attempt attach` when the target attempt's
+/// workspace dir no longer holds the content the store recorded materializing into it
+/// (`attempt_workspaces.materialized_content_ref`) — re-materializing would silently
+/// discard those workspace edits. This is an EQUALITY check, not a diff: the recorded
+/// tree is walked via the native store's read primitives and each workspace file is
+/// hash/byte-compared against it. Deliberately NOT `diff_working_vs_tree`, which
+/// writes a status cache into the scanned root — this check reads the workspace dir
+/// only and never mutates it, so a refusal leaves the workspace untouched.
+///
+/// Skipped (Ok) when nothing was ever materialized: a NULL/absent
+/// `materialized_content_ref` (including every git-backend workspace, which never
+/// records one) has no baseline to drift from.
+pub fn verify_attempt_workspace_undrifted(cwd: &Path, attempt_id: &str) -> Result<()> {
+    let context = open_repository(cwd)?;
+    attempt_by_id(&context, attempt_id)?.ok_or_else(|| ForgeError::UnknownAttempt {
+        selector: attempt_id.to_string(),
+    })?;
+    let connection = open_connection(&context.database_path)?;
+    let recorded: Option<String> = connection
+        .query_row(
+            "SELECT materialized_content_ref FROM attempt_workspaces
+             WHERE repo_id = ?1 AND attempt_id = ?2",
+            params![context.repo_id, attempt_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(recorded) = recorded else {
+        return Ok(());
+    };
+    // Only native `forge-tree:` refs are ever recorded (the git arm of workspace
+    // materialization records nothing); stay permissive on any other family.
+    let Some(tree_id) = recorded.strip_prefix(forge_content::FORGE_TREE_PREFIX) else {
+        return Ok(());
+    };
+    let workspace = context
+        .root_path
+        .join(attempt_workspace_rel_path(&context, attempt_id)?);
+    let drifted = workspace_drift_paths(&context.root_path, &workspace, tree_id)?;
+    if drifted.is_empty() {
+        return Ok(());
+    }
+    Err(ForgeError::WorkspaceDrift { paths: drifted }.into())
+}
+
+/// The tree-entry mode for a symlink (git's `120000`, mirroring the native backend's
+/// symlink representation): the blob holds the link *target* bytes, so equality
+/// compares the target string — the link is never followed.
+const WORKSPACE_SYMLINK_MODE: u32 = 0o120000;
+
+/// Plain per-file equality comparison of a workspace dir against a recorded native
+/// tree. Expected side: the recorded tree walked via `NativeObjectStore::read_object`,
+/// skipping `is_ignored_by_policy` entries exactly like materialization does (those
+/// were never written into the workspace, so they cannot have drifted). Actual side:
+/// a read-only filesystem walk of the workspace dir under the same policy filter
+/// (which also excludes the workspace marker and secret-risk names on both sides).
+/// A path drifts when it is missing, added, of the wrong type, or its bytes hash to
+/// a different blob id. Bytes/paths only — an executable-bit-only change is not
+/// reported (the recorded tree pins content identity, not permissions).
+fn workspace_drift_paths(repo_root: &Path, workspace: &Path, tree_id: &str) -> Result<Vec<String>> {
+    let store = forge_content_native::NativeObjectStore::new(repo_root);
+    let root = forge_content_native::ObjectId::parse(tree_id)?;
+    let mut expected = std::collections::BTreeMap::new();
+    collect_expected_tree_files(&store, &root, "", &mut expected)?;
+    let mut actual = std::collections::BTreeSet::new();
+    if workspace.is_dir() {
+        collect_workspace_paths(workspace, workspace, &mut actual)?;
+    }
+    let mut drifted = std::collections::BTreeSet::new();
+    for path in &actual {
+        if !expected.contains_key(path) {
+            drifted.insert(path.clone());
+        }
+    }
+    for (path, (mode, object)) in &expected {
+        // Short-circuit: a recorded path absent from the walk is a deletion — no
+        // per-file compare needed.
+        let matches = actual.contains(path)
+            && workspace_file_matches_blob(&store, &workspace.join(path), *mode, object)?;
+        if !matches {
+            drifted.insert(path.clone());
+        }
+    }
+    Ok(drifted.into_iter().collect())
+}
+
+/// Recursively collect `rel path -> (mode, blob object id)` for every file entry of a
+/// recorded native tree, via the store's read primitives. The tree payload is the
+/// content-addressed native tree object (`{ schema_version, entries: [{ name, kind,
+/// mode, object }] }`); `read_object` has already verified its hash, so a malformed
+/// shape here is store corruption, surfaced path-free.
+fn collect_expected_tree_files(
+    store: &forge_content_native::NativeObjectStore,
+    tree_id: &forge_content_native::ObjectId,
+    prefix: &str,
+    out: &mut std::collections::BTreeMap<String, (u32, String)>,
+) -> Result<()> {
+    let payload = store.read_object(tree_id)?;
+    let tree: Value = serde_json::from_slice(&payload)?;
+    let entries = tree
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("malformed native tree object"))?;
+    for entry in entries {
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("malformed native tree entry"))?;
+        let kind = entry
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("malformed native tree entry"))?;
+        let mode = entry
+            .get("mode")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("malformed native tree entry"))?;
+        let object = entry
+            .get("object")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("malformed native tree entry"))?;
+        let rel = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if forge_content::is_ignored_by_policy(&rel) {
+            continue;
+        }
+        match kind {
+            "file" => {
+                out.insert(rel, (mode as u32, object.to_string()));
+            }
+            "dir" => collect_expected_tree_files(
+                store,
+                &forge_content_native::ObjectId::parse(object)?,
+                &rel,
+                out,
+            )?,
+            _ => bail!("malformed native tree entry kind"),
+        }
+    }
+    Ok(())
+}
+
+/// Read-only recursive walk of the workspace dir: collects the forward-slash relative
+/// path of every regular file and symlink, skipping `is_ignored_by_policy` paths
+/// (`.forge/`, `.git/`, the workspace marker, restore temps, secret-risk names) and
+/// never descending through symlinked directories. A path that vanishes mid-walk is
+/// skipped as benign (mirrors the native scanner).
+fn collect_workspace_paths(
+    root: &Path,
+    dir: &Path,
+    out: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let entries =
+        fs::read_dir(dir).map_err(|error| anyhow!("read workspace dir: {}", error.kind()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| anyhow!("read workspace dir: {}", error.kind()))?;
+        let full = entry.path();
+        let Some(rel) = workspace_rel(root, &full) else {
+            continue;
+        };
+        if forge_content::is_ignored_by_policy(&rel) {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&full) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() {
+            collect_workspace_paths(root, &full, out)?;
+        } else {
+            out.insert(rel);
+        }
+    }
+    Ok(())
+}
+
+/// Workspace-relative, forward-slash path (only `Normal` components; lossy UTF-8) —
+/// matching the native scanner's path normalization so the two sides key identically.
+fn workspace_rel(root: &Path, full: &Path) -> Option<String> {
+    let rel = full.strip_prefix(root).ok()?;
+    let parts: Vec<String> = rel
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(os) => Some(os.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+/// Per-file equality against one recorded tree entry. A symlink entry compares the
+/// link target bytes to the recorded blob payload (never following the link); a
+/// regular file hashes its bytes into a blob `ObjectId` and compares ids — no file
+/// content ever leaves this function, and the workspace is only read.
+fn workspace_file_matches_blob(
+    store: &forge_content_native::NativeObjectStore,
+    full: &Path,
+    mode: u32,
+    object: &str,
+) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(full) {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(false), // vanished since the walk: content differs
+    };
+    if mode == WORKSPACE_SYMLINK_MODE {
+        if !metadata.file_type().is_symlink() {
+            return Ok(false);
+        }
+        let target = fs::read_link(full)
+            .map_err(|error| anyhow!("read workspace symlink: {}", error.kind()))?;
+        let expected = store.read_object(&forge_content_native::ObjectId::parse(object)?)?;
+        return Ok(target.to_string_lossy().as_bytes() == expected.as_slice());
+    }
+    if !metadata.is_file() {
+        return Ok(false); // dir or symlink where a regular file was recorded
+    }
+    let bytes = fs::read(full).map_err(|error| anyhow!("read workspace file: {}", error.kind()))?;
+    let actual =
+        forge_content_native::ObjectId::new(forge_content_native::ObjectKind::Blob, &bytes);
+    Ok(actual.to_string() == object)
 }

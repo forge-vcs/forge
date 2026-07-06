@@ -55,8 +55,8 @@ fn envelope_shape() -> Value {
 fn command_shapes() -> Value {
     let commands = [
         ("init", "Initializes a .forge repository; data carries root_path and the genesis operation."),
-        ("start", "Starts an intent + its first attempt; accepts repeatable --require <command> gates and --require-tests-pass <command> structured gates (which also require zero parsed failures) persisted on the intent, and an optional --actor; data carries the started attempt + operation_id."),
-        ("attempt start", "Starts a new attempt for an existing intent; data carries the attempt + operation_id."),
+        ("start", "Starts an intent + its first attempt; accepts repeatable --require <command> gates and --require-tests-pass <command> structured gates (which also require zero parsed failures) persisted on the intent, and an optional --actor; data carries the started attempt + operation_id, with workspace_path qualified by workspace_role=\"materialization_target\" (the workspace dir is materialized state, not an editing surface; edits belong in the repo root worktree)."),
+        ("attempt start", "Starts a new attempt for an existing intent; data carries the attempt + operation_id, with workspace_path qualified by workspace_role=\"materialization_target\" (the workspace dir is materialized state, not an editing surface; edits belong in the repo root worktree after `attempt attach`)."),
         ("attempt list", "Lists attempts; data carries { attempts: [...] }."),
         ("attempt show", "Shows one attempt; data carries the attempt detail."),
         ("attempt attach", "Attaches the active view to an attempt; data carries attempt_id, content_ref, current_view_id."),
